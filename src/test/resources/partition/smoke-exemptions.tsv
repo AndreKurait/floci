@@ -2,7 +2,7 @@
 # package<TAB>reason. PartitionSmokeInventoryTest fails on a minting package missing from both,
 # and on a row whose package no longer mints or is now covered. Shrink this file, never grow it
 # without a reason.
-account	the one ARN it builds is the member account an IAM check names, in the partition of the caller's organization's own ARN, and it never reaches the wire, so a case has nothing to assert
+account	Account member ARNs use stored organization identity; AccountRegionOrganizationIamIntegrationTest and AccountRegionUnknownPartitionIamIntegrationTest cover exact member and request-partition grants without a returned ARN.
 appintegrations	no non-commercial partition publishes the service, so a case would be skipped in every partition
 athena	the only ARNs it builds are the default workgroup and data catalog an IAM check names for a request naming none, in the request Region's partition, and they never reach the wire, so a case has nothing to assert
 bcmpricingcalculator	the only ARN it builds is the workload estimate's own, in the request's partition, which an IAM tag lookup compares against the ARN a request names, and it never reaches the wire, so a case has nothing to assert

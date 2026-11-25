@@ -281,8 +281,21 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "account" -> accountRegionConditionContext(action, ctx);
             default -> requestMemberConditions(action, ctx);
         };
+    }
+
+    private Map<String, List<String>> accountRegionConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("account:EnableRegion".equals(action) || "account:DisableRegion".equals(action)
+                || "account:GetRegionOptStatus".equals(action))) {
+            return requestMemberConditions(action, ctx);
+        }
+        JsonNode body = PassedRoles.jsonBody(ctx);
+        return requestConditions(action, member -> {
+            JsonNode value = body == null ? null : body.get(member);
+            return value != null && value.isTextual() ? value.textValue() : null;
+        });
     }
 
     /**

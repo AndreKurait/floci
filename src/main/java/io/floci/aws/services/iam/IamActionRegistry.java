@@ -8,6 +8,8 @@ import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.account.AccountController;
+import io.floci.aws.services.account.AccountRegionActions;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
@@ -583,6 +585,11 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("account".equals(credentialScope) && resourceInfo != null
+                && AccountController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return AccountRegionActions.forMethod(resourceInfo.getResourceMethod().getName());
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
