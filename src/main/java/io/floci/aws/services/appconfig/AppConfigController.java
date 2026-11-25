@@ -120,8 +120,8 @@ public class AppConfigController {
     @Path("/applications/{appId}/environments/{envId}")
     public Response updateEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId,
                                       String body) {
-        return Response.ok(service.updateEnvironment(appId, envId,
-                AppConfigUpdateRequest.read(objectMapper, body))).build();
+        return Response.ok(resourceResponse(service.updateEnvironment(appId, envId,
+                AppConfigUpdateRequest.read(objectMapper, body)))).build();
     }
 
     @DELETE
@@ -284,8 +284,8 @@ public class AppConfigController {
     @PATCH
     @Path("/deploymentstrategies/{id}")
     public Response updateDeploymentStrategy(@PathParam("id") String id, String body) {
-        return Response.ok(service.updateDeploymentStrategy(id,
-                AppConfigUpdateRequest.read(objectMapper, body))).build();
+        return Response.ok(resourceResponse(service.updateDeploymentStrategy(id,
+                AppConfigUpdateRequest.read(objectMapper, body)))).build();
     }
 
     @GET
@@ -335,7 +335,7 @@ public class AppConfigController {
     private Response listResponse(List<?> items, String nextToken) {
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode itemArray = root.putArray("Items");
-        items.forEach(itemArray::addPOJO);
+        items.forEach(item -> itemArray.add(resourceResponse(item)));
         if (nextToken != null) {
             root.put("NextToken", nextToken);
         }
