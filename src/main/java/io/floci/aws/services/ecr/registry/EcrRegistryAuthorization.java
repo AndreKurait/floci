@@ -34,7 +34,7 @@ import java.util.Objects;
 public class EcrRegistryAuthorization {
     @RegisterForReflection
     public record TokenRecord(String accessKeyId, String accountId, String principalArn, String userId,
-                              Instant expiresAt, boolean enforcementDisabled) {}
+                              Instant expiresAt, boolean enforcementDisabled, String region) {}
     public record IssuedToken(String authorizationToken, Instant expiresAt) {}
     public record Identity(TokenRecord token, IamService.CallerArns caller, CallerContext policies) {}
 
@@ -64,7 +64,7 @@ public class EcrRegistryAuthorization {
         this.clock = clock;
     }
 
-    public IssuedToken issue() {
+    public IssuedToken issue(String region) {
         boolean disabled = !config.services().iam().enforcementEnabled();
         String key = request.getAccessKeyId();
         IamService.CallerArns caller = key == null ? null : iam.resolveCallerArns(key).orElse(null);
@@ -90,7 +90,8 @@ public class EcrRegistryAuthorization {
         String password = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
         pruneExpired();
         tokens.putForAccount(account, hash(password), new TokenRecord(key, account,
-                caller == null ? null : caller.principalArn(), caller == null ? null : caller.userId(), expiry, disabled));
+                caller == null ? null : caller.principalArn(), caller == null ? null : caller.userId(),
+                expiry, disabled, region));
         return new IssuedToken(Base64.getEncoder().encodeToString(
                 ("AWS:" + password).getBytes(StandardCharsets.UTF_8)), expiry);
     }
@@ -111,14 +112,15 @@ public class EcrRegistryAuthorization {
     }
 
     @ActivateRequestContext
-    public Identity authenticate(String authorization) {
+    public Identity authenticate(String authorization, String region) {
         String password = password(authorization);
         if (password == null) {
             throw unauthorized();
         }
         AccountAwareStorageBackend.OwnedEntry<TokenRecord> stored = tokens.findAnyAccountEntry(hash(password)).orElseThrow(EcrRegistryAuthorization::unauthorized);
         TokenRecord token = stored.value();
-        if (!stored.account().equals(token.accountId()) || !token.expiresAt().isAfter(clock.instant())) {
+        if (!stored.account().equals(token.accountId()) || !token.expiresAt().isAfter(clock.instant())
+                || token.region() == null || !token.region().equals(region)) {
             throw unauthorized();
         }
         if (token.enforcementDisabled()) {

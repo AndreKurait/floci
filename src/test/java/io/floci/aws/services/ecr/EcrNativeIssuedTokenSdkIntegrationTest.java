@@ -48,8 +48,11 @@ class EcrNativeIssuedTokenSdkIntegrationTest {
                 AuthorizationData token = tokens.get(i);
                 assertEquals("https://" + registries.get(i) + ".dkr.ecr.us-west-2.amazonaws.com", token.proxyEndpoint());
                 EcrRegistryAuthorization.Identity caller = assertDoesNotThrow(
-                        () -> authorization.authenticate("Basic " + token.authorizationToken()));
+                        () -> authorization.authenticate("Basic " + token.authorizationToken(), "us-west-2"));
                 assertEquals(user.accessKeyId(), caller.token().accessKeyId());
+                assertEquals("us-west-2", caller.token().region());
+                assertEquals(401, assertThrows(AwsException.class, () -> authorization.authenticate(
+                        "Basic " + token.authorizationToken(), "us-east-1")).getHttpStatus());
                 assertTrue(caller.caller().principalArn().endsWith(":user/" + user.name()));
                 String resource = "arn:aws:ecr:us-west-2:" + registries.get(i) + ":repository/private";
                 assertEquals(403, assertThrows(AwsException.class,
@@ -64,12 +67,15 @@ class EcrNativeIssuedTokenSdkIntegrationTest {
              EcrClient client = client(user.accessKeyId(), user.secretAccessKey());
              EcrClient forged = client(user.accessKeyId(), "wrong-secret")) {
             AuthorizationData token = client.getAuthorizationToken().authorizationData().getFirst();
-            EcrRegistryAuthorization.Identity caller = authorization.authenticate("Basic " + token.authorizationToken());
+            EcrRegistryAuthorization.Identity caller = authorization.authenticate("Basic " + token.authorizationToken(), "us-west-2");
             assertEquals(user.accessKeyId(), caller.token().accessKeyId());
+            assertEquals("us-west-2", caller.token().region());
+            assertEquals(401, assertThrows(AwsException.class, () -> authorization.authenticate(
+                    "Basic " + token.authorizationToken(), "us-east-1")).getHttpStatus());
             assertEquals("https://" + caller.token().accountId() + ".dkr.ecr.us-west-2.amazonaws.com", token.proxyEndpoint());
             assertThrows(InvalidParameterException.class, () -> client.getAuthorizationToken(r -> r.registryIds("bad")));
             assertThrows(EcrException.class, () -> forged.getAuthorizationToken(r -> r.registryIds("111111111111")));
-            assertThrows(AwsException.class, () -> authorization.authenticate("Basic QVdTOmZsb2Np"));
+            assertThrows(AwsException.class, () -> authorization.authenticate("Basic QVdTOmZsb2Np", "us-west-2"));
         }
     }
 
