@@ -46,6 +46,7 @@ final class EcsServiceFixtures {
         private CloudWatchMetricsService cloudWatchMetricsService;
         private EcsServiceDiscoveryRegistrar discoveryRegistrar;
         private Clock clock = Clock.systemUTC();
+        private EcsService.WaitTimer waitTimer = EcsService.WaitTimer.SYSTEM;
         private boolean dockerMode;
 
         private Builder() {
@@ -88,6 +89,11 @@ final class EcsServiceFixtures {
             return this;
         }
 
+        Builder waitTimer(EcsService.WaitTimer waitTimer) {
+            this.waitTimer = waitTimer;
+            return this;
+        }
+
         /** Docker mode, for a test whose container manager stands in for Docker. */
         Builder dockerMode() {
             this.dockerMode = true;
@@ -101,7 +107,7 @@ final class EcsServiceFixtures {
             EcsService service = new EcsService(new RegionResolver(REGION, ACCOUNT), containerManager, config,
                     loadBalancerRegistrar,
                     storageFactory != null ? storageFactory : new InMemoryStorageFactory(ACCOUNT), eventPublisher,
-                    new EcsExecSessionRegistry(), discoveryRegistrar, cloudWatchMetricsService, clock);
+                    new EcsExecSessionRegistry(), discoveryRegistrar, cloudWatchMetricsService, clock, waitTimer);
             service.initializeStorage();
             return service;
         }
