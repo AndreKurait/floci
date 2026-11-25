@@ -383,10 +383,11 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * balancer's type; whether the subnets span two Availability Zones is checked after they are looked
      * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
      * message and order. Explicit global or regional single-zone overrides reduce the minimum to one.
+     * The account override permits one subnet but preserves this refusal when no subnet is named.
      */
     private void requireSubnets(String region, String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
-        if ("application".equals(lbType) && requiresTwoAlbZones(region) && count < 2) {
+        if ("application".equals(lbType) && requiresTwoAlbZones(region, count > 0) && count < 2) {
             throw new AwsException("ValidationError",
                     "At least two subnets in two different Availability Zones must be specified", 400);
         }
@@ -396,6 +397,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     private boolean requiresTwoAlbZones(String region) {
+        return requiresTwoAlbZones(region, true);
+    }
+
+    private boolean requiresTwoAlbZones(String region, boolean includeAccountOverride) {
         EmulatorConfig.AlbZoneRule rule = EmulatorConfig.AlbZoneRule.AWS;
         if (config != null) {
             EmulatorConfig.ElbV2ServiceConfig settings = config.services().elbv2();
@@ -405,7 +410,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             Map<String, EmulatorConfig.AlbZoneRule> regions = settings.albZoneRuleByRegion();
             if (regions != null && regions.containsKey(region)) {
                 rule = regions.get(region);
-            } else if (singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
+            } else if (includeAccountOverride && singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
                 return false;
             }
         }

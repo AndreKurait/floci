@@ -430,5 +430,7 @@ An explicit regional rule takes precedence, including `aws` to restore that
 region's AWS default. Otherwise a listed account permits one zone, followed by
 the global rule and AWS defaults. Unlisted accounts keep the global or regional
 behavior. Both `CreateLoadBalancer` and `SetSubnets`, including CloudFormation,
-apply the rule. Empty subnet lists are still rejected, and Network and Gateway
+apply the rule. An account grant permits one subnet but keeps the original
+Application Load Balancer error when no subnet is named. Explicit global and
+regional single-zone rules retain their one-subnet error. Network and Gateway
 Load Balancers are unchanged.
