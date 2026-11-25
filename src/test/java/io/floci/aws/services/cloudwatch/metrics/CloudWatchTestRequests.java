@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudwatch.metrics;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.restassured.parsing.Parser;
 import io.restassured.response.Response;
 
 import java.net.URI;
@@ -33,7 +34,8 @@ final class CloudWatchTestRequests {
             return given().port(endpoint.getPort()).header("Authorization", scope)
                     .contentType("application/x-amz-json-1.0")
                     .header("X-Amz-Target", "GraniteServiceVersion20100801." + operation)
-                    .body(MAPPER.writeValueAsString(body)).post("/");
+                    .body(MAPPER.writeValueAsBytes(body))
+                    .expect().parser("application/x-amz-json-1.0", Parser.JSON).when().post("/");
         }
         return given().port(endpoint.getPort()).header("Authorization", scope)
                 .contentType("application/x-www-form-urlencoded")
