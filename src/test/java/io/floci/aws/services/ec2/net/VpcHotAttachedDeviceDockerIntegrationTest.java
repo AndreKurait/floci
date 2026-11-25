@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Network;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerBuilder;
@@ -92,6 +93,7 @@ class VpcHotAttachedDeviceDockerIntegrationTest {
             assertEquals(Optional.of(network), manager.attachInterface(ACCOUNT, REGION, "vpc-attached",
                     "subnet-attached", guest, address, MAC));
             assertDefaultRouteUsesBridge(guest);
+            assertTrue(run(guest, "ip", "-j", "link").contains(originalMac));
             JsonNode links = new ObjectMapper().readTree(run(guest, "ip", "-j", "address"));
             JsonNode device = null;
             for (JsonNode link : links) {
@@ -122,13 +124,23 @@ class VpcHotAttachedDeviceDockerIntegrationTest {
             manager.restoreInterface(ACCOUNT, REGION, "vpc-attached", guest, address, MAC);
             assertTrue(run(guest, "ip", "-j", "link").contains(MAC));
             assertDefaultRouteUsesBridge(guest);
+            // Docker may regenerate an unconfigured bridge MAC when the container restarts.
+            // Detach must preserve the current primary endpoint, including its default route.
+            ContainerNetwork primaryBeforeDetach = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
+                    .getNetworks().get("bridge");
             manager.detachInterface(ACCOUNT, REGION, "vpc-attached", guest, address, MAC);
             manager.restoreInterface(ACCOUNT, REGION, "vpc-attached", guest, address, MAC);
             assertFalse(docker.inspectContainerCmd(guest).exec().getNetworkSettings().getNetworks().containsKey(network));
             String remainingLinks = run(guest, "ip", "-j", "link");
             assertFalse(remainingLinks.contains(MAC));
-            assertTrue(remainingLinks.contains(originalMac), remainingLinks);
-            assertTrue(docker.inspectContainerCmd(guest).exec().getNetworkSettings().getNetworks().containsKey("bridge"));
+            assertTrue(remainingLinks.contains(primaryBeforeDetach.getMacAddress()), remainingLinks);
+            ContainerNetwork primaryAfterDetach = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
+                    .getNetworks().get("bridge");
+            assertEquals(primaryBeforeDetach.getEndpointId(), primaryAfterDetach.getEndpointId());
+            assertEquals(primaryBeforeDetach.getNetworkID(), primaryAfterDetach.getNetworkID());
+            assertEquals(primaryBeforeDetach.getIpAddress(), primaryAfterDetach.getIpAddress());
+            assertEquals(primaryBeforeDetach.getMacAddress(), primaryAfterDetach.getMacAddress());
+            assertDefaultRouteUsesBridge(guest);
             assertTrue(docker.inspectContainerCmd(peer).exec().getNetworkSettings().getNetworks().containsKey(network));
             assertNotEquals(0L, ContainerExec.run(docker, peer, new String[]{"ping", "-c", "1", "-W", "1", address}, 5)
                     .throwIfTimedOut(peer).exitCode());
