@@ -28,6 +28,10 @@ The proxy is a transparent byte relay, so the host-facing proxy port range is un
 | `DescribeDBClusters` | List clusters and their connection details |
 | `DeleteDBCluster` | Stop and remove a cluster |
 | `ModifyDBCluster` | Update cluster settings, including deletion protection, backup retention, log exports and security groups |
+| `CreateDBClusterSnapshot` | Capture a manual snapshot of a Gremlin cluster, including its graph data |
+| `DescribeDBClusterSnapshots` | Read manual snapshot metadata by identifier, ARN or source cluster |
+| `DeleteDBClusterSnapshot` | Delete a snapshot and its stored graph archive |
+| `RestoreDBClusterFromSnapshot` | Restore an independent Gremlin cluster from a stored snapshot |
 | `AddRoleToDBCluster` | Associate an IAM role with a cluster (listed under `AssociatedRoles`) |
 | `RemoveRoleFromDBCluster` | Disassociate an IAM role from a cluster |
 | `DescribeGlobalClusters` | Always an empty list; global clusters are not modelled |
@@ -39,6 +43,36 @@ The proxy is a transparent byte relay, so the host-facing proxy port range is un
 | `AddTagsToResource` | Add or overwrite tags on a cluster or instance |
 | `RemoveTagsFromResource` | Remove tags from a cluster or instance by key |
 <!-- floci:actions:end -->
+
+## Cluster snapshots
+
+Manual snapshots of the default TinkerGraph backend preserve vertices, edges, identifiers, labels
+and properties in a GraphSON archive. The archive and captured settings are stored together in one
+atomic storage record. A restore loads that archive into a new backend before publishing the target
+cluster as available. Deleting or changing the source does not change an existing snapshot.
+
+Pause graph writes while creating a snapshot: this is a graph export, with no transaction spanning
+concurrent native client writes. Snapshots are limited to 64 MiB of GraphSON. Neo4j snapshots,
+automated backups, point-in-time recovery and snapshot sharing are not implemented. Listing returns
+the stored manual snapshots; pagination and additional snapshot filters are not modeled.
+
+Snapshot identifiers and ARNs are scoped to the caller's account and region. RDS-family requests
+select the store that owns the snapshot; ambiguous identifiers in legacy stores are refused.
+The snapshot retains backup, placement, encryption and log settings. Restore request values can
+override supported cluster settings; deletion protection defaults to false and restore tags come
+from the request. Restoring creates no DB instances.
+
+`FLOCI_SERVICES_NEPTUNE_MOCK=true` explicitly enables metadata-only snapshots without Docker.
+Such snapshots can only be restored in mock mode. With mock mode disabled, capture requires a
+working Gremlin backend, and a missing or failed restore backend produces an error and invokes
+target cleanup instead of returning an empty available cluster.
+
+With IAM enforcement enabled, Neptune snapshot calls use `rds` actions and resource ARNs.
+Creation checks the named source cluster and new snapshot; read and delete check the snapshot
+named by the request. Restore checks the named target cluster, source snapshot, and parameter
+or subnet groups explicitly supplied by the request. An unfiltered family listing requires `*`.
+This covers Neptune's snapshot requests; it does not change other RDS-family authorization paths
+or model permissions on unspecified default groups.
 
 ## Terraform and the `aws_neptune_cluster` resource
 
@@ -71,6 +105,7 @@ A requested `Port` is honoured when it is free and inside the proxy port range (
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLOCI_SERVICES_NEPTUNE_ENABLED` | `true` | Enable or disable Neptune |
+| `FLOCI_SERVICES_NEPTUNE_MOCK` | `false` | Explicit metadata-only clusters and snapshots without a graph backend |
 | `FLOCI_SERVICES_NEPTUNE_PROXY_BASE_PORT` | `8182` | First host port in the Gremlin proxy range |
 | `FLOCI_SERVICES_NEPTUNE_PROXY_MAX_PORT` | `8282` | Last host port in the proxy range |
 | `FLOCI_SERVICES_NEPTUNE_DB_TYPE` | `gremlin` | Backend engine: `gremlin` (Gremlin/WebSocket) or `neo4j` (openCypher/Bolt) |

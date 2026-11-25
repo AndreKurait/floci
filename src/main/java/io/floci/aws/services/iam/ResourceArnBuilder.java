@@ -6,6 +6,7 @@ import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.neptune.NeptuneSnapshotResources;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -15,8 +16,10 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Constructs the target resource ARN for a request so the policy evaluator
@@ -41,13 +44,21 @@ public class ResourceArnBuilder {
      * normalized path gives them otherwise (an S3 key's own slashes).
      */
     private final Instance<RequestPathLabels> requestPathLabels;
+    private final Instance<NeptuneSnapshotResources> neptuneSnapshotResources;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<StoredResourceArns> storedResourceArns,
-                              Instance<RequestPathLabels> requestPathLabels) {
+                              Instance<RequestPathLabels> requestPathLabels,
+                              Instance<NeptuneSnapshotResources> neptuneSnapshotResources) {
         this.objectMapper = objectMapper;
         this.storedResourceArns = storedResourceArns;
         this.requestPathLabels = requestPathLabels;
+        this.neptuneSnapshotResources = neptuneSnapshotResources;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<StoredResourceArns> storedResourceArns,
+                              Instance<RequestPathLabels> requestPathLabels) {
+        this(objectMapper, storedResourceArns, requestPathLabels, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<StoredResourceArns> storedResourceArns) {
@@ -91,6 +102,22 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation)
+                && neptuneSnapshotResources != null && !neptuneSnapshotResources.isUnsatisfied()) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            for (String member : List.of("Engine", "DBClusterIdentifier", "DBClusterSnapshotIdentifier",
+                    "SnapshotIdentifier", "DBClusterParameterGroupName", "DBSubnetGroupName")) {
+                String value = firstFormParam(ctx, member);
+                if (value != null) {
+                    parameters.put(member, value);
+                }
+            }
+            Optional<List<String>> resources = neptuneSnapshotResources.get().resolve(operation,
+                    parameters, partition, region, accountId);
+            if (resources.isPresent()) {
+                return resources.get();
+            }
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
