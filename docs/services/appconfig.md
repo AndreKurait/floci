@@ -188,6 +188,9 @@ For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` als
 Deployment `Ref` and public physical IDs return the deployment number as a string. Resource descriptions,
 lists, events and change-set previews use that number; deletion and rollback retain the full stored identity.
 
+Deployment provisioning respects `floci.services.appconfig.enabled`. Disabling AppConfig
+removes its Deployment provisioner from active CloudFormation routing.
+
 Deployment creation waits for AppConfig's `COMPLETE` state through rollout and final bake.
 `Fn::GetAtt DeploymentNumber` is a string, and `State` reports completion. The wait is
 interruptible and bounded to 24 hours. Changing deployment properties starts a replacement.
