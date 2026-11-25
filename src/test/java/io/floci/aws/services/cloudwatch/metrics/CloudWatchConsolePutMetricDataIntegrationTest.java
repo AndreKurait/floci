@@ -1,5 +1,6 @@
 package io.floci.aws.services.cloudwatch.metrics;
 
+import io.floci.aws.testing.AwsTestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.config.EncoderConfig;
@@ -10,8 +11,13 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
+import software.amazon.awssdk.services.cloudwatch.model.Datapoint;
+import software.amazon.awssdk.services.cloudwatch.model.Statistic;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.config;
@@ -19,6 +25,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
 class CloudWatchConsolePutMetricDataIntegrationTest {
@@ -56,13 +63,14 @@ class CloudWatchConsolePutMetricDataIntegrationTest {
     }
 
     private static void assertSum(String namespace, String metric, long timestamp, float sum) {
-        request("GraniteServiceVersion20100801.GetMetricStatistics")
-                .body("""
-                        {"Namespace":"%s","MetricName":"%s","StartTime":%d,"EndTime":%d,
-                         "Period":60,"Statistics":["Sum"]}
-                        """.formatted(namespace, metric, timestamp - 120, timestamp + 120))
-                .when().post("/")
-                .then().statusCode(200).body("Datapoints.Sum", hasItem(sum));
+        try (CloudWatchClient client = AwsTestClients.create(CloudWatchClient.builder(), "test", Region.US_EAST_1)) {
+            List<Datapoint> datapoints = client.getMetricStatistics(request -> request.namespace(namespace)
+                    .metricName(metric).startTime(Instant.ofEpochSecond(timestamp - 120))
+                    .endTime(Instant.ofEpochSecond(timestamp + 120)).period(60).statistics(Statistic.SUM))
+                    .datapoints();
+            assertEquals(1, datapoints.size());
+            assertEquals((double) sum, datapoints.getFirst().sum());
+        }
     }
 
     @Test
@@ -93,6 +101,43 @@ class CloudWatchConsolePutMetricDataIntegrationTest {
     }
 
     @Test
+    void valueArraysAreStoredAndReadableThroughTheStandardProtocol() {
+        String namespace = namespace();
+        long timestamp = Instant.now().getEpochSecond();
+        put().body("""
+                {"Namespace":"%s","MetricData":[
+                  {"MetricName":"Weighted","Values":[2,5],"Counts":[3,2],"Timestamp":%d},
+                  {"MetricName":"Unweighted","Values":[2,5],"Timestamp":%d}]}
+                """.formatted(namespace, timestamp, timestamp))
+                .when().post("/")
+                .then().statusCode(200);
+
+        assertSum(namespace, "Weighted", timestamp, 16);
+        assertSum(namespace, "Unweighted", timestamp, 7);
+    }
+
+    @Test
+    void zeroWeightedSamplesRemainZeroThroughStorageAndSdkReadback() {
+        String namespace = namespace();
+        long timestamp = Instant.now().getEpochSecond();
+        put().body("""
+                {"Namespace":"%s","MetricData":[
+                  {"MetricName":"Zero","Values":[7,11],"Counts":[0,0],"Timestamp":%d}]}
+                """.formatted(namespace, timestamp))
+                .when().post("/")
+                .then().statusCode(200);
+        assertSum(namespace, "Zero", timestamp, 0);
+        request("GraniteServiceVersion20100801.GetMetricStatistics")
+                .body("""
+                        {"Namespace":"%s","MetricName":"Zero","StartTime":%d,"EndTime":%d,
+                         "Period":60,"Statistics":["SampleCount","Minimum","Maximum"]}
+                        """.formatted(namespace, timestamp - 120, timestamp + 120))
+                .when().post("/")
+                .then().statusCode(200).body("Datapoints.SampleCount", hasItem(0f))
+                .body("Datapoints.Minimum", hasItem(7f)).body("Datapoints.Maximum", hasItem(11f));
+    }
+
+    @Test
     void unsupportedTopLevelShapeIsRejectedWithoutStoringTheValidDatum() {
         String namespace = namespace();
         put().body("""
@@ -105,7 +150,7 @@ class CloudWatchConsolePutMetricDataIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"\"StorageResolution\":1", "\"Values\":[2,5]", "\"Counts\":[2,1]"})
+    @ValueSource(strings = {"\"StorageResolution\":1", "\"Timestamps\":[1,2]", "\"OffsetTimestamps\":[1,2]"})
     void unsupportedDatumShapeRejectsTheEntireRequestBeforeAnyMetricIsStored(String unsupported) {
         String namespace = namespace();
         put().body("""
@@ -114,6 +159,35 @@ class CloudWatchConsolePutMetricDataIntegrationTest {
                 """.formatted(namespace, unsupported))
                 .when().post("/")
                 .then().statusCode(400).body("__type", equalTo("UnsupportedOperation"));
+        assertEmpty(namespace);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "\"Values\":[2,5],\"Counts\":[1]",
+            "\"Values\":[2],\"Counts\":[-1]",
+            "\"Values\":[\"not-a-number\"]"
+    })
+    void invalidWeightedDatumRejectsTheEntireRequestBeforeAnyMetricIsStored(String invalid) {
+        String namespace = namespace();
+        put().body("""
+                {"Namespace":"%s","MetricData":[{"MetricName":"Valid","Value":7},
+                  {"MetricName":"Invalid",%s}]}
+                """.formatted(namespace, invalid))
+                .when().post("/")
+                .then().statusCode(400).body("__type", equalTo("InvalidParameterValueException"));
+        assertEmpty(namespace);
+    }
+
+    @Test
+    void weightedValuesCannotBeCombinedWithAScalarValue() {
+        String namespace = namespace();
+        put().body("""
+                {"Namespace":"%s","MetricData":[{"MetricName":"Valid","Value":7},
+                  {"MetricName":"Invalid","Value":2,"Values":[2,5]}]}
+                """.formatted(namespace))
+                .when().post("/")
+                .then().statusCode(400).body("__type", equalTo("InvalidParameterCombinationException"));
         assertEmpty(namespace);
     }
 
