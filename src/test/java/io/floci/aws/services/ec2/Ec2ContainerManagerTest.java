@@ -48,7 +48,7 @@ import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.ec2instanceconnect.InstanceConnectKeys;
 import io.floci.aws.testing.HelperShellFixture;
 import io.floci.aws.testing.ParallelLocks;
-import org.junit.jupiter.api.AfterEach;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
@@ -81,6 +81,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -90,6 +91,7 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.zip.GZIPOutputStream;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -104,7 +106,6 @@ import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
@@ -128,13 +129,15 @@ class Ec2ContainerManagerTest {
         DockerClient docker = mock(DockerClient.class);
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
         when(firewall.enabled()).thenReturn(true);
+        TestTime time = TestTime.create();
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
                 mock(DockerHostResolver.class), docker, mock(PortAllocator.class), mock(EmulatorConfig.class),
                 mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
                 mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
-                mock(ContainerReachableEndpoint.class), firewall);
+                mock(ContainerReachableEndpoint.class), firewall, new Ec2InstanceTypeCatalog(),
+                timelinePause(time));
         Instance instance = instance("i-firewall-teardown");
         instance.setDockerContainerId(TEST_CONTAINER_ID);
         InstanceNetworkInterface eni = new InstanceNetworkInterface();
@@ -153,6 +156,8 @@ class Ec2ContainerManagerTest {
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
             verify(firewall).unregister("eni-firewall-teardown");
+            // The removal is followed by the half second the network teardown lags it.
+            assertEquals(TestTime.DEFAULT_START.plusMillis(500), time.now());
         } finally {
             manager.stop();
         }
@@ -162,12 +167,6 @@ class Ec2ContainerManagerTest {
     private static final String TEST_CONTAINER_ID = "container-1";
     private static final String TEST_LOG_STREAM_NAME = "yyyy/MM/dd/user-data";
     private static final String TEST_SSH_PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test@floci";
-
-    @AfterEach
-    void resetBridgeIpPolling() {
-        Ec2ContainerManager.containerBridgeIpAttempts = 30;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 500;
-    }
 
     @Test
     void exposeReachablePrivateAddressUpdatesInstanceAndAttachedNetworkInterfaces() {
@@ -1132,15 +1131,17 @@ class Ec2ContainerManagerTest {
         // API decoding and guest execution share the same budget. The hook must see every
         // decompression, and no more than four may run at once across both entry points.
         int concurrentLaunches = 12;
+        int budget = 4;
         AtomicInteger totalDecompressions = new AtomicInteger(0);
         AtomicInteger active = new AtomicInteger(0);
         AtomicInteger peakActive = new AtomicInteger(0);
+        CountDownLatch finishDecompressing = new CountDownLatch(1);
         UserDataPipeline.userDataDecompressionTestHook = () -> {
             totalDecompressions.incrementAndGet();
             int now = active.incrementAndGet();
             peakActive.accumulateAndGet(now, Math::max);
             try {
-                Thread.sleep(75);
+                finishDecompressing.await();
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             } finally {
@@ -1149,7 +1150,12 @@ class Ec2ContainerManagerTest {
         };
 
         List<List<String>> results = new CopyOnWriteArrayList<>();
-        ExecutorService pool = Executors.newFixedThreadPool(concurrentLaunches);
+        List<Thread> workers = new CopyOnWriteArrayList<>();
+        ExecutorService pool = Executors.newFixedThreadPool(concurrentLaunches, task -> {
+            Thread worker = new Thread(task);
+            workers.add(worker);
+            return worker;
+        });
         try {
             // ~9 MB of a repeated character: near the 10 MB per-payload cap, well within it.
             String nearCapPayload = "A".repeat(9 * 1024 * 1024);
@@ -1163,10 +1169,18 @@ class Ec2ContainerManagerTest {
                     futures.add(pool.submit(() -> List.of(Ec2UserDataDecoder.decode(gzipped))));
                 }
             }
+            // Hold the first decompressions open until every other caller has reached the budget:
+            // all twelve are then either decompressing or queued for a permit, and none is in between.
+            awaitUntil(() -> active.get() + queuedForDecompressionBudget(workers) == concurrentLaunches,
+                    Duration.ofSeconds(30));
+            assertEquals(budget, active.get(), "decompressions running while the other callers queue");
+            assertEquals(budget, totalDecompressions.get());
+            finishDecompressing.countDown();
             for (Future<List<String>> future : futures) {
                 results.add(future.get(30, TimeUnit.SECONDS));
             }
         } finally {
+            finishDecompressing.countDown();
             pool.shutdownNow();
             UserDataPipeline.userDataDecompressionTestHook = null;
         }
@@ -1178,6 +1192,15 @@ class Ec2ContainerManagerTest {
         assertTrue(peakActive.get() >= 2,
                 "test did not exercise real concurrency; peak concurrent decompressions was only "
                         + peakActive.get());
+    }
+
+    private static long queuedForDecompressionBudget(List<Thread> workers) {
+        return workers.stream()
+                .filter(worker -> worker.getState() == Thread.State.WAITING)
+                .filter(worker -> Arrays.stream(worker.getStackTrace()).anyMatch(frame ->
+                        frame.getClassName().equals(Semaphore.class.getName())
+                                && frame.getMethodName().equals("acquire")))
+                .count();
     }
 
     @Test
@@ -1603,8 +1626,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchReturnsTheLeaseWhenTheContainerNeverJoinsTheVpcNetwork() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 2;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerResponse noIp = inspectResponse(null);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
@@ -1846,8 +1867,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchPointsTheInstanceSdkAtTheSharedContainerEndpointAndKeepsImdsOnTheHostAddress() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse withIp = inspectResponse("172.18.0.13");
@@ -1871,8 +1890,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchSystemdGuestUsesInitInsteadOfTail() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InfoCmd infoCmd = mock(InfoCmd.class);
         Info info = mock(Info.class);
@@ -1944,8 +1961,6 @@ class Ec2ContainerManagerTest {
     }
 
     private ContainerSpec launchSpecForImage(ResolvedAmiImage image) throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
         when(harness.config.docker()).thenReturn(docker);
@@ -2064,8 +2079,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchWaitsForContainerBridgeIpBeforeRegisteringImds() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 3;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse noIp = inspectResponse(null);
@@ -2088,8 +2101,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchTerminatesWhenContainerBridgeIpNeverAppears() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 2;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse noIp = inspectResponse(null);
@@ -2105,12 +2116,12 @@ class Ec2ContainerManagerTest {
         verify(harness.portAllocator, timeout(2_000)).release(2201);
         assertNull(instance.getDockerContainerId());
         verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
+        // The address was looked for thirty times, half a second apart, before the launch gave up.
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(15), harness.time().now());
     }
 
     @Test
     void launchRetriesWithNextPortWhenDockerReportsHostPortCollision() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         when(harness.portAllocator.allocate(anyInt(), anyInt())).thenReturn(2201, 2202);
         when(harness.lifecycleManager.create(any(ContainerSpec.class)))
@@ -2202,7 +2213,8 @@ class Ec2ContainerManagerTest {
 
     @Test
     void cancelledLaunchRemovesContainerThatStartsAfterCancellation() throws Exception {
-        LaunchHarness harness = launchHarness();
+        ExecutorService launchExecutor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(launchExecutor, Duration.ofMinutes(30));
         CountDownLatch startEntered = new CountDownLatch(1);
         CountDownLatch allowStart = new CountDownLatch(1);
         when(harness.lifecycleManager.startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class))).thenAnswer(invocation -> {
@@ -2220,7 +2232,9 @@ class Ec2ContainerManagerTest {
         verify(harness.portAllocator).release(2201);
 
         allowStart.countDown();
-        verify(harness.portAllocator, after(500).times(1)).release(2201);
+        launchExecutor.shutdown();
+        assertTrue(launchExecutor.awaitTermination(5, TimeUnit.SECONDS), "launch worker should finish");
+        verify(harness.portAllocator, times(1)).release(2201);
     }
 
     @Test
@@ -2250,8 +2264,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchPublishesThePublicAddressBeforeTheInstanceReportsRunning() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 2;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
@@ -2279,8 +2291,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchCancelledAfterItsAddressWasPublishedKeepsNoAddress() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 2;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
@@ -2306,8 +2316,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchMarksInstanceRunningBeforeUserDataCompletes() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 2;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse withIp = inspectResponse("172.18.0.10");
@@ -2389,8 +2397,6 @@ class Ec2ContainerManagerTest {
         LaunchHarness harness = launchHarness(new ThreadPoolExecutor(
                 1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
                 new ThreadPoolExecutor.CallerRunsPolicy()), Duration.ofMillis(50));
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient().inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
         InspectContainerResponse withIp = inspectResponse("172.18.0.30");
@@ -2413,8 +2419,6 @@ class Ec2ContainerManagerTest {
     @Test
     void shutdownClosesActiveUserDataExecStream() throws Exception {
         LaunchHarness harness = launchHarness();
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient().inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
         InspectContainerResponse withIp = inspectResponse("172.18.0.31");
@@ -2435,8 +2439,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchCreatesSshdPrivilegeSeparationDirectoryBeforeStartingSshd() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse withIp = inspectResponse("172.18.0.12");
@@ -2688,50 +2690,36 @@ class Ec2ContainerManagerTest {
         VpcNetworkManager vpcNetworkManager = mock(VpcNetworkManager.class);
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
-        Ec2ContainerManager manager = executor == null
-                ? new Ec2ContainerManager(
-                        containerBuilder,
-                        lifecycleManager,
-                        logStreamer,
-                        mock(ContainerDetector.class),
-                        dockerHostResolver,
-                        dockerClient,
-                        portAllocator,
-                        config,
-                        metadataServer,
-                        portForwardManager,
-                        regionResolver,
-                        mock(ContainerNetworkReachability.class),
-                        vpcNetworkManager,
-                        reachableEndpoint)
-                : new Ec2ContainerManager(
-                        containerBuilder,
-                        lifecycleManager,
-                        logStreamer,
-                        mock(ContainerDetector.class),
-                        dockerHostResolver,
-                        dockerClient,
-                        portAllocator,
-                        config,
-                        metadataServer,
-                        portForwardManager,
-                        regionResolver,
-                        mock(ContainerNetworkReachability.class),
-                        vpcNetworkManager,
-                        reachableEndpoint,
-                        executor,
-                        userDataTimeout);
+        TestTime time = TestTime.create();
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                containerBuilder,
+                lifecycleManager,
+                logStreamer,
+                mock(ContainerDetector.class),
+                dockerHostResolver,
+                dockerClient,
+                portAllocator,
+                config,
+                metadataServer,
+                portForwardManager,
+                regionResolver,
+                mock(ContainerNetworkReachability.class),
+                vpcNetworkManager,
+                reachableEndpoint,
+                new Ec2InstanceTypeCatalog(),
+                executor != null ? executor : Ec2ContainerManager.createLaunchExecutor(),
+                Ec2ContainerManager.createServiceNetworkRetryExecutor(),
+                userDataTimeout,
+                timelinePause(time));
         return new LaunchHarness(manager, lifecycleManager, dockerClient, streamingDockerClient, metadataServer,
                 logStreamer, containerBuilder, builder, portAllocator, portForwardManager, config, vpcNetworkManager,
-                new CopyOnWriteArrayList<>());
+                new CopyOnWriteArrayList<>(), time);
     }
 
     // ── startup reconciliation of EC2 containers orphaned by a previous run ──────
 
     @Test
     void launchStampsTheOwnerPortLabelOnTheInstanceContainer() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         when(harness.config.port()).thenReturn(4680);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
@@ -2977,15 +2965,22 @@ class Ec2ContainerManagerTest {
         return inspect;
     }
 
-    private static void awaitUntil(BooleanSupplier condition, Duration timeout) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (System.nanoTime() < deadline) {
-            if (condition.getAsBoolean()) {
-                return;
+    private static void awaitUntil(BooleanSupplier condition, Duration timeout) {
+        await().atMost(timeout).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(5))
+                .until(condition::getAsBoolean);
+    }
+
+    /**
+     * The manager's pauses pass on the harness timeline instead of the wall clock, each for its
+     * production length, and stay interruptible like the sleeps they stand in for.
+     */
+    private static Ec2ContainerPause timelinePause(TestTime time) {
+        return millis -> {
+            if (Thread.interrupted()) {
+                throw new InterruptedException();
             }
-            Thread.sleep(10);
-        }
-        assertTrue(condition.getAsBoolean(), "condition was not met before timeout");
+            time.sleepAdvancing(Duration.ofMillis(millis));
+        };
     }
 
     @Test
@@ -3052,6 +3047,8 @@ class Ec2ContainerManagerTest {
 
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
         assertFalse(ran.get(), "the hook must not run when the container is still present");
+        // One removal attempt, so the teardown pause passed once at its production length
+        assertEquals(TestTime.DEFAULT_START.plusMillis(500), harness.time().now());
     }
 
     @Test
@@ -3075,8 +3072,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchKnownInstanceTypeAppliesResourceLimitsFromCatalog() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
@@ -3096,8 +3091,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchDifferentInstanceTypesProduceDifferentLimits() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(anyString())).thenReturn(inspect);
@@ -3124,8 +3117,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchUnknownInstanceTypeLaunchesUnboundedWithoutLimits() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
@@ -3146,8 +3137,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchWithResourceLimitsDisabledProducesNoLimits() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
         LaunchHarness harness = launchHarness();
         when(harness.config.services().ec2().instanceResourceLimits()).thenReturn(false);
 
@@ -3170,9 +3159,6 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchProducesContainerSpecWithCatalogMemoryAndCpuLimits() throws Exception {
-        Ec2ContainerManager.containerBridgeIpAttempts = 1;
-        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
-
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
         when(dockerHostResolver.resolve()).thenReturn("floci");
         ContainerReachableEndpoint reachableEndpoint = mock(ContainerReachableEndpoint.class);
@@ -3272,7 +3258,8 @@ class Ec2ContainerManagerTest {
                                  Ec2PortForwardManager portForwardManager,
                                  EmulatorConfig config,
                                  VpcNetworkManager vpcNetworkManager,
-                                 List<String[]> executedCommands) {
+                                 List<String[]> executedCommands,
+                                 TestTime time) {
         void stubSuccessfulExecs(CountDownLatch userDataStarted, CountDownLatch finishUserData) throws Exception {
             AtomicReference<String[]> currentCommand = new AtomicReference<>();
             ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));

@@ -4,6 +4,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.JsonPath;
 import io.restassured.path.json.config.JsonPathConfig;
 import jakarta.inject.Inject;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 
@@ -1365,22 +1367,16 @@ class EsmIntegrationTest {
             // 5. Wait for the poller to claim the message. Poll interval is 1000ms;
             //    a claimed message becomes in-flight (NotVisible > 0), proving the
             //    poller resolved the queue under account 000000000001 and received it.
-            long deadline = System.currentTimeMillis() + 8_000;
-            int notVisible = 0;
-            String lastBody = "";
-            while (System.currentTimeMillis() < deadline) {
-                lastBody = getQueueAttributesBody(MULTI_ACCOUNT_QUEUE_URL, sqsAuth);
-                notVisible = parseNotVisible(lastBody);
-                if (notVisible > 0) {
-                    break;
-                }
-                Thread.sleep(250);
-            }
-            assertTrue(notVisible > 0,
-                    "ESM poller never claimed the message under account " + NON_DEFAULT_ACCOUNT
-                            + " (ApproximateNumberOfMessagesNotVisible stayed 0) — "
-                            + "account-aware queue lookup in doReceiveMessage is broken. "
-                            + "Last GetQueueAttributes body: " + lastBody);
+            Awaitility.await().atMost(Duration.ofSeconds(8))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                    .untilAsserted(() -> {
+                        String lastBody = getQueueAttributesBody(MULTI_ACCOUNT_QUEUE_URL, sqsAuth);
+                        assertTrue(parseNotVisible(lastBody) > 0,
+                                "ESM poller never claimed the message under account " + NON_DEFAULT_ACCOUNT
+                                        + " (ApproximateNumberOfMessagesNotVisible stayed 0): "
+                                        + "account-aware queue lookup in doReceiveMessage is broken. "
+                                        + "Last GetQueueAttributes body: " + lastBody);
+                    });
 
         } finally {
             // Best-effort cleanup so the test is re-runnable and leaks no state.

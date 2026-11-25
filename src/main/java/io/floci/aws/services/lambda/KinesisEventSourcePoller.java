@@ -67,11 +67,7 @@ public class KinesisEventSourcePoller implements Resettable {
     private volatile boolean quiesced;
     /** Mappings stopped since their last start; a delete stops the mapping before the store forgets it. */
     final Set<String> stopped = ConcurrentHashMap.newKeySet();
-    private final ExecutorService pollExecutor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "kinesis-esm-poller");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService pollExecutor;
 
     @Inject
     public KinesisEventSourcePoller(Vertx vertx, KinesisService kinesisService,
@@ -93,6 +89,20 @@ public class KinesisEventSourcePoller implements Resettable {
                              PipesFilterMatcher filterMatcher,
                              StreamBatchFailures batchFailures,
                              LongSupplier clock) {
+        this(vertx, kinesisService, executorService, targetResolver, esmStore, config, objectMapper,
+                filterMatcher, batchFailures, clock, newPollExecutor());
+    }
+
+    /** Test seam: {@code pollExecutor} runs the polls, so a test can wait for them or run them inline. */
+    KinesisEventSourcePoller(Vertx vertx, KinesisService kinesisService,
+                             LambdaExecutorService executorService,
+                             LambdaTargetResolver targetResolver,
+                             EsmStore esmStore, EmulatorConfig config,
+                             ObjectMapper objectMapper,
+                             PipesFilterMatcher filterMatcher,
+                             StreamBatchFailures batchFailures,
+                             LongSupplier clock,
+                             ExecutorService pollExecutor) {
         this.vertx = vertx;
         this.kinesisService = kinesisService;
         this.executorService = executorService;
@@ -103,6 +113,15 @@ public class KinesisEventSourcePoller implements Resettable {
         this.filterMatcher = filterMatcher;
         this.batchFailures = batchFailures;
         this.clock = clock;
+        this.pollExecutor = pollExecutor;
+    }
+
+    private static ExecutorService newPollExecutor() {
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "kinesis-esm-poller");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public void startPersistedPollers() {

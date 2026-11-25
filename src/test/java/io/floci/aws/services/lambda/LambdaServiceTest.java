@@ -21,6 +21,7 @@ import io.floci.aws.services.s3.model.S3ObjectUpdatedEvent;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import io.floci.aws.testing.LambdaCodeFixtures;
 import io.floci.aws.testing.ParallelLocks;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,6 +35,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.ArrayList;
@@ -2800,13 +2802,10 @@ class LambdaServiceTest {
         return cfg;
     }
 
-    private static void awaitLastUpdateStatus(LambdaService service, LambdaFunction fn, String expected)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (!expected.equals(service.lastUpdateStatus(fn)) && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
-        assertEquals(expected, service.lastUpdateStatus(fn));
+    private static void awaitLastUpdateStatus(LambdaService service, LambdaFunction fn, String expected) {
+        Awaitility.await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals(expected, service.lastUpdateStatus(fn)));
     }
 
     @Test

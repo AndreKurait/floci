@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
+import java.time.Clock;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
 
@@ -39,6 +41,9 @@ class WebSocketProxyEventFormatTest {
 
     @TestHTTPResource("/")
     URI baseUri;
+
+    @Inject
+    Clock clock;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -285,13 +290,14 @@ class WebSocketProxyEventFormatTest {
     @Order(60)
     void connectedAtIsEpochMillis() throws Exception {
         // connectedAt is a valid epoch millisecond timestamp
-        long beforeConnect = System.currentTimeMillis();
+        // The server stamps connections with the injected clock, which tests control
+        long beforeConnect = clock.millis();
 
         WebSocketTestSupport.MessageCapture capture = new WebSocketTestSupport.MessageCapture();
         WebSocket ws = connectWebSocketWithListener(wsApiId, "test", capture);
         assertNotNull(ws);
 
-        long afterConnect = System.currentTimeMillis();
+        long afterConnect = clock.millis();
 
         ws.sendText("{\"action\":\"timestamp-test\"}", true).join();
 
@@ -304,17 +310,16 @@ class WebSocketProxyEventFormatTest {
         long connectedAt = event.get("requestContext").get("connectedAt").asLong();
 
         // connectedAt should be a reasonable epoch millis timestamp
-        assertTrue(connectedAt >= beforeConnect - 5000,
-                "connectedAt should be >= beforeConnect (with 5s tolerance), got: " + connectedAt);
-        assertTrue(connectedAt <= afterConnect + 5000,
-                "connectedAt should be <= afterConnect (with 5s tolerance), got: " + connectedAt);
+        assertTrue(connectedAt >= beforeConnect,
+                "connectedAt should be >= beforeConnect, got: " + connectedAt);
+        assertTrue(connectedAt <= afterConnect,
+                "connectedAt should be <= afterConnect, got: " + connectedAt);
 
         // Verify it's in milliseconds (not seconds) — should be > 1_000_000_000_000
         assertTrue(connectedAt > 1_000_000_000_000L,
                 "connectedAt should be in epoch milliseconds (> 1 trillion), got: " + connectedAt);
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 7: messageDirection is always IN ────────────────────────────
@@ -402,8 +407,7 @@ class WebSocketProxyEventFormatTest {
         assertArrayEquals(binaryData, decoded,
                 "Decoded body should match the original binary data");
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 11: Payload size limit enforcement ────────────────────────────
@@ -435,8 +439,7 @@ class WebSocketProxyEventFormatTest {
         String normalResponse = capture.getNextMessage(15, TimeUnit.SECONDS);
         assertNotNull(normalResponse, "Connection should still be alive after oversize rejection");
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Cleanup ────────────────────────────
@@ -466,8 +469,7 @@ class WebSocketProxyEventFormatTest {
         String response = capture.getResponse(15, TimeUnit.SECONDS);
         assertNotNull(response, "Should receive echoed event response");
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
 
         JsonNode wrapper = MAPPER.readTree(response);
         JsonNode event = wrapper.get("proxyEvent");
