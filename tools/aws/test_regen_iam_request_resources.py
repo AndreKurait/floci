@@ -3673,3 +3673,16 @@ def test_a_resource_named_after_its_path_or_signed_for_is_checked():
                 {"type": "group", "fill": {"GroupNameWithPath": "NewGroupName"}, "renames": "GroupName"},
                 dict(signer, signer="yes"), dict(signer, types=["user", "group"]), dict(signer, fill={})):
         assert r._resource_problems("iam:Op", bad, types, USERS_FORMATS), bad
+
+
+@pytest.mark.parametrize("upstream,expected", [
+    ("arn:${Partition}:swf::${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}"),
+])
+def test_swf_restores_only_the_known_missing_region(upstream, expected):
+    document = reference("swf", {}, {"domain": upstream})
+    assert r.arn_formats([document], {"swf"}) == {"swf": {"domain": expected}}
