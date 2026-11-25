@@ -1554,10 +1554,15 @@ class ResourceArnBuilderTest {
     private static final String KMS_ALIAS_ARN = "arn:aws:kms:us-east-1:000000000000:alias/app";
 
     /** A builder reading {@code kms} as KMS's stored ARNs answer from it, in the caller's account. */
+    @SuppressWarnings("unchecked")
     private static ResourceArnBuilder backedBy(KmsService kms) {
         RegionResolver regions = mock(RegionResolver.class);
         when(regions.getAccountId()).thenReturn(ACCOUNT);
-        return reading(new KmsStoredResourceArns(kms, regions));
+        Instance<KmsService> services = mock(Instance.class);
+        when(services.get()).thenReturn(kms);
+        Instance<StoredResourceArns> stored = mock(Instance.class);
+        when(stored.iterator()).thenAnswer(invocation -> List.of(new KmsStoredResourceArns(kms, regions)).iterator());
+        return new ResourceArnBuilder(new ObjectMapper(), null, null, null, null, services, stored);
     }
 
     /** The resources a KMS request is checked on, as the table reads {@code operation}. */
@@ -1733,8 +1738,8 @@ class ResourceArnBuilderTest {
 
     /**
      * The grant calls are checked on the key they name and on the key the grant their {@code GrantId} names is on,
-     * which closes naming one key while revoking another key's grant. A RetireGrant naming its grant by token alone
-     * names neither, as botocore's record of a grant holds no token: it is checked on {@code *}.
+     * which closes naming one key while revoking another key's grant. A stored grant token resolves its key
+     * through the service; a token no grant holds names no key and retains the table's {@code *} target.
      */
     @Test
     void theKmsGrantCallsAreCheckedOnTheirKeyAndTheKeyOfTheirGrant() {
@@ -1752,6 +1757,8 @@ class ResourceArnBuilderTest {
         assertEquals(List.of(KMS_KEY_ARN), kms(backed, "RevokeGrant"));
         setJsonBody("{\"GrantToken\":\"grant-token\"}");
         assertEquals(List.of("*"), kms(backed, "RetireGrant"));
+        when(kms.findGrantKeyArn("grant-token", null, "us-east-1")).thenReturn(Optional.of(KMS_KEY_ARN));
+        assertEquals(List.of(KMS_KEY_ARN), kms(backed, "RetireGrant"));
     }
 
     // ── SSM ──────────────────────────────────────────────────────────────────────
