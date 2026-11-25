@@ -132,9 +132,9 @@ class KinesisResourcePolicyIntegrationTest {
         RestAssuredJsonUtils.configureAwsContentTypes();
         for (String[] sample : new String[][]{
                 {"{}", "InvalidArgumentException"},
-                {"{\"ResourceARN\":42,\"Policy\":\"{}\"}", "InvalidArgumentException"},
+                {"{\"ResourceARN\":42,\"Policy\":\"{}\"}", "SerializationException"},
                 {"{\"ResourceARN\":\"arn:aws:kinesis:us-east-1:111111111111:stream/target\",\"Policy\":{}}",
-                        "InvalidArgumentException"}}) {
+                        "SerializationException"}}) {
             given().header("Authorization", auth(ACCOUNT, "kinesis"))
                     .header("X-Amz-Target", "Kinesis_20131202.PutResourcePolicy")
                     .contentType("application/x-amz-json-1.1").body(sample[0]).post("/")

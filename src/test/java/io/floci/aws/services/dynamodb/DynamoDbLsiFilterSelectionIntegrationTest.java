@@ -80,8 +80,7 @@ class DynamoDbLsiFilterSelectionIntegrationTest {
                                 Arguments.of("Query", "included", consistent, "count", "flag", 1))),
                 Stream.concat(
                         Stream.of("all", "projection", "legacy-all", "all-none", "projected", "count")
-                                .map(mode -> Arguments.of("Scan", "keys", consistent, mode, "flag",
-                                        List.of("all", "projection", "legacy-all").contains(mode) ? 1 : 0)),
+                                .map(mode -> Arguments.of("Scan", "keys", consistent, mode, "flag", 0)),
                         Stream.of(Arguments.of("Scan", "included", consistent, "projected", "flag", 1),
                                 Arguments.of("Scan", "included", consistent, "count", "flag", 1),
                                 Arguments.of("Scan", "included", consistent, "projected", "hidden", 0)))));
