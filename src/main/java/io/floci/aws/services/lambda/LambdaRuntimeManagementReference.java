@@ -13,6 +13,9 @@ public record LambdaRuntimeManagementReference(String name, String qualifier, St
 
     public static LambdaRuntimeManagementReference resolve(
             String reference, String qualifier, String region, String account) {
+        if (AwsArnUtils.looksLikeArn(reference) && !AwsArnUtils.isArn(reference)) {
+            throw invalid("Invalid ARN: " + reference);
+        }
         LambdaArnUtils.ResolvedFunctionRef parsed = LambdaArnUtils.resolveNamespacedFunctionName(reference);
         if (parsed.name().length() > 64 && parsed.account() == null && parsed.region() == null
                 && !AwsArnUtils.looksLikeArn(reference)) {
