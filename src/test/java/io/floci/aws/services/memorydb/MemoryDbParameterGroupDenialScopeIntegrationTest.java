@@ -154,6 +154,93 @@ class MemoryDbParameterGroupDenialScopeIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"create,protected", "create,open", "tag,protected", "tag,open"})
+    void caseVariantStoredTagsKeepEveryValueForDenial(String writePath, String deniedValue) throws Exception {
+        String name = owned();
+        try (MemoryDbClient root = client(ROOT)) {
+            root.createParameterGroup(request -> {
+                request.parameterGroupName(name).family("memorydb_redis6");
+                if (writePath.equals("create")) {
+                    request.tags(tag -> tag.key("Team").value("protected"), tag -> tag.key("team").value("open"));
+                }
+            });
+            if (writePath.equals("tag")) {
+                root.tagResource(request -> request.resourceArn(groupArn(name))
+                        .tags(tag -> tag.key("Team").value("protected"), tag -> tag.key("team").value("open")));
+            }
+            Optional<Snapshot> before = snapshot(root, name);
+            assertEquals(Map.of("Team", "protected", "team", "open"), before.orElseThrow().tags());
+            try (SignedUser user = user(tagPolicy("aws:ResourceTag/TEAM", deniedValue));
+                 MemoryDbClient caller = client(user.credentials())) {
+                Call response = capture(() -> caller.updateParameterGroup(request -> request.parameterGroupName(name)
+                        .parameterNameValues(value -> value.parameterName("timeout").parameterValue("30"))));
+                assertAll(() -> assertDenied(response, 403, "UpdateParameterGroup"),
+                        () -> assertEquals(before, snapshot(root, name)));
+            }
+            try (SignedUser user = user(tagPolicy("aws:ResourceTag/TEAM", "unrelated"));
+                 MemoryDbClient caller = client(user.credentials())) {
+                caller.updateParameterGroup(request -> request.parameterGroupName(name)
+                        .parameterNameValues(value -> value.parameterName("timeout").parameterValue("30")));
+                assertEquals("30", snapshot(root, name).orElseThrow().parameters().get("timeout").value());
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"create,protected", "create,open", "tag,protected", "tag,open"})
+    void caseVariantRequestedTagsKeepEveryValueForDenial(String writePath, String deniedValue) throws Exception {
+        String name = owned();
+        try (MemoryDbClient root = client(ROOT)) {
+            if (writePath.equals("tag")) {
+                root.createParameterGroup(request -> request.parameterGroupName(name).family("memorydb_redis6"));
+            }
+            Optional<Snapshot> before = snapshot(root, name);
+            try (SignedUser user = user(tagPolicy("aws:RequestTag/TEAM", deniedValue));
+                 MemoryDbClient caller = client(user.credentials())) {
+                Call response = capture(() -> writePath.equals("create")
+                        ? caller.createParameterGroup(request -> request.parameterGroupName(name).family("memorydb_redis6")
+                                .tags(tag -> tag.key("Team").value("protected"), tag -> tag.key("team").value("open")))
+                        : caller.tagResource(request -> request.resourceArn(groupArn(name))
+                                .tags(tag -> tag.key("Team").value("protected"), tag -> tag.key("team").value("open"))));
+                assertAll(() -> assertDenied(response, 403, writePath.equals("create")
+                                ? "CreateParameterGroup" : "TagResource"),
+                        () -> assertEquals(before, snapshot(root, name)));
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "tag"})
+    void repeatedExactRequestTagKeysUseTheHandlersLastValue(String writePath) throws Exception {
+        String name = owned();
+        try (MemoryDbClient root = client(ROOT)) {
+            if (writePath.equals("tag")) {
+                root.createParameterGroup(request -> request.parameterGroupName(name).family("memorydb_redis6"));
+            }
+            try (SignedUser user = user(tagPolicy("aws:RequestTag/TEAM", "protected"));
+                 MemoryDbClient caller = client(user.credentials())) {
+                if (writePath.equals("create")) {
+                    caller.createParameterGroup(request -> request.parameterGroupName(name).family("memorydb_redis6")
+                            .tags(tag -> tag.key("Team").value("protected"), tag -> tag.key("Team").value("open"),
+                                    tag -> tag.key("team").value("open")));
+                } else {
+                    caller.tagResource(request -> request.resourceArn(groupArn(name))
+                            .tags(tag -> tag.key("Team").value("protected"), tag -> tag.key("Team").value("open"),
+                                    tag -> tag.key("team").value("open")));
+                }
+            }
+            assertEquals(Map.of("Team", "open", "team", "open"), snapshot(root, name).orElseThrow().tags());
+        }
+    }
+
+    private static String tagPolicy(String conditionKey, String deniedValue) throws Exception {
+        return MAPPER.writeValueAsString(Map.of("Version", "2012-10-17", "Statement", List.of(
+                Map.of("Effect", "Allow", "Action", "memorydb:*", "Resource", "*"),
+                Map.of("Effect", "Deny", "Action", "memorydb:*", "Resource", "*",
+                        "Condition", Map.of("ForAnyValue:StringEquals", Map.of(conditionKey, deniedValue))))));
+    }
+
     private static SdkResponse invoke(MemoryDbClient client, String operation, String name, String arn) {
         return switch (operation) {
             case "CreateParameterGroup" -> client.createParameterGroup(request ->

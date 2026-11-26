@@ -351,21 +351,21 @@ public class IamConditionContextResolver {
         if (body == null || !body.isObject() || !MemoryDbParameterGroupTarget.claims(action, body)) {
             return null;
         }
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        Map<String, List<String>> conditions = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         if (("memorydb:CreateParameterGroup".equals(action) || "memorydb:TagResource".equals(action))
                 && body.path("Tags").isArray()) {
-            Set<String> keys = new LinkedHashSet<>();
+            Map<String, String> tags = new LinkedHashMap<>();
             for (JsonNode tag : body.path("Tags")) {
                 if (tag.path("Key").isTextual()
                         && (tag.path("Value").isTextual() || tag.path("Value").isNull() || !tag.has("Value"))) {
                     String key = tag.path("Key").textValue();
-                    keys.add(key);
-                    conditions.put(REQUEST_TAG_PREFIX + key, List.of(tag.path("Value").isTextual()
-                            ? tag.path("Value").textValue() : ""));
+                    tags.put(key, tag.path("Value").isTextual() ? tag.path("Value").textValue() : "");
                 }
             }
-            if (!keys.isEmpty()) {
-                conditions.put("aws:TagKeys", List.copyOf(keys));
+            if (!tags.isEmpty()) {
+                tags.forEach((key, value) -> conditions.computeIfAbsent(REQUEST_TAG_PREFIX + key,
+                        ignored -> new ArrayList<>()).add(value));
+                conditions.put("aws:TagKeys", List.copyOf(tags.keySet()));
             }
         } else if ("memorydb:UntagResource".equals(action) && body.path("TagKeys").isArray()) {
             List<String> keys = new ArrayList<>();
@@ -386,7 +386,7 @@ public class IamConditionContextResolver {
                     ? AwsRegions.partitionFor(region) : requestContext.getPartition();
             String arn = MemoryDbParameterGroupTarget.resourceArn(action, body, partition, region, account);
             memoryDbParameterGroups.get().iamTags(arn, partition, region, account).forEach((key, value) ->
-                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+                    conditions.computeIfAbsent(RESOURCE_TAG_PREFIX + key, ignored -> new ArrayList<>()).add(value));
         }
         return conditions.isEmpty() ? null : conditions;
     }
