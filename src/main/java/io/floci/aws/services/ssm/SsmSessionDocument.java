@@ -40,74 +40,9 @@ record SsmSessionDocument(String name, JsonNode content) {
               }
             }
             """;
-    private static final String COMMAND = """
-            {
-              "schemaVersion": "1.0",
-              "description": "%s",
-              "sessionType": "%s",
-              "parameters": {"command": {"type": "String", "description": "The command to run."}},
-              "properties": {
-                "windows": {"commands": "{{ command }}", "runAsElevated": false},
-                "linux": {"commands": "{{ command }}", "runAsElevated": false},
-                "macos": {"commands": "{{ command }}", "runAsElevated": false}
-              }
-            }
-            """;
-    private static final String PORT = """
-            {
-              "schemaVersion": "1.0",
-              "description": "Document to start a port forwarding session",
-              "sessionType": "Port",
-              "parameters": {
-                %s
-                "portNumber": {"type": "String", "default": "80"},
-                "localPortNumber": {"type": "String", "default": "0"}
-              },
-              "properties": {
-                %s
-                "portNumber": "{{ portNumber }}",
-                "type": "LocalPortForwarding",
-                "localPortNumber": "{{ localPortNumber }}"
-              }
-            }
-            """;
-    /**
-     * A non-interactive command can ask the agent to deliver stderr and the exit code apart from stdout
-     * (amazon-ssm-agent 3.1.1511.0, "Support separate output stream for non-interactive session"; the
-     * shell properties' {@code separateOutputStream}). The separator prefixes the agent also reads are not
-     * declared: AWS publishes no document that declares them.
-     */
-    private static final String NON_INTERACTIVE_COMMAND = """
-            {
-              "schemaVersion": "1.0",
-              "description": "Run one non-interactive command on a managed node",
-              "sessionType": "NonInteractiveCommands",
-              "parameters": {
-                "command": {"type": "String", "description": "The command to run."},
-                "separateOutputStream": {"type": "String", "default": "false", "allowedValues": ["true", "false"],
-                  "description": "Deliver stderr and the exit code separately from stdout."}
-              },
-              "properties": {
-                "windows": {"commands": "{{ command }}", "runAsElevated": false,
-                  "separateOutputStream": "{{ separateOutputStream }}"},
-                "linux": {"commands": "{{ command }}", "runAsElevated": false,
-                  "separateOutputStream": "{{ separateOutputStream }}"},
-                "macos": {"commands": "{{ command }}", "runAsElevated": false,
-                  "separateOutputStream": "{{ separateOutputStream }}"}
-              }
-            }
-            """;
-    private static final Map<String, String> AWS_DOCUMENTS = Map.of(
-            "AWS-StartNonInteractiveCommand", NON_INTERACTIVE_COMMAND,
-            "AWS-StartInteractiveCommand", COMMAND.formatted(
-                    "Run one interactive command on a managed node", "InteractiveCommands"),
-            "AWS-StartPortForwardingSession", PORT.formatted("", ""),
-            "AWS-StartPortForwardingSessionToRemoteHost", PORT.formatted(
-                    "\"host\": {\"type\": \"String\"},", "\"host\": \"{{ host }}\","));
-
     /** AWS owns these documents; their ARNs have no account. */
     static boolean isAwsSessionDocument(String name) {
-        return AWS_DOCUMENTS.containsKey(name);
+        return BuiltinSessionDocuments.contains(name);
     }
 
     /**
@@ -116,8 +51,9 @@ record SsmSessionDocument(String name, JsonNode content) {
      */
     static SsmSessionDocument resolve(SsmService documents, ObjectMapper mapper, String requested, String region) {
         String name = requested == null || requested.isBlank() ? DEFAULT_DOCUMENT : requested;
-        if (AWS_DOCUMENTS.containsKey(name)) {
-            return new SsmSessionDocument(name, parse(mapper, AWS_DOCUMENTS.get(name)));
+        if (BuiltinSessionDocuments.contains(name)) {
+            return new SsmSessionDocument(name, parse(mapper,
+                    BuiltinSessionDocuments.find(name).orElseThrow().getContent()));
         }
         synchronized (documents) {
             SsmDocument stored;

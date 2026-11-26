@@ -5,9 +5,12 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.services.ssm.SsmChannelAuthentication.Caller;
+import io.floci.aws.services.ssmmessages.ChannelAuthentication;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.Node;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -24,6 +27,7 @@ import org.jboss.logging.Logger;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 /** The agent's HTTPS token endpoint and WebSocket control-channel upgrade. */
 @Path("/v1/control-channel")
@@ -38,10 +42,18 @@ public class SsmMessagesController {
     private final ObjectMapper mapper;
     private final EmulatorConfig config;
     private final CurrentVertxRequest requests;
+    private final ChannelAuthentication gatewayAuthentication;
+
+    public SsmMessagesController(SsmMessagesService service, SsmChannelAuthentication authentication,
+                                 ObjectMapper mapper, EmulatorConfig config, CurrentVertxRequest requests) {
+        this(service, authentication, mapper, config, requests, null);
+    }
 
     @Inject
     public SsmMessagesController(SsmMessagesService service, SsmChannelAuthentication authentication,
-                                 ObjectMapper mapper, EmulatorConfig config, CurrentVertxRequest requests) {
+                                 ObjectMapper mapper, EmulatorConfig config, CurrentVertxRequest requests,
+                                 ChannelAuthentication gatewayAuthentication) {
+        this.gatewayAuthentication = gatewayAuthentication;
         this.service = service;
         this.authentication = authentication;
         this.mapper = mapper;
@@ -58,17 +70,17 @@ public class SsmMessagesController {
             if (bytes.length > 4096) {
                 throw new AwsException("ValidationException", "The channel request is too large.", 400);
             }
-            Caller caller = authenticate(requests.getCurrent().request(), bytes, "CreateControlChannel");
+            Caller caller = authenticate(requests.getCurrent().request(), bytes, "CreateControlChannel", instanceId);
             String token = service.create(caller, instanceId, mapper.readTree(bytes));
-            return Response.status(201).entity(new XmlBuilder().start("CreateControlChannelResponse")
+            return Response.status(201).entity(new XmlBuilder().start("ChannelOutput")
                     .elem("MessageSchemaVersion", "1.0").elem("TokenValue", token)
-                    .end("CreateControlChannelResponse").build()).build();
+                    .end("ChannelOutput").build()).build();
         } catch (AwsException rejected) {
-            return Response.status(rejected.getHttpStatus()).entity(errorXml(rejected)).build();
+            return errorResponse(rejected);
         } catch (Exception invalid) {
             LOG.debugv(invalid, "Invalid CreateControlChannel request");
             AwsException error = new AwsException("ValidationException", "Invalid channel request.", 400);
-            return Response.status(error.getHttpStatus()).entity(errorXml(error)).build();
+            return errorResponse(error);
         }
     }
 
@@ -89,20 +101,27 @@ public class SsmMessagesController {
             if (!"subscribe".equals(request.getParam("role")) || !"input".equals(request.getParam("stream"))) {
                 throw new AwsException("ValidationException", "Invalid control-channel direction.", 400);
             }
-            Caller caller = authenticate(request, new byte[0], "OpenControlChannel");
+            Caller caller = authenticate(request, new byte[0], "OpenControlChannel", instanceId);
             authentication.authorizeNode(caller, instanceId);
             request.toWebSocket().onSuccess(socket -> service.open(caller, instanceId, socket))
                     .onFailure(error -> LOG.debugv(error, "SSM control-channel upgrade failed"));
         } catch (AwsException rejected) {
             context.response().setStatusCode(rejected.getHttpStatus())
-                    .putHeader("Content-Type", MediaType.APPLICATION_XML).end(errorXml(rejected));
+                    .putHeader("Content-Type", MediaType.APPLICATION_JSON)
+                    .putHeader("x-amzn-errortype", rejected.getErrorCode())
+                    .end(new JsonObject().put("message", rejected.getMessage()).encode());
         }
     }
 
-    private Caller authenticate(HttpServerRequest request, byte[] bytes, String action) {
-        return authentication.authenticate(request.method().name(), URI.create(request.absoluteURI()),
+    private Caller authenticate(HttpServerRequest request, byte[] bytes, String action, String instanceId) {
+        Caller caller = authentication.authenticate(request.method().name(), URI.create(request.absoluteURI()),
                 request::getHeader, request::getParam, bytes, action,
                 request.remoteAddress().hostAddress(), request.isSSL());
+        if (gatewayAuthentication != null) {
+            gatewayAuthentication.authenticateAgent(request, bytes, "ssmmessages:" + action,
+                    new Node(caller.account(), caller.region(), instanceId));
+        }
+        return caller;
     }
 
     private void requireEnabled() {
@@ -111,8 +130,9 @@ public class SsmMessagesController {
         }
     }
 
-    private static String errorXml(AwsException error) {
-        return new XmlBuilder().start(error.getErrorCode()).elem("Message", error.getMessage())
-                .end(error.getErrorCode()).build();
+    private static Response errorResponse(AwsException error) {
+        return Response.status(error.getHttpStatus()).type(MediaType.APPLICATION_JSON)
+                .header("x-amzn-errortype", error.getErrorCode())
+                .entity(Map.of("message", error.getMessage())).build();
     }
 }

@@ -5,21 +5,12 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.services.ssm.SsmChannelAuthentication.Caller;
+import io.floci.aws.services.ssmmessages.DataChannelHandler;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerRequest;
-import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
-import jakarta.annotation.Priority;
-import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.event.Observes;
-import jakarta.inject.Inject;
-import jakarta.interceptor.Interceptor;
-import jakarta.ws.rs.Consumes;
-import jakarta.ws.rs.POST;
-import jakarta.ws.rs.Path;
-import jakarta.ws.rs.PathParam;
-import jakarta.ws.rs.Produces;
+import jakarta.enterprise.inject.Vetoed;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
@@ -32,11 +23,8 @@ import java.util.regex.Pattern;
  * The ssmmessages data channel of a Session Manager session: the agent's signed CreateDataChannel token
  * endpoint and the WebSocket both the agent and the session's client open at the stream URL.
  */
-@Path("/v1/data-channel")
-@Consumes(MediaType.APPLICATION_JSON)
-@Produces(MediaType.APPLICATION_XML)
-@ApplicationScoped
-public class SsmDataChannelController {
+@Vetoed
+public class SsmDataChannelController implements DataChannelHandler {
     private static final Logger LOG = Logger.getLogger(SsmDataChannelController.class);
     private static final Pattern SESSION_ID = Pattern.compile("[A-Za-z0-9+=,.@_-]{1,96}");
 
@@ -46,7 +34,6 @@ public class SsmDataChannelController {
     private final EmulatorConfig config;
     private final CurrentVertxRequest requests;
 
-    @Inject
     public SsmDataChannelController(SsmSessionService sessions, SsmChannelAuthentication authentication,
                                     ObjectMapper mapper, EmulatorConfig config, CurrentVertxRequest requests) {
         this.sessions = sessions;
@@ -56,9 +43,7 @@ public class SsmDataChannelController {
         this.requests = requests;
     }
 
-    @POST
-    @Path("/{sessionId}")
-    public Response createDataChannel(@PathParam("sessionId") String sessionId, String body) {
+    public Response createDataChannel(String sessionId, String body) {
         try {
             requireEnabled();
             validateSessionId(sessionId);
@@ -83,12 +68,9 @@ public class SsmDataChannelController {
         }
     }
 
-    /**
-     * Registered ahead of other data-channel routes on the same path (ECS Exec's), which keep the
-     * upgrades of sessions this service does not hold.
-     */
-    void routes(@Observes @Priority(Interceptor.Priority.APPLICATION + 400) Router router) {
-        router.get("/v1/data-channel/:sessionId").handler(this::upgrade);
+    @Override
+    public boolean supportsSession(String sessionId) {
+        return config.services().ssm().enabled() && sessionId != null && sessions.holds(sessionId);
     }
 
     /**
@@ -96,14 +78,14 @@ public class SsmDataChannelController {
      * signature; its session token, sent in the first text frame, authenticates it either way, and a
      * signature it does carry must verify.
      */
-    private void upgrade(RoutingContext context) {
+    @Override
+    public void open(String sessionId, RoutingContext context) {
         HttpServerRequest request = context.request();
         if (request.method() != HttpMethod.GET || !"websocket".equalsIgnoreCase(request.getHeader("Upgrade"))) {
             context.next();
             return;
         }
-        String sessionId = context.pathParam("sessionId");
-        if (!config.services().ssm().enabled() || sessionId == null || !sessions.holds(sessionId)) {
+        if (!supportsSession(sessionId)) {
             context.next();
             return;
         }

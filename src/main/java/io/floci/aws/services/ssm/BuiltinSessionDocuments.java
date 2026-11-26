@@ -15,6 +15,8 @@ final class BuiltinSessionDocuments {
 
     private static final Map<String, String> CONTENT = Map.of(
             "AWS-StartSSHSession", load("AWS-StartSSHSession"),
+            "AWS-StartInteractiveCommand", load("AWS-StartInteractiveCommand"),
+            "AWS-StartNonInteractiveCommand", load("AWS-StartNonInteractiveCommand"),
             "AWS-StartPortForwardingSession", load("AWS-StartPortForwardingSession"),
             "AWS-StartPortForwardingSessionToRemoteHost", load("AWS-StartPortForwardingSessionToRemoteHost"));
 

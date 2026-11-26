@@ -427,7 +427,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // failing even after the daemon recovers.
         String containerId = null;
         Closeable logHandle = null;
-        LambdaExitWatcher exitWatcher = null;
+        ContainerExitWatcher exitWatcher = null;
         boolean registeredForExitEvents = false;
         // Hoisted alongside containerId, for the same reason: the resolved volume name (if any)
         // must be visible in the catch block below to release its in-flight reference on any
@@ -683,7 +683,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             registeredForExitEvents = true;
             exitEvents.register(containerId, runtimeApiServer::handleRuntimeProcessExited);
         } else {
-            exitWatcher = LambdaExitWatcher.watchBeforeStart(dockerClient, streamingDocker, containerId,
+            exitWatcher = ContainerExitWatcher.watchBeforeStart(dockerClient, streamingDocker, containerId,
                     runtimeApiServer::handleRuntimeProcessExited, readinessBudget);
         }
         logHandle = logStreamer.attachBeforeStartForAccount(

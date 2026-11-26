@@ -7,7 +7,12 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.Resettable;
 import io.floci.aws.services.ssm.SsmChannelAuthentication.Caller;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.ControlTransport;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.Node;
 import io.vertx.core.Context;
+import io.vertx.core.Future;
+import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.ServerWebSocket;
@@ -39,6 +44,7 @@ public class SsmMessagesService implements Resettable {
     private final ObjectMapper mapper;
     private final Vertx vertx;
     private final Clock clock;
+    private final SsmMessageGateway sessionGateway;
     private final Map<String, Token> tokens = new ConcurrentHashMap<>();
     private final Map<Owner, Channel> channels = new ConcurrentHashMap<>();
     private final Set<Channel> sockets = ConcurrentHashMap.newKeySet();
@@ -48,9 +54,16 @@ public class SsmMessagesService implements Resettable {
         this(commands, null, authentication, mapper, vertx, clock);
     }
 
-    @Inject
     public SsmMessagesService(SsmCommandService commands, SsmSessionService sessions,
                               SsmChannelAuthentication authentication, ObjectMapper mapper, Vertx vertx, Clock clock) {
+        this(commands, sessions, authentication, mapper, vertx, clock, null);
+    }
+
+    @Inject
+    public SsmMessagesService(SsmCommandService commands, SsmSessionService sessions,
+                              SsmChannelAuthentication authentication, ObjectMapper mapper, Vertx vertx, Clock clock,
+                              SsmMessageGateway sessionGateway) {
+        this.sessionGateway = sessionGateway;
         this.commands = commands;
         this.sessions = sessions;
         this.authentication = authentication;
@@ -131,9 +144,10 @@ public class SsmMessagesService implements Resettable {
         private final ServerWebSocket socket;
         private final Context context;
         private final Map<String, Delivery> delivered = new HashMap<>();
-        private boolean authenticated;
+        private volatile boolean authenticated;
         private boolean polling;
-        private boolean closed;
+        private volatile boolean closed;
+        private final long gatewayGeneration;
         private long timer = -1;
         private long handshakeTimer = -1;
 
@@ -142,6 +156,7 @@ public class SsmMessagesService implements Resettable {
             this.owner = owner(caller, instanceId);
             this.socket = socket;
             this.context = Vertx.currentContext();
+            this.gatewayGeneration = sessionGateway == null ? 0 : sessionGateway.generation();
         }
 
         private void start() {
@@ -175,6 +190,26 @@ public class SsmMessagesService implements Resettable {
                 if (previous != null) {
                     previous.close((short) 1000, "The node opened a replacement control channel.");
                 }
+                if (sessionGateway != null && !sessionGateway.attachControl(node(), id, new ControlTransport() {
+                    @Override
+                    public boolean isOpen() {
+                        return active() && !socket.isClosed();
+                    }
+
+                    @Override
+                    public Future<Void> send(Buffer frame) {
+                        Promise<Void> sent = Promise.promise();
+                        context.runOnContext(ignored -> writeControl(frame).onComplete(sent));
+                        return sent.future();
+                    }
+
+                    @Override
+                    public void close() {
+                        Channel.this.close((short) 1000, "The session gateway retired this control channel.");
+                    }
+                }, gatewayGeneration)) {
+                    throw SsmChannelAuthentication.denied("The control channel belongs to an earlier service state.");
+                }
                 timer = vertx.setPeriodic(250, ignored -> poll());
                 LOG.infov("SSM control channel opened for account={0} region={1} node={2}",
                         owner.account(), owner.region(), owner.instanceId());
@@ -187,6 +222,28 @@ public class SsmMessagesService implements Resettable {
 
         private boolean active() {
             return authenticated && !closed && channels.get(owner) == this;
+        }
+
+        private Node node() {
+            return new Node(owner.account(), owner.region(), owner.instanceId());
+        }
+
+        private Future<Void> writeControl(Buffer frame) {
+            if (!active() || socket.isClosed() || socket.writeQueueFull()) {
+                return Future.failedFuture("The control channel is unavailable.");
+            }
+            try {
+                authentication.authorizeNode(caller, owner.instanceId());
+                RequestScopes.runAs(owner.account(), owner.region(),
+                        () -> authentication.authorize(caller, "OpenControlChannel"));
+            } catch (AwsException denied) {
+                close((short) 1008, "Session delivery was rejected.");
+                return Future.failedFuture(denied);
+            }
+            return socket.writeBinaryMessage(frame).onFailure(error -> {
+                LOG.debugv(error, "SSM session dispatch failed for node {0}", owner.instanceId());
+                close((short) 1011, "The channel write failed.");
+            });
         }
 
         private void poll() {
@@ -273,6 +330,9 @@ public class SsmMessagesService implements Resettable {
             }
             try {
                 SsmAgentMessage message = SsmAgentMessage.decode(bytes.getBytes());
+                if (sessionGateway != null && sessionGateway.receiveControl(node(), id, bytes)) {
+                    return;
+                }
                 if ("agent_task_complete".equals(message.type()) && sessions != null) {
                     JsonNode payload = mapper.readTree(message.payload());
                     sessions.agentTaskComplete(owner.account(), owner.region(), owner.instanceId(), payload);
@@ -348,6 +408,9 @@ public class SsmMessagesService implements Resettable {
                 channels.remove(owner, this);
                 RequestScopes.runAs(owner.account(), owner.region(), () ->
                         commands.messageGatewayClosed(owner.instanceId(), owner.region(), id));
+            }
+            if (sessionGateway != null) {
+                sessionGateway.detachControl(node(), id);
             }
             sockets.remove(this);
             delivered.clear();

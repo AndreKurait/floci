@@ -1,6 +1,8 @@
 package io.floci.aws.services.ssm.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonSetter;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.SessionState;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -23,6 +25,70 @@ public class SsmSession {
     private String maxSessionDuration;
 
     public SsmSession() {}
+
+    public SsmSession(String sessionId, String target, String owner, String documentName, String reason,
+                      SessionState state, Instant startDate, Instant endDate) {
+        this.sessionId = sessionId;
+        this.target = target;
+        this.owner = owner;
+        this.documentName = documentName;
+        this.reason = reason;
+        this.status = status(state);
+        this.startDate = startDate;
+        this.endDate = endDate;
+    }
+
+    // Older upstream snapshots used an enum named state instead of the public status string.
+    @JsonSetter("state")
+    public void readState(SessionState state) {
+        if (status == null && state != null) {
+            status = status(state);
+        }
+    }
+
+    public String sessionId() { return sessionId; }
+    public String target() { return target; }
+    public String owner() { return owner; }
+    public String documentName() { return documentName; }
+    public String reason() { return reason; }
+    public String status() { return status; }
+    public Instant startDate() { return startDate; }
+    public Instant endDate() { return endDate; }
+
+    public boolean active() {
+        return endDate == null;
+    }
+
+    public SessionState state() {
+        return switch (status) {
+            case "Connected" -> SessionState.CONNECTED;
+            case "Connecting", "Disconnected", "Terminating" -> SessionState.DISCONNECTED;
+            case "Terminated" -> SessionState.TERMINATED;
+            case "Failed" -> SessionState.FAILED;
+            default -> throw new IllegalStateException("Unknown SSM session status: " + status);
+        };
+    }
+
+    public SsmSession transition(SessionState next, Instant now) {
+        Instant end = switch (next) {
+            case TERMINATED, FAILED -> now;
+            case CONNECTED, DISCONNECTED -> null;
+        };
+        SsmSession updated = new SsmSession(sessionId, target, owner, documentName, reason, next, startDate, end);
+        updated.setAccountId(accountId);
+        updated.setRegion(region);
+        updated.setMaxSessionDuration(maxSessionDuration);
+        return updated;
+    }
+
+    private static String status(SessionState state) {
+        return switch (state) {
+            case CONNECTED -> "Connected";
+            case DISCONNECTED -> "Disconnected";
+            case TERMINATED -> "Terminated";
+            case FAILED -> "Failed";
+        };
+    }
 
     public String getSessionId() { return sessionId; }
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }

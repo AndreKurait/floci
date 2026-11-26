@@ -31,15 +31,22 @@ public class SsmMessageGatewayRoutes implements DataChannelHandler {
     private final ChannelAuthentication authentication;
     private final ObjectMapper mapper;
     private final boolean enabled;
+    private final boolean ownsControlRoutes;
 
     @Inject
     public SsmMessageGatewayRoutes(SsmMessageGateway gateway, ChannelAuthentication authentication,
                                    ObjectMapper mapper, EmulatorConfig config) {
-        this(gateway, authentication, mapper, config.services().ssm().enabled());
+        this(gateway, authentication, mapper, config.services().ssm().enabled(), false);
     }
 
     SsmMessageGatewayRoutes(SsmMessageGateway gateway, ChannelAuthentication authentication,
                             ObjectMapper mapper, boolean enabled) {
+        this(gateway, authentication, mapper, enabled, true);
+    }
+
+    private SsmMessageGatewayRoutes(SsmMessageGateway gateway, ChannelAuthentication authentication,
+                                    ObjectMapper mapper, boolean enabled, boolean ownsControlRoutes) {
+        this.ownsControlRoutes = ownsControlRoutes;
         this.gateway = gateway;
         this.authentication = authentication;
         this.mapper = mapper;
@@ -51,8 +58,10 @@ public class SsmMessageGatewayRoutes implements DataChannelHandler {
             return;
         }
         BodyHandler body = BodyHandler.create().setBodyLimit(16 * 1024).setHandleFileUploads(false);
-        router.post(CONTROL_PATH).handler(body).handler(this::createControl);
-        router.get(CONTROL_PATH).handler(this::openControl);
+        if (ownsControlRoutes) {
+            router.post(CONTROL_PATH).handler(body).handler(this::createControl);
+            router.get(CONTROL_PATH).handler(this::openControl);
+        }
         router.post(DATA_PATH).handler(body).handler(this::createData);
     }
 
@@ -82,7 +91,7 @@ public class SsmMessageGatewayRoutes implements DataChannelHandler {
     private boolean canOpenAgent(RoutingContext context, SsmMessageGateway.SessionTarget target) {
         try {
             return authentication.authenticateAgentUpgradeIfClaimed(context.request(), "ssmmessages:OpenDataChannel",
-                            target.sessionArn())
+                            target.sessionArn(), target.node())
                     .map(SsmMessageGatewayRoutes::node).filter(target.node()::equals).isPresent();
         } catch (AwsException expected) {
             if (expected.getHttpStatus() != 403) {
@@ -142,8 +151,7 @@ public class SsmMessageGatewayRoutes implements DataChannelHandler {
     private void createData(RoutingContext context) {
         try {
             byte[] body = context.body().buffer().getBytes();
-            ChannelAuthentication.AgentIdentity identity = authentication.authenticateAgent(
-                    context.request(), body, "ssmmessages:CreateDataChannel");
+            authentication.verifyAgentRequest(context.request(), body, "ssmmessages:CreateDataChannel");
             JsonNode clientId = readRequest(body).path("ClientId");
             if (!clientId.isMissingNode() && !clientId.isNull() && !clientId.isTextual()) {
                 throw invalidRequest();
@@ -151,6 +159,8 @@ public class SsmMessageGatewayRoutes implements DataChannelHandler {
             String sessionId = context.pathParam("sessionId");
             SsmMessageGateway.SessionTarget target = gateway.sessionTarget(sessionId)
                     .orElseThrow(SsmMessageGatewayRoutes::closedSession);
+            ChannelAuthentication.AgentIdentity identity = authentication.authenticateAgent(
+                    context.request(), body, "ssmmessages:CreateDataChannel", target.node());
             if (!target.node().equals(node(identity))) {
                 throw accessDenied();
             }

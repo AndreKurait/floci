@@ -1,5 +1,6 @@
 package io.floci.aws.services.lambda.launcher;
 
+import io.floci.aws.core.common.docker.ContainerExitWatcher;
 import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 
@@ -27,7 +28,7 @@ public class ContainerHandle {
     private Closeable logStream;
     private Function<Boolean, Supplier<String>> logTailReader = initialization -> () -> "";
     private final AtomicBoolean invoked = new AtomicBoolean();
-    private LambdaExitWatcher exitWatcher;
+    private ContainerExitWatcher exitWatcher;
     private CompletableFuture<Void> extensionExit = CompletableFuture.completedFuture(null);
     private String dnsResolverVolume;
     private boolean runtimeApiReleased;
@@ -85,7 +86,7 @@ public class ContainerHandle {
     boolean isRuntimeApiReleased() { return runtimeApiReleased; }
     void markRuntimeApiReleased() { runtimeApiReleased = true; }
 
-    void setExitWatcher(LambdaExitWatcher exitWatcher) { this.exitWatcher = exitWatcher; }
+    void setExitWatcher(ContainerExitWatcher exitWatcher) { this.exitWatcher = exitWatcher; }
 
     void setExtensionExit(CompletableFuture<Void> extensionExit) { this.extensionExit = extensionExit; }
 

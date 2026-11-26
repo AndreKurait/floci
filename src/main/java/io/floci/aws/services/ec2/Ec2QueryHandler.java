@@ -71,13 +71,18 @@ public class Ec2QueryHandler {
     private final Ec2IpamService ipamService;
     private final RegionResolver regionResolver;
     private final Ec2ClientVpnHandler clientVpnHandler;
+    private final Ec2PlacementGroupHandler placementGroupHandler;
+    private final Ec2PrivateLinkService privateLinkService;
+    private final Ec2PrivateLinkHandler privateLinkHandler;
 
     @Inject
     public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
                            Ec2EbsEncryptionService ebsEncryptionService,
                            Ec2BlockPublicAccessService blockPublicAccessService,
                            Ec2IpamService ipamService, RegionResolver regionResolver,
-                           Ec2ClientVpnService clientVpnService) {
+                           Ec2ClientVpnService clientVpnService,
+                           Ec2PlacementGroupService placementGroupService,
+                           Ec2PrivateLinkService privateLinkService) {
         this.service = service;
         this.config = config;
         this.flowLogService = flowLogService;
@@ -86,6 +91,30 @@ public class Ec2QueryHandler {
         this.ipamService = ipamService;
         this.regionResolver = regionResolver;
         this.clientVpnHandler = clientVpnService == null ? null : new Ec2ClientVpnHandler(clientVpnService, service);
+        this.placementGroupHandler = new Ec2PlacementGroupHandler(placementGroupService);
+        this.privateLinkService = privateLinkService;
+        this.privateLinkHandler = privateLinkService == null ? null : new Ec2PrivateLinkHandler(privateLinkService, service);
+    }
+
+    /** For callers that exercise no VPC endpoint service operation. */
+    public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
+                           Ec2EbsEncryptionService ebsEncryptionService,
+                           Ec2BlockPublicAccessService blockPublicAccessService,
+                           Ec2IpamService ipamService, RegionResolver regionResolver,
+                           Ec2ClientVpnService clientVpnService,
+                           Ec2PlacementGroupService placementGroupService) {
+        this(service, config, flowLogService, ebsEncryptionService, blockPublicAccessService, ipamService,
+                regionResolver, clientVpnService, placementGroupService, null);
+    }
+
+    /** For callers that exercise no placement-group operation. */
+    public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
+                           Ec2EbsEncryptionService ebsEncryptionService,
+                           Ec2BlockPublicAccessService blockPublicAccessService,
+                           Ec2IpamService ipamService, RegionResolver regionResolver,
+                           Ec2ClientVpnService clientVpnService) {
+        this(service, config, flowLogService, ebsEncryptionService, blockPublicAccessService, ipamService,
+                regionResolver, clientVpnService, null);
     }
 
     /** For unit tests that exercise no Client VPN operation. */
@@ -101,6 +130,10 @@ public class Ec2QueryHandler {
         LOG.debugv("EC2 action: {0}", action);
         try {
             return switch (action) {
+                case "CreatePlacementGroup" -> placementGroupHandler.create(params, region,
+                        parseTagsForResource(params, "placement-group", Set.of("placement-group")));
+                case "DescribePlacementGroups" -> placementGroupHandler.describe(params, region);
+                case "DeletePlacementGroup" -> placementGroupHandler.delete(params, region);
                 // Instances
                 case "RunInstances" -> handleRunInstances(params, region);
                 case "CreateFleet" -> handleCreateFleet(params, region);
@@ -153,6 +186,17 @@ public class Ec2QueryHandler {
                 case "DescribeVpcEndpoints" -> handleDescribeVpcEndpoints(params, region);
                 case "ModifyVpcEndpoint" -> handleModifyVpcEndpoint(params, region);
                 case "DeleteVpcEndpoints" -> handleDeleteVpcEndpoints(params, region);
+                // VPC endpoint services (PrivateLink, provider side)
+                case "CreateVpcEndpointServiceConfiguration" -> privateLinkHandler.create(params, region,
+                        parseTagsForResource(params, "vpc-endpoint-service", Set.of("vpc-endpoint-service")));
+                case "DescribeVpcEndpointServiceConfigurations" -> privateLinkHandler.describe(params, region);
+                case "ModifyVpcEndpointServiceConfiguration" -> privateLinkHandler.modify(params, region);
+                case "DeleteVpcEndpointServiceConfigurations" -> privateLinkHandler.delete(params, region);
+                case "DescribeVpcEndpointServicePermissions" -> privateLinkHandler.describePermissions(params, region);
+                case "ModifyVpcEndpointServicePermissions" -> privateLinkHandler.modifyPermissions(params, region);
+                case "DescribeVpcEndpointConnections" -> privateLinkHandler.describeConnections(params, region);
+                case "AcceptVpcEndpointConnections" -> privateLinkHandler.acceptConnections(params, region);
+                case "RejectVpcEndpointConnections" -> privateLinkHandler.rejectConnections(params, region);
                 // Flow Logs
                 case "CreateFlowLogs" -> handleCreateFlowLogs(params, region);
                 case "DescribeFlowLogs" -> handleDescribeFlowLogs(params, region);
@@ -268,6 +312,10 @@ public class Ec2QueryHandler {
                 case "RegisterImage" -> handleRegisterImage(params, region);
                 case "DeregisterImage" -> handleDeregisterImage(params, region);
                 case "CopyImage" -> handleCopyImage(params, region);
+                case "DescribeImageAttribute" -> handleDescribeImageAttribute(params, region);
+                case "ModifyImageAttribute" -> handleModifyImageAttribute(params, region);
+                case "DescribeSnapshotAttribute" -> handleDescribeSnapshotAttribute(params, region);
+                case "ModifySnapshotAttribute" -> handleModifySnapshotAttribute(params, region);
                 case "DescribeSnapshots" -> handleDescribeSnapshots(params, region);
                 case "CreateSnapshot" -> handleCreateSnapshot(params, region);
                 case "DeleteSnapshot" -> handleDeleteSnapshot(params, region);
@@ -322,6 +370,7 @@ public class Ec2QueryHandler {
                 case "DescribeCapacityReservations" -> handleDescribeCapacityReservations(params, region);
                 case "ModifyCapacityReservation" -> handleModifyCapacityReservation(params, region);
                 case "CancelCapacityReservation" -> handleCancelCapacityReservation(params, region);
+            case "MoveCapacityReservationInstances" -> handleMoveCapacityReservationInstances(params, region);
                 // Dedicated Hosts
                 case "AllocateHosts" -> handleAllocateHosts(params, region);
                 case "DescribeHosts" -> handleDescribeHosts(params, region);
@@ -361,6 +410,7 @@ public class Ec2QueryHandler {
                 case "CreateNetworkInterfacePermission" -> handleCreateNetworkInterfacePermission(params, region);
                 case "DescribeNetworkInterfacePermissions" ->
                         handleDescribeNetworkInterfacePermissions(params, region);
+                case "DeleteNetworkInterfacePermission" -> handleDeleteNetworkInterfacePermission(params, region);
                 // Volumes
                 case "CreateVolume" -> handleCreateVolume(params, region);
                 case "DescribeVolumes" -> handleDescribeVolumes(params, region);
@@ -454,6 +504,8 @@ public class Ec2QueryHandler {
             mapping.setDeviceName(deviceName);
             EbsBlockDevice ebs = new EbsBlockDevice();
             ebs.setSnapshotId(snapshotId);
+            ebs.setIops(parseOptionalInt(p.getFirst(prefix + ".Ebs.Iops"), prefix + ".Ebs.Iops"));
+            ebs.setThroughput(parseOptionalInt(p.getFirst(prefix + ".Ebs.Throughput"), prefix + ".Ebs.Throughput"));
             ebs.setVolumeSize(parseOptionalInt(volumeSize, prefix + ".Ebs.VolumeSize"));
             ebs.setVolumeType(volumeType);
             ebs.setDeleteOnTermination(parseOptionalBoolean(deleteOnTermination,
@@ -798,6 +850,93 @@ public class Ec2QueryHandler {
     // ─── Instance handlers ────────────────────────────────────────────────────
 
     private Response handleRunInstances(MultivaluedMap<String, String> p, String region) {
+        Reservation res;
+        String token = p.getFirst("ClientToken");
+        boolean dryRun = Boolean.parseBoolean(p.getFirst("DryRun"));
+        if (token == null || dryRun) {
+            res = launchRunInstances(p, region, null);
+        } else {
+            Map<String, List<String>> identity = new LinkedHashMap<>();
+            p.forEach((name, values) -> {
+                if (!Set.of("Action", "Version", "ClientToken", "DryRun", "AWSAccessKeyId", "Signature",
+                        "SignatureMethod", "SignatureVersion", "Timestamp", "Expires", "SecurityToken").contains(name)
+                        && !name.startsWith("X-Amz-")) {
+                    identity.put(name, List.copyOf(values));
+                }
+            });
+            if (!anyParamStartsWith(p, "LaunchTemplate.")) {
+                LaunchTemplateData.MetadataOptions defaults = LaunchTemplateData.MetadataOptions.launchDefaults();
+                identity.putIfAbsent("MetadataOptions.HttpTokens", List.of(defaults.getHttpTokens()));
+                identity.putIfAbsent("MetadataOptions.HttpEndpoint", List.of(defaults.getHttpEndpoint()));
+                identity.putIfAbsent("MetadataOptions.HttpPutResponseHopLimit",
+                        List.of(String.valueOf(defaults.getHttpPutResponseHopLimit())));
+                identity.putIfAbsent("MetadataOptions.HttpProtocolIpv6", List.of(defaults.getHttpProtocolIpv6()));
+                identity.putIfAbsent("MetadataOptions.InstanceMetadataTags", List.of(defaults.getInstanceMetadataTags()));
+            }
+            res = service.replayRunInstances(region, token, false, identity,
+                    p.getFirst("NetworkInterface.1.NetworkInterfaceId"),
+                    () -> runInstancesScope(p, region), attempt -> launchRunInstances(p, region, attempt));
+        }
+        XmlBuilder xml = new XmlBuilder()
+                .start("RunInstancesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("reservationId", res.getReservationId())
+                .elem("ownerId", res.getOwnerId())
+                .start("groupSet").end("groupSet")
+                .start("instancesSet");
+        Map<String, String> capacityAssociations = service.capacityReservationAssociations(region);
+        Map<String, List<VolumeAttachment>> volumeAttachments = service.instanceVolumeAttachments(res.getInstances());
+        Ec2Service.ElasticAddresses elasticAddresses = service.elasticAddresses(region);
+        for (Instance inst : res.getInstances()) {
+            xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments, elasticAddresses)).end("item");
+        }
+        xml.end("instancesSet")
+                .end("RunInstancesResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Ec2RunInstancesReplay.Scope runInstancesScope(MultivaluedMap<String, String> p, String region) {
+        String subnet = firstNonBlank(p.getFirst("SubnetId"), p.getFirst("NetworkInterface.1.SubnetId"));
+        String eni = p.getFirst("NetworkInterface.1.NetworkInterfaceId");
+        LaunchTemplateData template = resolveRunInstancesLaunchTemplateData(p, region, false);
+        String zone = runInstancesAvailabilityZone(p, region, template);
+        if (template != null) {
+            if (!anyParamStartsWith(p, "NetworkInterface.")) {
+                LaunchTemplateData.NetworkInterface primary = template.primaryNetworkInterface();
+                if (primary != null) {
+                    subnet = firstNonBlank(subnet, primary.getSubnetId());
+                    eni = firstNonBlank(eni, primary.getNetworkInterfaceId());
+                }
+            }
+        }
+        return service.runInstancesScope(region, subnet, eni, zone, p.getFirst("Placement.HostId"));
+    }
+
+    /**
+     * The zone a launch is placed in, named by the request or, when the request names neither a
+     * zone nor a zone ID, by the launch template. Request placement replaces template placement
+     * as a whole, so a request zone ID is not combined with a template zone name.
+     */
+    private String runInstancesAvailabilityZone(MultivaluedMap<String, String> p, String region,
+                                               LaunchTemplateData template) {
+        String zone = p.getFirst("Placement.AvailabilityZone");
+        String zoneId = p.getFirst("Placement.AvailabilityZoneId");
+        if (firstNonBlank(zone, zoneId) == null && template != null && template.getPlacement() != null) {
+            zone = template.getPlacement().getAvailabilityZone();
+            zoneId = template.getPlacement().getAvailabilityZoneId();
+        }
+        if (isSet(zoneId)) {
+            if (isSet(zone)) {
+                throw new AwsException("InvalidParameterCombination",
+                        "You cannot specify both AvailabilityZone and AvailabilityZoneId", 400);
+            }
+            return Ec2Service.zoneNameForZoneId(region, zoneId);
+        }
+        return zone;
+    }
+
+    private Reservation launchRunInstances(MultivaluedMap<String, String> p, String region,
+                                          Ec2RunInstancesReplay.Attempt attempt) {
         String imageId = p.getFirst("ImageId");
         String instanceType = p.getFirst("InstanceType");
         int minCount = parseRunInstancesCount(p, "MinCount");
@@ -836,7 +975,8 @@ public class Ec2QueryHandler {
         // the instance's primary interface (network_interface { network_interface_id = ... }).
         String networkInterfaceId = p.getFirst("NetworkInterface.1.NetworkInterfaceId");
         int networkInterfaceDeviceIndex = parseIntParam(p, "NetworkInterface.1.DeviceIndex", 0);
-        Boolean explicitDeleteOnTermination = parseOptionalBoolean(p.getFirst("NetworkInterface.1.DeleteOnTermination"), "NetworkInterface.1.DeleteOnTermination");
+        Boolean networkInterfaceDeleteOnTermination = parseOptionalBoolean(
+                p.getFirst("NetworkInterface.1.DeleteOnTermination"), "NetworkInterface.1.DeleteOnTermination");
         String clientToken = p.getFirst("ClientToken");
         List<String> sgIds = getList(p, "SecurityGroupId");
         // With a primary interface spec the groups travel on it: Terraform's aws_instance sends that
@@ -874,9 +1014,7 @@ public class Ec2QueryHandler {
         String creditSpecificationCpuCredits = p.getFirst("CreditSpecification.CpuCredits");
         String marketType = p.getFirst("InstanceMarketOptions.MarketType");
 
-        List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings =
-                parseLaunchTemplateBlockDeviceMappings(p, "");
-
+        List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings = parseLaunchTemplateBlockDeviceMappings(p, "");
         LaunchTemplateData launchTemplateData = resolveRunInstancesLaunchTemplateData(
                 p, region, userDataEncoded == null || userDataEncoded.isBlank());
         boolean suppliedInterfaces = p.keySet().stream().anyMatch(name -> name.startsWith("NetworkInterface."));
@@ -898,9 +1036,8 @@ public class Ec2QueryHandler {
             // a request entry spelling a template device differently ("xvdf") then merges into it.
             Ec2Service.requireValidLaunchDevices(launchTemplateData.getBlockDeviceMappings());
             Ec2Service.requireValidLaunchDevices(blockDeviceMappings);
-            blockDeviceMappings = LaunchTemplateData.BlockDeviceMapping.merge(
-                    launchTemplateData.getBlockDeviceMappings(),
-                    Ec2Service.spelledAs(launchTemplateData.getBlockDeviceMappings(), blockDeviceMappings));
+            blockDeviceMappings = Ec2BlockDevices.merge(
+                    launchTemplateData.getBlockDeviceMappings(), blockDeviceMappings);
             if (!suppliedInterfaces) {
                 // With neither request interfaces nor, after the checks above, a request SubnetId
                 // or PrivateIpAddress, the template's primary interface places the launch.
@@ -908,6 +1045,7 @@ public class Ec2QueryHandler {
                 if (primary != null) {
                     subnetId = primary.getSubnetId();
                     privateIpAddress = primary.getPrivateIpAddress();
+                    networkInterfaceDeleteOnTermination = primary.getDeleteOnTermination();
                     if (associatePublicIp == null) {
                         associatePublicIp = primary.getAssociatePublicIpAddress();
                     }
@@ -965,27 +1103,51 @@ public class Ec2QueryHandler {
         }
 
         // AWS only allows DeleteOnTermination=true for a newly created interface.
-        if (Boolean.TRUE.equals(explicitDeleteOnTermination) && networkInterfaceId != null && !networkInterfaceId.isBlank()) {
+        if (Boolean.TRUE.equals(networkInterfaceDeleteOnTermination) && networkInterfaceId != null && !networkInterfaceId.isBlank()) {
             throw new AwsException("InvalidParameterCombination",
                     "You can specify true for DeleteOnTermination only when creating a new network interface.", 400);
         }
 
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            Ec2Service.validateNewResourceTags(launchTemplateData.tagsForResource("network-interface"));
+            Map<String, Tag> primaryInterfaceTags = new LinkedHashMap<>();
+            launchTemplateData.tagsForResource("network-interface")
+                    .forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            networkInterfaceTags.forEach(tag -> primaryInterfaceTags.put(tag.getKey(), tag));
+            Ec2Service.validateNewResourceTags(new ArrayList<>(primaryInterfaceTags.values()));
+        }
+
+        String availabilityZone = runInstancesAvailabilityZone(p, region, launchTemplateData);
         String shutdownBehavior = p.getFirst("InstanceInitiatedShutdownBehavior");
         if (shutdownBehavior == null && launchTemplateData != null) {
             shutdownBehavior = launchTemplateData.getInstanceInitiatedShutdownBehavior();
         }
-        Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
+        Reservation res = attempt == null ? service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
-                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, dryRun(p),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
-                "spot".equals(marketType), privateIpAddress, capacitySpecification, shutdownBehavior);
+                "spot".equals(marketType), privateIpAddress, capacitySpecification,
+                networkInterfaceDeleteOnTermination, shutdownBehavior)
+                : service.launchInstances(region, imageId, instanceType, minCount, maxCount,
+                keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
+                creditSpecificationCpuCredits, userDataEncoded, false,
+                p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
+                "spot".equals(marketType), privateIpAddress, capacitySpecification,
+                networkInterfaceDeleteOnTermination, shutdownBehavior, attempt);
 
-        // Apply an explicit NetworkInterface.1.DeleteOnTermination to the launched instance.
-        if (explicitDeleteOnTermination != null) {
-            for (Instance inst : res.getInstances()) {
-                service.setNetworkInterfaceDeleteOnTermination(region, inst.getInstanceId(),
-                        explicitDeleteOnTermination);
+        if (launchTemplateData != null && !isSet(networkInterfaceId)) {
+            List<Tag> templateInterfaceTags = launchTemplateData.tagsForResource("network-interface");
+            if (!templateInterfaceTags.isEmpty()) {
+                List<String> primaryIds = res.getInstances().stream()
+                        .flatMap(instance -> instance.getNetworkInterfaces().stream())
+                        .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                        .map(InstanceNetworkInterface::getNetworkInterfaceId)
+                        .toList();
+                if (!primaryIds.isEmpty()) {
+                    service.tagRunInstancesInterfaces(region, primaryIds, templateInterfaceTags, attempt);
+                }
             }
         }
 
@@ -1009,27 +1171,15 @@ public class Ec2QueryHandler {
                 inst.getNetworkInterfaces().forEach(eni -> eniIds.add(eni.getNetworkInterfaceId()));
             }
             if (!eniIds.isEmpty()) {
-                service.createTags(region, eniIds, networkInterfaceTags);
+                if (attempt == null) {
+                    service.createTags(region, eniIds, networkInterfaceTags);
+                } else {
+                    service.tagRunInstancesInterfaces(region, eniIds, networkInterfaceTags, attempt);
+                }
             }
         }
 
-        XmlBuilder xml = new XmlBuilder()
-                .start("RunInstancesResponse", AwsNamespaces.EC2)
-                .elem("requestId", UUID.randomUUID().toString())
-                .elem("reservationId", res.getReservationId())
-                .elem("ownerId", res.getOwnerId())
-                .start("groupSet").end("groupSet")
-                .start("instancesSet");
-        Map<String, String> capacityAssociations = service.capacityReservationAssociations(region);
-        Map<String, List<VolumeAttachment>> volumeAttachments = service.instanceVolumeAttachments(res.getInstances());
-        Ec2Service.ElasticAddresses elasticAddresses = service.elasticAddresses(region);
-        for (Instance inst : res.getInstances()) {
-            xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments, elasticAddresses))
-                    .end("item");
-        }
-        xml.end("instancesSet")
-                .end("RunInstancesResponse");
-        return xmlResponse(xml.build());
+        return res;
     }
 
     private int parseRunInstancesCount(MultivaluedMap<String, String> p, String name) {
@@ -1073,7 +1223,7 @@ public class Ec2QueryHandler {
         if ((id == null || id.isBlank()) && (name == null || name.isBlank())) {
             return null;
         }
-        return service.resolveLaunchTemplateData(region, id, name, version, decodeUserData);
+        return service.resolveRunInstancesLaunchTemplateData(region, id, name, version, decodeUserData);
     }
 
     /**
@@ -1142,7 +1292,7 @@ public class Ec2QueryHandler {
                         launch.keyName(),
                         launch.securityGroupIds(),
                         launch.subnetId(),
-                        p.getFirst("ClientToken"),
+                        null, // A fleet token identifies the fleet request, not each member launch.
                         launch.instanceTags(),
                         launch.userData(),
                         launch.iamInstanceProfileArn(),
@@ -1857,9 +2007,8 @@ public class Ec2QueryHandler {
         String cidrBlock = p.getFirst("CidrBlock");
         boolean amazonProvidedIpv6 = "true".equalsIgnoreCase(p.getFirst("AmazonProvidedIpv6CidrBlock"));
         List<Tag> vpcTags = parseTagsForResource(p, "vpc");
-        // Answered before Ec2Service checks the CIDR block and the tenancy, an order AWS does not document.
-        checkDryRun(p);
-        Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6, p.getFirst("InstanceTenancy"));
+        Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6,
+                p.getFirst("InstanceTenancy"), Boolean.parseBoolean(p.getFirst("DryRun")));
         applyResourceTags(vpcTags, region, vpc.getVpcId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateVpcResponse", AwsNamespaces.EC2)
@@ -2082,15 +2231,31 @@ public class Ec2QueryHandler {
             xml.end("availabilityZoneSet")
                     .elem("owner", svc.owner)
                     .elem("acceptanceRequired", svc.acceptanceRequired)
-                    .elem("managesVpcEndpoints", svc.managesVpcEndpoints)
-                    .end("item");
+                    .elem("managesVpcEndpoints", svc.managesVpcEndpoints);
+            if (svc.endpointService != null) {
+                VpcEndpointServiceConfiguration own = svc.endpointService;
+                xml.elem("serviceId", own.getServiceId())
+                        .elem("serviceRegion", own.getRegion())
+                        .start("baseEndpointDnsNameSet")
+                        .elem("item", Ec2PrivateLinkService.baseEndpointDnsName(own))
+                        .end("baseEndpointDnsNameSet")
+                        .start("supportedIpAddressTypeSet");
+                for (String ipType : own.getSupportedIpAddressTypes()) xml.elem("item", ipType);
+                xml.end("supportedIpAddressTypeSet")
+                        .elem("privateDnsName", own.getPrivateDnsName())
+                        .elem("privateDnsNameVerificationState", Ec2PrivateLinkService.privateDnsVerificationState(own))
+                        .raw(tagSetXml(svc.tags));
+            }
+            xml.end("item");
         }
         xml.end("serviceDetailSet").end("DescribeVpcEndpointServicesResponse");
         return xmlResponse(xml.build());
     }
 
     /**
-     * Service detail for VPC endpoint service, used for filtering.
+     * Service detail for VPC endpoint service, used for filtering. {@code endpointService} is set
+     * for an endpoint service an account created, and {@code tags} are its tags when the caller
+     * owns it.
      */
     private record ServiceDetail(
             String serviceName,
@@ -2100,7 +2265,24 @@ public class Ec2QueryHandler {
             String acceptanceRequired,
             String managesVpcEndpoints,
             String serviceRegion,
-            List<String> supportedIpAddressTypes) {
+            List<String> supportedIpAddressTypes,
+            VpcEndpointServiceConfiguration endpointService,
+            List<Tag> tags) {
+
+        private ServiceDetail(String serviceName, List<String> serviceTypes, List<String> availabilityZones,
+                              String owner, String acceptanceRequired, String managesVpcEndpoints,
+                              String serviceRegion, List<String> supportedIpAddressTypes) {
+            this(serviceName, serviceTypes, availabilityZones, owner, acceptanceRequired, managesVpcEndpoints,
+                    serviceRegion, supportedIpAddressTypes, null, List.of());
+        }
+    }
+
+    private ServiceDetail endpointServiceDetail(VpcEndpointServiceConfiguration own) {
+        return new ServiceDetail(own.getServiceName(), List.of(own.getServiceType()), own.getAvailabilityZones(),
+                own.getOwnerId(), String.valueOf(own.isAcceptanceRequired()), "false", own.getRegion(),
+                own.getSupportedIpAddressTypes(), own,
+                privateLinkService.ownedByCaller(own) ? service.resourceTags(own.getRegion(), own.getServiceId())
+                        : List.of());
     }
 
     private List<ServiceDetail> buildServiceDetails(String region, List<String> requested, List<String> azNames) {
@@ -2134,6 +2316,12 @@ public class Ec2QueryHandler {
         }
 
         for (String full : fullNames) {
+            Optional<VpcEndpointServiceConfiguration> own = !requested.isEmpty() && privateLinkService != null
+                    ? privateLinkService.visibleService(region, full) : Optional.empty();
+            if (own.isPresent()) {
+                services.add(endpointServiceDetail(own.get()));
+                continue;
+            }
             List<String> serviceTypes;
             String gatewayInterface = gatewayInterfaces.get(full);
             if (gatewayInterface == null) {
@@ -2152,6 +2340,9 @@ public class Ec2QueryHandler {
                     "false",
                     region,
                     List.of("ipv4", "ipv6")));
+        }
+        if (requested.isEmpty() && privateLinkService != null) {
+            privateLinkService.visibleServices(region).forEach(own -> services.add(endpointServiceDetail(own)));
         }
 
         return services;
@@ -2208,11 +2399,10 @@ public class Ec2QueryHandler {
             case "service-type" -> svc.serviceTypes.stream().anyMatch(t -> values.contains(t));
             case "supported-ip-address-types" -> svc.supportedIpAddressTypes.stream()
                     .anyMatch(t -> values.contains(t));
-            case String n when n.startsWith("tag:") -> {
-                // VPC endpoint services don't have user tags, so no tag filters match
-                yield false;
-            }
-            case "tag-key" -> false; // No tags on these services
+            // Only an endpoint service an account created carries tags, and only its owner sees them.
+            case String n when n.startsWith("tag:") -> svc.tags.stream().anyMatch(tag ->
+                    tag.getKey().equals(n.substring("tag:".length())) && values.contains(tag.getValue()));
+            case "tag-key" -> svc.tags.stream().anyMatch(tag -> values.contains(tag.getKey()));
             default -> throw new AwsException("InvalidFilter",
                     "The filter '" + filterName + "' is invalid.", 400);
         };
@@ -2733,6 +2923,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleCreateVpcEndpoint(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         VpcEndpoint endpoint = service.createVpcEndpoint(
                 region,
                 p.getFirst("VpcId"),
@@ -2754,6 +2945,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleModifyVpcEndpoint(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.modifyVpcEndpoint(
                 region,
                 p.getFirst("VpcEndpointId"),
@@ -2778,6 +2970,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeVpcEndpoints(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> endpointIds = getList(p, "VpcEndpointId");
         List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<VpcEndpoint> endpoints = service.describeVpcEndpoints(region, endpointIds, filters);
@@ -3584,6 +3777,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteVpcEndpoints(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> endpointIds = getList(p, "VpcEndpointId");
         service.deleteVpcEndpoints(region, endpointIds);
         XmlBuilder xml = new XmlBuilder()
@@ -3660,11 +3854,8 @@ public class Ec2QueryHandler {
         String azId = p.getFirst("AvailabilityZoneId");
         String ipv6CidrBlock = p.getFirst("Ipv6CidrBlock");
         List<Tag> tags = parseTagsForResource(p, "subnet", Set.of("subnet"));
-        // A dry run needs the VPC to exist and is answered before the CIDR, zone and overlap checks.
-        requireParameter(p, "VpcId");
-        service.requireVpc(region, vpcId);
-        checkDryRun(p);
-        Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock);
+        Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock,
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         try {
             if (!tags.isEmpty()) {
                 service.createTags(region, List.of(subnet.getSubnetId()), tags);
@@ -3749,10 +3940,8 @@ public class Ec2QueryHandler {
         String groupName = requireParameter(p, "GroupName");
         String description = requireParameter(p, "GroupDescription");
         String vpcId = p.getFirst("VpcId");
-        // A dry run needs the (default) VPC to exist and is answered before the taken-name check.
-        service.requireSecurityGroupVpc(region, vpcId);
-        checkDryRun(p);
-        SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId);
+        SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId,
+                Boolean.parseBoolean(p.getFirst("DryRun")));
         applyResourceTags(resourceTags, region, sg.getGroupId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateSecurityGroupResponse", AwsNamespaces.EC2)
@@ -3929,17 +4118,32 @@ public class Ec2QueryHandler {
     }
 
     private Response handleUpdateSgRuleDescriptionsIngress(MultivaluedMap<String, String> p, String region) {
-        checkDryRun(p);
-        String groupId = p.getFirst("GroupId");
-        service.updateSecurityGroupRuleDescriptionsIngress(region, groupId, Collections.emptyList());
-        return booleanResponse("UpdateSecurityGroupRuleDescriptionsIngress");
+        return updateSgRuleDescriptions(p, region, false);
     }
 
     private Response handleUpdateSgRuleDescriptionsEgress(MultivaluedMap<String, String> p, String region) {
-        checkDryRun(p);
-        String groupId = p.getFirst("GroupId");
-        service.updateSecurityGroupRuleDescriptionsEgress(region, groupId, Collections.emptyList());
-        return booleanResponse("UpdateSecurityGroupRuleDescriptionsEgress");
+        return updateSgRuleDescriptions(p, region, true);
+    }
+
+    private Response updateSgRuleDescriptions(MultivaluedMap<String, String> p, String region, boolean egress) {
+        List<SecurityGroupRule> descriptions = new ArrayList<>();
+        for (int index = 1; ; index++) {
+            String prefix = "SecurityGroupRuleDescription." + index + ".";
+            String id = p.getFirst(prefix + "SecurityGroupRuleId");
+            String description = p.getFirst(prefix + "Description");
+            if (id == null && description == null) {
+                break;
+            }
+            SecurityGroupRule value = new SecurityGroupRule();
+            value.setSecurityGroupRuleId(id);
+            value.setDescription(description);
+            descriptions.add(value);
+        }
+        service.updateSecurityGroupRuleDescriptions(region, p.getFirst("GroupId"), p.getFirst("GroupName"),
+                parseIpPermissions(p, "IpPermissions"), descriptions, egress,
+                dryRun(p));
+        return booleanResponse(egress ? "UpdateSecurityGroupRuleDescriptionsEgress"
+                : "UpdateSecurityGroupRuleDescriptionsIngress");
     }
 
     // ─── Key Pair handlers ────────────────────────────────────────────────────
@@ -4292,6 +4496,7 @@ public class Ec2QueryHandler {
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeregisterImage.html">DeregisterImage</a>
      */
     private Response handleDeregisterImage(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<Ec2Service.SnapshotDeletion> deletions = service.deregisterImage(
                 region,
                 p.getFirst("ImageId"),
@@ -4321,6 +4526,12 @@ public class Ec2QueryHandler {
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CopyImage.html">CopyImage</a>
      */
     private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
+        if (p.containsKey("KmsKeyId") || Boolean.parseBoolean(p.getFirst("Encrypted"))
+                || p.keySet().stream().anyMatch(name -> name.startsWith("Destination")
+                        || name.equals("SnapshotCopyCompletionDurationMinutes"))) {
+            throw new AwsException("UnsupportedOperation",
+                    "CopyImage supports regional copies without encryption or placement options.", 400);
+        }
         List<Tag> imageTags = parseTagsForResource(p, "image", IMAGE_TAG_RESOURCE_TYPES);
         List<Tag> snapshotTags = parseTagsForResource(p, "snapshot", IMAGE_TAG_RESOURCE_TYPES);
         Image image = service.copyImage(
@@ -4329,8 +4540,8 @@ public class Ec2QueryHandler {
                 p.getFirst("SourceImageId"),
                 p.getFirst("Name"),
                 p.getFirst("Description"),
-                Boolean.parseBoolean(p.getFirst("CopyImageTags")),
-                imageTags);
+                Boolean.parseBoolean(p.getFirst("DryRun")),
+                Boolean.parseBoolean(p.getFirst("CopyImageTags")), imageTags);
         applyResourceTags(imageTags, region, image.getImageId());
         applyImageSnapshotTags(snapshotTags, region, image);
         XmlBuilder xml = new XmlBuilder()
@@ -4340,6 +4551,106 @@ public class Ec2QueryHandler {
                 .end("CopyImageResponse");
         return xmlResponse(xml.build());
     }
+
+    private Response handleDescribeImageAttribute(MultivaluedMap<String, String> p, String region) {
+        requirePermissionAttribute(p, "launchPermission");
+        List<String> users = service.describeImageLaunchPermissions(region, p.getFirst("ImageId"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return permissionResponse("DescribeImageAttribute", "imageId", p.getFirst("ImageId"),
+                "launchPermission", users);
+    }
+
+    private Response handleDescribeSnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        requirePermissionAttribute(p, "createVolumePermission");
+        List<String> users = service.describeSnapshotCreateVolumePermissions(region, p.getFirst("SnapshotId"),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return permissionResponse("DescribeSnapshotAttribute", "snapshotId", p.getFirst("SnapshotId"),
+                "createVolumePermission", users);
+    }
+
+    private void requirePermissionAttribute(MultivaluedMap<String, String> p, String expected) {
+        if (p.getFirst("Attribute") == null) {
+            throw new AwsException("MissingParameter", "The parameter Attribute is missing", 400);
+        }
+        if (!expected.equals(p.getFirst("Attribute"))) {
+            throw new AwsException("UnsupportedOperation", "Only the " + expected + " attribute is supported.", 400);
+        }
+    }
+
+    private Response permissionResponse(String action, String idName, String id, String permission,
+                                        List<String> users) {
+        XmlBuilder xml = new XmlBuilder().start(action + "Response", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString()).elem(idName, id).start(permission);
+        for (String user : users) {
+            xml.start("item").elem("userId", user).end("item");
+        }
+        return xmlResponse(xml.end(permission).end(action + "Response").build());
+    }
+
+    private Response handleModifyImageAttribute(MultivaluedMap<String, String> p, String region) {
+        PermissionChanges changes = permissionChanges(p, "ImageId", "LaunchPermission", "launchPermission");
+        service.modifyImageLaunchPermissions(region, p.getFirst("ImageId"), changes.add(), changes.remove(),
+                Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("ModifyImageAttribute");
+    }
+
+    private Response handleModifySnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        PermissionChanges changes = permissionChanges(p, "SnapshotId",
+                "CreateVolumePermission", "createVolumePermission");
+        service.modifySnapshotCreateVolumePermissions(region, p.getFirst("SnapshotId"),
+                changes.add(), changes.remove(), Boolean.parseBoolean(p.getFirst("DryRun")));
+        return booleanResponse("ModifySnapshotAttribute");
+    }
+
+    private record PermissionChanges(List<String> add, List<String> remove) {}
+
+    private PermissionChanges permissionChanges(MultivaluedMap<String, String> p, String idName,
+                                                 String field, String attribute) {
+        if (p.containsKey("Attribute") && !attribute.equals(p.getFirst("Attribute"))) {
+            throw new AwsException("UnsupportedOperation", "Only the " + attribute + " attribute is supported.", 400);
+        }
+        Map<Integer, String> add = new TreeMap<>();
+        Map<Integer, String> remove = new TreeMap<>();
+        Set<String> common = Set.of("Action", "Version", idName, "Attribute", "DryRun");
+        for (String key : p.keySet()) {
+            if (common.contains(key)) {
+                continue;
+            }
+            if (!key.startsWith(field + ".")) {
+                throw new AwsException("UnsupportedOperation",
+                        "Only nested " + field + " Add/Remove UserId changes are supported.", 400);
+            }
+            String[] parts = key.substring(field.length() + 1).split("\\.", -1);
+            if (parts.length != 3 || !Set.of("Add", "Remove").contains(parts[0])
+                    || !parts[1].matches("[1-9][0-9]*") || !"UserId".equals(parts[2])) {
+                throw new AwsException("UnsupportedOperation",
+                        "Only nested " + field + " Add/Remove UserId changes are supported.", 400);
+            }
+            int index;
+            try {
+                index = Integer.parseInt(parts[1]);
+            } catch (NumberFormatException invalid) {
+                throw new AwsException("InvalidParameterValue", "Invalid permission index.", 400);
+            }
+            if (p.get(key).size() != 1) {
+                throw new AwsException("InvalidParameterValue", "Permission UserId must have one value.", 400);
+            }
+            ("Add".equals(parts[0]) ? add : remove).put(index, p.getFirst(key));
+        }
+        for (Map<Integer, String> changes : List.of(add, remove)) {
+            int expected = 1;
+            for (int index : changes.keySet()) {
+                if (index != expected++) {
+                    throw new AwsException("InvalidParameterValue", "Permission indexes must start at 1 without gaps.", 400);
+                }
+            }
+        }
+        return new PermissionChanges(new ArrayList<>(add.values()), new ArrayList<>(remove.values()));
+    }
+
+
+
+
 
     private Response handleDescribeSnapshots(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "SnapshotId");
@@ -4362,6 +4673,11 @@ public class Ec2QueryHandler {
      * a snapshot it has just started; DescribeSnapshots then reports it {@code completed}.
      */
     private Response handleCreateSnapshot(MultivaluedMap<String, String> p, String region) {
+        String location = p.getFirst("Location");
+        if (p.getFirst("OutpostArn") != null || location != null && !"regional".equals(location)) {
+            throw new AwsException("UnsupportedOperation",
+                    "CreateSnapshot supports regional snapshots without an OutpostArn.", 400);
+        }
         List<Tag> snapshotTags = parseTagsForResource(p, "snapshot", Set.of("snapshot"));
         Snapshot snapshot = service.createSnapshot(region, p.getFirst("VolumeId"),
                 p.getFirst("Description"), snapshotTags, dryRun(p));
@@ -4818,10 +5134,11 @@ public class Ec2QueryHandler {
                 getList(p, "SecondaryAllocationId"),
                 getList(p, "SecondaryPrivateIpAddress"),
                 p.getFirst("SecondaryPrivateIpAddressCount"),
-                parseTagsForResource(p, "natgateway"));
+                parseTagsForResource(p, "natgateway"), p.getFirst("ClientToken"));
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateNatGatewayResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
+                .elem("clientToken", natGateway.getClientToken())
                 .start("natGateway").raw(natGatewayXml(natGateway)).end("natGateway")
                 .end("CreateNatGatewayResponse");
         return xmlResponse(xml.build());
@@ -5005,12 +5322,34 @@ public class Ec2QueryHandler {
         return booleanResponse("CancelCapacityReservation");
     }
 
+    private Response handleMoveCapacityReservationInstances(MultivaluedMap<String, String> p, String region) {
+        Integer instanceCount = intOrNull(p, "InstanceCount");
+        checkDryRun(p);
+        Ec2Service.CapacityReservationMoveResult moved = service.moveCapacityReservationInstances(region,
+                p.getFirst("SourceCapacityReservationId"), p.getFirst("DestinationCapacityReservationId"),
+                instanceCount, p.getFirst("ClientToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("MoveCapacityReservationInstancesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("sourceCapacityReservation").raw(capacityReservationXml(moved.source(), false))
+                .end("sourceCapacityReservation")
+                .start("destinationCapacityReservation").raw(capacityReservationXml(moved.destination(), false))
+                .end("destinationCapacityReservation")
+                .elem("instanceCount", moved.instanceCount())
+                .end("MoveCapacityReservationInstancesResponse");
+        return xmlResponse(xml.build());
+    }
+
     private String capacityReservationXml(CapacityReservation reservation) {
+        return capacityReservationXml(reservation, true);
+    }
+
+    private String capacityReservationXml(CapacityReservation reservation, boolean includeMetadata) {
         XmlBuilder xml = new XmlBuilder()
                 .elem("capacityReservationId", reservation.getCapacityReservationId())
                 .elem("ownerId", reservation.getOwnerId())
-                .elem("capacityReservationArn", reservation.getCapacityReservationArn())
-                .elem("availabilityZoneId", reservation.getAvailabilityZoneId())
+                .elem("capacityReservationArn", includeMetadata ? reservation.getCapacityReservationArn() : null)
+                .elem("availabilityZoneId", includeMetadata ? reservation.getAvailabilityZoneId() : null)
                 .elem("availabilityZone", reservation.getAvailabilityZone())
                 .elem("instanceType", reservation.getInstanceType())
                 .elem("instancePlatform", reservation.getInstancePlatform())
@@ -5028,7 +5367,7 @@ public class Ec2QueryHandler {
                 .elem("createDate", reservation.getCreateDate() != null ? ISO_FMT.format(reservation.getCreateDate()) : null)
                 .elem("outpostArn", reservation.getOutpostArn())
                 .elem("placementGroupArn", reservation.getPlacementGroupArn())
-                .raw(tagSetXml(reservation.getTags()));
+                .raw(includeMetadata ? tagSetXml(reservation.getTags()) : null);
         if (reservation.getCommitmentDuration() != null) {
             xml.start("commitmentInfo")
                     .elem("commitmentDuration", reservation.getCommitmentDuration())
@@ -5211,13 +5550,19 @@ public class Ec2QueryHandler {
     }
 
     private Response handleReleaseAddress(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.releaseAddress(region, p.getFirst("AllocationId"));
         return booleanResponse("ReleaseAddress");
     }
 
     private Response handleDescribeAddresses(MultivaluedMap<String, String> p, String region) {
         List<String> allocationIds = getList(p, "AllocationId");
-        List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
+        List<Map.Entry<String, List<String>>> filters = new ArrayList<>(getFiltersList(p));
+        List<String> publicIps = getList(p, "PublicIp");
+        if (!publicIps.isEmpty()) {
+            // The addresses named by PublicIp.N are the only ones the answer may carry.
+            filters.add(Map.entry("public-ip", publicIps));
+        }
         List<Address> addrs = service.describeAddresses(region, allocationIds, filters);
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAddressesResponse", AwsNamespaces.EC2)
@@ -5720,6 +6065,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteNetworkInterface(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteNetworkInterface(region, p.getFirst("NetworkInterfaceId"));
         return booleanResponse("DeleteNetworkInterface");
     }
@@ -5736,13 +6082,6 @@ public class Ec2QueryHandler {
                 .elem("attachmentId", attachment.getAttachmentId())
                 .end("AttachNetworkInterfaceResponse");
         return xmlResponse(xml.build());
-    }
-
-    private Response handleDetachNetworkInterface(MultivaluedMap<String, String> p, String region) {
-        String attachmentId = p.getFirst("AttachmentId");
-        boolean force = "true".equalsIgnoreCase(p.getFirst("Force"));
-        service.detachNetworkInterface(region, attachmentId, force);
-        return booleanResponse("DetachNetworkInterface");
     }
 
     private Response handleAssignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
@@ -5801,6 +6140,13 @@ public class Ec2QueryHandler {
         return xmlResponse(xml.build());
     }
 
+    private Response handleDetachNetworkInterface(MultivaluedMap<String, String> p, String region) {
+        String attachmentId = p.getFirst("AttachmentId");
+        boolean force = "true".equalsIgnoreCase(p.getFirst("Force"));
+        service.detachNetworkInterface(region, attachmentId, force);
+        return booleanResponse("DetachNetworkInterface");
+    }
+
     private Response handleModifyNetworkInterfaceAttribute(MultivaluedMap<String, String> p, String region) {
         String networkInterfaceId = requireNetworkInterfaceId(p);
         refuseUnappliedMembers(p, "ModifyNetworkInterfaceAttribute", UNAPPLIED_INTERFACE_ATTRIBUTES);
@@ -5839,6 +6185,13 @@ public class Ec2QueryHandler {
             xml.elem("nextToken", page.nextToken());
         }
         return endResponse(xml, "DescribeNetworkInterfacePermissions");
+    }
+
+    private Response handleDeleteNetworkInterfacePermission(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        service.deleteNetworkInterfacePermission(region, p.getFirst("NetworkInterfacePermissionId"),
+                "true".equalsIgnoreCase(p.getFirst("Force")));
+        return booleanResponse("DeleteNetworkInterfacePermission");
     }
 
     private static String networkInterfacePermissionXml(NetworkInterfacePermission permission) {
@@ -6874,7 +7227,6 @@ public class Ec2QueryHandler {
             MultivaluedMap<String, String> p, String prefix) {
         List<LaunchTemplateData.BlockDeviceMapping> mappings = new ArrayList<>();
         for (int i = 1; ; i++) {
-            // An empty prefix reads RunInstances' own top-level BlockDeviceMapping.N members.
             String base = (prefix.isEmpty() ? "" : prefix + ".") + "BlockDeviceMapping." + i;
             if (!anyParamStartsWith(p, base + ".")) {
                 break;
@@ -7091,6 +7443,12 @@ public class Ec2QueryHandler {
                 if (ebs.getEncrypted() != null) {
                     xml.elem("encrypted", String.valueOf(ebs.getEncrypted()));
                 }
+                if (ebs.getIops() != null) {
+                    xml.elem("iops", String.valueOf(ebs.getIops()));
+                }
+                if (ebs.getThroughput() != null) {
+                    xml.elem("throughput", String.valueOf(ebs.getThroughput()));
+                }
                 xml.end("ebs");
             }
             xml.end("item");
@@ -7129,21 +7487,19 @@ public class Ec2QueryHandler {
     private Response handleCreateVolume(MultivaluedMap<String, String> p, String region) {
         String availabilityZone = p.getFirst("AvailabilityZone");
         String volumeType = p.getFirst("VolumeType");
-        String sizeStr = p.getFirst("Size");
-        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 8;
+        Integer suppliedSize = parseOptionalInt(p.getFirst("Size"), "Size");
+        int size = suppliedSize != null ? suppliedSize : 0;
+        if (suppliedSize != null && suppliedSize <= 0) {
+            throw new AwsException("InvalidParameterValue", "Size must be greater than zero.", 400);
+        }
         String encryptedStr = p.getFirst("Encrypted");
         boolean encrypted = "true".equalsIgnoreCase(encryptedStr);
-        String iopsStr = p.getFirst("Iops");
-        int iops = iopsStr != null ? Integer.parseInt(iopsStr) : 0;
-        String throughputStr = p.getFirst("Throughput");
-        Integer throughput = null;
-        if (throughputStr != null) {
-            try {
-                throughput = Integer.parseInt(throughputStr);
-            } catch (NumberFormatException e) {
-                throw new AwsException("ValidationException", "Invalid Throughput value: " + throughputStr, 400);
-            }
+        Integer suppliedIops = parseOptionalInt(p.getFirst("Iops"), "Iops");
+        int iops = suppliedIops != null ? suppliedIops : 0;
+        if (suppliedIops != null && suppliedIops <= 0) {
+            throw new AwsException("InvalidParameterValue", "Iops must be greater than zero.", 400);
         }
+        Integer throughput = parseOptionalInt(p.getFirst("Throughput"), "Throughput");
 
         String snapshotId = p.getFirst("SnapshotId");
         String kmsKeyId = p.getFirst("KmsKeyId");
@@ -7166,17 +7522,20 @@ public class Ec2QueryHandler {
     private Response handleDescribeVolumes(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "VolumeId");
         List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
-        List<Volume> volList = service.describeVolumes(region, ids, filters);
+        Integer maxResults = parseOptionalInt(p.getFirst("MaxResults"), "MaxResults");
+        VolumeListResult result = service.describeVolumes(region, ids, filters, maxResults, p.getFirst("NextToken"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeVolumesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("volumeSet");
-        for (Volume vol : volList) {
+        for (Volume vol : result.volumes()) {
             xml.start("item").raw(volumeXml(vol)).end("item");
         }
-        xml.end("volumeSet")
-                .elem("nextToken", "")
-                .end("DescribeVolumesResponse");
+        xml.end("volumeSet");
+        if (result.nextToken() != null) {
+            xml.elem("nextToken", result.nextToken());
+        }
+        xml.end("DescribeVolumesResponse");
         return xmlResponse(xml.build());
     }
 
