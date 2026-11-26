@@ -44,6 +44,24 @@ class EmbeddedDnsAliasTargetTest {
         verifyNoInteractions(next);
     }
 
+    @Test
+    void resourceAliasResolutionPreservesTheReceivingListenerAndVpc() {
+        DnsClientVpcSource.ClientVpc origin = new DnsClientVpcSource.ClientVpc("111122223333", "us-east-1", "vpc-owned");
+        DnsAnswer answer = DnsAnswer.records(List.of("192.0.2.20"), 37);
+        DnsRecordSource source = mock(DnsRecordSource.class);
+        when(source.resolveAliasTarget(TARGET, "ZOWNED", 1, "192.0.2.10", origin))
+                .thenReturn(Optional.of(answer));
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of(), List.of(source));
+        assertEquals(Optional.of(answer), dns.resolveAliasTarget(TARGET, "ZOWNED", 1, "192.0.2.10", origin));
+    }
+
+    @Test
+    void publicApiAliasesKeepTheExplicitListenerOutsideVpcRouting() {
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of(), List.of());
+        assertEquals(Optional.of("192.0.2.10"), dns.publicApiAddress("192.0.2.10", null));
+        assertEquals(Optional.empty(), dns.publicApiAddress(null, null));
+    }
+
     private static DnsRecordSource source(Optional<DnsAnswer> answer) {
         DnsRecordSource source = mock(DnsRecordSource.class);
         when(source.resolveAliasTarget(TARGET, "ZOWNED", 1, "192.0.2.10")).thenReturn(answer);

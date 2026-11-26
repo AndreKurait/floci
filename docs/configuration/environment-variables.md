@@ -66,6 +66,7 @@ exposed headers. The disable-CORS switch above also disables this behavior.
 | `FLOCI_TLS_CERT_PATH` | _(none)_ | Path to a PEM certificate file. When set, disables auto-generation |
 | `FLOCI_TLS_KEY_PATH` | _(none)_ | Path to a PEM private key file. Required when `FLOCI_TLS_CERT_PATH` is set |
 | `FLOCI_TLS_EXTRA_CA_PATH` | _(none)_ | Path to a PEM file of extra CA certificates that Floci's own outbound HTTPS clients (EventBridge API destinations, SNS HTTPS subscriptions, API Gateway HTTP and HTTP_PROXY integrations, JWT issuer fetch) trust on top of the JVM's roots. Works with TLS on or off; containers Floci launches do not receive them |
+| `FLOCI_TLS_EXTRA_CA_CERTS` | _(none)_ | With TLS enabled, adds the PEM certificates from this file to workload CA bundles and Java trust stores. Public roots and Floci's CA are retained; private keys are excluded. Invalid explicit trust prevents startup |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate and persist a server certificate signed by Floci's local CA when no cert/key paths are provided |
 
 See [TLS / HTTPS](./tls.md) for SDK configuration examples and WebSocket (`wss://`) support.
@@ -189,6 +190,7 @@ Floci's embedded DNS server always resolves the following wildcard suffixes to F
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_DNS_EXTRA_SUFFIXES` | _(none)_ | Comma-separated list of additional hostname suffixes to resolve to Floci's container IP. Use this for custom domains beyond the built-in ones above (e.g. a private internal suffix). |
+| `FLOCI_DNS_AUTHORITATIVE_SUFFIXES` | unset | DNS suffixes served only from resource records or scoped VPC forwarding rules. Unknown names return NXDOMAIN. |
 | `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` | `false` | Resolve every AWS partition's DNS and dual-stack suffix (`amazonaws.com`, `api.aws`, `amazonaws.eu`, and more) and every subdomain to Floci's container IP inside spawned containers (transparent endpoint injection). See below. |
 | `FLOCI_DNS_HOST_PORT` | _(none)_ | When Floci runs natively, the UDP port of a resolver on `127.0.0.1` that answers the same names, for the host's own resolver. See [Floci running natively](#floci-running-natively). |
 | `FLOCI_DNS_BRIDGE_LISTENER_ENABLED` | `true` | When Floci runs natively on a host with a `docker0` bridge, listen on that bridge's address, port 53, and give it to the containers Floci launches as their resolver. See [Floci running natively](#floci-running-natively). |
@@ -339,6 +341,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ENABLED` | `true` | Re-deploy a function when the S3 object it was deployed from is overwritten. See [Reactive S3 Sync](../services/lambda.md#reactive-s3-sync-configuration) |
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ASYNC` | `false` | Run that re-deploy in the background so the upload returns at once; the function reports `LastUpdateStatus` `InProgress` until it finishes |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | _(none)_ | Docker network for Lambda containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
+| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | _(none)_ | Comma-separated existing Docker network names or IDs joined before a function starts. Name/ID aliases attach once. Additional endpoints use a lower gateway priority where Docker supports it, preserving the primary route. A failed attachment aborts and cleans up the launch; duplicate or invalid names are rejected |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | _(none)_ | Additional Docker flags applied to Lambda containers, such as `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for Lambda-spawned containers and code volumes (must match `[A-Za-z0-9][A-Za-z0-9_.-]*`) |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | _(none)_ | Explicit host/IP Lambda containers use to reach the Runtime API, bypassing auto-detection (e.g. rootless Podman) |
@@ -635,6 +638,8 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` | `none` | Automatic public IPv4 address of a mock instance: `none`, `documentation` (from `203.0.113.0/24`) or `fixed` (`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS`) |
 | `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS` | `127.0.0.1` | Address given to every mock instance due one when `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` is `fixed`, and shown by an Elastic IP on its primary private address |
 | `FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` | (unset) | Path to a complete YAML image catalog replacing the bundled EC2 catalog; mount the file at this path when running in Docker |
+| `FLOCI_SERVICES_EC2_EXTRA_ENV` | (unset) | Explicit guest `KEY=VALUE` entries, comma-separated (escape a literal comma as `\,`). Duplicate keys and reserved identity, credential, region, endpoint and IMDS settings are rejected |
+| `FLOCI_SERVICES_EC2_ULIMITS` | (unset) | Guest process limits as comma-separated `name=soft[:hard]`, for example `memlock=-1,nofile=1024000`. Omitted hard equals soft; `-1` means unlimited |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Port for the EC2 Instance Metadata Service (IMDS) endpoint |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | First port in the SSH port range for EC2 instances |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | Last port in the SSH port range |
