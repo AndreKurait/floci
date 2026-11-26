@@ -16,6 +16,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.interceptor.Context;
 import software.amazon.awssdk.core.interceptor.ExecutionAttribute;
@@ -54,6 +55,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.await;
@@ -69,6 +71,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestProfile(PolicyWorkloadClockProfile.class)
 @Timeout(45)
 class DynamoDbPolicyClockIntegrationTest {
+    LongSupplier cleanupNanoTime = System::nanoTime;
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final ExecutionAttribute<Integer> WIRE_ID =
             new ExecutionAttribute<>("floci-ddb-policy-clock-wire-id");
@@ -269,16 +273,21 @@ class DynamoDbPolicyClockIntegrationTest {
             }
             if (dynamo != null && createAttempted) {
                 AtomicBoolean deletionAcknowledged = new AtomicBoolean();
+                DynamoDbCleanupDeadline deadline = new DynamoDbCleanupDeadline(cleanupNanoTime);
                 cleanup(failures, () -> await().pollInSameThread().atMost(Duration.ofSeconds(3))
                         .pollInterval(Duration.ofMillis(50)).ignoreExceptionsInstanceOf(SdkClientException.class)
                         .until(() -> {
                             try {
-                                TableDescription current = describe();
+                                AwsRequestOverrideConfiguration describeTimeout = deadline.requestTimeout();
+                                TableDescription current = dynamo.describeTable(request -> request.tableName(table)
+                                        .overrideConfiguration(describeTimeout)).table();
                                 if (initialTable != null) {
                                     assertEquals(initialTable.tableId(), current.tableId());
                                 }
                                 if (!deletionAcknowledged.get() && current.tableStatus() != TableStatus.DELETING) {
-                                    dynamo.deleteTable(request -> request.tableName(table));
+                                    AwsRequestOverrideConfiguration deleteTimeout = deadline.requestTimeout();
+                                    dynamo.deleteTable(request -> request.tableName(table)
+                                            .overrideConfiguration(deleteTimeout));
                                     deletionAcknowledged.set(true);
                                 }
                                 return false;

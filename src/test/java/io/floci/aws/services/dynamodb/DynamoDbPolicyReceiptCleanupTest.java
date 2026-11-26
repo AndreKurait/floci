@@ -34,12 +34,16 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -103,6 +107,24 @@ class DynamoDbPolicyReceiptCleanupTest {
     @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
     void recoveredDeleteStillReportsUnansweredExchange(String suite) throws Exception {
         exercise(suite, false, "unanswered");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void expiredBudgetPreventsDescribe(String suite) throws Exception {
+        exercise(suite, false, "expiredBeforeDescribe");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void slowDescribeCannotStartLateDelete(String suite) throws Exception {
+        exercise(suite, false, "expiredAfterDescribe");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void remainingBudgetBoundsEachSdkRequest(String suite) throws Exception {
+        exercise(suite, false, "budgeted");
     }
 
     private void exercise(String suite, boolean incomplete, String deletion) throws Exception {
@@ -212,6 +234,45 @@ class DynamoDbPolicyReceiptCleanupTest {
                         .thenReturn(DeleteTableResponse.builder().build());
             }
         }
+        if (deletion.startsWith("expired") || deletion.equals("budgeted")) {
+            AtomicLong elapsed = new AtomicLong();
+            LongSupplier clock = deletion.equals("expiredBeforeDescribe")
+                    ? () -> elapsed.getAndSet(Duration.ofSeconds(4).toNanos()) : elapsed::get;
+            set(fixture, "cleanupNanoTime", clock);
+            AtomicInteger describes = new AtomicInteger();
+            doAnswer(invocation -> {
+                Consumer<DescribeTableRequest.Builder> action = invocation.getArgument(0);
+                DescribeTableRequest.Builder request = DescribeTableRequest.builder();
+                action.accept(request);
+                DescribeTableRequest built = request.build();
+                assertEquals(table, built.tableName());
+                if (deletion.equals("budgeted")) {
+                    Duration expected = Duration.ofSeconds(describes.get() == 0 ? 3 : 1);
+                    assertEquals(expected, built.overrideConfiguration().orElseThrow().apiCallTimeout().orElseThrow());
+                    assertEquals(expected, built.overrideConfiguration().orElseThrow().apiCallAttemptTimeout().orElseThrow());
+                }
+                if (describes.getAndIncrement() > 0) {
+                    throw ResourceNotFoundException.builder().statusCode(400).build();
+                }
+                elapsed.set(Duration.ofSeconds(deletion.equals("expiredAfterDescribe") ? 4 : 1).toNanos());
+                return DescribeTableResponse.builder().table(TableDescription.builder()
+                        .tableName(table).tableId("owned-id").tableStatus(TableStatus.ACTIVE).build()).build();
+            }).when(dynamo).describeTable(ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any());
+            doAnswer(invocation -> {
+                Consumer<DeleteTableRequest.Builder> action = invocation.getArgument(0);
+                DeleteTableRequest.Builder request = DeleteTableRequest.builder();
+                action.accept(request);
+                DeleteTableRequest built = request.build();
+                if (deletion.equals("budgeted")) {
+                    assertEquals(Duration.ofSeconds(2), built.overrideConfiguration().orElseThrow()
+                            .apiCallTimeout().orElseThrow());
+                    assertEquals(Duration.ofSeconds(2), built.overrideConfiguration().orElseThrow()
+                            .apiCallAttemptTimeout().orElseThrow());
+                }
+                elapsed.set(Duration.ofSeconds(2).toNanos());
+                return DeleteTableResponse.builder().build();
+            }).when(dynamo).deleteTable(ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any());
+        }
         Object wire = get(fixture, "wire");
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> calls = (List<Map<String, Object>>) get(wire, "calls");
@@ -250,7 +311,13 @@ class DynamoDbPolicyReceiptCleanupTest {
         };
         Method teardown = fixture.getClass().getDeclaredMethod(methodName);
         try {
-            if (incomplete) {
+            if (deletion.startsWith("expired")) {
+                InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                        () -> teardown.invoke(fixture));
+                AssertionError aggregate = assertInstanceOf(AssertionError.class, thrown.getCause());
+                assertEquals(1, aggregate.getSuppressed().length);
+                assertTrue(aggregate.getSuppressed()[0].getMessage().contains("cleanup deadline expired"));
+            } else if (incomplete) {
                 InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
                         () -> teardown.invoke(fixture));
                 AssertionError aggregate = assertInstanceOf(AssertionError.class, thrown.getCause());
@@ -291,7 +358,7 @@ class DynamoDbPolicyReceiptCleanupTest {
             if (!deletion.equals("none")) {
                 int deletions = switch (deletion) {
                     case "recover", "unanswered" -> 2;
-                    case "absent" -> 0;
+                    case "absent", "expiredBeforeDescribe", "expiredAfterDescribe" -> 0;
                     default -> 1;
                 };
                 ArgumentCaptor<Consumer<DeleteTableRequest.Builder>> requests = ArgumentCaptor.captor();
@@ -300,6 +367,9 @@ class DynamoDbPolicyReceiptCleanupTest {
                     DeleteTableRequest.Builder request = DeleteTableRequest.builder();
                     action.accept(request);
                     assertEquals(table, request.build().tableName(), "Every deletion must target the reserved table");
+                }
+                if (deletion.equals("expiredBeforeDescribe")) {
+                    verify(dynamo, never()).describeTable(ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any());
                 }
                 if (deletion.equals("recover") || deletion.equals("unanswered")) {
                     verify(dynamo, times(3)).describeTable(
@@ -322,7 +392,7 @@ class DynamoDbPolicyReceiptCleanupTest {
                 assertTrue(retry.has("responseBase64"));
             }
             assertEquals(!incomplete, saved.get("calls").get(0).has("responseBase64"));
-            assertEquals(alarmFailure ? cachedAlarm ? 3 : 2 : incomplete || deletion.equals("replacement") ? 1 : 0,
+            assertEquals(alarmFailure ? cachedAlarm ? 3 : 2 : incomplete || deletion.equals("replacement") || deletion.startsWith("expired") ? 1 : 0,
                     saved.get("observations").get("cleanupFailures").size());
         } finally {
             Files.deleteIfExists(receipt);
