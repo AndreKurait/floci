@@ -52,6 +52,15 @@ and forward AWS requests to Floci without changing the application's hostnames,
 credentials, or TLS verification. The configured upstream supplies its TLS
 certificate; the caller must trust that certificate's issuer.
 
+For known VPC clients, recursive DNS answers pointing at this configured upstream
+use the bridge's public address. This lets an existing DNS resolver remain the
+authority for peer readiness and suffix matching. Negative answers remain
+negative; unrelated addresses, native records, private-zone answers and explicit
+Resolver rules retain their behavior. Only matching A records in the answer
+section change. Names, TTLs and other records remain intact; truncated, malformed
+or signed responses are not partially rewritten. Non-VPC clients receive the
+original upstream response.
+
 The bridge still admits only ports 80 and 443 through the caller's native NAT,
 internet-gateway route and security-group policy. Its outbound connections are
 limited to the selected address and ports. It does not give guests a route to

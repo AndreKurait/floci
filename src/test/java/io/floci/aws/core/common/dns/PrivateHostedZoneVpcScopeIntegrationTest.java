@@ -290,6 +290,36 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
                 .answer().orElseThrow().isEmpty());
     }
 
+    @Test
+    void privateAwsEndpointZoneOverridesSpoofingOnlyForItsAssociatedVpc() {
+        String name = "endpoint-" + UUID.randomUUID() + ".amazonaws.com";
+        String privateZone = zone(name, firstVpc);
+        addAddress(privateZone, "api." + name, "10.73.1.7");
+        DnsClientVpcSource clients = address -> switch (address) {
+            case "192.0.2.10" -> Optional.of(new DnsClientVpcSource.ClientVpc(
+                    config.defaultAccountId(), "us-east-1", firstVpc));
+            case "192.0.2.20" -> Optional.of(new DnsClientVpcSource.ClientVpc(
+                    config.defaultAccountId(), "us-east-1", secondVpc));
+            default -> Optional.empty();
+        };
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(records), List.of(),
+                List.of(clients), true, List.of(), List.of(), "172.17.0.1");
+        assertEquals(List.of("10.73.1.7"), server.planQuery("api." + name, "192.0.2.10", "127.0.0.1", 1)
+                .answer().orElseThrow().addresses());
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                server.planQuery("api." + name, "192.0.2.20", "127.0.0.1", 1).answer().orElseThrow().addresses());
+        assertEquals(List.of("127.0.0.1"), server.planQuery("api." + name, "192.0.2.30", "127.0.0.1", 1)
+                .answer().orElseThrow().addresses());
+        assertEquals(3, server.planQuery("missing." + name, "192.0.2.10", "127.0.0.1", 1)
+                .answer().orElseThrow().responseCode());
+        route53.associateVpcWithHostedZone(privateZone, new VpcAssociation(secondVpc, "us-east-1"), null);
+        route53.disassociateVpcFromHostedZone(privateZone, new VpcAssociation(firstVpc, "us-east-1"), null);
+        assertEquals(List.of("10.73.1.7"), server.planQuery("api." + name, "192.0.2.20", "127.0.0.1", 1)
+                .answer().orElseThrow().addresses());
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                server.planQuery("api." + name, "192.0.2.10", "127.0.0.1", 1).answer().orElseThrow().addresses());
+    }
+
     private List<List<DnsRecordSource>> sourceOrders() {
         return List.of(List.of(records, cloudMapRecords), List.of(cloudMapRecords, records));
     }

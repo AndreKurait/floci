@@ -224,6 +224,11 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     }
 
     @Override
+    public Optional<DnsAnswer> resolvePrivate(String name, int type, ClientVpc origin) {
+        return origin == null ? Optional.empty() : resolve(name, type, origin);
+    }
+
+    @Override
     public Optional<DnsAnswer> resolve(String name, int type) {
         return resolve(name, type, null);
     }

@@ -52,6 +52,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -135,6 +136,7 @@ public class EmbeddedDnsServer {
     private final Iterable<DnsClientVpcSource> clientVpcSources;
     private boolean publicAwsApi;
     private List<String> publicApiHosts = List.of();
+    private PublicApiDnsResponse publicApiDnsResponse;
 
     EmbeddedDnsServer(List<String> suffixes) {
         this(suffixes, List.of());
@@ -205,11 +207,20 @@ public class EmbeddedDnsServer {
                       Iterable<DnsForwardingRuleSource> forwardingRuleSources,
                       Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi,
                       List<String> publicApiHosts, List<String> authoritativeSuffixes) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, publicAwsApi,
+                publicApiHosts, authoritativeSuffixes, null);
+    }
+
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi,
+                      List<String> publicApiHosts, List<String> authoritativeSuffixes, String publicUpstream) {
         this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, authoritativeSuffixes);
         this.publicAwsApi = publicAwsApi;
         this.publicApiHosts = publicApiHosts.stream().map(EmbeddedDnsServer::publicEndpointHost).distinct().toList();
         if (publicAwsApi) {
             this.suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+            publicApiDnsResponse = publicUpstream == null ? null : new PublicApiDnsResponse(publicUpstream);
         }
     }
 
@@ -287,6 +298,8 @@ public class EmbeddedDnsServer {
                     && config.network().vpcRouting().publicAwsApi();
             publicApiHosts = config.network().vpcRouting().publicAwsApiHosts().orElse(List.of()).stream()
                     .map(EmbeddedDnsServer::publicEndpointHost).distinct().toList();
+            publicApiDnsResponse = publicAwsApi ? config.network().vpcRouting().publicAwsApiUpstreamHost()
+                    .map(PublicApiDnsResponse::new).orElse(null) : null;
             if (shouldWarnSpoofInvisibleToTls(true, TlsConfigSource.tlsEnabledVisibleToTls(),
                     TlsConfigSource.spoofAwsEndpointsVisibleToTls())) {
                 LOG.warnv("floci.dns.spoof-aws-endpoints is set in application config but the TLS certificate only reads it from FLOCI_DNS_SPOOF_AWS_ENDPOINTS or -Dfloci.dns.spoof-aws-endpoints; https:// calls to {0} will fail the handshake until it is set there.", TlsConfigSource.awsEndpointSuffixes());
@@ -483,9 +496,12 @@ public class EmbeddedDnsServer {
                     .compose(plan -> {
                         if (plan.answer().isEmpty()) {
                             if (plan.ruleTargets().isEmpty()) {
-                                return forwardsUnknownNames ? forwardAsync(vertx, data, tcp)
-                                        : Future.succeededFuture(buildPublicResponse(data, txId,
-                                                questionOffset, questionEnd, DnsAnswer.refused(), tcp));
+                                if (!forwardsUnknownNames) {
+                                    return Future.succeededFuture(buildPublicResponse(data, txId,
+                                            questionOffset, questionEnd, DnsAnswer.refused(), tcp));
+                                }
+                                Future<byte[]> forwarded = forwardAsync(vertx, data, tcp);
+                                return plan.routedUpstream() ? forwarded.map(publicApiDnsResponse::rewrite) : forwarded;
                             }
                             return forwardToRuleTargets(vertx, data, plan.ruleTargets(), tcp,
                                     qname, txId, questionOffset, questionEnd);
@@ -591,20 +607,21 @@ public class EmbeddedDnsServer {
      * which leaves it to the upstream resolvers.
      */
     record QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets,
-                     boolean reservedAuthority) {
+                     boolean reservedAuthority, boolean routedUpstream) {
 
-        static final QueryPlan UPSTREAM = new QueryPlan(Optional.empty(), List.of(), false);
+        static final QueryPlan UPSTREAM = new QueryPlan(Optional.empty(), List.of(), false, false);
+        static final QueryPlan ROUTED_UPSTREAM = new QueryPlan(Optional.empty(), List.of(), false, true);
 
         static QueryPlan answering(DnsAnswer answer) {
-            return new QueryPlan(Optional.of(answer), List.of(), false);
+            return new QueryPlan(Optional.of(answer), List.of(), false, false);
         }
 
         static QueryPlan answeringReservedAuthority(DnsAnswer answer) {
-            return new QueryPlan(Optional.of(answer), List.of(), true);
+            return new QueryPlan(Optional.of(answer), List.of(), true, false);
         }
 
         static QueryPlan forwardingTo(List<DnsForwardingRule.Target> targets) {
-            return new QueryPlan(Optional.empty(), targets, false);
+            return new QueryPlan(Optional.empty(), targets, false, false);
         }
     }
 
@@ -630,13 +647,16 @@ public class EmbeddedDnsServer {
         DnsClientVpcSource.ClientVpc origin = vpcForClient(clientAddress).orElse(null);
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp, origin);
         boolean authoritative = hasAuthoritativeSuffix(name);
-        boolean routedApi = publicAwsApi && origin != null && TlsConfigSource.awsEndpointSuffixes().stream()
+        boolean awsEndpointName = TlsConfigSource.awsEndpointSuffixes().stream()
                 .anyMatch(suffix -> DomainNames.isWithin(name.toLowerCase(Locale.ROOT), suffix));
+        boolean routedApi = publicAwsApi && origin != null && awsEndpointName;
         boolean externalPeer = publicAwsApi && origin == null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT));
         Optional<DnsAnswer> emulatorName = authoritative || externalPeer ? Optional.empty() : resolveEmulatorName(name,
                 routedApi ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
-            return QueryPlan.answering(emulatorName.orElseThrow());
+            Optional<DnsAnswer> vpcScoped = origin == null || !awsEndpointName ? Optional.empty()
+                    : firstAnswer(name, source -> source.resolvePrivate(name, type, origin));
+            return QueryPlan.answering(vpcScoped.orElseGet(emulatorName::orElseThrow));
         }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
         // gated on the record type: the raw query is relayed to the rule's resolvers as it stands.
@@ -652,13 +672,15 @@ public class EmbeddedDnsServer {
                 && stored.filter(answer -> answer.responseCode() == 5).isPresent()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
+        QueryPlan upstream = publicApiDnsResponse != null && origin != null ? QueryPlan.ROUTED_UPSTREAM
+                : QueryPlan.UPSTREAM;
         return stored.or(() -> resolveFromRecordSources(name, type, false, myIp, origin))
                 .or(() -> publicAwsApi && origin != null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT))
                         ? Optional.of(type == 1 ? DnsAnswer.records(
                                 List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
                                 DnsAnswer.DEFAULT_TTL_SECONDS) : DnsAnswer.noData())
                         : Optional.empty())
-                .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
+                .map(answer -> answer.upstream() ? upstream : QueryPlan.answering(answer)).orElse(upstream);
     }
 
     /** Resolve a stored resource before wildcard endpoint spoofing or upstream lookup. */
@@ -812,6 +834,11 @@ public class EmbeddedDnsServer {
     private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative,
                                                          String listenerAddress,
                                                          DnsClientVpcSource.ClientVpc origin) {
+        return firstAnswer(name, source -> authoritative
+                ? source.resolveAuthoritative(name, type, listenerAddress, origin) : source.resolve(name, type, origin));
+    }
+
+    private Optional<DnsAnswer> firstAnswer(String name, Function<DnsRecordSource, Optional<DnsAnswer>> lookup) {
         if (recordSources == null) {
             return Optional.empty();
         }
@@ -822,8 +849,7 @@ public class EmbeddedDnsServer {
         Optional<DnsAnswer> empty = Optional.empty();
         for (DnsRecordSource source : recordSources) {
             try {
-                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type, listenerAddress, origin)
-                        : source.resolve(name, type, origin);
+                Optional<DnsAnswer> answer = lookup.apply(source);
                 if (answer != null && answer.isPresent()) {
                     if (answer.get().isEmpty()) {
                         if (empty.isEmpty() || (!empty.get().nameExists() && answer.get().nameExists())) {
@@ -1076,7 +1102,7 @@ public class EmbeddedDnsServer {
         }
     }
 
-    private Future<byte[]> forwardAsync(Vertx vertx, byte[] query, boolean tcp) {
+    Future<byte[]> forwardAsync(Vertx vertx, byte[] query, boolean tcp) {
         List<String> upstreams = upstreamDnsServers;
         if (upstreams.isEmpty()) {
             return Future.succeededFuture();

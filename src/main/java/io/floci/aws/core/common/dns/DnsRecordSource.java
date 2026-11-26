@@ -62,4 +62,9 @@ public interface DnsRecordSource {
     default Optional<DnsAnswer> resolve(String name, int type, DnsClientVpcSource.ClientVpc origin) {
         return resolve(name, type);
     }
+    /** Only private zones associated with this VPC may override AWS endpoint spoofing. */
+    default Optional<DnsAnswer> resolvePrivate(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        return Optional.empty();
+    }
+
 }
