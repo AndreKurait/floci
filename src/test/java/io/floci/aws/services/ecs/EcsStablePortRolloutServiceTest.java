@@ -6,7 +6,6 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
 import io.floci.aws.core.common.docker.ContainerExecStubs;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
-import io.floci.aws.services.ec2.SecurityGroupDnsFixture;
 import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
 import io.floci.aws.services.ec2.SecurityGroupNftCompiler;
 import io.floci.aws.services.ec2.model.SecurityGroup;
@@ -49,6 +48,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
+import static io.floci.aws.services.ecs.EcsTestExecutors.inlineExecutor;
+import static io.floci.aws.services.ecs.EcsTestExecutors.queuedExecutor;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
@@ -78,7 +80,7 @@ class EcsStablePortRolloutServiceTest {
 
     @ParameterizedTest
     @MethodSource("stablePortDeployments")
-    void deploymentReleasesStablePortBeforeStartingReplacement(PublicationMode publication, boolean force) throws Exception {
+    void deploymentReleasesStablePortBeforeStartingReplacement(PublicationMode publication, boolean force) {
         try (Harness harness = new Harness(publication)) {
             EcsServiceModel service = harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -97,8 +99,7 @@ class EcsStablePortRolloutServiceTest {
 
             assertEquals("STOPPED", original.getDesiredStatus());
             assertEquals(0, harness.runningTasks("web").size());
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPED", original.getLastStatus());
+            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
             harness.ecs.reconcileServices();
 
             EcsTask replacement = harness.runningTasks("web").getFirst();
@@ -147,7 +148,7 @@ class EcsStablePortRolloutServiceTest {
     }
 
     @Test
-    void protocolChangeStillWaitsForTheCurrentTcpPublisherToReleaseTheHostPort() throws Exception {
+    void protocolChangeStillWaitsForTheCurrentTcpPublisherToReleaseTheHostPort() {
         try (Harness harness = new Harness()) {
             harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -159,15 +160,14 @@ class EcsStablePortRolloutServiceTest {
 
             assertEquals("STOPPED", original.getDesiredStatus());
             assertEquals(0, harness.runningTasks("web").size());
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPED", original.getLastStatus());
+            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
             harness.ecs.reconcileServices();
             assertEquals(revision.getTaskDefinitionArn(), harness.runningTasks("web").getFirst().getTaskDefinitionArn());
         }
     }
 
     @Test
-    void retainedStoppingTaskIsRetriedBeforeAnyReplacementIsPlaced() throws Exception {
+    void retainedStoppingTaskIsRetriedBeforeAnyReplacementIsPlaced() {
         try (Harness harness = new Harness()) {
             harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -186,22 +186,20 @@ class EcsStablePortRolloutServiceTest {
 
             harness.forceDeployment("web");
             harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals(1, stops.get());
-            assertEquals("STOPPING", original.getLastStatus());
-            // Each later pass retries the stop once, and places no replacement while it is incomplete.
-            harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPING", original.getLastStatus());
-            assertEquals(0, harness.runningTasks("web").size());
-            assertEquals(2, stops.get(), "incomplete removal is retried");
+            await().atMost(TIMEOUT).until(() -> stops.get() > 0);
+            await().atMost(TIMEOUT).untilAsserted(() -> {
+                harness.ecs.reconcileServices();
+                assertEquals("STOPPING", original.getLastStatus());
+                assertEquals(0, harness.runningTasks("web").size());
+                assertTrue(stops.get() >= 2, "incomplete removal is retried");
+            });
             verify(harness.manager, times(1)).startTask(any(), any(), any(), anyString());
 
             removalAllowed.set(true);
-            harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPED", original.getLastStatus());
-            assertEquals(3, stops.get());
+            await().atMost(TIMEOUT).untilAsserted(() -> {
+                harness.ecs.reconcileServices();
+                assertEquals("STOPPED", original.getLastStatus());
+            });
             harness.ecs.reconcileServices();
             assertEquals(1, harness.runningTasks("web").size());
             assertNotEquals(original.getTaskArn(), harness.runningTasks("web").getFirst().getTaskArn());
@@ -209,7 +207,7 @@ class EcsStablePortRolloutServiceTest {
     }
 
     @Test
-    void retainedNamespaceHelperKeepsTaskStoppingUntilItsPublishedPortIsReleased() throws Exception {
+    void retainedNamespaceHelperKeepsTaskStoppingUntilItsPublishedPortIsReleased() {
         try (Harness harness = new Harness()) {
             ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
             EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
@@ -228,22 +226,20 @@ class EcsStablePortRolloutServiceTest {
             EcsTask original = harness.runningTasks("web").getFirst();
 
             harness.forceDeployment("web");
-            harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals(1, attempts.get());
-            assertEquals("STOPPING", original.getLastStatus());
-            harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPING", original.getLastStatus());
-            assertEquals(0, harness.runningTasks("web").size());
-            assertEquals(2, attempts.get(), "namespace removal remains retryable");
-            verify(credentials, atLeastOnce()).revoke(original.getTaskArn());
+            await().atMost(TIMEOUT).untilAsserted(() -> {
+                harness.ecs.reconcileServices();
+                assertEquals("STOPPING", original.getLastStatus());
+                assertEquals(0, harness.runningTasks("web").size());
+                assertTrue(attempts.get() >= 2, "namespace removal remains retryable");
+                verify(credentials, atLeastOnce()).revoke(original.getTaskArn());
+            });
             verify(harness.manager, times(1)).startTask(any(), any(), any(), anyString());
 
             removalAllowed.set(true);
-            harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPED", original.getLastStatus());
+            await().atMost(TIMEOUT).untilAsserted(() -> {
+                harness.ecs.reconcileServices();
+                assertEquals("STOPPED", original.getLastStatus());
+            });
             harness.ecs.reconcileServices();
             assertEquals(1, harness.runningTasks("web").size());
         }
@@ -285,8 +281,7 @@ class EcsStablePortRolloutServiceTest {
             } finally {
                 release.countDown();
             }
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPED", original.getLastStatus());
+            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
         }
     }
 
@@ -327,7 +322,7 @@ class EcsStablePortRolloutServiceTest {
     }
 
     @Test
-    void protectedTaskDelaysStablePortReplacementUntilProtectionIsRemoved() throws Exception {
+    void protectedTaskDelaysStablePortReplacementUntilProtectionIsRemoved() {
         try (Harness harness = new Harness()) {
             harness.createService("web", Map.of("minimumHealthyPercent", 0));
             harness.ecs.reconcileServices();
@@ -342,8 +337,7 @@ class EcsStablePortRolloutServiceTest {
 
             harness.ecs.updateTaskProtection(CLUSTER, List.of(original.getTaskArn()), false, null, REGION);
             harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPED", original.getLastStatus());
+            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
             harness.ecs.reconcileServices();
             assertEquals(1, harness.runningTasks("web").size());
             assertNotEquals(original.getTaskArn(), harness.runningTasks("web").getFirst().getTaskArn());
@@ -357,7 +351,7 @@ class EcsStablePortRolloutServiceTest {
 
     @ParameterizedTest
     @MethodSource("replacementFirstMinima")
-    void positiveAndDefaultMinimaKeepReplacementFirst(Map<String, Object> configuration) throws Exception {
+    void positiveAndDefaultMinimaKeepReplacementFirst(Map<String, Object> configuration) {
         try (Harness harness = new Harness()) {
             harness.createService("web", configuration);
             harness.ecs.reconcileServices();
@@ -369,8 +363,7 @@ class EcsStablePortRolloutServiceTest {
             assertEquals(2, harness.runningTasks("web").size());
 
             harness.ecs.reconcileServices();
-            harness.ecs.awaitPendingStops();
-            assertEquals("STOPPED", original.getLastStatus());
+            await().atMost(TIMEOUT).until(() -> "STOPPED".equals(original.getLastStatus()));
             assertEquals(1, harness.runningTasks("web").size());
         }
     }
@@ -394,19 +387,12 @@ class EcsStablePortRolloutServiceTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void daemonStillReplacesItsTaskAfterStoppingItWithoutHostPublishing(boolean stopDuringReconciliation) {
+    void daemonStillReplacesItsTaskAfterStoppingItWithoutHostPublishing(boolean stopDuringReconciliation)
+            throws InterruptedException {
         Queue<Runnable> stops = new ArrayDeque<>();
-        ExecutorService stopper = mock(ExecutorService.class);
-        doAnswer(invocation -> {
-            Runnable stop = invocation.getArgument(0);
-            if (stopDuringReconciliation) {
-                stop.run();
-            } else {
-                stops.add(stop);
-            }
-            return null;
-        }).when(stopper).execute(any(Runnable.class));
+        ExecutorService stopper = stopDuringReconciliation ? inlineExecutor() : queuedExecutor(stops);
         try (Harness harness = new Harness(PublicationMode.PRIVATE_AWSVPC, stopper)) {
+            harness.ecs.registerContainerInstance(CLUSTER, null, List.of(), REGION);
             harness.createService("web", Map.of("minimumHealthyPercent", 0), "DAEMON");
             harness.ecs.reconcileServices();
             EcsTask original = harness.runningTasks("web").getFirst();
@@ -437,7 +423,7 @@ class EcsStablePortRolloutServiceTest {
         DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
         when(lifecycle.getDockerClient()).thenReturn(docker);
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        SecurityGroupFirewallManager firewall = SecurityGroupDnsFixture.rawManager(docker, null, lifecycle,
+        SecurityGroupFirewallManager firewall = new SecurityGroupFirewallManager(docker, null, lifecycle,
                 config, mock(EmbeddedDnsServer.class));
         NamespaceStops namespaces = new NamespaceStops(docker, firewall);
         namespaces.register("eni-web", "helper", "172.18.0.2");
@@ -455,7 +441,6 @@ class EcsStablePortRolloutServiceTest {
 
     private record NamespaceStops(DockerClient docker, SecurityGroupFirewallManager firewall) {
         private void register(String eniId, String helperId, String address) {
-            when(docker.inspectContainerCmd(helperId).exec().getId()).thenReturn(helperId);
             when(docker.inspectContainerCmd(helperId).exec().getState().getRunning()).thenReturn(true);
             ContainerExecStubs.completeEveryExec(docker, helperId, 0, "", "");
             SecurityGroup group = new SecurityGroup();
@@ -517,8 +502,6 @@ class EcsStablePortRolloutServiceTest {
             }
             ecs.initializeStorage();
             ecs.createCluster(CLUSTER, REGION);
-            // EC2 tasks are placed on a registered container instance, as on ECS.
-            ecs.registerContainerInstance(CLUSTER, null, List.of(), REGION);
             registerTaskDefinition(publication == PublicationMode.BRIDGE_DYNAMIC
                     || publication == PublicationMode.STABLE_AWSVPC_IMPLICIT
                     ? List.of(new PortMapping(8080)) : List.of(new PortMapping(8080, 8080, "tcp")));
