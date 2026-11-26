@@ -26,6 +26,7 @@ import io.floci.aws.services.iam.ResourcePolicyProviders;
 import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupTarget;
 import io.floci.aws.services.s3.S3ObjectActions;
 import io.floci.aws.services.s3.S3ScratchSpace;
 import io.floci.aws.services.s3.S3Service;
@@ -100,6 +101,8 @@ import static io.floci.aws.core.common.auth.SigV4RequestValidator.LEGACY_ACCESS_
 public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(IamEnforcementFilter.class);
+    private static final String MEMORYDB_PARAMETER_GROUP_REQUEST =
+            IamEnforcementFilter.class.getName() + ".memorydbParameterGroupRequest";
 
     /** AWS's wording for a credential it does not recognise. */
     private static final String INVALID_SECURITY_TOKEN = "The security token included in the request is invalid.";
@@ -1824,6 +1827,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      */
     private List<String> targetResources(String credentialScope, String operation, ContainerRequestContext ctx,
                                          String region, String accountId) {
+        if ("memorydb".equals(credentialScope)
+                && MemoryDbParameterGroupTarget.claims(operation, PassedRoles.jsonBody(ctx))
+                && claimedProtocol(ctx) == WireProtocol.AWS_JSON_1_1) {
+            ctx.setProperty(MEMORYDB_PARAMETER_GROUP_REQUEST, Boolean.TRUE);
+        }
         // ARNs the table renders take the request's partition, which a Region Floci does not know cannot be mapped to.
         return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, requestPartition());
     }
@@ -1954,6 +1962,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         // reaches the s3control SDK deserializers (issue #557).
         if (IamActionRegistry.isS3ControlRequest(credentialScope, ctx)) {
             return s3ControlXmlAccessDenied(accessDeniedMessage(action));
+        }
+        if (Boolean.TRUE.equals(ctx.getProperty(MEMORYDB_PARAMETER_GROUP_REQUEST))) {
+            return jsonAccessDenied(accessDeniedMessage(action), 403);
         }
         boolean restXml = catalog.byCredentialScope(credentialScope)
                 .filter(descriptor -> descriptor.supportsProtocol(ServiceProtocol.REST_XML)).isPresent();

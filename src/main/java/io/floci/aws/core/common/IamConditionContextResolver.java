@@ -18,6 +18,8 @@ import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupService;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupTarget;
 import io.floci.aws.services.s3.S3ConditionKeys;
 import io.floci.aws.services.s3.S3ControlTagConditionKeys;
 import io.floci.aws.services.s3.S3ObjectActions;
@@ -115,6 +117,7 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<MemoryDbParameterGroupService> memoryDbParameterGroups;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -122,6 +125,23 @@ public class IamConditionContextResolver {
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       Instance<RequestConditionSpelling> requestConditionSpellings,
+                                       Instance<StoredResourceArns> storedResourceArns,
+                                       RequestContext requestContext,
+                                       RegionResolver regionResolver,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog, Instance<MemoryDbParameterGroupService> memoryDbParameterGroups) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService,
+                lambdaWebService, requestConditionSpellings, storedResourceArns, requestContext, regionResolver,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), memoryDbParameterGroups);
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -151,6 +171,25 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService, lambdaWebService, requestConditionSpellings,
+                storedResourceArns, requestContext, regionResolver, config, currentVertxRequest, serviceCatalog,
+                clock, null);
+    }
+
+    IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                Instance<RequestConditionSpelling> requestConditionSpellings,
+                                Instance<StoredResourceArns> storedResourceArns,
+                                RequestContext requestContext,
+                                RegionResolver regionResolver,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                Instance<MemoryDbParameterGroupService> memoryDbParameterGroups) {
+        this.memoryDbParameterGroups = memoryDbParameterGroups;
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -307,9 +346,56 @@ public class IamConditionContextResolver {
         return null;
     }
 
+    private Map<String, List<String>> memoryDbParameterGroupConditions(String action, ContainerRequestContext ctx) {
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.isObject() || !MemoryDbParameterGroupTarget.claims(action, body)) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        if (("memorydb:CreateParameterGroup".equals(action) || "memorydb:TagResource".equals(action))
+                && body.path("Tags").isArray()) {
+            Map<String, String> tags = new LinkedHashMap<>();
+            for (JsonNode tag : body.path("Tags")) {
+                if (tag.path("Key").isTextual()
+                        && (tag.path("Value").isTextual() || tag.path("Value").isNull() || !tag.has("Value"))) {
+                    String key = tag.path("Key").textValue();
+                    tags.put(key, tag.path("Value").isTextual() ? tag.path("Value").textValue() : "");
+                }
+            }
+            if (!tags.isEmpty()) {
+                tags.forEach((key, value) -> conditions.computeIfAbsent(REQUEST_TAG_PREFIX + key,
+                        ignored -> new ArrayList<>()).add(value));
+                conditions.put("aws:TagKeys", List.copyOf(tags.keySet()));
+            }
+        } else if ("memorydb:UntagResource".equals(action) && body.path("TagKeys").isArray()) {
+            List<String> keys = new ArrayList<>();
+            body.path("TagKeys").forEach(key -> {
+                if (key.isTextual()) {
+                    keys.add(key.textValue());
+                }
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        if (!"memorydb:CreateParameterGroup".equals(action)
+                && memoryDbParameterGroups != null && memoryDbParameterGroups.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? AwsRegions.partitionFor(region) : requestContext.getPartition();
+            String arn = MemoryDbParameterGroupTarget.resourceArn(action, body, partition, region, account);
+            memoryDbParameterGroups.get().iamTags(arn, partition, region, account).forEach((key, value) ->
+                    conditions.computeIfAbsent(RESOURCE_TAG_PREFIX + key, ignored -> new ArrayList<>()).add(value));
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "memorydb" -> withResourceTags(requestMemberConditions(action, ctx),
+                    memoryDbParameterGroupConditions(action, ctx));
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
