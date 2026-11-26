@@ -4,6 +4,8 @@ import io.floci.aws.core.common.AccountResolver;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.IamEnforcementFilter;
 import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.ssm.ExternalAgentAuthentication;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.Node;
 import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testutil.AwsRequestSigner;
 import io.vertx.core.MultiMap;
@@ -29,6 +31,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -135,6 +138,88 @@ class ChannelAuthenticationTest {
         URI partial = URI.create(DATA + "?X-Amz-Signature=invalid");
         HttpServerRequest request = request(HttpMethod.GET, partial, Map.of());
         assertThrows(AwsException.class, () -> authentication.authorizeClient(request, ACCOUNT, REGION, SESSION_ARN));
+    }
+
+    @Test
+    void registeredExternalAgentStillRequiresAValidSignatureAndMatchingAccount() throws Exception {
+        Node external = new Node(ACCOUNT, REGION, "mi-0123456789abcdef0");
+        ExternalAgentAuthentication registry = mock(ExternalAgentAuthentication.class);
+        when(registry.supports(external)).thenReturn(true);
+        when(iam.resolveAccountId(KEY)).thenReturn(Optional.of(ACCOUNT));
+        when(iam.findSecretKey(KEY, TOKEN)).thenReturn(Optional.of(SECRET));
+        ChannelAuthentication combined = new ChannelAuthentication(iam, new AccountResolver(ACCOUNT),
+                iamEnforcement, Clock.fixed(NOW, ZoneOffset.UTC), registry);
+        HttpServerRequest request = agentRequest(HttpMethod.POST, CONTROL, BODY, GATEWAY);
+
+        assertEquals(new ChannelAuthentication.AgentIdentity(ACCOUNT, REGION, external.instanceId()),
+                combined.authenticateAgent(request, BODY, CREATE, external));
+        verify(registry).authorize(request, BODY, CREATE, "*", external);
+    }
+
+    @Test
+    void externalRegistrationDoesNotMakeAnAlteredBodyAuthentic() throws Exception {
+        Node external = new Node(ACCOUNT, REGION, "mi-0123456789abcdef0");
+        ExternalAgentAuthentication registry = mock(ExternalAgentAuthentication.class);
+        when(registry.supports(external)).thenReturn(true);
+        when(iam.resolveAccountId(KEY)).thenReturn(Optional.of(ACCOUNT));
+        when(iam.findSecretKey(KEY, TOKEN)).thenReturn(Optional.of(SECRET));
+        ChannelAuthentication combined = new ChannelAuthentication(iam, new AccountResolver(ACCOUNT),
+                iamEnforcement, Clock.fixed(NOW, ZoneOffset.UTC), registry);
+        HttpServerRequest request = agentRequest(HttpMethod.POST, CONTROL, BODY, GATEWAY);
+        assertThrows(AwsException.class, () -> combined.authenticateAgent(request, EMPTY, CREATE, external));
+        verify(registry, never()).authorize(any(), any(), anyString(), anyString(), any());
+    }
+
+    @Test
+    void externalRegistrationCannotCrossAccounts() throws Exception {
+        Node external = new Node("444455556666", REGION, "mi-0123456789abcdef0");
+        ExternalAgentAuthentication registry = mock(ExternalAgentAuthentication.class);
+        when(registry.supports(external)).thenReturn(true);
+        when(iam.resolveAccountId(KEY)).thenReturn(Optional.of(ACCOUNT));
+        ChannelAuthentication combined = new ChannelAuthentication(iam, new AccountResolver(ACCOUNT),
+                iamEnforcement, Clock.fixed(NOW, ZoneOffset.UTC), registry);
+        HttpServerRequest request = agentRequest(HttpMethod.POST, CONTROL, BODY, GATEWAY);
+        assertThrows(AwsException.class, () -> combined.authenticateAgent(request, BODY, CREATE, external));
+        verify(registry, never()).authorize(any(), any(), anyString(), anyString(), any());
+    }
+
+    @Test
+    void anUnregisteredExternalTargetDoesNotAcceptGenericIamCredentials() throws Exception {
+        Node external = new Node(ACCOUNT, REGION, "mi-0123456789abcdef0");
+        ExternalAgentAuthentication registry = mock(ExternalAgentAuthentication.class);
+        ChannelAuthentication combined = new ChannelAuthentication(iam, new AccountResolver(ACCOUNT),
+                iamEnforcement, Clock.fixed(NOW, ZoneOffset.UTC), registry);
+        HttpServerRequest request = agentRequest(HttpMethod.POST, CONTROL, BODY, GATEWAY);
+        assertThrows(AwsException.class, () -> combined.authenticateAgent(request, BODY, CREATE, external));
+        verify(registry, never()).authorize(any(), any(), anyString(), anyString(), any());
+    }
+
+    @Test
+    void duplicateAuthorizationHeadersAreRejectedBeforeExternalAuthorization() throws Exception {
+        Node external = new Node(ACCOUNT, REGION, "mi-0123456789abcdef0");
+        ExternalAgentAuthentication registry = mock(ExternalAgentAuthentication.class);
+        when(registry.supports(external)).thenReturn(true);
+        ChannelAuthentication combined = new ChannelAuthentication(iam, new AccountResolver(ACCOUNT),
+                iamEnforcement, Clock.fixed(NOW, ZoneOffset.UTC), registry);
+        HttpServerRequest request = agentRequest(HttpMethod.POST, CONTROL, BODY, GATEWAY);
+        request.headers().add("Authorization", request.getHeader("Authorization"));
+        assertThrows(AwsException.class, () -> combined.authenticateAgent(request, BODY, CREATE, external));
+        verify(registry, never()).authorize(any(), any(), anyString(), anyString(), any());
+    }
+
+    @Test
+    void externalAgentUpgradeRetainsSessionResourceAuthorization() throws Exception {
+        Node external = new Node(ACCOUNT, REGION, "mi-0123456789abcdef0");
+        ExternalAgentAuthentication registry = mock(ExternalAgentAuthentication.class);
+        when(registry.supports(external)).thenReturn(true);
+        when(iam.resolveAccountId(KEY)).thenReturn(Optional.of(ACCOUNT));
+        when(iam.findSecretKey(KEY, TOKEN)).thenReturn(Optional.of(SECRET));
+        ChannelAuthentication combined = new ChannelAuthentication(iam, new AccountResolver(ACCOUNT),
+                iamEnforcement, Clock.fixed(NOW, ZoneOffset.UTC), registry);
+        HttpServerRequest request = agentRequest(HttpMethod.GET, DATA, EMPTY, GATEWAY);
+        assertEquals(Optional.of(new ChannelAuthentication.AgentIdentity(ACCOUNT, REGION, external.instanceId())),
+                combined.authenticateAgentUpgradeIfClaimed(request, "ssmmessages:OpenDataChannel", SESSION_ARN, external));
+        verify(registry).authorize(request, EMPTY, "ssmmessages:OpenDataChannel", SESSION_ARN, external);
     }
 
     private void instanceCredentials() {

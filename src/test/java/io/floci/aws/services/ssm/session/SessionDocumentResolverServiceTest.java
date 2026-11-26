@@ -157,9 +157,17 @@ class SessionDocumentResolverServiceTest {
         assertEquals("InvalidDocument", error.getErrorCode());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"InteractiveCommands", "NonInteractiveCommands"})
+    void acceptsCommandSessionTypes(String sessionType) {
+        stored(CUSTOM, "Session", "{\"schemaVersion\":\"1.0\",\"sessionType\":\"" + sessionType + "\"}");
+        ResolvedDocument document = resolver.resolve(REGION, CUSTOM, Map.of());
+        assertEquals(sessionType, document.content().path("sessionType").asText());
+    }
+
     @Test
     void rejectsUnsupportedSessionType() {
-        stored(CUSTOM, "Session", "{\"schemaVersion\":\"1.0\",\"sessionType\":\"InteractiveCommands\"}");
+        stored(CUSTOM, "Session", "{\"schemaVersion\":\"1.0\",\"sessionType\":\"UnsupportedType\"}");
         AwsException error = assertThrows(AwsException.class, () -> resolver.resolve(REGION, CUSTOM, Map.of()));
         assertEquals("InvalidDocument", error.getErrorCode());
     }

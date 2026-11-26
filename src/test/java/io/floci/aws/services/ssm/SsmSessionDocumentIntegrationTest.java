@@ -67,7 +67,8 @@ class SsmSessionDocumentIntegrationTest {
                 DocumentKeyValuesFilter.builder().key("PlatformTypes").values("Linux").build()))
                 .documentIdentifiers();
 
-        assertEquals(List.of("AWS-StartPortForwardingSession", "AWS-StartPortForwardingSessionToRemoteHost",
+        assertEquals(List.of("AWS-StartInteractiveCommand", "AWS-StartNonInteractiveCommand",
+                        "AWS-StartPortForwardingSession", "AWS-StartPortForwardingSessionToRemoteHost",
                         "AWS-StartSSHSession"),
                 documents.stream().map(DocumentIdentifier::name).sorted().toList());
         for (DocumentIdentifier document : documents) {

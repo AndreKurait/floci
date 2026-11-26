@@ -16,6 +16,8 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -35,6 +37,7 @@ import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.net.http.WebSocketHandshakeException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -47,6 +50,7 @@ import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -99,7 +103,7 @@ class SsmSessionManagerIntegrationTest {
                 .documentName("AWS-StartNonInteractiveCommand").reason("relay check")
                 .parameters(Map.of("command", List.of("printf relayed"))));
         String sessionId = started.sessionId();
-        assertTrue(sessionId.matches("root-[0-9a-f]{17}"), sessionId);
+        assertTrue(sessionId.matches("root-[0-9a-f]+") && sessionId.length() <= 96, sessionId);
         assertEquals(URI.create(dataChannel(sessionId).toString().replaceFirst("^http", "ws")
                 + "?role=publish_subscribe"), URI.create(started.streamUrl()));
 
@@ -170,6 +174,7 @@ class SsmSessionManagerIntegrationTest {
         JsonNode acknowledged = mapper.readTree(control.next("agent_task_acknowledge").payload());
         assertEquals(complete.id().toString(), acknowledged.path("MessageId").asText());
         assertEquals(started.sessionId(), acknowledged.path("TaskId").asText());
+        agent.socket.sendClose(WebSocket.NORMAL_CLOSURE, "The agent task completed.").get(5, TimeUnit.SECONDS);
         assertEquals("done", mapper.readTree(client.next("channel_closed").payload()).path("Output").asText());
         assertEquals("Terminated", only(SessionState.HISTORY, started.sessionId()).statusAsString());
     }
@@ -215,10 +220,11 @@ class SsmSessionManagerIntegrationTest {
             URI stream = URI.create(started.streamUrl());
             WebSocket.Builder builder = http.newWebSocketBuilder();
             user.signer("ssmmessages").headersFor("GET", stream, Map.of(), new byte[0]).forEach(builder::header);
-            WebSocket socket = builder.buildAsync(stream, client).get(5, TimeUnit.SECONDS);
-            sockets.add(socket);
-            socket.sendText(open(started.tokenValue(), null), true).get(5, TimeUnit.SECONDS);
-            assertEquals(1008, client.closed.get(5, TimeUnit.SECONDS));
+            ExecutionException denied = assertThrows(ExecutionException.class,
+                    () -> builder.buildAsync(stream, client).get(5, TimeUnit.SECONDS));
+            WebSocketHandshakeException handshake = assertInstanceOf(WebSocketHandshakeException.class,
+                    denied.getCause());
+            assertEquals(403, handshake.getResponse().statusCode());
         }
     }
 
@@ -246,7 +252,7 @@ class SsmSessionManagerIntegrationTest {
         }
         SsmException missing = assertThrows(SsmException.class, () -> ssm.startSession(request ->
                 request.target(instance).documentName("AWS-StartNonInteractiveCommand")));
-        assertEquals("ValidationException", missing.awsErrorDetails().errorCode());
+        assertEquals("InvalidParameters", missing.awsErrorDetails().errorCode());
         String session = "session-doc-" + UUID.randomUUID();
         ssm.createDocument(request -> request.name(session).documentType("Session").content("""
                 {"schemaVersion":"1.0","sessionType":"InteractiveCommands",
@@ -256,7 +262,7 @@ class SsmSessionManagerIntegrationTest {
         try {
             SsmException pattern = assertThrows(SsmException.class, () -> ssm.startSession(request ->
                     request.target(instance).documentName(session).parameters(Map.of("logpath", List.of("x;y")))));
-            assertEquals("ValidationException", pattern.awsErrorDetails().errorCode());
+            assertEquals("InvalidParameters", pattern.awsErrorDetails().errorCode());
             StartSessionResponse started = ssm.startSession(request -> request.target(instance).documentName(session)
                     .parameters(Map.of("logpath", List.of("/var/log/agent.log"))));
             JsonNode task = mapper.readTree(mapper.readTree(control.next("interactive_shell").payload())
@@ -272,8 +278,12 @@ class SsmSessionManagerIntegrationTest {
                 .filters(filter -> filter.key(SessionFilterKey.TARGET).value(instance))).sessions().isEmpty());
     }
 
-    @Test
-    void startSessionNeedsTheDocumentAndTheTargetInTheCallersPolicy() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"i-", "mi-"})
+    void startSessionNeedsTheDocumentAndTheTargetInTheCallersPolicy(String prefix) throws Exception {
+        instance = prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
+        RequestScopes.runAs(regions.getDefaultAccountId(), REGION, () ->
+                commands.updateInstanceInformation(mapper.createObjectNode().put("InstanceId", instance), REGION));
         Receiver control = new Receiver();
         handshake(openControl(control), controlToken());
         String document = "arn:aws:ssm:us-east-1::document/AWS-StartNonInteractiveCommand";
@@ -286,7 +296,8 @@ class SsmSessionManagerIntegrationTest {
                             .parameters(Map.of("command", List.of("true")))));
             assertEquals("AccessDeniedException", denied.awsErrorDetails().errorCode());
         }
-        String target = "arn:aws:ec2:us-east-1:000000000000:instance/" + instance;
+        String target = (prefix.equals("mi-") ? "arn:aws:ssm:us-east-1:000000000000:managed-instance/"
+                : "arn:aws:ec2:us-east-1:000000000000:instance/") + instance;
         try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "ssm-start-", "start", """
                 {"Statement":[{"Effect":"Allow","Action":"ssm:StartSession","Resource":["%s","%s"]},
                   {"Effect":"Allow","Action":"ssm:TerminateSession","Resource":"arn:aws:ssm:us-east-1:000000000000:session/nobody-*"}]}
@@ -323,7 +334,7 @@ class SsmSessionManagerIntegrationTest {
         SsmException invalid = assertThrows(SsmException.class, () -> ssm.startSession(request -> request
                 .target(instance).documentName("AWS-StartNonInteractiveCommand")
                 .parameters(Map.of("command", List.of("true"), "separateOutputStream", List.of("yes")))));
-        assertEquals("ValidationException", invalid.awsErrorDetails().errorCode());
+        assertEquals("InvalidParameters", invalid.awsErrorDetails().errorCode());
     }
 
     @Test
@@ -396,17 +407,18 @@ class SsmSessionManagerIntegrationTest {
     }
 
     private void attachAgent(String sessionId, Receiver agent) throws Exception {
+        String clientId = UUID.randomUUID().toString();
         String token = given().filter(ROOT).contentType("application/json")
                 .body("{\"MessageSchemaVersion\":\"1.0\",\"RequestId\":\"" + UUID.randomUUID()
-                        + "\",\"ClientId\":\"" + UUID.randomUUID() + "\"}")
+                        + "\",\"ClientId\":\"" + clientId + "\"}")
                 .post(dataChannel(sessionId)).then().statusCode(201).extract().xmlPath()
-                .getString("CreateDataChannelResponse.TokenValue");
+                .getString("ChannelOutput.TokenValue");
         URI uri = URI.create(dataChannel(sessionId).toString().replaceFirst("^http", "ws") + "?role=publish_subscribe");
         WebSocket.Builder builder = http.newWebSocketBuilder();
         ROOT.headersFor("GET", uri, Map.of(), new byte[0]).forEach(builder::header);
         WebSocket socket = builder.buildAsync(uri, agent).get(5, TimeUnit.SECONDS);
         sockets.add(socket);
-        socket.sendText(open(token, instance), true).get(5, TimeUnit.SECONDS);
+        socket.sendText(open(token, instance, clientId), true).get(5, TimeUnit.SECONDS);
     }
 
     private void attachClient(String streamUrl, String token, Receiver client) throws Exception {
@@ -416,8 +428,12 @@ class SsmSessionManagerIntegrationTest {
     }
 
     private String open(String token, String clientInstance) throws Exception {
+        return open(token, clientInstance, UUID.randomUUID().toString());
+    }
+
+    private String open(String token, String clientInstance, String clientId) throws Exception {
         Map<String, String> open = new LinkedHashMap<>(Map.of("MessageSchemaVersion", "1.0",
-                "RequestId", UUID.randomUUID().toString(), "TokenValue", token, "ClientId", UUID.randomUUID().toString()));
+                "RequestId", UUID.randomUUID().toString(), "TokenValue", token, "ClientId", clientId));
         if (clientInstance != null) {
             open.put("ClientInstanceId", clientInstance);
         } else {
@@ -442,7 +458,7 @@ class SsmSessionManagerIntegrationTest {
         return given().filter(ROOT).contentType("application/json")
                 .body("{\"MessageSchemaVersion\":\"1.0\",\"RequestId\":\"" + UUID.randomUUID() + "\"}")
                 .post(controlChannel(instance)).then().statusCode(201).extract().xmlPath()
-                .getString("CreateControlChannelResponse.TokenValue");
+                .getString("ChannelOutput.TokenValue");
     }
 
     private WebSocket openControl(Receiver receiver) throws Exception {

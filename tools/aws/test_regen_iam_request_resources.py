@@ -4141,20 +4141,20 @@ def session_models() -> dict[str, dict]:
     }}
 
 
-def test_start_session_names_both_the_document_and_ec2_target(session_models: dict[str, dict]) -> None:
+def test_start_session_names_the_document_and_both_managed_target_types(session_models: dict[str, dict]) -> None:
     operation = "ssm:StartSession"
     upstream = {"action": operation, "types": list(SSM_SESSION_FORMATS)}
     assert r.entry_for(operation, upstream, SSM_SESSION_FORMATS, session_models)["resources"] == [
         {"type": "document", "fill": {"DocumentName": "DocumentName"}, "defaults": {"DocumentName": "document"}},
-        {"types": ["instance"], "through": "Target"},
+        {"types": ["instance", "managed-instance"], "through": "Target"},
     ]
 
 
-def test_connection_status_names_only_the_ec2_target(session_models: dict[str, dict]) -> None:
+def test_connection_status_names_both_managed_target_types(session_models: dict[str, dict]) -> None:
     operation = "ssm:GetConnectionStatus"
     upstream = {"action": operation, "types": ["instance", "managed-instance", "task"]}
     assert r.entry_for(operation, upstream, SSM_SESSION_FORMATS, session_models)["resources"] == [
-        {"types": ["instance"], "through": "Target"},
+        {"types": ["instance", "managed-instance"], "through": "Target"},
     ]
 
 
@@ -4187,3 +4187,10 @@ def test_start_session_requires_an_account_owned_default_in_the_policy(session_m
         r.session_permissions([{"type": "document", "fill": {"DocumentName": "DocumentName"}}],
                               operation, source, list(SSM_SESSION_FORMATS),
                               SSM_SESSION_FORMATS, session_models)
+
+
+def test_session_target_requires_the_managed_node_type_in_the_reference(session_models: dict[str, dict]) -> None:
+    operation = "ssm:GetConnectionStatus"
+    upstream = {"action": operation, "types": ["instance", "task"]}
+    with pytest.raises(ValueError, match="one managed-node type"):
+        r.entry_for(operation, upstream, SSM_SESSION_FORMATS, session_models)

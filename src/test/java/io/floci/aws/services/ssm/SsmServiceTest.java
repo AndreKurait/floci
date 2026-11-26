@@ -1,12 +1,15 @@
 package io.floci.aws.services.ssm;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.core.storage.PersistentStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.eventbridge.EventBridgeService;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
@@ -20,9 +23,13 @@ import io.floci.aws.services.ssm.model.SsmAssociation;
 import io.floci.aws.services.ssm.model.SsmDocument;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -55,6 +62,31 @@ class SsmServiceTest {
     private SsmService ssmService;
 
     @Test
+    void builtinCommandOwnershipDoesNotChangeDocumentManagement() throws Exception {
+        for (String region : List.of("us-east-1", "us-gov-west-1", "cn-north-1")) {
+            for (String name : List.of("AWS-RunShellScript", "AWS-RunPowerShellScript")) {
+                String partition = AwsRegions.partitionFor(region);
+                String expected = "arn:" + partition + ":ssm:" + region + "::document/" + name;
+                assertEquals(Optional.of(expected),
+                        ssmService.resolveNamedForOperation("ssm:SendCommand", "document", name, region));
+                JsonNode body = MAPPER.readTree("{\"DocumentName\":\"" + name + "\"}");
+                assertEquals(List.of(expected), RequestResources.ofBody("ssm:SendCommand", body,
+                        partition, region, "000000000000", ssmService));
+                for (String operation : List.of("ssm:CreateDocument", "ssm:GetDocument", "ssm:CreateAssociation",
+                        "ssm:AddTagsToResource")) {
+                    assertEquals(Optional.empty(),
+                            ssmService.resolveNamedForOperation(operation, "document", name, region));
+                }
+                assertEquals(Optional.empty(), ssmService.find("document", List.of(name), region));
+            }
+        }
+        assertEquals(Optional.empty(),
+                ssmService.resolveNamedForOperation("ssm:SendCommand", "document", "custom", "us-east-1"));
+        assertEquals(Optional.empty(), ssmService.resolveNamedForOperation("ssm:SendCommand", "parameter",
+                "AWS-RunShellScript", "us-east-1"));
+    }
+
+    @Test
     void labeledCurrentVersionUsesKeyIdFromLegacyHistory() {
         InMemoryStorage<String, Parameter> parameters = new InMemoryStorage<>();
         InMemoryStorage<String, List<ParameterHistory>> history = new InMemoryStorage<>();
@@ -84,10 +116,33 @@ class SsmServiceTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"mi-0123456789abcdef0", "ecs:cluster_container_runtime", "i-*",
+    @ValueSource(strings = {"ecs:cluster_container_runtime", "i-*",
             "i-0123456789abcdef0/suffix", "arn:aws:ec2:us-east-1:111122223333:instance/i-0123456789abcdef0"})
     void resolvesNoSessionResourceForAnUnsupportedTarget(String target) {
         assertEquals(List.of(), ssmService.through("Target", target, "us-east-1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "us-gov-west-1", "cn-north-1"})
+    void resolvesManagedInstanceSessionTargetsInEachPartition(String region) {
+        String partition = Map.of("us-east-1", "aws", "us-gov-west-1", "aws-us-gov",
+                "cn-north-1", "aws-cn").get(region);
+        assertEquals(List.of("arn:" + partition + ":ssm:" + region
+                        + ":000000000000:managed-instance/mi-0123456789abcdef0"),
+                ssmService.through("Target", "mi-0123456789abcdef0", region));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"AWS-StartInteractiveCommand", "AWS-StartNonInteractiveCommand",
+            "AWS-StartSSHSession", "AWS-StartPortForwardingSession",
+            "AWS-StartPortForwardingSessionToRemoteHost"})
+    void sessionIamUsesTheAwsOwnedDocumentArn(String name) throws Exception {
+        String document = "arn:aws:ssm:us-east-1::document/" + name;
+        assertEquals(Optional.of(document), ssmService.find("document", List.of(name), "us-east-1"));
+        assertEquals(List.of(document, "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0"),
+                RequestResources.ofBody("ssm:StartSession", MAPPER.readTree("{\"Target\":\"i-0123456789abcdef0\","
+                                + "\"DocumentName\":\"" + name + "\"}"),
+                        "aws", "us-east-1", "000000000000", ssmService));
     }
 
     @Test
@@ -858,6 +913,120 @@ class SsmServiceTest {
     }
 
     @Test
+    void documentDefaultAndRetainedContentSurviveStorageReload(@TempDir Path directory) {
+        Path path = directory.resolve("documents.json");
+        SsmService service = serviceWithPersistentDocuments(path);
+        service.createDocument("Doc", "first", "Command", "us-east-1");
+        service.updateDocument("Doc", "second", "us-east-1");
+        service.updateDocumentDefaultVersion("Doc", "2", "us-east-1");
+        service.updateDocument("Doc", "third", "us-east-1");
+
+        SsmService reloaded = serviceWithPersistentDocuments(path);
+        SsmDocument document = reloaded.getDocument("Doc", "us-east-1");
+        assertEquals(2, document.getDefaultVersion());
+        assertEquals(3, document.getDocumentVersion());
+        assertEquals(Map.of("1", "first", "2", "second", "3", "third"), document.getVersions());
+        reloaded.updateDocument("Doc", "fourth", "us-east-1");
+        assertEquals(2, serviceWithPersistentDocuments(path).getDocument("Doc", "us-east-1").getDefaultVersion());
+
+        reloaded.deleteDocument("Doc", "us-east-1");
+        SsmService afterDelete = serviceWithPersistentDocuments(path);
+        AwsException deleted = assertThrows(AwsException.class,
+                () -> afterDelete.updateDocumentDefaultVersion("Doc", "1", "us-east-1"));
+        assertEquals("InvalidDocument", deleted.getErrorCode());
+    }
+
+    @Test
+    void legacyDocumentKeepsItsDefaultAndAvailableContentOnUpdate(@TempDir Path directory) throws IOException {
+        Path path = directory.resolve("legacy-documents.json");
+        Files.writeString(path, """
+                {"us-east-1::LegacyDoc":{"Name":"LegacyDoc","DocumentType":"Command",
+                  "Content":"third","DocumentVersion":3}}
+                """);
+        SsmService service = serviceWithPersistentDocuments(path);
+        assertEquals(Map.of(), service.listTagsForResource("Document", "LegacyDoc", "us-east-1"));
+        assertEquals(Map.of(), service.listDocumentTags("LegacyDoc", "us-east-1"));
+        assertEquals(3, service.getDocument("LegacyDoc", "us-east-1").getDefaultVersion());
+        service.updateDocument("LegacyDoc", "fourth", "us-east-1");
+
+        SsmService reloaded = serviceWithPersistentDocuments(path);
+        SsmDocument document = reloaded.getDocument("LegacyDoc", "us-east-1");
+        assertEquals(3, document.getDefaultVersion());
+        assertEquals(4, document.getDocumentVersion());
+        assertEquals(Map.of("3", "third", "4", "fourth"), document.getVersions());
+        reloaded.updateDocumentDefaultVersion("LegacyDoc", "1", "us-east-1");
+        SsmDocument legacySelection = serviceWithPersistentDocuments(path).getDocument("LegacyDoc", "us-east-1");
+        assertEquals(1, legacySelection.getDefaultVersion());
+        assertFalse(legacySelection.hasRetainedContent("1"));
+        assertNull(legacySelection.getContentForVersion("1"));
+        assertEquals(Map.of("3", "third", "4", "fourth"), legacySelection.getVersions());
+    }
+
+    @Test
+    void documentTagsPersistWithoutSharingMutableMaps(@TempDir Path directory) {
+        Path path = directory.resolve("tagged-documents.json");
+        SsmService service = serviceWithPersistentDocuments(path);
+        Map<String, String> supplied = new LinkedHashMap<>(Map.of("workflow", "first"));
+        SsmDocument created = service.createDocument("Doc", "first", "Command", supplied, "us-east-1");
+        supplied.put("workflow", "mutated");
+        created.getTags().clear();
+        service.listTagsForResource("Document", "Doc", "us-east-1").clear();
+        assertEquals(Map.of("workflow", "first"), service.listTagsForResource("Document", "Doc", "us-east-1"));
+        service.updateDocument("Doc", "second", "us-east-1");
+        service.addTagsToResource("Document", "Doc", Map.of("workflow", "updated", "owner", "retained"), "us-east-1");
+
+        SsmService reloaded = serviceWithPersistentDocuments(path);
+        assertEquals(Map.of("workflow", "updated", "owner", "retained"),
+                reloaded.listTagsForResource("Document", "Doc", "us-east-1"));
+        reloaded.removeTagsFromResource("Document", "Doc", List.of("workflow"), "us-east-1");
+        assertEquals(Map.of("owner", "retained"),
+                serviceWithPersistentDocuments(path).listTagsForResource("Document", "Doc", "us-east-1"));
+        reloaded.createDocument("Doc", "west", "Command", Map.of("owner", "west"), "us-west-2");
+        assertEquals(Map.of("owner", "retained"), reloaded.listTagsForResource("Document", "Doc", "us-east-1"));
+        assertEquals(Map.of("owner", "west"), reloaded.listTagsForResource("Document", "Doc", "us-west-2"));
+        reloaded.deleteDocument("Doc", "us-east-1");
+        AwsException missing = assertThrows(AwsException.class,
+                () -> serviceWithPersistentDocuments(path).listTagsForResource("Document", "Doc", "us-east-1"));
+        assertEquals("InvalidResourceId", missing.getErrorCode());
+    }
+
+    @Test
+    void documentTagHelpersPersistWithoutSharingMutableMaps(@TempDir Path directory) {
+        Path path = directory.resolve("tagged-documents.json");
+        SsmService service = serviceWithPersistentDocuments(path);
+        Map<String, String> supplied = new LinkedHashMap<>(Map.of("workflow", "first"));
+        SsmDocument created = service.createDocument("Doc", "first", "Command", "us-east-1", supplied);
+        supplied.put("workflow", "mutated");
+        created.getTags().clear();
+        service.listDocumentTags("Doc", "us-east-1").clear();
+        assertEquals(Map.of("workflow", "first"), service.listDocumentTags("Doc", "us-east-1"));
+        service.updateDocument("Doc", "second", "us-east-1");
+        service.addDocumentTags("Doc", Map.of("workflow", "updated", "owner", "retained"), "us-east-1");
+
+        SsmService reloaded = serviceWithPersistentDocuments(path);
+        assertEquals(Map.of("workflow", "updated", "owner", "retained"),
+                reloaded.listDocumentTags("Doc", "us-east-1"));
+        reloaded.removeDocumentTags("Doc", List.of("workflow"), "us-east-1");
+        assertEquals(Map.of("owner", "retained"),
+                serviceWithPersistentDocuments(path).listDocumentTags("Doc", "us-east-1"));
+        reloaded.createDocument("Doc", "west", "Command", "us-west-2", Map.of("owner", "west"));
+        assertEquals(Map.of("owner", "retained"), reloaded.listDocumentTags("Doc", "us-east-1"));
+        assertEquals(Map.of("owner", "west"), reloaded.listDocumentTags("Doc", "us-west-2"));
+        reloaded.deleteDocument("Doc", "us-east-1");
+        AwsException missing = assertThrows(AwsException.class,
+                () -> serviceWithPersistentDocuments(path).listDocumentTags("Doc", "us-east-1"));
+        assertEquals("InvalidResourceId", missing.getErrorCode());
+    }
+
+    private static SsmService serviceWithPersistentDocuments(Path path) {
+        PersistentStorage<String, SsmDocument> documents =
+                new PersistentStorage<>(path, new TypeReference<Map<String, SsmDocument>>() {});
+        documents.load();
+        return new SsmService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                documents, new InMemoryStorage<>(), 5, new RegionResolver("us-east-1", "000000000000"));
+    }
+
+    @Test
     void updateDocumentSameContentThrowsDuplicateDocumentContent() {
         String region = "us-east-1";
         ssmService.createDocument("Doc", "{\"a\":1}", "Session", region);
@@ -1136,12 +1305,12 @@ class SsmServiceTest {
         ssmService.createDocument("Doc3", "{}", "Command", "us-west-2");
 
         List<SsmDocument> eastDocs = ssmService.listDocuments("us-east-1", null);
-        assertEquals(5, eastDocs.size());
+        assertEquals(7, eastDocs.size());
         assertTrue(eastDocs.stream().anyMatch(d -> "Doc1".equals(d.getName())));
         assertTrue(eastDocs.stream().anyMatch(d -> "Doc2".equals(d.getName())));
 
         List<SsmDocument> westDocs = ssmService.listDocuments("us-west-2", Map.of());
-        assertEquals(4, westDocs.size());
+        assertEquals(6, westDocs.size());
         assertTrue(westDocs.stream().anyMatch(d -> "Doc3".equals(d.getName())));
         assertFalse(westDocs.stream().anyMatch(d -> "Doc1".equals(d.getName()) || "Doc2".equals(d.getName())));
 
@@ -1163,16 +1332,16 @@ class SsmServiceTest {
         List<SsmDocument> selfDocs = ssmService.listDocuments("us-east-1", Map.of("Owner", List.of("Self")));
         assertEquals(2, selfDocs.size());
         List<SsmDocument> allDocs = ssmService.listDocuments("us-east-1", Map.of("Owner", List.of("All")));
-        assertEquals(5, allDocs.size());
+        assertEquals(7, allDocs.size());
 
         // Amazon selects the built-in documents.
         List<SsmDocument> amazonDocs = ssmService.listDocuments("us-east-1", Map.of("Owner", List.of("Amazon")));
-        assertEquals(3, amazonDocs.size());
+        assertEquals(5, amazonDocs.size());
         assertTrue(amazonDocs.stream().allMatch(d -> "Amazon".equals(d.getOwner())));
 
         // Filter by PlatformTypes (all documents default to Windows/Linux/MacOS)
         List<SsmDocument> windowsDocs = ssmService.listDocuments("us-east-1", Map.of("PlatformTypes", List.of("Windows")));
-        assertEquals(5, windowsDocs.size());
+        assertEquals(7, windowsDocs.size());
         List<SsmDocument> aixDocs = ssmService.listDocuments("us-east-1", Map.of("PlatformTypes", List.of("AIX")));
         assertTrue(aixDocs.isEmpty());
     }
@@ -1184,7 +1353,8 @@ class SsmServiceTest {
 
         List<SsmDocument> documents = ssmService.listDocuments("us-west-2", null);
 
-        assertEquals(List.of("AWS-StartPortForwardingSession", "AWS-StartPortForwardingSessionToRemoteHost",
+        assertEquals(List.of("AWS-StartInteractiveCommand", "AWS-StartNonInteractiveCommand",
+                        "AWS-StartPortForwardingSession", "AWS-StartPortForwardingSessionToRemoteHost",
                         "AWS-StartSSHSession", "WestDoc"),
                 documents.stream().map(SsmDocument::getName).sorted().toList());
     }
@@ -1209,7 +1379,7 @@ class SsmServiceTest {
         assertEquals("123456789012", accountDocs.get(0).getOwner());
 
         List<SsmDocument> unfilteredDocs = service.listDocuments("us-east-1", null);
-        assertEquals(4, unfilteredDocs.size());
+        assertEquals(6, unfilteredDocs.size());
         assertEquals("123456789012", unfilteredDocs.stream()
                 .filter(d -> "LegacyDoc".equals(d.getName())).findFirst().orElseThrow().getOwner());
 
@@ -1217,7 +1387,7 @@ class SsmServiceTest {
     }
 
     @Test
-    void testCreateAssociation_Success() {
+    void createAssociationStartsPending() {
         String region = "us-east-1";
         ssmService.createDocument("AWS-RunShellScript", "{}", "Command", region);
 
@@ -1244,11 +1414,12 @@ class SsmServiceTest {
         assertEquals(parameters, assoc.getParameters());
         assertEquals("rate(30 minutes)", assoc.getScheduleExpression());
         assertNotNull(assoc.getStatus());
-        assertEquals("Success", assoc.getStatus().getName());
+        assertEquals("Pending", assoc.getStatus().getName());
         assertNotNull(assoc.getOverview());
-        assertEquals("Success", assoc.getOverview().getStatus());
-        assertEquals("Success", assoc.getOverview().getDetailedStatus());
+        assertEquals("Pending", assoc.getOverview().getStatus());
+        assertEquals("Creating", assoc.getOverview().getDetailedStatus());
         assertNotNull(assoc.getCreatedDate());
+        assertNull(assoc.getLastExecutionDate());
     }
 
     @Test
@@ -1470,7 +1641,8 @@ class SsmServiceTest {
         SsmAssociation created = ssmService.createAssociation("MyDoc", "my-assoc", null, "i-12345", null, null, null, region);
 
         AwsException ex = assertThrows(AwsException.class, () ->
-                ssmService.updateAssociation(created.getAssociationId(), null, "99", null, null, null, null, null, null, region));
+                ssmService.updateAssociation(created.getAssociationId(), null, null, "99",
+                        null, null, null, null, null, null, null, region));
         assertEquals("InvalidDocumentVersion", ex.getErrorCode());
 
         // The association's DocumentVersion is unchanged after the rejected update
@@ -1511,8 +1683,8 @@ class SsmServiceTest {
         assertEquals("1", created.getAssociationVersion());
 
         SsmAssociation updated = ssmService.updateAssociation(
-                created.getAssociationId(), null, null, null, null,
-                "rate(1 hour)", "5", null, null, region);
+                created.getAssociationId(), null, null, null, null, null,
+                "rate(1 hour)", "5", null, null, null, region);
 
         assertEquals("rate(1 hour)", updated.getScheduleExpression());
         assertEquals("5", updated.getMaxErrors());
@@ -1523,10 +1695,36 @@ class SsmServiceTest {
     }
 
     @Test
+    void associationUpdateWaitsForExecutionAndPreservesHistory() {
+        String region = "us-east-1";
+        ssmService.createDocument("Configuration", "{}", "Command", region);
+        SsmAssociation created = ssmService.createAssociation(
+                "Configuration", "configuration", null, "i-12345", null, null, null, region);
+        Instant previousExecution = Instant.parse("2025-01-01T00:00:00Z");
+        created.setStatus(new SsmAssociation.AssociationStatus("Success", "Completed", previousExecution, null));
+        created.setOverview(new SsmAssociation.AssociationOverview("Success", "Success"));
+        created.setLastExecutionDate(previousExecution);
+
+        SsmAssociation updated = ssmService.updateAssociation(created.getAssociationId(), null, null, null,
+                null, null, "rate(6 hours)", null, null, null, null, region);
+
+        assertEquals("2", updated.getAssociationVersion());
+        assertEquals("Pending", updated.getStatus().getName());
+        assertEquals("Pending", updated.getOverview().getStatus());
+        assertTrue(updated.getStatus().getDate().isAfter(previousExecution));
+        assertEquals(previousExecution, updated.getLastExecutionDate());
+        assertEquals(created.getCreatedDate(), updated.getCreatedDate());
+        SsmAssociation stored = ssmService.describeAssociation(created.getAssociationId(), null, null, region);
+        assertEquals("Pending", stored.getOverview().getStatus());
+        assertEquals(previousExecution, stored.getLastExecutionDate());
+    }
+
+    @Test
     void testUpdateAssociation_NotFound() {
         String region = "us-east-1";
         AwsException ex = assertThrows(AwsException.class, () ->
-                ssmService.updateAssociation("non-existent-id", null, null, null, null, null, null, null, null, region));
+                ssmService.updateAssociation("non-existent-id", null, null, null,
+                        null, null, null, null, null, null, null, region));
         assertEquals("AssociationDoesNotExist", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
     }

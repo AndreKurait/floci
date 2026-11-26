@@ -98,7 +98,7 @@ class SsmMessageGatewayServiceTest {
         SsmMessageGatewayRoutes routes = new SsmMessageGatewayRoutes(gateway, auth, mapper, true);
         new DataChannelRouter(List.of(routes)).init(router);
         routes.init(router);
-        port = result(vertx.createHttpServer().requestHandler(router).listen(0)).actualPort();
+        port = result(vertx.createHttpServer().requestHandler(router).listen(0, "127.0.0.1")).actualPort();
     }
 
     @AfterEach
@@ -261,6 +261,24 @@ class SsmMessageGatewayServiceTest {
         agent.open(agentGrant, true, "other-client-id");
 
         assertEquals(1008, agent.closed());
+    }
+
+    @Test
+    void agentPublicationTracksClientAttachmentAndReconnect() throws Exception {
+        String token = start();
+        TestPeer agent = dataPeer(NODE);
+        agent.open(createGrant(DATA_PATH), true);
+        assertEquals("pause_publication", agent.publications.poll(10, TimeUnit.SECONDS));
+
+        TestPeer client = dataPeer(null);
+        client.open(token, false);
+        assertEquals("start_publication", agent.publications.poll(10, TimeUnit.SECONDS));
+        result(client.socket.close());
+        assertEquals("pause_publication", agent.publications.poll(10, TimeUnit.SECONDS));
+
+        TestPeer reconnected = dataPeer(null);
+        reconnected.open(gateway.resumeSession(NODE, SESSION_ID).orElseThrow(), false);
+        assertEquals("start_publication", agent.publications.poll(10, TimeUnit.SECONDS));
     }
 
     @Test
@@ -522,11 +540,19 @@ class SsmMessageGatewayServiceTest {
     private static final class TestPeer {
         private final WebSocket socket;
         private final BlockingQueue<Buffer> received = new LinkedBlockingQueue<>();
+        private final BlockingQueue<String> publications = new LinkedBlockingQueue<>();
         private final CompletableFuture<Short> close = new CompletableFuture<>();
 
         private TestPeer(WebSocket socket) {
             this.socket = socket;
-            socket.binaryMessageHandler(received::add);
+            socket.binaryMessageHandler(frame -> {
+                String kind = AgentMessage.gatewayMessageType(frame);
+                if ("pause_publication".equals(kind) || "start_publication".equals(kind)) {
+                    publications.add(kind);
+                } else {
+                    received.add(frame);
+                }
+            });
             socket.closeHandler(ignored -> close.complete(socket.closeStatusCode()));
         }
 

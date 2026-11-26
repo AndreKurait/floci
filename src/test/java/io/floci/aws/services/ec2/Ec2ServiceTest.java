@@ -1,8 +1,15 @@
 package io.floci.aws.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.ListNetworksCmd;
+import com.github.dockerjava.api.command.RestartContainerCmd;
+import com.github.dockerjava.api.command.StartContainerCmd;
+import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.NetworkSettings;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
@@ -10,6 +17,15 @@ import io.floci.aws.core.common.AwsPartitions;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
+import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.common.ServiceConfigAccess;
+import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerDetector;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.ContainerLogStreamer;
+import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
+import io.floci.aws.core.common.docker.DockerHostResolver;
+import io.floci.aws.core.common.docker.PortAllocator;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
@@ -44,6 +60,7 @@ import io.floci.aws.services.ec2.model.PrefixList;
 import io.floci.aws.services.ec2.model.PrefixListEntry;
 import io.floci.aws.services.ec2.model.PrefixListId;
 import io.floci.aws.services.ec2.model.Reservation;
+import io.floci.aws.services.ec2.model.Route;
 import io.floci.aws.services.ec2.model.RouteTable;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.SecurityGroupRule;
@@ -60,6 +77,8 @@ import io.floci.aws.services.ec2.model.TransitGatewayVpcAttachmentOptions;
 import io.floci.aws.services.ec2.model.UserIdGroupPair;
 import io.floci.aws.services.ec2.model.Volume;
 import io.floci.aws.services.ec2.model.VolumeAttachment;
+import io.floci.aws.services.ec2.model.VolumeListResult;
+import io.floci.aws.services.ec2.model.VolumeModification;
 import io.floci.aws.services.ec2.model.Vpc;
 import io.floci.aws.services.ec2.model.VpcCidrBlockAssociation;
 import io.floci.aws.services.ec2.model.VpcEndpoint;
@@ -68,6 +87,7 @@ import io.floci.aws.services.ec2.net.Cidr4;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.testing.ParkingStore;
+import io.floci.aws.testing.ThreadStates;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
 import org.awaitility.Awaitility;
@@ -109,6 +129,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -124,6 +145,7 @@ import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static io.floci.aws.services.ec2.Ec2KeyPairFixtures.ECDSA_P256_KEY;
@@ -134,12 +156,14 @@ import static io.floci.aws.services.ec2.Ec2KeyPairFixtures.RSA_KEY;
 import static io.floci.aws.services.ec2.Ec2KeyPairFixtures.TRUNCATED_RSA_KEY;
 import static io.floci.aws.testing.ParkingStoreAssertions.assertOperationWaitsForParkedStore;
 import static io.floci.aws.testing.ThreadStates.awaitBlockedOrDone;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -149,15 +173,19 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -168,10 +196,77 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
+
+    @Test
+    void storedInstanceTagsUseTheArnAccountAndRegionWithoutBorrowingState() {
+        AccountAwareStorageBackend<Instance> instances = AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<List<Tag>> tags = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of(
+                        "ec2-instances.json", instances, "ec2-tags.json", tags)));
+        String key = "us-east-1::i-same";
+        instances.putForAccount("000000000000", key, new Instance());
+        instances.putForAccount("111122223333", key, new Instance());
+        tags.putForAccount("000000000000", key, List.of(new Tag("workflow", "caller")));
+        tags.putForAccount("111122223333", key, List.of(new Tag("workflow", "owner")));
+        Ec2StoredResourceArns stored = new Ec2StoredResourceArns(service,
+                new RegionResolver("us-east-1", "000000000000"));
+        String ownerArn = "arn:aws:ec2:us-east-1:111122223333:instance/i-same";
+        assertEquals(Map.of("workflow", "owner"), stored.storedTags(ownerArn));
+        assertEquals(Map.of("workflow", "owner"), stored.storedTags(
+                ownerArn.replace("us-east-1", "")));
+        assertEquals(Map.of("workflow", "caller"), stored.storedTags(
+                "arn:aws:ec2:us-east-1:000000000000:instance/i-same"));
+        assertTrue(stored.storedTags(ownerArn.replace("us-east-1", "us-west-2")).isEmpty());
+        assertTrue(stored.storedTags(ownerArn.replace("111122223333", "444455556666")).isEmpty());
+        assertTrue(stored.storedTags(ownerArn.replace("instance/", "volume/")).isEmpty());
+        assertTrue(stored.storedTags(ownerArn.replace("arn:aws:", "arn:aws-cn:")).isEmpty());
+        stored.storedTags(ownerArn).put("workflow", "mutated");
+        assertEquals(Map.of("workflow", "owner"), stored.storedTags(ownerArn));
+        instances.deleteForAccount("111122223333", key);
+        assertTrue(stored.storedTags(ownerArn).isEmpty());
+    }
+
+    @Test
+    void serviceInterfaceOwnershipSurvivesSerializationAndCannotBeForgedByTags() throws Exception {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.94.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.94.1.0/24", region + "a");
+        NetworkInterface owned = service.createServiceNetworkInterface(region, subnet.getSubnetId(),
+                "Classic frontend", List.of(), "allocation-token");
+        NetworkInterface unrelated = service.createNetworkInterface(region, subnet.getSubnetId(),
+                "Classic frontend", null, List.of(), List.of(),
+                List.of(new Tag("floci:elb-classic:allocation", "allocation-token")));
+
+        assertEquals(List.of(owned.getNetworkInterfaceId()), service.findServiceNetworkInterfaces(region,
+                "allocation-token").stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        assertNull(unrelated.getServiceAllocationToken());
+        assertTrue(service.findServiceNetworkInterfaces("us-west-2", "allocation-token").isEmpty());
+        assertTrue(service.findServiceNetworkInterfaces(region, "other-token").isEmpty());
+        ObjectMapper mapper = new ObjectMapper();
+        NetworkInterface restored = mapper.readValue(mapper.writeValueAsBytes(owned), NetworkInterface.class);
+        assertEquals("allocation-token", restored.getServiceAllocationToken());
+        service.deleteNetworkInterface(region, owned.getNetworkInterfaceId());
+        assertTrue(service.findServiceNetworkInterfaces(region, "allocation-token").isEmpty());
+        assertEquals(List.of(unrelated.getNetworkInterfaceId()), service.describeNetworkInterfaces(region,
+                List.of(), Map.of()).networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+    }
+
+    @Test
+    void serviceInterfaceOwnershipRejectsMissingTokenBeforeAllocation() {
+        Ec2Service service = mockModeService();
+        assertThrows(IllegalArgumentException.class,
+                () -> service.createServiceNetworkInterface("us-east-1", "subnet", null, List.of(), null));
+        assertThrows(IllegalArgumentException.class,
+                () -> service.findServiceNetworkInterfaces("us-east-1", " "));
+    }
 
     @ParameterizedTest
     @CsvSource({"false, us-east-1", "true, us-east-1", "false, eu-west-1", "true, eu-west-1"})
@@ -216,6 +311,149 @@ class Ec2ServiceTest {
         }
     }
 
+
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void routeTableDeleteWaitsForGatewayRetirementWithoutResurrection(boolean nat) throws Exception {
+        String region = "us-east-1";
+        ParkingStore<RouteTable> parked = new ParkingStore<>();
+        AccountAwareStorageBackend<RouteTable> tables =
+                new AccountAwareStorageBackend<>(parked, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-route-tables.json", tables)));
+        String vpc = service.createVpc(region, "10.134.0.0/16", false).getVpcId();
+        String gateway;
+        if (nat) {
+            String subnet = service.createSubnet(region, vpc, "10.134.1.0/24", region + "a").getSubnetId();
+            gateway = service.createNatGateway(region, subnet, null, "private", List.of()).getNatGatewayId();
+        } else {
+            gateway = service.createEgressOnlyInternetGateway(region, vpc, null, List.of())
+                    .getEgressOnlyInternetGatewayId();
+        }
+        RouteTable table = service.createRouteTable(region, vpc);
+        Route route =
+                new Route();
+        route.setDestinationCidrBlock("0.0.0.0/0");
+        route.setState("active");
+        if (nat) {
+            route.setNatGatewayId(gateway);
+        } else {
+            route.setEgressOnlyInternetGatewayId(gateway);
+        }
+        table.getRoutes().add(route);
+        tables.put(region + "::" + table.getRouteTableId(), table);
+        parked.parkNextWrite();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> retirement = pool.submit(() -> {
+                if (nat) {
+                    service.deleteNatGateway(region, gateway);
+                } else {
+                    service.deleteEgressOnlyInternetGateway(region, gateway);
+                }
+            });
+            assertTrue(parked.awaitParked(), "gateway retirement must reach the route write");
+            AtomicReference<Thread> deleting = new AtomicReference<>();
+            Future<?> deletion = pool.submit(() -> {
+                deleting.set(Thread.currentThread());
+                service.deleteRouteTable(region, table.getRouteTableId());
+            });
+            awaitBlockedOrDone(deleting, deletion);
+            assertFalse(deletion.isDone(), "deletion must wait for the in-flight route write");
+            parked.release();
+            retirement.get(2, TimeUnit.SECONDS);
+            deletion.get(2, TimeUnit.SECONDS);
+            assertTrue(tables.get(region + "::" + table.getRouteTableId()).isEmpty());
+            assertTrue(service.describeRouteTables(region, List.of(table.getRouteTableId()), Map.of()).isEmpty());
+            AwsException missing = assertThrows(AwsException.class,
+                    () -> service.deleteRouteTable(region, table.getRouteTableId()));
+            assertEquals("InvalidRouteTableID.NotFound", missing.getErrorCode());
+        } finally {
+            parked.release();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+
+
+    @ParameterizedTest
+    @CsvSource({
+            "vpc, DryRunOperation",
+            "group, DryRunOperation",
+            "default-group, DryRunOperation",
+            "missing-group-vpc, DryRunOperation",
+            "missing-subnet-vpc, DryRunOperation",
+            "invalid-vpc-cidr, DryRunOperation",
+            "invalid-vpc-tenancy, DryRunOperation"
+    })
+    void createDryRunDoesNotSeedFreshRegion(String operation, String errorCode) {
+        InMemoryStorageFactory storageFactory = new InMemoryStorageFactory();
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), storageFactory);
+        AwsException error = assertThrows(AwsException.class, () -> {
+            switch (operation) {
+                case "vpc" -> service.createVpc("eu-west-1", "10.86.0.0/16", false, true, null, true);
+                case "invalid-vpc-cidr" -> service.createVpc("eu-west-1", "invalid", false, false, null, true);
+                case "invalid-vpc-tenancy" -> service.createVpc("eu-west-1", "10.86.0.0/16", false, false, "invalid", true);
+                case "group" -> service.createSecurityGroup("eu-west-1", "probe", "probe", null, true);
+                case "default-group" -> service.createSecurityGroup("eu-west-1", "default", "probe", null, true);
+                case "missing-group-vpc" ->
+                        service.createSecurityGroup("eu-west-1", "probe", "probe", "vpc-missing", true);
+                case "missing-subnet-vpc" ->
+                        service.createSubnet("eu-west-1", "vpc-missing", "10.86.1.0/24", null, null, null, true);
+                default -> throw new AssertionError(operation);
+            }
+        });
+        assertEquals(errorCode, error.getErrorCode());
+        assertEquals("DryRunOperation".equals(errorCode) ? 412 : 400, error.getHttpStatus());
+        storageFactory.created.forEach(backend -> assertTrue(backend.scan(key -> true).isEmpty()));
+        // A dry run must not mark the region seeded and prevent a later normal call from seeding it.
+        service.ensureDefaultResources("eu-west-1");
+        assertTrue(service.describeVpcs("eu-west-1", List.of(), Map.of()).stream().anyMatch(Vpc::isDefault));
+    }
+
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false"})
+    void changedInstanceGroupsReachRetainedInterfaceSnapshots(boolean supplied, boolean deleteOnTermination) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        SecurityGroup next = service.createSecurityGroup(region, "replacement-groups",
+                "replacement groups", subnet.getVpcId());
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), supplied ? null : subnet.getSubnetId(), null, List.of(), null, null,
+                null, suppliedId, 0, null, null, null, null, false, null, null, List.of(), false,
+                null, null, deleteOnTermination).getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        List<String> groups = List.of(next.getGroupId());
+
+        service.modifyInstanceGroups(region, instance.getInstanceId(), groups);
+
+        assertEquals(groups, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                .networkInterfaces().getFirst().getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        assertEquals(groups, service.describeInstances(region, List.of(instance.getInstanceId()), Map.of())
+                .getFirst().getInstances().getFirst().getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        assertThrows(AwsException.class, () -> service.modifyInstanceGroups(region, instance.getInstanceId(),
+                List.of("sg-missing")));
+        assertEquals(groups, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                .networkInterfaces().getFirst().getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        if (!deleteOnTermination) {
+            NetworkInterface retained = service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of())
+                    .networkInterfaces().getFirst();
+            assertEquals(groups, retained.getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+            assertEquals("available", retained.getStatus());
+        }
+    }
+
     @ParameterizedTest
     @CsvSource({
             "false, aws:autoscaling:groupName", "true, aws:autoscaling:groupName",
@@ -248,6 +486,48 @@ class Ec2ServiceTest {
             for (Instance instance : reservation.getInstances()) {
                 assertEquals(original, instance.getTags());
             }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"grant-before-detach", "detach-before-grant", "grant-before-describe"})
+    void interfacePermissionOperationsShareAttachmentSynchronization(String order) throws Exception {
+        String region = "us-east-1";
+        ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
+        AccountAwareStorageBackend<NetworkInterface> interfaceStore =
+                new AccountAwareStorageBackend<>(interfaces, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaceStore)));
+        String subnet = publicSubnet(service, region, "10.243.0.0/24");
+        NetworkInterface eni = service.createNetworkInterface(region, subnet, null, "10.243.0.10",
+                List.of(), List.of(), List.of());
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(region,
+                eni.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+        Runnable grant = () -> service.createNetworkInterfacePermission(region, eni.getNetworkInterfaceId(),
+                "111111111111", null, Ec2Service.INSTANCE_ATTACH);
+        Runnable detach = () -> service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+        Runnable describe = () -> assertEquals(1, service.describeNetworkInterfacePermissions(
+                region, List.of(), List.of(), null, null).permissions().size());
+        interfaces.parkNextWrite();
+
+        switch (order) {
+            case "grant-before-detach" -> assertOperationWaitsForParkedStore(interfaces, grant, detach);
+            case "detach-before-grant" -> assertOperationWaitsForParkedStore(interfaces, detach, grant);
+            case "grant-before-describe" -> assertOperationWaitsForParkedStore(interfaces, grant, describe);
+            default -> throw new IllegalArgumentException(order);
+        }
+
+        assertEquals(1, service.describeNetworkInterfacePermissions(
+                region, List.of(), List.of(), null, null).permissions().size());
+        if (!"grant-before-describe".equals(order)) {
+            assertNull(eni.getAttachment());
+            assertTrue(instance.getNetworkInterfaces().stream()
+                    .noneMatch(value -> eni.getNetworkInterfaceId().equals(value.getNetworkInterfaceId())));
         }
     }
 
@@ -353,6 +633,17 @@ class Ec2ServiceTest {
         groups.delete(region + "::" + service.defaultSecurityGroupOf(region, vpcId).orElseThrow().getGroupId());
 
         assertTrue(service.defaultSecurityGroupOf(region, vpcId).isEmpty());
+    }
+
+    @Test
+    void defaultSecurityGroupCannotBeDeleted() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.94.0.0/16", false).getVpcId();
+        AwsException failure = assertThrows(AwsException.class, () -> service.deleteSecurityGroup(
+                region, service.defaultSecurityGroupOf(region, vpcId).orElseThrow().getGroupId()));
+        assertEquals("Client.CannotDelete", failure.getErrorCode());
+        assertTrue(service.defaultSecurityGroupOf(region, vpcId).isPresent());
     }
 
     @Test
@@ -560,6 +851,50 @@ class Ec2ServiceTest {
                 .getFirst().getInstances().getFirst();
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void restartVerifiesManagedMountsBeforeRestoringAttachments(boolean refuse) {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(config, containers,
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(), null, null, devices);
+        Reservation launch = launchKeepingADataVolume(service);
+        Instance instance = launch.getInstances().getFirst();
+        Volume managed = service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                .filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId()))
+                .findFirst().orElseThrow();
+        managed.setManagedFilesystem("ext4");
+        instance.setState(InstanceState.stopped());
+        when(config.services().ec2().mock()).thenReturn(false);
+        List<Runnable> callbacks = new ArrayList<>();
+        doAnswer(invocation -> {
+            callbacks.add(invocation.getArgument(1));
+            callbacks.add(invocation.getArgument(2));
+            return null;
+        }).when(containers).start(eq(instance), any(Runnable.class), any(Runnable.class));
+        clearInvocations(devices);
+        IllegalStateException failure = new IllegalStateException("retained mount missing");
+        if (refuse) {
+            doThrow(failure).when(devices).verifyInstanceMount(managed, instance, "/dev/sdf");
+        }
+
+        service.startInstances("us-east-1", List.of(instance.getInstanceId()));
+        assertEquals(2, callbacks.size());
+        if (refuse) {
+            assertSame(failure, assertThrows(IllegalStateException.class, callbacks.getFirst()::run));
+            verify(devices, never()).attachVolume(any(), any(), anyString());
+        } else {
+            callbacks.getFirst().run();
+            instance.setState(InstanceState.running());
+            callbacks.get(1).run();
+            InOrder ordered = inOrder(devices);
+            ordered.verify(devices).verifyInstanceMount(managed, instance, "/dev/sdf");
+            ordered.verify(devices).attachVolume(managed, instance, "/dev/sdf");
+        }
+    }
+
     @Test
     void aLaunchRefusedWhenItTakesCapacityLeavesNoVolumeBehind() {
         Ec2Service service = spy(new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
@@ -576,12 +911,15 @@ class Ec2ServiceTest {
 
     @Test
     void aRollbackWhoseTerminationFailsKeepsEachVolumesDeleteOnTermination() {
-        Ec2Service service = spy(new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+        AccountAwareStorageBackend<Instance> instanceStore = spy(
+                AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
-                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory()));
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of(
+                        "ec2-instances.json", instanceStore)));
         Reservation launch = launchKeepingADataVolume(service);
-        doThrow(new AwsException("InternalError", "termination failed", 500))
-                .when(service).terminateInstances(anyString(), anyList());
+        doThrow(new AwsException("InternalError", "instance lookup failed", 500)).doCallRealMethod()
+                .when(instanceStore).get("us-east-1::" + launch.getInstances().getFirst().getInstanceId());
 
         assertThrows(AwsException.class, () -> service.rollBackLaunch("us-east-1", launch));
 
@@ -646,6 +984,7 @@ class Ec2ServiceTest {
         String rootId = instance.getRootVolumeId();
         String dataId = launch.getLaunchVolumeIds().stream()
                 .filter(id -> !rootId.equals(id)).findFirst().orElseThrow();
+        when(devices.deleteVolume(dataId)).thenReturn(true);
         service.createTags("us-east-1", List.of(rootId, dataId), List.of(new Tag("Owner", "launch")));
         if (settleFirst) {
             instance.setState(InstanceState.terminated());
@@ -661,15 +1000,204 @@ class Ec2ServiceTest {
         verify(devices).deleteVolume(dataId);
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void backingDeletionFailureRetainsVolumeAndTagsForRetry(boolean managed) {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        when(devices.isAvailable()).thenReturn(true);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(), null, null, devices);
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of(new Tag("Owner", "retry")));
+        if (managed) {
+            volume.setManagedFilesystem("ext4");
+            doThrow(new AwsException("InternalError", "busy", 500)).doNothing()
+                    .when(devices).deleteManagedVolume(volume, "000000000000");
+        } else {
+            when(devices.deleteVolume(volume.getVolumeId())).thenReturn(false, true);
+        }
+
+        AwsException dryRun = assertThrows(AwsException.class,
+                () -> service.deleteVolume("us-east-1", volume.getVolumeId(), true));
+        assertEquals("DryRunOperation", dryRun.getErrorCode());
+        verify(devices, never()).deleteVolume(anyString());
+        verify(devices, never()).deleteManagedVolume(any(), anyString());
+        assertEquals("InternalError", assertThrows(AwsException.class,
+                () -> service.deleteVolume("us-east-1", volume.getVolumeId())).getErrorCode());
+        assertEquals(1, service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).size());
+        assertFalse(service.describeTags("us-east-1", Map.of("resource-id", List.of(volume.getVolumeId()))).isEmpty());
+
+        service.deleteVolume("us-east-1", volume.getVolumeId());
+
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(volume.getVolumeId()))).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"terminate", "settle", "rollback"})
+    void managedRootDeletionFailureRetainsMetadataForRetry(String operation) {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(), null, null, devices);
+        Reservation launch = service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1,
+                null, List.of(), null, null, List.of(), null, null);
+        Instance instance = launch.getInstances().getFirst();
+        Volume root = service.describeVolumes("us-east-1", List.of(instance.getRootVolumeId()), Map.of()).getFirst();
+        root.setManagedFilesystem("ext4");
+        service.createTags("us-east-1", List.of(root.getVolumeId()), List.of(new Tag("Owner", "retry")));
+        doThrow(new AwsException("InternalError", "busy", 500))
+                .when(devices).deleteManagedVolume(root, "000000000000");
+
+        assertThrows(AwsException.class, () -> {
+            switch (operation) {
+                case "terminate" -> service.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+                case "rollback" -> service.rollBackLaunch("us-east-1", launch);
+                case "settle" -> {
+                    instance.setState(InstanceState.terminated());
+                    service.describeVolumes("us-east-1", List.of(), Map.of());
+                }
+                default -> throw new IllegalArgumentException(operation);
+            }
+        });
+        assertFalse(service.describeTags("us-east-1", Map.of("resource-id", List.of(root.getVolumeId()))).isEmpty());
+        doNothing().when(devices).deleteManagedVolume(root, "000000000000");
+        instance.setState(InstanceState.terminated());
+
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(root.getVolumeId()))).isEmpty());
+    }
+
+    @Test
+    void aManagedRootStillRequiresBackingStorageDeletion() {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, devices);
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        Volume root = service.describeVolumes("us-east-1", List.of(instance.getRootVolumeId()),
+                Map.of()).getFirst();
+        root.setManagedFilesystem("ext4");
+        doThrow(new AwsException("InternalError", "managed backing unavailable", 500))
+                .when(devices).deleteManagedVolume(eq(root), anyString());
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.terminateInstances("us-east-1", List.of(instance.getInstanceId())));
+
+        assertEquals("managed backing unavailable", failure.getMessage());
+        verify(devices).deleteManagedVolume(eq(root), anyString());
+        verify(devices, never()).deleteVolume(anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"terminate", "settle", "rollback"})
+    void rawDataDeletionRefusalRetainsMetadataForRetry(String operation) {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        when(devices.isAvailable()).thenReturn(true);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(), null, null, devices);
+        Reservation launch = launchKeepingADataVolume(service);
+        Instance instance = launch.getInstances().getFirst();
+        Volume data = service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                .filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId())).findFirst().orElseThrow();
+        data.getAttachments().getFirst().setDeleteOnTermination(true);
+        service.createTags("us-east-1", List.of(data.getVolumeId()), List.of(new Tag("Owner", "retry")));
+
+        assertThrows(AwsException.class, () -> {
+            switch (operation) {
+                case "terminate" -> service.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+                case "rollback" -> service.rollBackLaunch("us-east-1", launch);
+                case "settle" -> {
+                    instance.setState(InstanceState.terminated());
+                    service.describeVolumes("us-east-1", List.of(), Map.of());
+                }
+                default -> throw new IllegalArgumentException(operation);
+            }
+        });
+        assertFalse(service.describeTags("us-east-1", Map.of("resource-id", List.of(data.getVolumeId()))).isEmpty());
+        when(devices.deleteVolume(data.getVolumeId())).thenReturn(true);
+        instance.setState(InstanceState.terminated());
+
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(data.getVolumeId()))).isEmpty());
+    }
+
+    @Test
+    void managedDeletionWithoutBackendRetainsMetadataAndDryRunPrecedence() {
+        Ec2Service service = mockModeService();
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of(new Tag("Owner", "retry")));
+        volume.setManagedFilesystem("ext4");
+
+        assertEquals("DryRunOperation", assertThrows(AwsException.class,
+                () -> service.deleteVolume("us-east-1", volume.getVolumeId(), true)).getErrorCode());
+        assertEquals("InternalError", assertThrows(AwsException.class,
+                () -> service.deleteVolume("us-east-1", volume.getVolumeId())).getErrorCode());
+        assertEquals(1, service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).size());
+        assertFalse(service.describeTags("us-east-1", Map.of("resource-id", List.of(volume.getVolumeId()))).isEmpty());
+        volume.setState("in-use");
+        assertEquals("VolumeInUse", assertThrows(AwsException.class,
+                () -> service.deleteVolume("us-east-1", volume.getVolumeId(), true)).getErrorCode());
+        assertEquals("InvalidVolume.NotFound", assertThrows(AwsException.class,
+                () -> service.deleteVolume("us-east-1", "vol-absent", true)).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"terminate", "settle", "rollback"})
+    void failedBackingDeletionKeepsVolumeAndTagsForCleanupRetry(String operation) {
+        AccountAwareStorageBackend<Volume> volumeStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        when(devices.isAvailable()).thenReturn(true);
+        when(devices.deleteVolume(anyString())).thenReturn(true);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-volumes.json", volumeStore)),
+                null, null, null, null, devices);
+        Reservation launch = launchWithDataVolume(service, true);
+        Instance instance = launch.getInstances().getFirst();
+        String volumeId = service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                .filter(volume -> "/dev/sdf".equals(volume.getAttachments().getFirst().getDevice()))
+                .findFirst().orElseThrow().getVolumeId();
+        service.createTags("us-east-1", List.of(volumeId), List.of(new Tag("Owner", "retained")));
+        when(devices.deleteVolume(volumeId)).thenReturn(false);
+        Runnable cleanup = switch (operation) {
+            case "terminate" -> () -> service.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+            case "rollback" -> () -> service.rollBackLaunch("us-east-1", launch);
+            case "settle" -> () -> {
+                instance.setState(InstanceState.terminated());
+                service.describeVolumes("us-east-1", List.of(volumeId), Map.of());
+            };
+            default -> throw new IllegalArgumentException(operation);
+        };
+
+        AwsException failure = assertThrows(AwsException.class, cleanup::run);
+
+        assertEquals("InternalError", failure.getErrorCode());
+        assertEquals(500, failure.getHttpStatus());
+        Volume retained = volumeStore.get("us-east-1::" + volumeId).orElseThrow();
+        assertEquals(instance.getInstanceId(), retained.getAttachments().getFirst().getInstanceId());
+        assertTrue(retained.getAttachments().getFirst().isDeleteOnTermination());
+        assertEquals(1, service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).size());
+
+        when(devices.deleteVolume(volumeId)).thenReturn(true);
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).isEmpty());
+        verify(devices, times(2)).deleteVolume(volumeId);
+    }
+
     @Test
     void launchAttachesTheVolumesItCreatesOnceTheInstanceRuns() {
         Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
         Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
         doAnswer(invocation -> {
-            invocation.<Runnable>getArgument(7).run();
+            invocation.<Runnable>getArgument(8).run();
             return null;
         }).when(containerManager).launch(any(Instance.class), any(ResolvedAmiImage.class), any(), anyString(),
-                any(), anyList(), anyMap(), any(Runnable.class));
+                any(), anyList(), anyMap(), any(), any(Runnable.class), any());
         AmiImageResolver resolver = mock(AmiImageResolver.class);
         when(resolver.resolveImage("ami-test")).thenReturn(ResolvedAmiImage.minimal("guest:latest"));
         Ec2Service service = new Ec2Service(mockConfig(false), containerManager,
@@ -686,9 +1214,13 @@ class Ec2ServiceTest {
     }
 
     private static Reservation launchKeepingADataVolume(Ec2Service service) {
+        return launchWithDataVolume(service, false);
+    }
+
+    private static Reservation launchWithDataVolume(Ec2Service service, boolean deleteOnTermination) {
         LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
         ebs.setVolumeSize(5);
-        ebs.setDeleteOnTermination(false);
+        ebs.setDeleteOnTermination(deleteOnTermination);
         LaunchTemplateData.BlockDeviceMapping data = new LaunchTemplateData.BlockDeviceMapping();
         data.setDeviceName("/dev/sdf");
         data.setEbs(ebs);
@@ -750,47 +1282,7 @@ class Ec2ServiceTest {
                 AwsArnUtils.Arn.of("ec2", region, account, "network-interface/" + eni).toString());
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = {"grant-before-detach", "detach-before-grant", "grant-before-describe"})
-    void interfacePermissionOperationsShareAttachmentSynchronization(String order) throws Exception {
-        String region = "us-east-1";
-        ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
-        AccountAwareStorageBackend<NetworkInterface> interfaceStore =
-                new AccountAwareStorageBackend<>(interfaces, null, "000000000000");
-        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
-                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
-                new Ec2InstanceTypeCatalog(),
-                new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaceStore)));
-        String subnet = publicSubnet(service, region, "10.243.0.0/24");
-        NetworkInterface eni = service.createNetworkInterface(region, subnet, null, "10.243.0.10",
-                List.of(), List.of(), List.of());
-        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
-                1, 1, null, List.of(), subnet, null, List.of(), null, null, null).getInstances().getFirst();
-        instance.setState(InstanceState.running());
-        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(region,
-                eni.getNetworkInterfaceId(), instance.getInstanceId(), 1);
-        Runnable grant = () -> service.createNetworkInterfacePermission(region, eni.getNetworkInterfaceId(),
-                "111111111111", null, Ec2Service.INSTANCE_ATTACH);
-        Runnable detach = () -> service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
-        Runnable describe = () -> assertEquals(1, service.describeNetworkInterfacePermissions(
-                region, List.of(), List.of(), null, null).permissions().size());
-        interfaces.parkNextWrite();
 
-        switch (order) {
-            case "grant-before-detach" -> assertOperationWaitsForParkedStore(interfaces, grant, detach);
-            case "detach-before-grant" -> assertOperationWaitsForParkedStore(interfaces, detach, grant);
-            case "grant-before-describe" -> assertOperationWaitsForParkedStore(interfaces, grant, describe);
-            default -> throw new IllegalArgumentException(order);
-        }
-
-        assertEquals(1, service.describeNetworkInterfacePermissions(
-                region, List.of(), List.of(), null, null).permissions().size());
-        if (!"grant-before-describe".equals(order)) {
-            assertNull(eni.getAttachment());
-            assertTrue(instance.getNetworkInterfaces().stream()
-                    .noneMatch(value -> eni.getNetworkInterfaceId().equals(value.getNetworkInterfaceId())));
-        }
-    }
 
     @Test
     void subnetAvailableAddressesTrackAllocationsAndRelease() {
@@ -836,6 +1328,48 @@ class Ec2ServiceTest {
         assertEquals(11, service.describeSubnets(region, List.of(small.getSubnetId()), Map.of())
                 .getFirst().getAvailableIpAddressCount());
     }
+
+    @Test
+    void systemTagDeletionOnlyRemovesTheExpectedGroup() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Tag membership = new Tag("aws:autoscaling:groupName", "group-a");
+        Tag userTag = new Tag("env", "test");
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(membership, userTag), null, null)
+                .getInstances().getFirst();
+        List<String> ids = List.of(instance.getInstanceId());
+
+        service.deleteSystemTag("us-east-1", ids, membership.getKey(), "group-b");
+        assertEquals(List.of(membership, userTag), instance.getTags());
+        service.deleteSystemTag("us-east-1", ids, membership.getKey(), "group-a");
+        assertEquals(List.of(userTag), instance.getTags());
+    }
+
+    @Test
+    void pruningTerminatedInstancesDeletesTheirTagsAfterTheRetentionPeriod() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        List<Tag> instanceTags = List.of(new Tag("aws:autoscaling:groupName", "group"), new Tag("env", "test"));
+        List<Instance> launched = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                2, 2, null, List.of(), null, null, instanceTags, null, null).getInstances();
+        Instance expired = launched.getFirst();
+        Instance retained = launched.getLast();
+        service.terminateInstances("us-east-1", List.of(expired.getInstanceId(), retained.getInstanceId()));
+        assertEquals(instanceTags, expired.getTags());
+        assertEquals(2, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(expired.getInstanceId()))).size());
+        expired.setTerminatedAt(System.currentTimeMillis() - 3_600_001L);
+
+        service.pruneTerminatedInstances();
+
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(expired.getInstanceId()))).isEmpty());
+        assertEquals(2, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(retained.getInstanceId()))).size());
+    }
+
 
     @Test
     void createAndDescribeVpcsDoNotContactDockerEvenOnFirstUse() {
@@ -1373,6 +1907,216 @@ class Ec2ServiceTest {
         assertTrue(service.describeTags("eu-west-1", Map.of("resource-id", List.of(volume.getVolumeId()))).isEmpty());
     }
 
+    @ParameterizedTest
+    @CsvSource({"gp2,1,0,,100,", "gp2,100,0,,300,", "gp2,16384,0,,16000,",
+            "gp3,1,0,,3000,125", "gp3,8,100,126,3000,126", "gp3,8,2999,750,3000,750",
+            "gp3,8,3000,0,3000,125", "gp3,8,3000,124,3000,125", "gp3,160,80000,2000,80000,2000",
+            "io1,1280,64000,,64000,", "io2,256,256000,,256000,"})
+    void volumesReportDefaultAndProvisionedPerformance(String type, int size, int iops,
+                                                       Integer throughput, int expectedIops,
+                                                       Integer expectedThroughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", type, size,
+                false, iops, throughput, null, List.of());
+        Volume described = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals(expectedIops, described.getIops());
+        assertEquals(expectedThroughput, described.getThroughput());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"invalid,10,0,", "gp2,0,0,", "gp2,16385,0,", "gp3,65537,0,",
+            "io1,3,100,", "io1,10,0,", "io2,10,0,", "gp2,10,100,", "gp2,10,0,250",
+            "gp3,1,2999,", "gp3,160,80001,", "gp3,1,3500,", "gp3,10,3000,-1",
+            "gp3,160,80000,2001", "gp3,10,3000,751", "io1,4,201,", "io2,4,4001,"})
+    void invalidVolumePerformanceIsRefusedBeforeAllocatingResources(String type, int size, int iops,
+                                                                   Integer throughput) {
+        AccountAwareStorageBackend<Volume> volumeStore = AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<Vpc> vpcStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(
+                Map.of("ec2-volumes.json", volumeStore, "ec2-vpcs.json", vpcStore)));
+        assertEquals(400, assertThrows(AwsException.class,
+                () -> service.createVolume("us-east-1", "us-east-1a", type, size,
+                        false, iops, throughput, null, List.of())).getHttpStatus());
+        assertTrue(volumeStore.keys().isEmpty());
+        assertTrue(vpcStore.keys().isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1,65537,gp3,,", "1,1,gp3,1,", "1,1,gp3,-1,", "1,1,gp3,2999,", "1,1,gp3,3500,",
+            "160,160,gp3,80001,", "1,1,gp3,3000,-1", "160,160,gp3,8000,2001",
+            "10,20,gp3,3000,751", "1,3,io1,100,", "1,4,io1,201,",
+            "1,4,io2,4001,", "256,256,io2,256001,", "1,16385,gp2,,",
+            "1,1025,standard,,", "1,124,sc1,,"})
+    void invalidVolumeModificationIsRefusedBeforeResizeOrMetadataMutation(int originalSize, int targetSize,
+                                                                         String targetType, Integer iops,
+                                                                         Integer throughput) throws Exception {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", originalSize,
+                false, 3000, 125, null, List.of(new Tag("Owner", "unchanged")));
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Field field = Ec2Service.class.getDeclaredField("volumeBlockDeviceManager");
+        field.setAccessible(true);
+        field.set(service, devices);
+
+        AwsException error = assertThrows(AwsException.class, () -> service.modifyVolume("us-east-1",
+                volume.getVolumeId(), targetSize, targetType, iops, throughput, null, false));
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        Volume described = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals(originalSize, described.getSize());
+        assertEquals("gp3", described.getVolumeType());
+        assertEquals(3000, described.getIops());
+        assertEquals(125, described.getThroughput());
+        assertEquals("unchanged", described.getTags().getFirst().getValue());
+        assertTrue(service.describeVolumesModifications("us-east-1", List.of(), Map.of()).isEmpty());
+        verifyNoInteractions(devices);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0,,4000,250", ",0,4000,250", "100,126,3000,126", "2999,750,3000,750", ",124,4000,125"})
+    void gp3ModificationsNormalizeBelowBaselineAndPreserveZeroParameters(Integer iops, Integer throughput,
+                                                                        int expectedIops, int expectedThroughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 4000, 250, null, List.of());
+
+        VolumeModification modification = service.modifyVolume("us-east-1", volume.getVolumeId(),
+                null, null, iops, throughput, null, false);
+
+        assertEquals(expectedIops, modification.getTargetIops());
+        assertEquals(expectedThroughput, modification.getTargetThroughput());
+        assertEquals(expectedIops, volume.getIops());
+        assertEquals(expectedThroughput, volume.getThroughput());
+    }
+
+    @Test
+    void volumeModificationDryRunDoesNotResolveOrSeedResources() {
+        AccountAwareStorageBackend<Volume> volumeStore = AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<Vpc> vpcStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(
+                Map.of("ec2-volumes.json", volumeStore, "ec2-vpcs.json", vpcStore)));
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.modifyVolume("us-east-1", "vol-00000000000000000",
+                        0, "invalid", -1, -1, null, true));
+
+        assertEquals("DryRunOperation", failure.getErrorCode());
+        assertEquals(412, failure.getHttpStatus());
+        assertTrue(volumeStore.keys().isEmpty());
+        assertTrue(vpcStore.keys().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1, 4})
+    void volumePagesRejectSizesBelowFive(int maxResults) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.describeVolumes("us-east-1", List.of(), Map.of(), maxResults, null));
+
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        assertEquals("Value ( " + maxResults + " ) for parameter maxResults is invalid. "
+                + "Expecting a value greater than 5.", failure.getMessage());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {5, 500, 501, 1000, 1001, 10000})
+    void volumePagesAcceptSizesAtOrAboveFive(int maxResults) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of(), maxResults, null).volumes().isEmpty());
+    }
+
+    @Test
+    void volumePaginationPreservesRepeatedFilters() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        for (int i = 0; i < 6; i++) {
+            service.createVolume("us-east-1", "us-east-1a", "gp3", 1,
+                    false, 3000, null, null, List.of());
+        }
+        service.createVolume("us-east-1", "us-east-1a", "gp2", 1,
+                false, 0, null, null, List.of());
+        List<Map.Entry<String, List<String>>> filters = List.of(
+                Map.entry("volume-type", List.of("gp2", "gp3")),
+                Map.entry("volume-type", List.of("gp3")));
+
+        VolumeListResult first = service.describeVolumes("us-east-1", List.of(), filters, 5, null);
+        VolumeListResult second = service.describeVolumes("us-east-1", List.of(), filters, 5, first.nextToken());
+
+        assertEquals(5, first.volumes().size());
+        assertEquals(1, second.volumes().size());
+        assertTrue(first.volumes().stream().allMatch(volume -> "gp3".equals(volume.getVolumeType())));
+        assertEquals("gp3", second.volumes().getFirst().getVolumeType());
+        assertNull(second.nextToken());
+        assertTrue(service.describeVolumes("us-east-1", List.of(), List.of(
+                Map.entry("volume-type", List.of("gp2")),
+                Map.entry("volume-type", List.of("gp3"))), 5, null).volumes().isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1,3000,128", "500,3000,250", "2000,6000,250"})
+    void gp2ToGp3MigrationPreservesSourcePerformanceAboveTheBaseline(int size, int expectedIops,
+                                                                   int expectedThroughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp2", size,
+                false, 0, null, null, List.of());
+        VolumeModification modification = service.modifyVolume("us-east-1", volume.getVolumeId(),
+                null, "gp3", null, null, null, false);
+        assertEquals(expectedIops, modification.getTargetIops());
+        assertEquals(expectedThroughput, modification.getTargetThroughput());
+        Volume described = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals(expectedIops, described.getIops());
+        assertEquals(expectedThroughput, described.getThroughput());
+    }
+
+    @Test
+    void gp2SizeIncreaseRecomputesPerformanceAndGp3SizeIncreaseRetainsProvisioning() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume gp2 = service.createVolume("us-east-1", "us-east-1a", "gp2", 32,
+                false, 0, null, null, List.of());
+        service.modifyVolume("us-east-1", gp2.getVolumeId(), 100, null, null, null, null, false);
+        assertEquals(300, gp2.getIops());
+        Volume gp3 = service.createVolume("us-east-1", "us-east-1a", "gp3", 160,
+                false, 80000, 2000, null, List.of());
+        service.modifyVolume("us-east-1", gp3.getVolumeId(), 200, null, null, null, null, false);
+        assertEquals(80000, gp3.getIops());
+        assertEquals(2000, gp3.getThroughput());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"gp3,160,80000,2000,io2,3000,", "io2,256,256000,,gp3,3000,125"})
+    void changingProvisionedVolumeTypeUsesTheTargetsDefaults(String sourceType, int size, int iops,
+                                                            Integer throughput, String targetType,
+                                                            int expectedIops, Integer expectedThroughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", sourceType, size,
+                false, iops, throughput, null, List.of());
+        service.modifyVolume("us-east-1", volume.getVolumeId(), null, targetType, null, null, null, false);
+        assertEquals(expectedIops, volume.getIops());
+        assertEquals(expectedThroughput, volume.getThroughput());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"gp3,160,80000,2000", "gp3,65536,3000,125", "io1,1280,64000,",
+            "io2,256,256000,", "io2,65536,256000,"})
+    void validVolumeModificationsReportTheNewPerformanceLimits(String type, int size, int iops,
+                                                              Integer throughput) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 1,
+                false, 0, null, null, List.of());
+        VolumeModification changed = service.modifyVolume("us-east-1", volume.getVolumeId(),
+                size, type, iops, throughput, null, false);
+        assertEquals("completed", changed.getModificationState());
+        assertEquals(size, changed.getTargetSize());
+        assertEquals(iops, changed.getTargetIops());
+        assertEquals(throughput, changed.getTargetThroughput());
+        VolumeModification retained = service.modifyVolume("us-east-1", volume.getVolumeId(),
+                null, null, null, null, null, false);
+        assertEquals(iops, retained.getTargetIops());
+        assertEquals(throughput, retained.getTargetThroughput());
+        assertEquals(size, volume.getSize());
+        assertEquals(type, volume.getVolumeType());
+    }
+
     @Test
     void tagsStoredByBareIdMoveUnderTheirResourcesRegionAndOrphansAreDropped() {
         AccountAwareStorageBackend<List<Tag>> tagStore = AccountAwareStorageBackend.inMemory("000000000000");
@@ -1836,8 +2580,10 @@ class Ec2ServiceTest {
                     deleter.set(Thread.currentThread());
                     service.deleteEgressOnlyInternetGateway(region, eigwId);
                 });
-                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> deleting.isDone()
-                        || (deleter.get() != null && deleter.get().getState() == Thread.State.BLOCKED));
+                Awaitility.await().atMost(Duration.ofSeconds(5))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> deleting.isDone()
+                                || (deleter.get() != null && deleter.get().getState() == Thread.State.BLOCKED));
                 assertFalse(deleting.isDone(), "delete must take the gateway's tag lock");
             }
             deleting.get(5, TimeUnit.SECONDS);
@@ -1927,6 +2673,45 @@ class Ec2ServiceTest {
         assertEquals(1, result.networkInterfaces().size());
     }
 
+    @Test
+    void describeNetworkInterfacesPaginationSurvivesStorageReordering() {
+        AccountAwareStorageBackend<Instance> instances =
+                spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instances)));
+        List<Instance> launched = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                6, 6, null, List.of(), null, null, List.of(), null, null).getInstances();
+        Map<String, List<String>> filters = Map.of("vpc-id", List.of(launched.getFirst().getVpcId()));
+
+        doReturn(launched).when(instances).scanForAccount(eq("000000000000"), any());
+        NetworkInterfaceListResult first =
+                service.describeNetworkInterfaces("us-east-1", List.of(), filters, 5, null);
+        assertEquals(5, first.networkInterfaces().size());
+        assertNotNull(first.nextToken());
+
+        // Another write can reorder a storage scan without changing the matching interfaces.
+        doReturn(launched.reversed()).when(instances).scanForAccount(eq("000000000000"), any());
+        NetworkInterfaceListResult last =
+                service.describeNetworkInterfaces("us-east-1", List.of(), filters, 5, first.nextToken());
+        assertEquals(1, last.networkInterfaces().size());
+        assertNull(last.nextToken());
+
+        List<String> ids = new ArrayList<>(first.networkInterfaces().stream()
+                .map(NetworkInterface::getNetworkInterfaceId).toList());
+        ids.addAll(last.networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        Set<String> expected = new HashSet<>(launched.stream()
+                .map(instance -> instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId()).toList());
+        assertEquals(6, new HashSet<>(ids).size(), "Continuation must not repeat an interface");
+        assertEquals(expected, new HashSet<>(ids));
+
+        doReturn(launched).when(instances).scanForAccount(eq("000000000000"), any());
+        assertEquals(last.networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList(),
+                service.describeNetworkInterfaces("us-east-1", List.of(), filters, 5, first.nextToken())
+                        .networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+    }
+
     @ParameterizedTest
     @CsvSource({"false,false", "false,true", "true,false", "true,true"})
     void describeNetworkInterfacesFiltersActualAddressAssociations(boolean suppliedInterface, boolean defaultVpc) {
@@ -2003,6 +2788,32 @@ class Ec2ServiceTest {
                 Map.of("association.public-ip", List.of("*")), 0, null).networkInterfaces().isEmpty());
         assertEquals(2, service.describeNetworkInterfaces("us-east-1", List.of(), Map.of(), 0, null)
                 .networkInterfaces().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void primaryInterfaceMacIsPresentAndStableAcrossDescriptions(boolean suppliedInterface) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnetId = service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId();
+        NetworkInterface supplied = suppliedInterface
+                ? service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(), List.of()) : null;
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnetId, null, List.of(), null, null,
+                null, supplied != null ? supplied.getNetworkInterfaceId() : null, 0).getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        String mac = instance.getNetworkInterfaces().getFirst().getMacAddress();
+        assertNotNull(mac);
+        assertTrue(mac.matches("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}"));
+        if (supplied != null) {
+            assertEquals(supplied.getMacAddress(), mac);
+        }
+        assertEquals(mac, service.describeInstances(region, List.of(instance.getInstanceId()), Map.of()).getFirst()
+                .getInstances().getFirst().getNetworkInterfaces().getFirst().getMacAddress());
+        assertEquals(mac, service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of(), 0, null)
+                .networkInterfaces().getFirst().getMacAddress());
     }
 
     @ParameterizedTest
@@ -2307,6 +3118,73 @@ class Ec2ServiceTest {
         assertTrue(instance.getPublicIpAddress().startsWith("203.0.113."), instance.getPublicIpAddress());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"", "invalid", "198.51.100.1/30", "198.51.100.0/23", "2001:db8::/32"})
+    void mockPublicAddressPoolRejectsUnsupportedConfiguration(String cidr) {
+        EmulatorConfig config = mockPublicPoolConfig(cidr);
+        assertThrows(IllegalArgumentException.class, () -> mockModeService(config));
+    }
+
+    @Test
+    void mockPublicAddressPoolReservesWholeBatchesBeforeAnyInstanceWrites() {
+        Ec2Service service = mockModeService(mockPublicPoolConfig("198.51.100.4/30"));
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.242.0.0/24");
+        List<Instance> original = service.runInstances(region, "ami-test", "t3.micro", 3, 3,
+                null, List.of(), subnetId, null, List.of(), null, null).getInstances();
+        assertEquals(Set.of("198.51.100.4", "198.51.100.5", "198.51.100.6"),
+                original.stream().map(Instance::getPublicIpAddress).collect(Collectors.toSet()));
+        int volumes = service.describeVolumes(region, List.of(), Map.of()).size();
+        int interfaces = service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().size();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.runInstances(region,
+                "ami-test", "t3.micro", 2, 2, null, List.of(), subnetId, null, List.of(), null, null));
+
+        assertEquals("AddressLimitExceeded", error.getErrorCode());
+        assertEquals(3, service.describeInstances(region, List.of(), Map.of()).stream()
+                .mapToInt(reservation -> reservation.getInstances().size()).sum());
+        assertEquals(volumes, service.describeVolumes(region, List.of(), Map.of()).size());
+        assertEquals(interfaces, service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().size());
+        service.stopInstances(region, List.of(original.getFirst().getInstanceId()));
+        Instance replacement = service.runInstances(region, "ami-test", "t3.micro", 1, 1,
+                null, List.of(), subnetId, null, List.of(), null, null).getInstances().getFirst();
+        assertFalse(original.subList(1, 3).stream()
+                .anyMatch(instance -> instance.getPublicIpAddress().equals(replacement.getPublicIpAddress())));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void mockPublicAddressPoolExhaustionPreservesAnElasticIpAssociation(boolean dryRun) {
+        Ec2Service service = mockModeService(mockPublicPoolConfig("198.51.100.8/32"));
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.243.0.0/24");
+        Instance first = service.runInstances(region, "ami-test", "t3.micro", 1, 1,
+                null, List.of(), subnetId, null, List.of(), null, null).getInstances().getFirst();
+        service.describeInstances(region, List.of(first.getInstanceId()), Map.of());
+        Address elastic = service.allocateAddress(region);
+        service.associateAddress(region, elastic.getAllocationId(), first.getInstanceId());
+        String associationId = elastic.getAssociationId();
+        String publicIp = first.getPublicIpAddress();
+        service.runInstances(region, "ami-test", "t3.micro", 1, 1,
+                null, List.of(), subnetId, null, List.of(), null, null);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.disassociateAddress(region, associationId, dryRun));
+
+        assertEquals(dryRun ? "DryRunOperation" : "AddressLimitExceeded", error.getErrorCode());
+        assertEquals(associationId, elastic.getAssociationId());
+        assertEquals(first.getInstanceId(), elastic.getInstanceId());
+        assertEquals(publicIp, first.getPublicIpAddress());
+    }
+
+    private static EmulatorConfig mockPublicPoolConfig(String cidr) {
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().mockPublicAddresses())
+                .thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.POOL);
+        when(config.services().ec2().mockPublicAddressPool()).thenReturn(Optional.of(cidr));
+        return config;
+    }
+
     @Test
     void documentationAddressesAreDistinctAndChangeOnRestart() {
         Ec2Service service = mockModeService();
@@ -2318,7 +3196,8 @@ class Ec2ServiceTest {
         Set<String> addresses = new HashSet<>();
         for (Instance instance : launched) {
             assertTrue(instance.getPublicIpAddress().matches("203\\.0\\.113\\.[0-9]+"), instance.getPublicIpAddress());
-            assertEquals(instance.getPublicIpAddress(), instance.getPublicDnsName());
+            assertEquals("ec2-" + instance.getPublicIpAddress().replace('.', '-') + ".compute-1.amazonaws.com",
+                    instance.getPublicDnsName());
             addresses.add(instance.getPublicIpAddress());
         }
         assertEquals(3, addresses.size());
@@ -2333,7 +3212,8 @@ class Ec2ServiceTest {
     }
 
     @ParameterizedTest
-    @CsvSource(value = {"192.168.65.2,192.168.65.2,192.168.65.2", "' 192.168.65.3 ',192.168.65.3,192.168.65.3",
+    @CsvSource(value = {"192.168.65.2,192.168.65.2,ec2-192-168-65-2.compute-1.amazonaws.com",
+            "' 192.168.65.3 ',192.168.65.3,ec2-192-168-65-3.compute-1.amazonaws.com",
             "'  ',127.0.0.1,localhost", "NULL,127.0.0.1,localhost"}, nullValues = "NULL")
     void fixedMockAddressesUseTheConfiguredAddress(String configured, String expected, String dnsName) {
         EmulatorConfig config = mockConfig(true);
@@ -2376,20 +3256,89 @@ class Ec2ServiceTest {
         }
     }
 
-    @Test
-    void allocationFailsOnceEveryDocumentationAddressIsTaken() {
-        Ec2Service service = mockModeService();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void allocationFailsOnceEveryDocumentationAddressIsTaken(boolean anotherAccount) {
+        @SuppressWarnings("unchecked")
+        jakarta.enterprise.inject.Instance<RequestContext> contextInstance = mock(jakarta.enterprise.inject.Instance.class);
+        RequestContext context = new RequestContext();
+        when(contextInstance.isResolvable()).thenReturn(true);
+        when(contextInstance.get()).thenReturn(context);
+        context.setAccountId("111111111111");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(contextInstance), contextInstance);
         String region = "us-east-1";
         List<Address> allocated = new ArrayList<>();
         for (int i = 0; i < 254; i++) {
-            allocated.add(service.allocateAddress(region));
+            allocated.add(service.allocateAddress(i % 2 == 0 ? region : "us-west-2"));
         }
         assertEquals(254, allocated.stream().map(Address::getPublicIp).distinct().count());
+        if (anotherAccount) {
+            context.setAccountId("222222222222");
+            assertTrue(service.describeAddresses(region, List.of(), Map.of()).isEmpty());
+        }
         AwsException full = assertThrows(AwsException.class, () -> service.allocateAddress(region));
         assertEquals("AddressLimitExceeded", full.getErrorCode());
 
+        context.setAccountId("111111111111");
         service.releaseAddress(region, allocated.getFirst().getAllocationId());
-        assertEquals(allocated.getFirst().getPublicIp(), service.allocateAddress(region).getPublicIp());
+        context.setAccountId(anotherAccount ? "222222222222" : "111111111111");
+        Address replacement = service.allocateAddress("us-west-2");
+        assertEquals(allocated.getFirst().getPublicIp(), replacement.getPublicIp());
+        assertTrue(service.describeAddresses(region, List.of(replacement.getAllocationId()), Map.of()).isEmpty());
+        if (anotherAccount) {
+            context.setAccountId("111111111111");
+            assertTrue(service.describeAddresses("us-west-2",
+                    List.of(replacement.getAllocationId()), Map.of()).isEmpty());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void documentationAddressesKeepOtherAccountsReservationsAfterCursorWrapOrServiceRestart(boolean restart) {
+        @SuppressWarnings("unchecked")
+        jakarta.enterprise.inject.Instance<RequestContext> contextInstance = mock(jakarta.enterprise.inject.Instance.class);
+        RequestContext context = new RequestContext();
+        when(contextInstance.isResolvable()).thenReturn(true);
+        when(contextInstance.get()).thenReturn(context);
+        AccountAwareStorageBackend<Instance> instanceStore = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), contextInstance, "000000000000");
+        AccountAwareStorageBackend<Address> addressStore = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), contextInstance, "000000000000");
+        InMemoryStorageFactory storage = new InMemoryStorageFactory(
+                Map.of("ec2-instances.json", instanceStore, "ec2-addresses.json", addressStore), contextInstance);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), storage, contextInstance);
+        context.setAccountId("111111111111");
+        String subnet = publicSubnet(service, "us-east-1", "10.236.0.0/24");
+        Instance held = service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null, null).getInstances().getFirst();
+        service.describeInstances("us-east-1", List.of(held.getInstanceId()), Map.of());
+        Address elastic = service.allocateAddress("us-west-2");
+        Set<String> reserved = Set.of(held.getPublicIpAddress(), elastic.getPublicIp());
+        assertEquals(2, reserved.size());
+        context.setAccountId("222222222222");
+        if (restart) {
+            service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                    mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                    new Ec2InstanceTypeCatalog(), storage, contextInstance);
+        } else {
+            for (int i = 0; i < 252; i++) {
+                Address transientAddress = service.allocateAddress("us-east-1");
+                service.releaseAddress("us-east-1", transientAddress.getAllocationId());
+            }
+        }
+        assertTrue(service.describeInstances("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeAddresses("us-west-2", List.of(), Map.of()).isEmpty());
+        Address allocated = service.allocateAddress("us-east-1");
+        assertFalse(reserved.contains(allocated.getPublicIp()), allocated.getPublicIp());
+        context.setAccountId("111111111111");
+        assertEquals(held.getPublicIpAddress(), service.describeInstances("us-east-1",
+                List.of(held.getInstanceId()), Map.of()).getFirst().getInstances().getFirst().getPublicIpAddress());
+        assertEquals(elastic.getPublicIp(), service.describeAddresses("us-west-2",
+                List.of(elastic.getAllocationId()), Map.of()).getFirst().getPublicIp());
     }
 
     @Test
@@ -2468,7 +3417,8 @@ class Ec2ServiceTest {
 
     @Test
     void containerModeLaunchOnARetainedInterfaceRecordsTheElasticIpItCarries() {
-        Ec2Service service = containerModeService();
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(containerManager);
         String region = "us-east-1";
         String subnetId = publicSubnet(service, region, "10.249.0.0/24");
         NetworkInterface retained = service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(),
@@ -2477,6 +3427,7 @@ class Ec2ServiceTest {
         Address carried = service.allocateAddress(region);
         service.associateAddress(region, carried.getAllocationId(), first.getInstanceId());
         service.terminateInstances(region, List.of(first.getInstanceId()));
+        completeContainerTermination(containerManager, first, retained);
         assertNotNull(carried.getAssociationId());
 
         Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
@@ -2530,6 +3481,7 @@ class Ec2ServiceTest {
         service.associateAddress(region, carried.getAllocationId(), first.getInstanceId());
         String firstAddress = carried.getPublicIp();
         service.terminateInstances(region, List.of(first.getInstanceId()));
+        completeContainerTermination(containerManager, first, retained);
         Instance second = runningContainerInstance(service, region, subnetId, retained.getNetworkInterfaceId());
         String secondAddress = containerManager.reachablePublicAddress(second);
         assertNotEquals(firstAddress, secondAddress);
@@ -2562,6 +3514,16 @@ class Ec2ServiceTest {
         assertNull(instance.getPublicIpAddress());
     }
 
+    private static void completeContainerTermination(Ec2ContainerManager containerManager, Instance instance,
+                                                      NetworkInterface retained) {
+        assertEquals("in-use", retained.getStatus());
+        ArgumentCaptor<Runnable> completed = ArgumentCaptor.forClass(Runnable.class);
+        verify(containerManager).terminate(eq(instance), completed.capture());
+        instance.setState(InstanceState.terminated());
+        completed.getValue().run();
+        assertEquals("available", retained.getStatus());
+    }
+
     @Test
     void anInstanceCarriesItsShutdownBehaviorBeforeItsContainerLaunches() {
         Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
@@ -2570,7 +3532,8 @@ class Ec2ServiceTest {
             Instance launched = invocation.getArgument(0);
             behaviorsAtLaunch.add(launched.getInstanceInitiatedShutdownBehavior());
             return null;
-        }).when(containerManager).launch(any(), any(ResolvedAmiImage.class), any(), any(), any(), any(), any(), any());
+        }).when(containerManager).launch(any(), any(ResolvedAmiImage.class), any(), any(), any(),
+                any(), any(), any(), any(), any());
         AmiImageResolver images = mock(AmiImageResolver.class);
         when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
         Ec2Service service = new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class),
@@ -2578,7 +3541,7 @@ class Ec2ServiceTest {
 
         service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro", 2, 2, null, List.of(), null, null,
                 List.of(), null, null, null, null, 0, null, null, null, null, false, null, null, null, false, null,
-                null, "terminate");
+                null, null, "terminate");
 
         assertEquals(List.of("terminate", "terminate"), behaviorsAtLaunch);
     }
@@ -2675,8 +3638,313 @@ class Ec2ServiceTest {
     }
 
     /** Ec2Service in container mode, with a container manager whose containers answer on loopback. */
+    @Test
+    void attachingAndDetachingAnInterfaceGivesImdsTheInstancesCurrentInterfaces() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager);
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.245.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(),
+                List.of());
+
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(
+                region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+
+        ArgumentCaptor<Instance> refreshed = ArgumentCaptor.forClass(Instance.class);
+        verify(manager).refreshInstanceMetadata(refreshed.capture());
+        assertEquals(instance.getInstanceId(), refreshed.getValue().getInstanceId());
+        assertTrue(refreshed.getValue().getNetworkInterfaces().stream().anyMatch(eni ->
+                eni.getDeviceIndex() == 1 && extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())
+                        && extra.getMacAddress().equals(eni.getMacAddress())));
+
+        service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+
+        verify(manager, times(2)).refreshInstanceMetadata(refreshed.capture());
+        assertTrue(refreshed.getValue().getNetworkInterfaces().stream()
+                .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"current", "record-only", "deleted", "replaced"})
+    void attachingPersistsOwnershipOnlyOnTheCurrentInstance(String scenario, @TempDir Path directory) {
+        EmulatorConfig config = mockConfig(false);
+        EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
+        when(config.storage()).thenReturn(storage);
+        when(storage.persistentPath()).thenReturn(directory.toString());
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode("ec2")).thenReturn("persistent");
+        StorageFactory disk = new StorageFactory(config, access);
+        AccountAwareStorageBackend<Instance> store = disk.create("ec2", "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager,
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", store)));
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.246.0.0/24");
+        String otherSubnet = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, otherSubnet, null, null, List.of(), List.of(),
+                List.of());
+        String storageKey = region + "::" + instance.getInstanceId();
+        doAnswer(call -> {
+            InstanceNetworkInterface attached = call.getArgument(1);
+            if (scenario.equals("record-only")) {
+                return Optional.of("physical attachment disabled");
+            }
+            attached.setSharedNetworkContainerId(instance.getDockerContainerId());
+            if (scenario.equals("deleted")) {
+                store.delete(storageKey);
+            } else if (scenario.equals("replaced")) {
+                Instance replacement = new Instance();
+                replacement.setInstanceId(instance.getInstanceId());
+                replacement.setOwnerId(instance.getOwnerId());
+                replacement.setRegion(region);
+                replacement.setDockerContainerId("replacement-container");
+                store.put(storageKey, replacement);
+            }
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any(), any(), any());
+
+        service.attachNetworkInterface(region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+
+        StorageFactory recoveredDisk = new StorageFactory(config, access);
+        AccountAwareStorageBackend<Instance> recovered = recoveredDisk.create("ec2", "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        if (scenario.equals("deleted")) {
+            assertTrue(recovered.get(storageKey).isEmpty());
+        } else if (scenario.equals("replaced")) {
+            assertEquals("replacement-container", recovered.get(storageKey).orElseThrow().getDockerContainerId());
+            assertTrue(recovered.get(storageKey).orElseThrow().getNetworkInterfaces().isEmpty());
+        } else {
+            InstanceNetworkInterface attached = recovered.get(storageKey).orElseThrow().getNetworkInterfaces().stream()
+                    .filter(eni -> eni.getDeviceIndex() == 1).findFirst().orElseThrow();
+            assertEquals(scenario.equals("current") ? instance.getDockerContainerId() : null,
+                    attached.getSharedNetworkContainerId());
+        }
+    }
+
+    @Test
+    void failedOwnershipPersistenceRetainsTheAttachmentForCleanup() {
+        AccountAwareStorageBackend<Instance> store = spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager,
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", store)));
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.246.0.0/24");
+        String otherSubnet = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, otherSubnet, null, null, List.of(), List.of(),
+                List.of());
+        doAnswer(call -> {
+            InstanceNetworkInterface attached = call.getArgument(1);
+            attached.setSharedNetworkContainerId(instance.getDockerContainerId());
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any(), any(), any());
+        doThrow(new IllegalStateException("ownership write failed")).when(store).persistIfCurrent(anyString(), any());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
+                service.attachNetworkInterface(region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1));
+
+        assertEquals("ownership write failed", failure.getMessage());
+        assertSame(instance, store.get(region + "::" + instance.getInstanceId()).orElseThrow());
+        InstanceNetworkInterface attached = instance.getNetworkInterfaces().stream()
+                .filter(eni -> eni.getDeviceIndex() == 1).findFirst().orElseThrow();
+        assertEquals(instance.getDockerContainerId(), attached.getSharedNetworkContainerId());
+        assertNotNull(extra.getAttachment());
+        service.detachNetworkInterface(region, extra.getAttachment().getAttachmentId(), false);
+        verify(manager).unplugNetworkInterface(instance, attached);
+        assertNull(extra.getAttachment());
+    }
+
+    @Test
+    void attachingPlugsTheInterfaceAsADeviceAndDetachingUnplugsIt() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager);
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.246.0.0/24");
+        String otherSubnet = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, otherSubnet, null, null, List.of(), List.of(),
+                List.of());
+
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(
+                region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+
+        ArgumentCaptor<Instance> holder = ArgumentCaptor.forClass(Instance.class);
+        ArgumentCaptor<InstanceNetworkInterface> device = ArgumentCaptor.forClass(InstanceNetworkInterface.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<SecurityGroup>> groups = ArgumentCaptor.forClass(List.class);
+        verify(manager).plugNetworkInterface(holder.capture(), device.capture(), groups.capture(), any());
+        // A protected namespace enforces the attached interface's own groups: its VPC's default group here.
+        assertEquals(extra.getGroups().stream().map(GroupIdentifier::getGroupId).toList(),
+                groups.getValue().stream().map(SecurityGroup::getGroupId).toList());
+        assertEquals(extra.getVpcId(), groups.getValue().getFirst().getVpcId());
+        assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
+        assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
+        assertEquals(1, device.getValue().getDeviceIndex());
+        assertEquals(extra.getVpcId(), device.getValue().getVpcId());
+        assertEquals(extra.getSubnetId(), device.getValue().getSubnetId());
+        assertEquals(extra.getPrivateIpAddress(), device.getValue().getPrivateIpAddress());
+        assertEquals(extra.getMacAddress(), device.getValue().getMacAddress());
+        verify(manager, never()).unplugNetworkInterface(any(), any());
+
+        service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+
+        verify(manager).unplugNetworkInterface(holder.capture(), device.capture());
+        verify(manager, times(2)).refreshInstanceMetadata(any(Instance.class));
+        assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
+        assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
+        assertEquals(extra.getMacAddress(), device.getValue().getMacAddress());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+    void attachedInterfacePolicyUsesItsOwnerAccount(boolean foreign, boolean restore) throws Exception {
+        String owner = "111111111111";
+        String hostAccount = foreign ? "222222222222" : owner;
+        String region = "us-east-1";
+        RequestContext context = new RequestContext();
+        context.setAccountId(owner);
+        // The EC2 model Instance is imported; this is CDI's Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        EmulatorConfig config = mockConfig(true);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(contexts), contexts);
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface extra = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        SecurityGroup group = service.describeSecurityGroups(region,
+                List.of(extra.getGroups().getFirst().getGroupId()), List.of(), Map.of()).getFirst();
+        ManagedPrefixList prefix = service.createManagedPrefixList(region, "interface-owner-prefix", "IPv4", 1,
+                List.of(new PrefixListEntry("192.0.2.0/24", "owner")), List.of());
+        IpPermission permission = new IpPermission();
+        permission.setIpProtocol("-1");
+        permission.getPrefixListIds().add(new PrefixListId(prefix.getPrefixListId(), null));
+        group.getIpPermissions().add(permission);
+        service.createNetworkInterfacePermission(region, extra.getNetworkInterfaceId(), hostAccount, null,
+                Ec2Service.INSTANCE_ATTACH);
+        context.setAccountId(hostAccount);
+        String hostSubnet = privateSubnet(service, region, "10.234.0.0/24");
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), hostSubnet, null, List.of(), null, null).getInstances().getFirst();
+        host.setState(InstanceState.running());
+
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(region,
+                extra.getNetworkInterfaceId(), host.getInstanceId(), 1);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<SecurityGroup>> groups = ArgumentCaptor.forClass(List.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, List<String>>> prefixes = ArgumentCaptor.forClass(Map.class);
+        if (restore) {
+            EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class, RETURNS_DEEP_STUBS);
+            when(config.network()).thenReturn(network);
+            when(network.securityGroupEnforcement().enabled()).thenReturn(true);
+            Method restoreFirewall = Ec2Service.class.getDeclaredMethod("restoreInstanceFirewall", Instance.class);
+            restoreFirewall.setAccessible(true);
+            restoreFirewall.invoke(service, host);
+            verify(manager).restoreAttachedInterface(eq(host), any(), groups.capture(), prefixes.capture());
+        } else {
+            verify(manager).plugNetworkInterface(eq(host), any(), groups.capture(), prefixes.capture());
+        }
+        assertEquals(List.of(group), groups.getValue(), "The attached policy belongs to the interface owner");
+        assertEquals(Map.of(prefix.getPrefixListId(), List.of("192.0.2.0/24")), prefixes.getValue());
+        assertEquals(hostAccount, context.getAccountId(), "Policy resolution must not change the request owner");
+        context.setAccountId(owner);
+        service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+        ArgumentCaptor<InstanceNetworkInterface> detached = ArgumentCaptor.forClass(InstanceNetworkInterface.class);
+        verify(manager).unplugNetworkInterface(eq(host), detached.capture());
+        assertEquals(extra.getNetworkInterfaceId(), detached.getValue().getNetworkInterfaceId());
+        assertTrue(host.getNetworkInterfaces().stream()
+                .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void detachWaitsForTheAdmittedPlugButVpcTopologyRemainsAvailable(boolean foreign) throws Exception {
+        String owner = "111111111111";
+        String hostAccount = foreign ? "222222222222" : owner;
+        String region = "us-east-1";
+        ThreadLocal<String> current = ThreadLocal.withInitial(() -> owner);
+        // Account-aware storage caches the CDI proxy, whose values follow the current request.
+        RequestContext context = mock(RequestContext.class);
+        when(context.getAccountId()).thenAnswer(call -> current.get());
+        // CDI Instance and the imported EC2 model Instance have the same simple name.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(contexts), contexts);
+        String customer = privateSubnet(service, region, "10.247.0.0/24");
+        NetworkInterface extra = service.createNetworkInterface(region, customer, null, null,
+                List.of(), List.of(), List.of());
+        if (foreign) {
+            service.createNetworkInterfacePermission(region, extra.getNetworkInterfaceId(), hostAccount, null,
+                    Ec2Service.INSTANCE_ATTACH);
+        }
+        current.set(hostAccount);
+        String home = privateSubnet(service, region, "10.246.0.0/24");
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), home, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<String> attachment = new AtomicReference<>();
+        AtomicReference<Thread> detaching = new AtomicReference<>();
+        doAnswer(call -> {
+            InstanceNetworkInterface device = call.getArgument(1);
+            attachment.set(device.getAttachmentId());
+            entered.countDown();
+            assertTrue(release.await(15, TimeUnit.SECONDS));
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any(), any(), any());
+        ExecutorService workers = Executors.newFixedThreadPool(3);
+        try {
+            Future<NetworkInterfaceAttachment> attaching = workers.submit(() -> {
+                current.set(hostAccount);
+                return service.attachNetworkInterface(region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+            });
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            Future<NetworkInterfaceAttachment> detached = workers.submit(() -> {
+                detaching.set(Thread.currentThread());
+                return service.detachNetworkInterface(region, attachment.get(), false);
+            });
+            awaitBlockedOrDone(detaching, detached);
+            if (detached.isDone()) {
+                detached.get(5, TimeUnit.SECONDS);
+            }
+            assertFalse(detached.isDone(), "Detach must not race ahead of the admitted Docker plug");
+            assertNotNull(workers.submit(() -> service.createVpc(region, "10.248.0.0/24", false))
+                    .get(5, TimeUnit.SECONDS), "Unrelated topology changes must not wait for Docker");
+            verify(manager, never()).unplugNetworkInterface(any(), any());
+            release.countDown();
+            assertEquals(attaching.get(5, TimeUnit.SECONDS).getAttachmentId(),
+                    detached.get(5, TimeUnit.SECONDS).getAttachmentId());
+            InOrder order = inOrder(manager);
+            order.verify(manager).plugNetworkInterface(any(), any(), any(), any());
+            order.verify(manager).unplugNetworkInterface(any(), any());
+            assertTrue(instance.getNetworkInterfaces().stream()
+                    .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
+        } finally {
+            release.countDown();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+            current.remove();
+        }
+    }
+
     private static Ec2Service containerModeService() {
-        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        return containerModeService(mock(Ec2ContainerManager.class));
+    }
+
+    private static Ec2Service containerModeService(Ec2ContainerManager containerManager) {
+        return containerModeService(containerManager, new InMemoryStorageFactory());
+    }
+
+    private static Ec2Service containerModeService(Ec2ContainerManager containerManager, StorageFactory storageFactory) {
         when(containerManager.reachablePublicAddress(any())).thenAnswer(invocation -> {
             Instance instance = invocation.getArgument(0);
             return instance.getDockerContainerId() == null ? null : "127.0.0.1";
@@ -2684,7 +3952,7 @@ class Ec2ServiceTest {
         AmiImageResolver images = mock(AmiImageResolver.class);
         when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
         return new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class), images,
-                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), storageFactory);
     }
 
     private static String publicSubnet(Ec2Service service, String region, String cidr) {
@@ -2746,6 +4014,23 @@ class Ec2ServiceTest {
         for (String filter : List.of("association.ip-owner-id", "association.public-ip")) {
             assertTrue(service.describeNetworkInterfaces("us-east-1", List.of(),
                     Map.of(filter, List.of("*")), 0, null).networkInterfaces().isEmpty());
+        }
+    }
+
+    @Test
+    void awaitContainerLaunchWakesAllWaitersOnRunningWithoutPolling() throws Exception {
+        Ec2Service service = new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Instance instance = new Instance();
+        instance.setInstanceId("i-signalled");
+        instance.setState(InstanceState.pending());
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> first = executor.submit(() -> service.awaitContainerLaunch(instance));
+            Future<?> second = executor.submit(() -> service.awaitContainerLaunch(instance));
+            instance.setState(InstanceState.running());
+            first.get(2, TimeUnit.SECONDS);
+            second.get(2, TimeUnit.SECONDS);
         }
     }
 
@@ -2901,6 +4186,38 @@ class Ec2ServiceTest {
         assertEquals(instanceId, after.getAttachment().getInstanceId());
     }
 
+    @Test
+    void serviceInterfaceGroupsValidateBeforeMutationAndRestoreTheVpcDefault() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        NetworkInterface eni = service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of());
+        String eniId = eni.getNetworkInterfaceId();
+        List<GroupIdentifier> defaults = List.copyOf(eni.getGroups());
+        SecurityGroup group = service.createSecurityGroup(region, "alb-backend", "backend", subnet.getVpcId());
+
+        assertEquals("InvalidNetworkInterface.InUse", assertThrows(AwsException.class,
+                () -> service.setNetworkInterfaceGroupsForService(region, eniId, List.of(group.getGroupId())))
+                .getErrorCode());
+        service.holdNetworkInterfaceForService(region, eniId);
+        service.setNetworkInterfaceGroupsForService(region, eniId, List.of(group.getGroupId()));
+        assertEquals(List.of(group.getGroupId()), readInterface(service, eniId).getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        String foreignVpc = service.createVpc(region, "10.93.0.0/16", false).getVpcId();
+        SecurityGroup foreign = service.createSecurityGroup(region, "foreign-alb", "foreign", foreignVpc);
+        assertEquals("InvalidGroup.NotFound", assertThrows(AwsException.class,
+                () -> service.setNetworkInterfaceGroupsForService(region, eniId,
+                        List.of(group.getGroupId(), foreign.getGroupId()))).getErrorCode());
+        assertEquals(List.of(group.getGroupId()), readInterface(service, eniId).getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        service.setNetworkInterfaceGroupsForService(region, eniId, List.of());
+        assertEquals(defaults.stream().map(GroupIdentifier::getGroupId).toList(),
+                readInterface(service, eniId).getGroups().stream().map(GroupIdentifier::getGroupId).toList());
+    }
+
     private static NetworkInterface readInterface(Ec2Service service, String networkInterfaceId) {
         return service.describeNetworkInterfaces("us-east-1", List.of(networkInterfaceId), Map.of(), 0, null)
                 .networkInterfaces().getFirst();
@@ -3012,8 +4329,10 @@ class Ec2ServiceTest {
                 (associateFirst ? delete : associate).run();
             });
             String secondMethod = associateFirst ? "deleteNetworkInterface" : "associateAddress";
-            Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> second.isDone()
-                    || isBlockedIn(secondWorker.get(), secondMethod, firstWorker.get()));
+            Awaitility.await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> second.isDone()
+                            || isBlockedIn(secondWorker.get(), secondMethod, firstWorker.get()));
             parking.release();
             first.get(10, TimeUnit.SECONDS);
             if (associateFirst) {
@@ -3337,7 +4656,7 @@ class Ec2ServiceTest {
     @Test
     void aSecondaryAddressUpdateRefusesAGatewayStoredAsDeleted() throws Exception {
         CountDownLatch putReached = new CountDownLatch(1);
-        CountDownLatch deleteDone = new CountDownLatch(1);
+        CountDownLatch gatewayDeleted = new CountDownLatch(1);
         AtomicReference<Boolean> pausePut = new AtomicReference<>(false);
         InMemoryStorage<String, NatGateway> rawGateways = new InMemoryStorage<>() {
             @Override
@@ -3345,12 +4664,18 @@ class Ec2ServiceTest {
                 if (pausePut.getAndSet(false)) {
                     putReached.countDown();
                     try {
-                        assertTrue(deleteDone.await(5, TimeUnit.SECONDS));
+                        assertTrue(gatewayDeleted.await(5, TimeUnit.SECONDS));
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
                 }
                 super.put(key, value);
+            }
+
+            @Override
+            public void delete(String key) {
+                super.delete(key);
+                gatewayDeleted.countDown();
             }
         };
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
@@ -3369,7 +4694,6 @@ class Ec2ServiceTest {
                     List.of(new Tag("k", "v"))));
             assertTrue(putReached.await(5, TimeUnit.SECONDS), "the tag write reaches its put");
             service.deleteNatGateway(region, natId);
-            deleteDone.countDown();
             tagging.get(5, TimeUnit.SECONDS);
             assertEquals("deleted", rawGateways.scan(k -> true).getFirst().getState(),
                     "the tag write stored the deleted gateway");
@@ -3380,6 +4704,7 @@ class Ec2ServiceTest {
             assertNull(service.describeAddresses(region, List.of(added), Map.of()).getFirst().getAssociationId(),
                     "the requested Elastic IP is not held for the deleted gateway");
         } finally {
+            gatewayDeleted.countDown();
             worker.shutdownNow();
             assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
         }
@@ -3521,6 +4846,61 @@ class Ec2ServiceTest {
         assertFalse(deleter.isAlive());
         assertNull(service.describeAddresses("us-east-1", List.of(allocationId), Map.of())
                 .getFirst().getAssociationId());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "replace"})
+    void deletingNatGatewayBlackholesARouteWhoseTargetWasJustValidated(String operation) throws Exception {
+        ParkingStore<NatGateway> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<NatGateway> store =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-nat-gateways.json", store)));
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String allocation = service.allocateAddress(region).getAllocationId();
+        String nat = service.createNatGateway(region, subnet.getSubnetId(), allocation, null, null).getNatGatewayId();
+        String table = service.createRouteTable(region, subnet.getVpcId()).getRouteTableId();
+        if ("replace".equals(operation)) {
+            String gateway = service.describeInternetGateways(region, List.of(), Map.of())
+                    .getFirst().getInternetGatewayId();
+            service.createRoute(region, table, "0.0.0.0/0", null, null, gateway, null, null, null);
+        }
+        parking.parkNextRead();
+        AtomicReference<Thread> deletingThread = new AtomicReference<>();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> mutation = workers.submit(() -> {
+                if ("create".equals(operation)) {
+                    service.createRoute(region, table, "0.0.0.0/0", null, null, null, nat, null, null);
+                } else {
+                    service.replaceRoute(region, table, "0.0.0.0/0", null, null, null, nat, null);
+                }
+            });
+            assertTrue(parking.awaitParked(), "The route must have read its target before deletion");
+            Future<?> deletion = workers.submit(() -> {
+                deletingThread.set(Thread.currentThread());
+                service.deleteNatGateway(region, nat);
+            });
+            Awaitility.await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() ->
+                            store.get(region + "::" + nat).isEmpty() && (deletion.isDone()
+                                    || deletingThread.get() != null && deletingThread.get().getState() == Thread.State.BLOCKED));
+            parking.release();
+            mutation.get(5, TimeUnit.SECONDS);
+            deletion.get(5, TimeUnit.SECONDS);
+
+            assertEquals("blackhole", service.describeRouteTables(region, List.of(table), Map.of())
+                    .getFirst().getRoutes().stream().filter(route -> nat.equals(route.getNatGatewayId()))
+                    .findFirst().orElseThrow().getState());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     @Test
@@ -3923,8 +5303,10 @@ class Ec2ServiceTest {
                         service.associateVpcCidrBlock("us-east-1", vpc.getVpcId(), "198.18.0.0/16");
                     }
                 });
-                Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> editing.isDone()
-                        || (editor.get() != null && editor.get().getState() == Thread.State.BLOCKED));
+                Awaitility.await().atMost(Duration.ofSeconds(5))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .until(() -> editing.isDone()
+                                || (editor.get() != null && editor.get().getState() == Thread.State.BLOCKED));
                 assertFalse(editing.isDone(), "CIDR edits must not mutate the list while subnet validation scans it");
                 resume.countDown();
                 assertEquals("10.1.1.0/24", creating.get(5, TimeUnit.SECONDS).getCidrBlock());
@@ -4135,6 +5517,7 @@ class Ec2ServiceTest {
                 String method = "create".equals(operation) ? "createLaunchTemplateVersion" : "modifyLaunchTemplate";
                 Awaitility.await("mutation has resolved the original name and waits for its monitor")
                         .atMost(Duration.ofSeconds(10))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                         .until(() -> isBlockedIn(mutationThread.get(), method, owner));
                 service.deleteLaunchTemplate("us-east-1", original.getLaunchTemplateId(), null);
                 replacement = service.createLaunchTemplate("us-east-1", name, new LaunchTemplateData(), List.of());
@@ -4568,7 +5951,7 @@ class Ec2ServiceTest {
 
         assertEquals(1, images.size());
         Image matched = images.getFirst();
-        assertEquals("ami-amazonlinux2023-arm64", matched.getImageId());
+        assertEquals("ami-0abcdef1234567894", matched.getImageId());
         assertEquals("arm64", matched.getArchitecture());
         assertEquals("al2023-ami-2023.0.20230315.0-kernel-6.1-arm64", matched.getName());
     }
@@ -4814,6 +6197,13 @@ class Ec2ServiceTest {
         legacyVpc.setOwnerId("000000000000");
         legacyVpc.setRegion("us-east-1");
         putViaReflection(service, "vpcs", "us-east-1::vpc-default", legacyVpc);
+        SecurityGroup legacyGroup = new SecurityGroup();
+        legacyGroup.setGroupId("sg-default");
+        legacyGroup.setGroupName("default");
+        legacyGroup.setVpcId("vpc-default");
+        legacyGroup.setOwnerId("000000000000");
+        legacyGroup.setRegion("us-east-1");
+        putViaReflection(service, "securityGroups", "us-east-1::sg-default", legacyGroup);
 
         assertEquals("vpc-default", service.resolveDefaultVpcId("us-east-1"),
                 "must resolve the pre-existing unscoped default VPC, not compute a fresh scoped id");
@@ -4822,9 +6212,100 @@ class Ec2ServiceTest {
         assertEquals("vpc-default", created.getVpcId(),
                 "a new security group with no explicit VpcId must attach to the real default VPC on file");
 
-        // A genuinely fresh region has neither format on file, so the resolver falls back to the
+        Instance launched = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        assertEquals(List.of("sg-default"), launched.getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+
+        // A genuinely fresh region has neither format on file, so both resolvers fall back to the
         // scoped form ensureDefaultResources would seed.
         assertEquals(Ec2Service.defaultVpcId("eu-west-1", "000000000000"), service.resolveDefaultVpcId("eu-west-1"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "eu-west-1"})
+    void runInstancesUsesTheSelectedVpcDefaultSecurityGroup(String region) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String vpcId = service.createVpc(region, "10.82.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.82.1.0/24", region + "a");
+        String expectedGroupId = service.describeSecurityGroups(region, List.of(), List.of(), Map.of()).stream()
+                .filter(group -> vpcId.equals(group.getVpcId()) && "default".equals(group.getGroupName()))
+                .findFirst().orElseThrow().getGroupId();
+
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro",
+                1, 1, null, List.of(), subnet.getSubnetId(), null, List.of(), null, null)
+                .getInstances().getFirst();
+
+        assertEquals(vpcId, instance.getVpcId());
+        assertEquals(List.of(expectedGroupId), instance.getSecurityGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        assertEquals(List.of(expectedGroupId), instance.getNetworkInterfaces().getFirst().getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "eu-west-1"})
+    void runInstancesRejectsAnotherVpcGroupBeforeAllocatingResources(String region) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String selectedVpc = service.createVpc(region, "10.83.0.0/16", false).getVpcId();
+        String otherVpc = service.createVpc(region, "10.84.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, selectedVpc, "10.83.1.0/28", region + "a");
+        String otherGroup = service.createSecurityGroup(region, "foreign-vpc", "foreign-vpc", otherVpc).getGroupId();
+        int available = subnet.getAvailableIpAddressCount();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.runInstances(region, "ami-test", "t3.micro",
+                1, 1, null, List.of(otherGroup), subnet.getSubnetId(), null,
+                List.of(new Tag("RejectedLaunch", "probe")), null, null));
+
+        assertEquals("InvalidParameter", error.getErrorCode());
+        assertEquals("Security group " + otherGroup + " and subnet " + subnet.getSubnetId()
+                + " belong to different networks.", error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+        assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of(), 0, null).networkInterfaces().isEmpty());
+        assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags(region, Map.of("key", List.of("RejectedLaunch"))).isEmpty());
+        assertEquals(available, service.describeSubnets(region, List.of(subnet.getSubnetId()), Map.of())
+                .getFirst().getAvailableIpAddressCount());
+    }
+
+    @Test
+    void securityGroupErrorsPreserveTheOperationAndMissingGroupDistinction() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpc = service.createVpc(region, "10.88.0.0/16", false).getVpcId();
+        String otherVpc = service.createVpc(region, "10.89.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpc, "10.88.1.0/24", region + "a");
+        String foreign = service.createSecurityGroup(region, "foreign", "foreign", otherVpc).getGroupId();
+
+        assertEquals("InvalidGroup.NotFound", assertThrows(AwsException.class,
+                () -> service.createNetworkInterface(region, subnet.getSubnetId(), null, null, List.of(),
+                        List.of(foreign), List.of())).getErrorCode());
+        assertEquals("InvalidGroup.NotFound", assertThrows(AwsException.class,
+                () -> service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                        List.of("sg-fffffffffffffffff"), subnet.getSubnetId(), null, List.of(), null, null))
+                .getErrorCode());
+        assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+    }
+
+    @Test
+    void suppliedPrimaryInterfaceKeepsItsOwnVpcSecurityGroups() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.85.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.85.1.0/24", region + "a");
+        String groupId = service.createSecurityGroup(region, "interface-group", "interface-group", vpcId).getGroupId();
+        NetworkInterface eni = service.createNetworkInterface(region, subnet.getSubnetId(), "primary",
+                null, List.of(), List.of(groupId), List.of());
+
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(service.resolveDefaultSecurityGroupId(region)), null, null, List.of(),
+                null, null, null, eni.getNetworkInterfaceId(), 0).getInstances().getFirst();
+
+        assertEquals(vpcId, instance.getVpcId());
+        assertEquals(List.of(groupId), instance.getSecurityGroups().stream().map(GroupIdentifier::getGroupId).toList());
+        assertEquals(eni.getNetworkInterfaceId(), instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
     }
 
     @SuppressWarnings("unchecked")
@@ -5549,6 +7030,32 @@ class Ec2ServiceTest {
                 .getInstances().getFirst().getPrivateIpAddress());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void isolatedDefaultVpcIgnoresAnotherAccountsPrivateAddress(boolean requested) {
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000");
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other",
+                defaultSubnetInstance("i-other", "172.31.0.50", InstanceState.running()));
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        when(vpcNetworks.isolatesAddressSpaces()).thenReturn(true);
+        when(vpcNetworks.effectiveSubnetCidr("000000000000", "us-east-1", subnetId)).thenReturn(Optional.of("172.31.0.0/20"));
+        when(vpcNetworks.allocatePrivateIp("000000000000", "us-east-1", subnetId))
+                .thenReturn(Optional.of("172.31.0.50"), Optional.of("172.31.0.51"));
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-instances.json", instanceStore), vpcNetworks);
+
+        String address = requested
+                ? launchWithPrivateIp(service, subnetId, 1, "172.31.0.50")
+                    .getInstances().getFirst().getPrivateIpAddress()
+                : launchAddresses(service, subnetId, 1).getFirst();
+
+        assertEquals("172.31.0.50", address);
+        AwsException duplicate = assertThrows(AwsException.class,
+                () -> launchWithPrivateIp(service, subnetId, 1, address));
+        assertEquals("InvalidIPAddress.InUse", duplicate.getErrorCode(),
+                "Isolation must still reject an address held in the caller's own subnet");
+    }
+
     @Test
     void aRequestedPrivateIpIsLeasedSoTheRealVpcNetworkDoesNotHandItOutAgain() {
         // The manager's allocator consults only its own lease table. Without the lease it would
@@ -5760,6 +7267,549 @@ class Ec2ServiceTest {
         context.setAccountId("000000000000");
 
         assertEquals(List.of("172.31.0.10"), launchAddresses(service, subnetId, 1));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void systemTagCleanupDoesNotSeedDefaultsOrRequireOpenAdmission(boolean paused) throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        ParkingStore<Instance> backing = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> instances =
+                new AccountAwareStorageBackend<>(backing, null, "000000000000");
+        Instance instance = defaultSubnetInstance("i-cleanup-tags", "172.31.0.10", InstanceState.stopped());
+        instance.setTags(new ArrayList<>(List.of(new Tag("aws:autoscaling:groupName", "owned"),
+                new Tag("keep", "value"))));
+        instances.put("us-east-1::i-cleanup-tags", instance);
+        AccountAwareStorageBackend<List<Tag>> tags =
+                new AccountAwareStorageBackend<>(new ParkingStore<>(), null, "000000000000");
+        tags.put("us-east-1::i-cleanup-tags", new ArrayList<>(instance.getTags()));
+        Ec2Service service = mockedVpcNetworkService(
+                Map.of("ec2-instances.json", instances, "ec2-tags.json", tags), networks);
+        if (paused) {
+            service.pauseAndDrainOperations(Duration.ZERO);
+        }
+        clearInvocations(networks);
+
+        service.deleteSystemTag("us-east-1", List.of(instance.getInstanceId()),
+                "aws:autoscaling:groupName", "other");
+        assertEquals(2, instance.getTags().size());
+        service.deleteSystemTag("us-east-1", List.of(instance.getInstanceId()),
+                "aws:autoscaling:groupName", "owned");
+
+        assertEquals(1, instance.getTags().size());
+        assertEquals("keep", instance.getTags().getFirst().getKey());
+        assertEquals("value", instance.getTags().getFirst().getValue());
+        assertEquals("keep", service.resourceTags("us-east-1", instance.getInstanceId()).getFirst().getKey());
+        verifyNoInteractions(networks);
+        if (paused) {
+            assertThrows(IllegalStateException.class, () -> service.ensureDefaultResources("us-east-1"));
+            assertThrows(IllegalStateException.class,
+                    () -> service.createSystemTags("us-east-1", List.of(instance.getInstanceId()),
+                            List.of(new Tag("aws:autoscaling:groupName", "new"))));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void missingSystemTagCleanupDoesNotSeedDefaultsOrRequireOpenAdmission(boolean paused) throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(Map.of(), networks);
+        if (paused) {
+            service.pauseAndDrainOperations(Duration.ZERO);
+        }
+        clearInvocations(networks);
+
+        service.deleteSystemTag("us-west-2", List.of("i-missing"), "aws:autoscaling:groupName", "owned");
+
+        assertTrue(service.resourceTags("us-west-2", "i-missing").isEmpty());
+        verifyNoInteractions(networks);
+        if (paused) {
+            assertThrows(IllegalStateException.class, () -> service.ensureDefaultResources("us-west-2"));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"register", "copy", "deregister"})
+    void resetAdmissionDrainsImageMutationAndRefusesLaterCalls(String mutation) throws Exception {
+        ParkingStore<Image> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Image> images =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-registered-images.json", images),
+                mock(VpcNetworkManager.class));
+        Image source = service.registerImage("us-east-1", "source", null, null, null, List.of());
+        Runnable change = switch (mutation) {
+            case "register" -> () -> service.registerImage("us-east-1", "created", null, null, null, List.of());
+            case "copy" -> () -> service.copyImage("us-west-2", "us-east-1", source.getImageId(),
+                    "copied", null, false, List.of());
+            case "deregister" -> () -> service.deregisterImage("us-east-1", source.getImageId(), false);
+            default -> throw new IllegalArgumentException(mutation);
+        };
+        if ("register".equals(mutation)) {
+            parking.parkNextWrite();
+        } else {
+            parking.parkNextRead();
+        }
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> changed = executor.submit(change);
+            try {
+                assertTrue(parking.awaitParked());
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                parking.release();
+            }
+            changed.get(10, TimeUnit.SECONDS);
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertThrows(IllegalStateException.class, change::run);
+        if ("deregister".equals(mutation)) {
+            assertEquals("deregistered", images.get("us-east-1::" + source.getImageId()).orElseThrow().getState());
+        } else {
+            assertEquals(2, images.scan(key -> true).size());
+        }
+        service.resumeOperationsAfterReset();
+        assertDoesNotThrow(() -> service.registerImage("us-east-1", "resumed", null, null, null, List.of()));
+    }
+
+    @Test
+    void resetAdmissionDrainsImageCaptureAfterRegistration() throws Exception {
+        Ec2ContainerManager containers = capturingContainerManager();
+        Ec2Service service = liveService(containers, minimalImageResolver());
+        String instanceId = runOne(service, "ami-source");
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(containers.commitInstance(any(Instance.class), anyString())).thenAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return "floci-ami/test-capture:latest";
+        });
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<Image> created = executor.submit(() -> service.createImage("us-east-1", instanceId,
+                    "captured", null, true));
+            try {
+                assertTrue(entered.await(10, TimeUnit.SECONDS));
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                release.countDown();
+            }
+            assertEquals("floci-ami/test-capture:latest", created.get(10, TimeUnit.SECONDS).getDockerImage());
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertThrows(IllegalStateException.class,
+                () -> service.createImage("us-east-1", instanceId, "closed", null, true));
+        verify(containers).commitInstance(any(Instance.class), anyString());
+        service.resumeOperationsAfterReset();
+        assertEquals("resumed", service.createImage("us-east-1", instanceId, "resumed", null, true).getName());
+    }
+
+    @Test
+    void resetAdmissionReleasesFailedImageCaptureAndAllowsNameReuse() throws Exception {
+        Ec2ContainerManager containers = capturingContainerManager();
+        Ec2Service service = liveService(containers, minimalImageResolver());
+        String instanceId = runOne(service, "ami-source");
+        when(containers.commitInstance(any(Instance.class), anyString())).thenReturn(null);
+        assertEquals("IncorrectInstanceState", assertThrows(AwsException.class,
+                () -> service.createImage("us-east-1", instanceId, "captured", null, true)).getErrorCode());
+        service.pauseAndDrainOperations(Duration.ZERO);
+        service.resumeOperationsAfterReset();
+        when(containers.commitInstance(any(Instance.class), anyString())).thenReturn("floci-ami/test-capture:latest");
+        assertEquals("captured", service.createImage("us-east-1", instanceId, "captured", null, true).getName());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "copy", "delete"})
+    void resetAdmissionDrainsSnapshotMutationAndRefusesLaterCalls(String mutation) throws Exception {
+        ParkingStore<Snapshot> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Snapshot> snapshots =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-snapshots.json", snapshots),
+                mock(VpcNetworkManager.class));
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of());
+        Snapshot source = service.createSnapshot("us-east-1", volume.getVolumeId(), "source", List.of(), false);
+        Runnable change = switch (mutation) {
+            case "create" -> () -> service.createSnapshot("us-east-1", volume.getVolumeId(),
+                    "created", List.of(), false);
+            case "copy" -> () -> service.copySnapshot("us-west-2", "us-east-1", source.getSnapshotId(),
+                    "copied", false, List.of(), false);
+            case "delete" -> () -> service.deleteSnapshot("us-east-1", source.getSnapshotId(), false);
+            default -> throw new IllegalArgumentException(mutation);
+        };
+        if ("delete".equals(mutation)) {
+            parking.parkNextRead();
+        } else {
+            parking.parkNextWrite();
+        }
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> changed = executor.submit(change);
+            try {
+                assertTrue(parking.awaitParked());
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                parking.release();
+            }
+            changed.get(10, TimeUnit.SECONDS);
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertThrows(IllegalStateException.class, change::run);
+        if ("delete".equals(mutation)) {
+            assertTrue(snapshots.get("us-east-1::" + source.getSnapshotId()).isEmpty());
+        } else {
+            assertEquals(2, snapshots.scan(key -> true).size());
+            assertTrue(service.describeSnapshots("copy".equals(mutation) ? "us-west-2" : "us-east-1",
+                    List.of(), List.of(), Map.of()).stream()
+                    .anyMatch(snapshot -> ("copy".equals(mutation) ? "copied" : "created")
+                            .equals(snapshot.getDescription())));
+        }
+        service.resumeOperationsAfterReset();
+        assertDoesNotThrow(() -> service.copySnapshot("us-west-2", "us-east-1",
+                service.createSnapshot("us-east-1", volume.getVolumeId(), "resumed", List.of(), false)
+                        .getSnapshotId(), "resumed copy", false, List.of(), false));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "modify", "attach", "detach", "delete", "settle"})
+    void resetAdmissionDrainsVolumeMutationAndRefusesLaterCalls(String mutation) throws Exception {
+        ParkingStore<Volume> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Volume> volumes =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        AccountAwareStorageBackend<Instance> instances = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = defaultSubnetInstance("i-reset-volume", "172.31.0.10", InstanceState.stopped());
+        instance.setPlacement(new Placement("us-east-1a"));
+        instances.put("us-east-1::i-reset-volume", instance);
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-volumes.json", volumes,
+                "ec2-instances.json", instances), mock(VpcNetworkManager.class));
+        Volume volume = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of());
+        if (List.of("detach", "settle").contains(mutation)) {
+            service.attachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/xvdf");
+        }
+        if ("settle".equals(mutation)) {
+            instance.setState(InstanceState.terminated());
+        }
+        Runnable change = switch (mutation) {
+            case "create" -> () -> service.createVolume("us-east-1", "us-east-1a", "gp3", 9,
+                    false, 0, null, null, List.of());
+            case "modify" -> () -> service.modifyVolume("us-east-1", volume.getVolumeId(), 9,
+                    null, null, null, null, false);
+            case "attach" -> () -> service.attachVolume("us-east-1", volume.getVolumeId(),
+                    instance.getInstanceId(), "/dev/xvdf");
+            case "detach" -> () -> service.detachVolume("us-east-1", volume.getVolumeId(),
+                    instance.getInstanceId(), "/dev/xvdf", false);
+            case "delete" -> () -> service.deleteVolume("us-east-1", volume.getVolumeId());
+            case "settle" -> () -> service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of());
+            default -> throw new IllegalArgumentException(mutation);
+        };
+        if ("delete".equals(mutation)) {
+            parking.parkNextRead();
+        } else {
+            parking.parkNextWrite();
+        }
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> changed = executor.submit(change);
+            try {
+                assertTrue(parking.awaitParked());
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                parking.release();
+            }
+            changed.get(10, TimeUnit.SECONDS);
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertThrows(IllegalStateException.class, change::run);
+        if ("delete".equals(mutation)) {
+            assertTrue(volumes.get("us-east-1::" + volume.getVolumeId()).isEmpty());
+        } else if (List.of("detach", "settle").contains(mutation)) {
+            assertEquals("available", volume.getState());
+            assertTrue(volume.getAttachments().isEmpty());
+        } else if ("attach".equals(mutation)) {
+            assertEquals(instance.getInstanceId(), volume.getAttachments().getFirst().getInstanceId());
+        } else {
+            assertTrue(volumes.scan(key -> true).stream().anyMatch(value -> value.getSize() == 9));
+        }
+        service.resumeOperationsAfterReset();
+        assertDoesNotThrow(() -> service.describeVolumes("us-east-1", List.of(), Map.of()));
+    }
+
+    @Test
+    void resetAdmissionDrainsVolumeBackingCreationAfterMetadataWrite() throws Exception {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(), null, null, devices);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(devices).createVolume(anyString(), anyInt());
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<Volume> created = executor.submit(() -> service.createVolume("us-east-1", "us-east-1a",
+                    "gp3", 8, false, 0, null, null, List.of()));
+            try {
+                assertTrue(entered.await(10, TimeUnit.SECONDS));
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                release.countDown();
+            }
+            assertEquals(8, created.get(10, TimeUnit.SECONDS).getSize());
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        service.resumeOperationsAfterReset();
+        assertEquals(1, service.describeVolumes("us-east-1", List.of(), Map.of()).size());
+    }
+
+    @Test
+    void resetAdmissionRefusesDefaultSeedingAndLifecycleCalls() throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(Map.of(), networks);
+        service.pauseAndDrainOperations(Duration.ZERO);
+        clearInvocations(networks);
+
+        assertThrows(IllegalStateException.class, () -> service.ensureDefaultResources("us-east-1"));
+        assertThrows(IllegalStateException.class,
+                () -> service.describeInstances("us-east-1", List.of(), Map.of()));
+        assertThrows(IllegalStateException.class,
+                () -> service.stopInstances("us-east-1", List.of("i-test")));
+        assertThrows(IllegalStateException.class,
+                () -> service.terminateInstances("us-east-1", List.of("i-test")));
+        assertThrows(IllegalStateException.class,
+                () -> service.rebootInstances("us-east-1", List.of("i-test")));
+        assertThrows(IllegalStateException.class, () -> service.pruneTerminatedInstances(Instant.now()));
+        verifyNoInteractions(networks);
+
+        service.resumeOperationsAfterReset();
+        service.ensureDefaultResources("us-east-1");
+        verify(networks).declareVpc("000000000000", "us-east-1", Ec2Service.defaultVpcId("us-east-1", "000000000000"), "172.31.0.0/16");
+    }
+
+    @Test
+    void resetAdmissionDrainsDefaultSeedingThroughNetworkDeclaration() throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(Map.of(), networks);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(networks).declareVpc("000000000000", "us-west-2", Ec2Service.defaultVpcId("us-west-2", "000000000000"), "172.31.0.0/16");
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> seeded = executor.submit(() -> service.ensureDefaultResources("us-west-2"));
+            try {
+                assertTrue(entered.await(10, TimeUnit.SECONDS));
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                release.countDown();
+            }
+            seeded.get(10, TimeUnit.SECONDS);
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        service.resumeOperationsAfterReset();
+        assertEquals(3, service.describeSubnets("us-west-2", List.of(), Map.of()).size());
+    }
+
+    @Test
+    void resetAdmissionDrainsStopThroughFinalStorageWrite() throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> store =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Instance instance = defaultSubnetInstance("i-reset-stop", "172.31.0.10", InstanceState.running());
+        store.put("us-east-1::i-reset-stop", instance);
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-instances.json", store), mock(VpcNetworkManager.class));
+        service.ensureDefaultResources("us-east-1");
+        parking.parkNextWrite();
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> stopped = executor.submit(() -> service.stopInstances("us-east-1", List.of("i-reset-stop")));
+            try {
+                assertTrue(parking.awaitParked());
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                parking.release();
+            }
+            stopped.get(10, TimeUnit.SECONDS);
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertEquals("stopped", instance.getState().getName());
+        service.resumeOperationsAfterReset();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"userData", "attribute", "groups", "metadata", "monitoring", "profileRemoval"})
+    void resetAdmissionDrainsInstanceMutationThroughFinalStorageWrite(String mutation) throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> store =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Instance instance = defaultSubnetInstance("i-reset-mutation", "172.31.0.10", InstanceState.stopped());
+        instance.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/reset");
+        store.put("us-east-1::i-reset-mutation", instance);
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-instances.json", store), mock(VpcNetworkManager.class));
+        service.ensureDefaultResources("us-east-1");
+        Runnable change = switch (mutation) {
+            case "userData" -> () -> service.modifyInstanceUserData("us-east-1", instance.getInstanceId(), "updated");
+            case "attribute" -> () -> service.modifyInstanceAttribute("us-east-1", instance.getInstanceId(),
+                    "ebsOptimized", "true");
+            case "groups" -> () -> service.modifyInstanceGroups("us-east-1", instance.getInstanceId(), List.of());
+            case "metadata" -> () -> service.modifyInstanceMetadataOptions("us-east-1", instance.getInstanceId(),
+                    new LaunchTemplateData.MetadataOptions());
+            case "monitoring" -> () -> service.setInstanceMonitoring("us-east-1", List.of(instance.getInstanceId()), true);
+            case "profileRemoval" -> () -> service.disassociateIamInstanceProfile("us-east-1",
+                    Ec2Service.iamInstanceProfileAssociationId(instance.getInstanceId()));
+            default -> throw new IllegalArgumentException(mutation);
+        };
+        parking.parkNextWrite();
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> changed = executor.submit(change);
+            try {
+                assertTrue(parking.awaitParked());
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                parking.release();
+            }
+            changed.get(10, TimeUnit.SECONDS);
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertThrows(IllegalStateException.class, change::run);
+        service.resumeOperationsAfterReset();
+        assertEquals(instance, store.get("us-east-1::i-reset-mutation").orElseThrow());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "system", "delete"})
+    void resetAdmissionDrainsTagMutationThroughFinalStorageWrite(String mutation) throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> store =
+                new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Instance instance = defaultSubnetInstance("i-reset-tags", "172.31.0.10", InstanceState.stopped());
+        store.put("us-east-1::i-reset-tags", instance);
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-instances.json", store), mock(VpcNetworkManager.class));
+        List<String> ids = List.of(instance.getInstanceId());
+        service.createTags("us-east-1", ids, List.of(new Tag("before", "value")));
+        Runnable change = switch (mutation) {
+            case "create" -> () -> service.createTags("us-east-1", ids, List.of(new Tag("after", "value")));
+            case "system" -> () -> service.createSystemTags("us-east-1", ids,
+                    List.of(new Tag("aws:service", "owned")));
+            case "delete" -> () -> service.deleteTags("us-east-1", ids, List.of(new Tag("before", null)));
+            default -> throw new IllegalArgumentException(mutation);
+        };
+        parking.parkNextWrite();
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> changed = executor.submit(change);
+            try {
+                assertTrue(parking.awaitParked());
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+            } finally {
+                parking.release();
+            }
+            changed.get(10, TimeUnit.SECONDS);
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertThrows(IllegalStateException.class, change::run);
+        service.resumeOperationsAfterReset();
+        Map<String, String> expected = switch (mutation) {
+            case "create" -> Map.of("before", "value", "after", "value");
+            case "system" -> Map.of("before", "value", "aws:service", "owned");
+            case "delete" -> Map.of();
+            default -> throw new IllegalArgumentException(mutation);
+        };
+        Map<String, String> actual = new HashMap<>();
+        for (Tag tag : instance.getTags()) {
+            actual.put(tag.getKey(), tag.getValue());
+        }
+        assertEquals(expected, actual);
+        assertEquals(instance, store.get("us-east-1::i-reset-tags").orElseThrow());
+    }
+
+    @Test
+    void resetAdmissionRefusesLaunchAndStartBeforeDefaultSeeding() throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(Map.of(), networks);
+        service.pauseAndDrainOperations(Duration.ZERO);
+        clearInvocations(networks);
+
+        assertThrows(IllegalStateException.class, () -> service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null));
+        assertThrows(IllegalStateException.class, () -> service.startInstances("us-east-1", List.of("i-test")));
+        verifyNoInteractions(networks);
+    }
+
+    @Test
+    void resetAdmissionRefusesSharedVpcWritesAndAllowsOwnerCleanup() throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(Map.of(), networks);
+        service.pauseAndDrainOperations(Duration.ZERO);
+        clearInvocations(networks);
+
+        assertThrows(IllegalStateException.class,
+                () -> service.allocateVpcPrivateIp("000000000000", "us-east-1", "subnet-test"));
+        assertThrows(IllegalStateException.class,
+                () -> service.reserveVpcPrivateIp("000000000000", "us-east-1", "subnet-test", "10.0.0.4"));
+        assertThrows(IllegalStateException.class,
+                () -> service.attachContainerToVpc("000000000000", "us-east-1", "vpc-test", "container"));
+        assertThrows(IllegalStateException.class,
+                () -> service.attachContainerToVpc("000000000000", "us-east-1", "vpc-test", "subnet-test",
+                        "container", "10.0.0.4"));
+        verifyNoInteractions(networks);
+
+        service.releaseVpcPrivateIp("000000000000", "us-east-1", "subnet-test", "10.0.0.4");
+        service.detachContainerFromVpc("000000000000", "us-east-1", "vpc-test", "container");
+        verify(networks).releasePrivateIp("000000000000", "us-east-1", "subnet-test", "10.0.0.4");
+        verify(networks).detach("000000000000", "us-east-1", "vpc-test", "container");
+    }
+
+    @Test
+    void resetAdmissionDrainsSharedAttachAndRemainsClosedAfterTimeout() throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(Map.of(), networks);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(networks.attachContainer("000000000000", "us-east-1", "vpc-test", "container")).thenAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(10, TimeUnit.SECONDS));
+            return true;
+        });
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<Boolean> attached = executor.submit(() ->
+                    service.attachContainerToVpc("000000000000", "us-east-1", "vpc-test", "container"));
+            try {
+                assertTrue(entered.await(10, TimeUnit.SECONDS));
+                assertThrows(IllegalStateException.class, () -> service.pauseAndDrainOperations(Duration.ZERO));
+                assertThrows(IllegalStateException.class, service::resumeOperationsAfterReset);
+                assertThrows(IllegalStateException.class,
+                        () -> service.allocateVpcPrivateIp("000000000000", "us-east-1", "subnet-test"));
+            } finally {
+                release.countDown();
+            }
+            assertTrue(attached.get(10, TimeUnit.SECONDS));
+        }
+        service.pauseAndDrainOperations(Duration.ZERO);
+        assertThrows(IllegalStateException.class,
+                () -> service.attachContainerToVpc("000000000000", "us-east-1", "vpc-test", "container"));
+        service.resumeOperationsAfterReset();
+        assertTrue(service.attachContainerToVpc("000000000000", "us-east-1", "vpc-test", "container"));
+    }
+
+    @Test
+    void resetAdmissionReleasesFailedSharedOperationOwnership() throws Exception {
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(Map.of(), networks);
+        when(networks.attachContainer("000000000000", "us-east-1", "vpc-test", "container"))
+                .thenThrow(new IllegalArgumentException("attachment failed"));
+        assertThrows(IllegalArgumentException.class,
+                () -> service.attachContainerToVpc("000000000000", "us-east-1", "vpc-test", "container"));
+        service.pauseAndDrainOperations(Duration.ZERO);
+        service.resumeOperationsAfterReset();
+        assertThrows(IllegalArgumentException.class,
+                () -> service.attachContainerToVpc("000000000000", "us-east-1", "vpc-test", "container"));
     }
 
     @Test
@@ -6407,8 +8457,10 @@ class Ec2ServiceTest {
                 return request.apply(second);
             });
             Awaitility.await("the second request to finish or to wait in storeNewKeyPair")
-                    .atMost(Duration.ofSeconds(30)).until(() -> secondResult.isDone()
-                    || isBlockedIn(secondWorker.get(), "storeNewKeyPair", firstWorker.get()));
+                    .atMost(Duration.ofSeconds(30))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> secondResult.isDone()
+                            || isBlockedIn(secondWorker.get(), "storeNewKeyPair", firstWorker.get()));
             parking.release();
 
             KeyPair stored = firstResult.get(30, TimeUnit.SECONDS);
@@ -6458,8 +8510,10 @@ class Ec2ServiceTest {
                 return service.deleteKeyPair("us-east-1", "retagged", null);
             });
             Awaitility.await("the delete to finish or to wait in deleteKeyPair")
-                    .atMost(Duration.ofSeconds(30)).until(() -> deleting.isDone()
-                    || isBlockedIn(deleteWorker.get(), "deleteKeyPair", tagWorker.get()));
+                    .atMost(Duration.ofSeconds(30))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> deleting.isDone()
+                            || isBlockedIn(deleteWorker.get(), "deleteKeyPair", tagWorker.get()));
             parking.release();
             tagging.get(30, TimeUnit.SECONDS);
 
@@ -6943,15 +8997,16 @@ class Ec2ServiceTest {
     @Test
     void createImageRebootsTheSourceInstanceUnlessNoRebootIsSet() {
         Ec2ContainerManager containerManager = capturingContainerManager();
-        Ec2Service service = liveService(containerManager, mock(AmiImageResolver.class));
+        Ec2Service service = liveService(containerManager, minimalImageResolver());
         String instanceId = runOne(service, "ami-src");
 
         service.createImage("us-east-1", instanceId, "with-reboot", null, false);
-        verify(containerManager).reboot(argThat(i -> instanceId.equals(i.getInstanceId())));
+        verify(containerManager).reboot(argThat(i -> instanceId.equals(i.getInstanceId())), any(Runnable.class));
 
         service.createImage("us-east-1", instanceId, "without-reboot", null, true);
         // Still one: NoReboot=true opted the second call out.
-        verify(containerManager, times(1)).reboot(argThat(i -> instanceId.equals(i.getInstanceId())));
+        verify(containerManager, times(1)).reboot(argThat(i -> instanceId.equals(i.getInstanceId())),
+                any(Runnable.class));
     }
 
     @Test
@@ -6974,6 +9029,285 @@ class Ec2ServiceTest {
         verify(resolver, times(4)).resolveImage("ami-src");
         verify(resolver, never()).resolveImage(createdAmi);
         verify(resolver, never()).resolveImage(chainedAmi);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"root", "snapshot"})
+    void managedMountAdmissionRejectsBeforeLaunchMutation(String scenario) {
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        String device = "root".equals(scenario) ? new Instance().getRootDeviceName() : "/dev/sdf";
+        when(resolver.resolveImage("ami-managed")).thenReturn(new ResolvedAmiImage("guest:latest",
+                ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/amd64",
+                List.of(new Ec2ImageCatalog.VolumeMount(device, "/data", "ext4"))));
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = liveService(manager, resolver);
+        Volume source = service.createVolume("us-east-1", "us-east-1a", "gp3", 5, false, 0, null, null, List.of());
+        String snapshot = service.createSnapshot("us-east-1", source.getVolumeId(), "source", List.of(), false).getSnapshotId();
+        List<String> before = service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                .map(Volume::getVolumeId).toList();
+        for (boolean dryRun : List.of(false, true)) {
+            AwsException error = assertThrows(AwsException.class, () -> {
+                if ("root".equals(scenario)) {
+                    service.runInstances("us-east-1", "ami-managed", "t3.micro", 1, 1,
+                            null, List.of(), null, null, List.of(), null, null,
+                            null, null, 0, null, null, null, null, dryRun);
+                } else {
+                    runWithDataMount(service, "ami-managed", "snapshot".equals(scenario) ? snapshot : "",
+                            dryRun, "removed".equals(scenario));
+                }
+            });
+            assertEquals("InvalidParameterValue", error.getErrorCode());
+            assertTrue(error.getMessage().contains("snapshot-free non-root mapping"));
+            assertTrue(service.describeInstances("us-east-1", List.of(), Map.of()).isEmpty());
+            assertEquals(before, service.describeVolumes("us-east-1", List.of(), Map.of()).stream()
+                    .map(Volume::getVolumeId).toList());
+            verifyNoInteractions(manager);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void managedMountAdmissionAllowsNormalizedDataDevice(boolean managed) {
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        when(resolver.resolveImage("ami-managed")).thenReturn(new ResolvedAmiImage("guest:latest",
+                ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/amd64", managed
+                        ? List.of(new Ec2ImageCatalog.VolumeMount("/dev/sdf", "/data", "ext4")) : List.of()));
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = liveService(manager, resolver);
+        assertEquals("DryRunOperation", assertThrows(AwsException.class,
+                () -> runWithDataMount(service, "ami-managed", "", true)).getErrorCode());
+        assertTrue(service.describeInstances("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
+        verifyNoInteractions(manager);
+        Reservation reservation = runWithDataMount(service, "ami-managed", "", false);
+        assertEquals(1, reservation.getInstances().size());
+        assertEquals(2, service.describeVolumes("us-east-1", List.of(), Map.of()).size());
+        verify(manager).launch(eq(reservation.getInstances().getFirst()), any(), isNull(), eq("us-east-1"),
+                any(), anyList(), anyMap(), any(), any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"success", "persistence", "missing", "detached", "ambiguous", "terminated", "replaced"})
+    void launchMountSupplierPublishesOnlyDurableOwnedMarkers(String scenario) {
+        AccountAwareStorageBackend<Volume> volumes = spy(AccountAwareStorageBackend.<Volume>inMemory("000000000000"));
+        AccountAwareStorageBackend<Instance> instances = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        Ec2ImageCatalog.VolumeMount mapping = new Ec2ImageCatalog.VolumeMount("/dev/sdf", "/data", "ext4");
+        when(resolver.resolveImage("ami-managed")).thenReturn(new ResolvedAmiImage("guest:latest",
+                ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/amd64", List.of(mapping)));
+        Ec2Service service = new Ec2Service(mockConfig(false), containers, mock(Ec2PortForwardManager.class),
+                resolver, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-volumes.json", volumes, "ec2-instances.json", instances)),
+                null, null, devices);
+        List<Supplier<List<Ec2VolumeBlockDeviceManager.PreparedMount>>> suppliers = new ArrayList<>();
+        doAnswer(invocation -> {
+            suppliers.add(invocation.getArgument(7));
+            return null;
+        }).when(containers).launch(any(), any(), any(), anyString(), any(), anyList(), anyMap(), any(), any(), any());
+        Instance instance = runWithDataMount(service, "ami-managed", "", false).getInstances().getFirst();
+        assertEquals(1, suppliers.size());
+        Volume original = volumes.scan(k -> true).stream()
+                .filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId())).findFirst().orElseThrow();
+        String volumeKey = "us-east-1::" + original.getVolumeId();
+        String instanceKey = "us-east-1::" + instance.getInstanceId();
+        original.setClientToken("retained-token");
+        original.setRequestTags(Map.of("purpose", "retained"));
+        original.setRequestParameters(List.of("size", "5"));
+        IllegalStateException refused = new IllegalStateException("durable write refused");
+        switch (scenario) {
+            case "persistence" -> doThrow(refused).when(volumes).putAllDurablyForAccount(anyString(), anyMap());
+            case "missing" -> volumes.delete(volumeKey);
+            case "detached" -> original.getAttachments().getFirst().setState("detached");
+            case "ambiguous" -> {
+                Volume duplicate = new Volume();
+                duplicate.setVolumeId("vol-duplicate");
+                duplicate.setRegion("us-east-1");
+                duplicate.setAttachments(new ArrayList<>(original.getAttachments()));
+                volumes.put("us-east-1::vol-duplicate", duplicate);
+            }
+            case "terminated" -> instance.setState(InstanceState.terminated());
+            case "replaced" -> instances.put(instanceKey, new Instance());
+            default -> { }
+        }
+        Ec2VolumeBlockDeviceManager.PreparedMount mount = new Ec2VolumeBlockDeviceManager.PreparedMount(
+                original.getVolumeId(), "/dev/sdf", "/dev/loop7", "managed-data", "/data");
+        when(devices.prepareMount(any(), eq(instance), eq(mapping))).thenAnswer(invocation -> {
+            Volume published = invocation.getArgument(0);
+            assertSame(published, volumes.getForAccount("000000000000", volumeKey).orElseThrow());
+            assertEquals("ext4", published.getManagedFilesystem());
+            assertNotSame(original, published);
+            assertNull(original.getManagedFilesystem());
+            assertEquals(original.getClientToken(), published.getClientToken());
+            assertEquals(original.getRequestTags(), published.getRequestTags());
+            assertEquals(original.getRequestParameters(), published.getRequestParameters());
+            assertEquals(original.getAttachments(), published.getAttachments());
+            return mount;
+        });
+        if ("success".equals(scenario)) {
+            List<Ec2VolumeBlockDeviceManager.PreparedMount> prepared = RequestScopes.callAs("222222222222", "eu-west-1",
+                    suppliers.getFirst());
+            assertEquals(List.of(mount), prepared);
+            assertThrows(UnsupportedOperationException.class, () -> prepared.add(mount));
+            verify(devices).prepareMount(any(), eq(instance), eq(mapping));
+            assertTrue(volumes.getForAccount("222222222222", volumeKey).isEmpty());
+        } else {
+            RuntimeException failure = assertThrows(RuntimeException.class, () -> RequestScopes.callAs(
+                    "222222222222", "eu-west-1", suppliers.getFirst()));
+            if ("persistence".equals(scenario)) {
+                assertSame(refused, failure);
+                assertSame(original, volumes.getForAccount("000000000000", volumeKey).orElseThrow());
+            }
+            assertNull(original.getManagedFilesystem());
+            verifyNoInteractions(devices);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"running", "pending", "terminated", "replaced", "deleted", "detached"})
+    void launchCompletionRestoresOnlyCurrentOwnerAttachments(String scenario) {
+        AccountAwareStorageBackend<Volume> volumes = AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<Instance> instances = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(false), containers, mock(Ec2PortForwardManager.class),
+                minimalImageResolver(), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-volumes.json", volumes, "ec2-instances.json", instances)),
+                null, null, devices);
+        List<Runnable> callbacks = new ArrayList<>();
+        doAnswer(invocation -> {
+            callbacks.add(invocation.getArgument(9));
+            return null;
+        }).when(containers).launch(any(), any(), any(), anyString(), any(), anyList(), anyMap(), any(), any(), any());
+        Instance instance = runWithDataMount(service, "ami-minimal", "", false).getInstances().getFirst();
+        assertEquals(1, callbacks.size());
+        Volume own = volumes.scan(k -> true).stream().filter(volume ->
+                !volume.getVolumeId().equals(instance.getRootVolumeId())).findFirst().orElseThrow();
+        Volume foreign = new Volume();
+        foreign.setVolumeId("vol-foreign");
+        foreign.setRegion("us-east-1");
+        foreign.setAttachments(new ArrayList<>(own.getAttachments()));
+        volumes.putForAccount("222222222222", "us-east-1::vol-foreign", foreign);
+        instance.setState(InstanceState.running());
+        String instanceKey = "us-east-1::" + instance.getInstanceId();
+        switch (scenario) {
+            case "pending" -> instance.setState(InstanceState.pending());
+            case "terminated" -> instance.setState(InstanceState.terminated());
+            case "replaced" -> instances.put(instanceKey, new Instance());
+            case "deleted" -> instances.delete(instanceKey);
+            case "detached" -> own.getAttachments().getFirst().setState("detached");
+            default -> { }
+        }
+        RequestScopes.runAs("222222222222", "eu-west-1", callbacks.getFirst());
+        if ("running".equals(scenario)) {
+            verify(devices).attachVolume(eq(own), eq(instance), anyString());
+            verifyNoMoreInteractions(devices);
+        } else {
+            verifyNoInteractions(devices);
+        }
+        if ("deleted".equals(scenario)) {
+            assertTrue(instances.get(instanceKey).isEmpty());
+        }
+        assertTrue(instances.getForAccount("222222222222", instanceKey).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"running", "pending", "terminated", "replaced", "deleted", "detached"})
+    void restartCompletionRestoresOnlyCurrentOwnerAttachments(String scenario) {
+        AccountAwareStorageBackend<Volume> volumes = AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<Instance> instances = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(false), containers, mock(Ec2PortForwardManager.class),
+                minimalImageResolver(), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-volumes.json", volumes, "ec2-instances.json", instances)),
+                null, null, devices);
+        List<Runnable> callbacks = new ArrayList<>();
+        doAnswer(invocation -> {
+            callbacks.add(invocation.getArgument(2));
+            return null;
+        }).when(containers).start(any(), any(Runnable.class), any(Runnable.class));
+        Instance instance = runWithDataMount(service, "ami-minimal", "", false).getInstances().getFirst();
+        instance.setState(InstanceState.stopped());
+        service.startInstances("us-east-1", List.of(instance.getInstanceId()));
+        assertEquals(1, callbacks.size());
+        Volume own = volumes.scan(k -> true).stream().filter(volume ->
+                !volume.getVolumeId().equals(instance.getRootVolumeId())).findFirst().orElseThrow();
+        Volume foreign = new Volume();
+        foreign.setVolumeId("vol-foreign");
+        foreign.setRegion("us-east-1");
+        foreign.setAttachments(new ArrayList<>(own.getAttachments()));
+        volumes.putForAccount("222222222222", "us-east-1::vol-foreign", foreign);
+        instance.setState(InstanceState.running());
+        String instanceKey = "us-east-1::" + instance.getInstanceId();
+        switch (scenario) {
+            case "pending" -> instance.setState(InstanceState.pending());
+            case "terminated" -> instance.setState(InstanceState.terminated());
+            case "replaced" -> instances.put(instanceKey, new Instance());
+            case "deleted" -> instances.delete(instanceKey);
+            case "detached" -> own.getAttachments().getFirst().setState("detached");
+            default -> { }
+        }
+        RequestScopes.runAs("222222222222", "eu-west-1", callbacks.getFirst());
+        if ("running".equals(scenario)) {
+            verify(devices).attachVolume(eq(own), eq(instance), anyString());
+            verifyNoMoreInteractions(devices);
+        } else {
+            verifyNoInteractions(devices);
+        }
+        if ("deleted".equals(scenario)) {
+            assertTrue(instances.get(instanceKey).isEmpty());
+        }
+        assertTrue(instances.getForAccount("222222222222", instanceKey).isEmpty());
+    }
+
+    private static Reservation runWithDataMount(Ec2Service service, String imageId, String snapshot, boolean dryRun) {
+        return runWithDataMount(service, imageId, snapshot, dryRun, false);
+    }
+
+    private static Reservation runWithDataMount(Ec2Service service, String imageId, String snapshot,
+                                                 boolean dryRun, boolean removed) {
+        LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
+        ebs.setVolumeSize(5);
+        ebs.setSnapshotId(snapshot);
+        LaunchTemplateData.BlockDeviceMapping data = new LaunchTemplateData.BlockDeviceMapping();
+        data.setDeviceName("sdf");
+        data.setEbs(ebs);
+        if (removed) {
+            data.setNoDevice("");
+        }
+        return service.runInstances("us-east-1", imageId, "t3.micro", 1, 1, null, List.of(), null, null,
+                List.of(), null, null, null, null, 0, null, null, null, null, dryRun, null, null,
+                List.of(data), false, null, null);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void capturedImageLaunchRetainsCatalogMounts(boolean managed) {
+        List<Ec2ImageCatalog.VolumeMount> mounts = managed
+                ? List.of(new Ec2ImageCatalog.VolumeMount("/dev/sdf", "/data", "ext4")) : List.of();
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        when(resolver.resolveImage("ami-src")).thenReturn(new ResolvedAmiImage("guest:latest",
+                ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/amd64", mounts));
+        Ec2ContainerManager manager = capturingContainerManager();
+        Ec2Service service = liveService(manager, resolver);
+        String source = runWithDataMount(service, "ami-src", "", false).getInstances().getFirst().getInstanceId();
+        String captured = service.createImage("us-east-1", source, "captured-mounts", null, true).getImageId();
+        String first = runWithDataMount(service, captured, "", false).getInstances().getFirst().getInstanceId();
+        String chained = service.createImage("us-east-1", first, "chained-mounts", null, true).getImageId();
+        String second = runWithDataMount(service, chained, "", false).getInstances().getFirst().getInstanceId();
+
+        for (String instanceId : List.of(first, second)) {
+            ArgumentCaptor<ResolvedAmiImage> image = ArgumentCaptor.forClass(ResolvedAmiImage.class);
+            verify(manager).launch(argThat(instance -> instanceId.equals(instance.getInstanceId())),
+                    image.capture(), isNull(), eq("us-east-1"), any(), anyList(), anyMap(), any(), any(), any());
+            assertEquals("floci-ami/test-capture:latest", image.getValue().dockerImage());
+            assertEquals(ResolvedAmiImage.SYSTEMD_RUNTIME, image.getValue().guestRuntime());
+            assertTrue(image.getValue().cloudInit());
+            assertEquals("linux/amd64", image.getValue().dockerPlatform());
+            assertEquals(mounts, image.getValue().volumeMounts());
+        }
     }
 
     @Test
@@ -7062,7 +9396,7 @@ class Ec2ServiceTest {
     @Test
     void dryRunValidatesSuppliedEniWithoutAttachingOrProvisioning() {
         Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
-        Ec2Service service = liveService(manager, mock(AmiImageResolver.class));
+        Ec2Service service = liveService(manager, minimalImageResolver());
         String subnetId = service.describeSubnets("us-east-1", List.of(), Map.of()).getFirst().getSubnetId();
         NetworkInterface eni = service.createNetworkInterface("us-east-1", subnetId, null, null,
                 List.of(), List.of(), List.of());
@@ -7109,7 +9443,7 @@ class Ec2ServiceTest {
         source.rootDeviceType = "ebs";
         source.rootDeviceName = "/dev/xvda";
         when(catalog.findByIdOrAlias("ami-src")).thenReturn(Optional.of(source));
-        Ec2Service service = liveService(capturingContainerManager(), mock(AmiImageResolver.class), catalog);
+        Ec2Service service = liveService(capturingContainerManager(), minimalImageResolver(), catalog);
         String instanceId = runOne(service, "ami-src");
 
         Image image = service.createImage("us-east-1", instanceId, "captured", null, true);
@@ -7132,8 +9466,42 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void createImageWithoutInstanceRootDeviceFallsBackToSourceImage() {
+        Ec2ImageCatalog catalog = mock(Ec2ImageCatalog.class);
+        Ec2ImageCatalog.CatalogImage source = new Ec2ImageCatalog.CatalogImage();
+        source.imageId = "ami-src";
+        source.architecture = "x86_64";
+        source.rootDeviceType = "ebs";
+        source.rootDeviceName = "/dev/xvda";
+        when(catalog.findByIdOrAlias("ami-src")).thenReturn(Optional.of(source));
+        Ec2Service service = liveService(capturingContainerManager(), minimalImageResolver(), catalog);
+        String instanceId = runOne(service, "ami-src");
+
+        service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                .getFirst().getInstances().getFirst().setRootDeviceName(null);
+
+        Image image = service.createImage("us-east-1", instanceId, "captured", null, true);
+
+        assertEquals("/dev/xvda", image.getRootDeviceName());
+        assertEquals(1, image.getBlockDeviceMappings().size());
+        BlockDeviceMapping root = image.getBlockDeviceMappings().getFirst();
+        assertEquals("/dev/xvda", root.getDeviceName());
+        assertNotNull(root.getEbs().getSnapshotId());
+
+        // The rebuilt root describes the volume RunInstances actually created for the
+        // source, so DescribeImages does not report a type the instance never had.
+        assertEquals("gp3", root.getEbs().getVolumeType());
+        assertEquals(8, root.getEbs().getVolumeSize());
+
+        // The mapping's snapshot is registered, so DescribeSnapshots can resolve it.
+        List<Snapshot> snapshots = service.describeSnapshots("us-east-1",
+                List.of(root.getEbs().getSnapshotId()), null, Map.of());
+        assertEquals(1, snapshots.size());
+    }
+
+    @Test
     void createImageTakesItsOwnSnapshotRatherThanTheSourceAmisOne() {
-        Ec2Service service = liveService(capturingContainerManager(), mock(AmiImageResolver.class));
+        Ec2Service service = liveService(capturingContainerManager(), minimalImageResolver());
         Image source = service.registerImage("us-east-1", "source-image", null, null, "/dev/sda1",
                 List.of(blockDeviceMapping("snap-source", 16)));
 
@@ -7173,6 +9541,218 @@ class Ec2ServiceTest {
         assertEquals(50, attached.getEbs().getVolumeSize());
         assertEquals("gp3", attached.getEbs().getVolumeType());
         assertNotNull(attached.getEbs().getSnapshotId());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void startupRestoresWorkloadsOnlyWhenEc2IsEnabled(boolean enabled) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.services().ec2().enabled()).thenReturn(enabled);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-other", "10.20.1.10", InstanceState.running());
+        instance.setDockerContainerId("container-other");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        when(containers.restoreMetadataRegistration(any())).thenReturn(true);
+        Ec2PortForwardManager forwarding = mock(Ec2PortForwardManager.class);
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        when(networks.enabled()).thenReturn(true);
+        Ec2Service service = new Ec2Service(config, containers, forwarding,
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), networks);
+
+        service.restoreMetadataRegistrations();
+
+        verify(forwarding).setPersister(any());
+        verify(containers).setPersister(any());
+        verify(containers).setGuestShutdownHandler(any());
+        if (enabled) {
+            verify(containers).restoreMetadataRegistration(instance);
+            verify(containers).reconcileOrphanedContainers(any());
+            verify(networks).reconcileOrphans(any());
+            verify(forwarding).restore(instance);
+        } else {
+            verifyNoInteractions(networks);
+            verifyNoMoreInteractions(containers);
+            verify(forwarding, never()).restore(any());
+        }
+        assertEquals("running", instanceStore.getForAccount("111122223333", "us-east-1::i-other")
+                .orElseThrow().getState().getName());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void resetRetiresEveryAccountsInstancesRegardlessOfStorageMode(String mode) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.storage().mode()).thenReturn(mode);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        List<Instance> instances = new ArrayList<>();
+        for (String account : List.of("111122223333", "444455556666")) {
+            for (InstanceState state : List.of(InstanceState.running(), InstanceState.stopped(), InstanceState.pending())) {
+                Instance instance = persistedInstance("i-" + account + "-" + state.getName(), "10.20.1.10", state);
+                if (!"pending".equals(state.getName())) {
+                    instance.setDockerContainerId("container-" + instance.getInstanceId());
+                }
+                instanceStore.putForAccount(account, "us-east-1::" + instance.getInstanceId(), instance);
+                instances.add(instance);
+            }
+        }
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        try {
+            service.beforeReset();
+            for (Instance instance : instances) {
+                verify(containers).terminateForShutdown(instance);
+            }
+        } finally {
+            service.afterReset();
+        }
+    }
+
+    @Test
+    void resetRefusesToDiscardInstanceRecordsWhenGuestRetirementFails() {
+        EmulatorConfig config = mockConfig(false);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-retirement-failure", "10.20.1.10", InstanceState.stopped());
+        instance.setDockerContainerId("retained-container");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-retirement-failure", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        IllegalStateException failure = new IllegalStateException("Guest retirement failed");
+        doThrow(failure).when(containers).terminateForShutdown(instance);
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), networks);
+
+        try {
+            assertSame(failure, assertThrows(IllegalStateException.class, service::beforeReset));
+            assertSame(instance, instanceStore.getForAccount("111122223333", "us-east-1::i-retirement-failure")
+                    .orElseThrow());
+            verify(networks, never()).resetNetworks();
+        } finally {
+            service.afterReset();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void resetRetiresGuestsOnlyWhenContainerBackedEc2IsEnabled(boolean enabled, boolean mockEc2) {
+        EmulatorConfig config = mockConfig(mockEc2);
+        when(config.services().ec2().enabled()).thenReturn(enabled);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-reset-enabled", "10.20.1.10", InstanceState.running());
+        instance.setDockerContainerId("container-reset-enabled");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-reset-enabled", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), networks);
+
+        try {
+            service.beforeReset();
+            if (enabled && !mockEc2) {
+                verify(containers).terminateForShutdown(instance);
+            } else {
+                verifyNoInteractions(containers);
+            }
+            if (enabled) {
+                verify(networks).resetNetworks();
+            } else {
+                verifyNoInteractions(networks);
+            }
+        } finally {
+            service.afterReset();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shutdownStopsWorkloadsOnlyWhenEc2IsEnabled(boolean enabled) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.services().ec2().enabled()).thenReturn(enabled);
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-other", "10.20.1.10", InstanceState.running());
+        instance.setDockerContainerId("container-other");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        service.stopManagedContainers();
+
+        if (enabled) {
+            verify(containers).stopForShutdown(instance);
+        } else {
+            verifyNoInteractions(containers);
+        }
+        assertEquals(enabled ? "stopped" : "running", instanceStore.getForAccount("111122223333", "us-east-1::i-other")
+                .orElseThrow().getState().getName());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "memory, none, true", "persistent, none, false", "hybrid, none, false", "wal, none, false",
+            "memory, persistent, false", "persistent, memory, true", "hybrid, memory, true", "wal, memory, true"
+    })
+    void shutdownUsesEffectiveEc2StorageMode(String global, String override, boolean ephemeral) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.storage().mode()).thenReturn(global);
+        when(config.storage().services().ec2().mode())
+                .thenReturn("none".equals(override) ? Optional.empty() : Optional.of(override));
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        List<Instance> instances = new ArrayList<>();
+        for (InstanceState state : List.of(InstanceState.running(), InstanceState.stopped(), InstanceState.pending())) {
+            Instance instance = persistedInstance("i-" + state.getName(), "10.20.1.10", state);
+            instance.setDockerContainerId("container-" + state.getName());
+            instanceStore.putForAccount("111122223333", "us-east-1::" + instance.getInstanceId(), instance);
+            instances.add(instance);
+        }
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        service.stopManagedContainers();
+
+        verify(containers).stopForShutdown(instances.getFirst());
+        for (Instance instance : instances) {
+            if (ephemeral) {
+                verify(containers).terminateForShutdown(instance);
+                assertEquals("terminated", instance.getState().getName());
+            } else {
+                verify(containers, never()).terminateForShutdown(instance);
+            }
+        }
+        if (!ephemeral) {
+            assertEquals(List.of("stopped", "stopped", "pending"),
+                    instances.stream().map(instance -> instance.getState().getName()).toList());
+        }
+        assertEquals(Set.of("111122223333"), instanceStore.scanAllAccountEntries(key -> true).stream()
+                .map(AccountAwareStorageBackend.AccountEntry::accountId).collect(Collectors.toSet()));
+    }
+
+    @Test
+    void shutdownReclaimsPendingMetadataHelpersBeforeTheWorkloadContainerExists() {
+        EmulatorConfig config = mockConfig(false);
+        when(config.storage().mode()).thenReturn("memory");
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance instance = persistedInstance("i-pending-helper", "10.20.1.10", InstanceState.pending());
+        instanceStore.putForAccount("111122223333", "us-east-1::i-pending-helper", instance);
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, containers, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
+
+        service.stopManagedContainers();
+
+        verify(containers).terminateForShutdown(instance);
+        verify(containers, never()).stopForShutdown(instance);
+        assertEquals("terminated", instance.getState().getName());
     }
 
     @Test
@@ -7357,7 +9937,7 @@ class Ec2ServiceTest {
         instance.setDockerContainerId("container-other");
         instanceStore.putForAccount("111122223333", "us-east-1::i-other", instance);
         Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
-        Ec2Service service = new Ec2Service(mockConfig(false), containerManager,
+        Ec2Service service = new Ec2Service(shutdownConfig("persistent", null), containerManager,
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
                 new Ec2InstanceTypeCatalog(),
                 new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)), mock(VpcNetworkManager.class));
@@ -7369,6 +9949,108 @@ class Ec2ServiceTest {
                 instanceStore.scanAllAccountEntries(key -> key.endsWith("i-other"));
         assertEquals(List.of("111122223333"), stored.stream().map(AccountAwareStorageBackend.AccountEntry::accountId).toList());
         assertEquals("stopped", stored.get(0).value().getState().getName());
+    }
+
+    @Test
+    void memoryShutdownRemovesRunningAndStoppedInstancesInTheirOwnerAccounts() {
+        AccountAwareStorageBackend<Instance> store = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance running = persistedInstance("i-running", "10.20.1.10", InstanceState.running());
+        running.setDockerContainerId("container-running");
+        Instance stopped = persistedInstance("i-stopped", "10.20.1.11", InstanceState.stopped());
+        stopped.setDockerContainerId("container-stopped");
+        store.putForAccount("111122223333", "us-east-1::i-running", running);
+        store.putForAccount("111122223333", "us-east-1::i-stopped", stopped);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = shutdownService(shutdownConfig("persistent", "memory"), manager, store);
+
+        service.stopManagedContainers();
+
+        verify(manager).stopForShutdown(running);
+        verify(manager, never()).stopForShutdown(stopped);
+        verify(manager).terminateForShutdown(running);
+        verify(manager).terminateForShutdown(stopped);
+        assertEquals("terminated", store.getForAccount("111122223333", "us-east-1::i-running")
+                .orElseThrow().getState().getName());
+        assertEquals("terminated", store.getForAccount("111122223333", "us-east-1::i-stopped")
+                .orElseThrow().getState().getName());
+        assertTrue(store.getForAccount("000000000000", "us-east-1::i-running").isEmpty());
+    }
+
+    @Test
+    void memoryShutdownRetainsFailedCleanupAndContinuesOtherInstances() {
+        AccountAwareStorageBackend<Instance> store = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance failed = persistedInstance("i-failed", "10.20.1.10", InstanceState.stopped());
+        failed.setDockerContainerId("container-failed");
+        Instance pending = persistedInstance("i-pending", "10.20.1.11", InstanceState.pending());
+        store.put("us-east-1::i-failed", failed);
+        store.put("us-east-1::i-pending", pending);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        doThrow(new IllegalStateException("cleanup incomplete")).when(manager).terminateForShutdown(failed);
+        Ec2Service service = shutdownService(shutdownConfig("memory", null), manager, store);
+
+        assertDoesNotThrow(service::stopManagedContainers);
+
+        verify(manager).terminateForShutdown(failed);
+        verify(manager).terminateForShutdown(pending);
+        assertEquals("stopped", failed.getState().getName());
+        assertEquals("container-failed", failed.getDockerContainerId());
+        assertEquals("terminated", pending.getState().getName());
+        verify(manager, never()).stopForShutdown(any());
+    }
+
+    @Test
+    void persistentOverrideKeepsStoppedContainersForRestart() {
+        AccountAwareStorageBackend<Instance> store = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance stopped = persistedInstance("i-stopped", "10.20.1.10", InstanceState.stopped());
+        stopped.setDockerContainerId("container-stopped");
+        store.put("us-east-1::i-stopped", stopped);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = shutdownService(shutdownConfig("memory", "persistent"), manager, store);
+
+        service.stopManagedContainers();
+
+        verify(manager, never()).stopForShutdown(any());
+        verify(manager, never()).terminateForShutdown(any());
+        assertEquals("stopped", stopped.getState().getName());
+        assertEquals("container-stopped", stopped.getDockerContainerId());
+    }
+
+    @Test
+    void disabledEc2ShutdownDoesNotTouchRetainedContainers() {
+        AccountAwareStorageBackend<Instance> store = AccountAwareStorageBackend.inMemory("000000000000");
+        Instance running = persistedInstance("i-running", "10.20.1.10", InstanceState.running());
+        running.setDockerContainerId("container-running");
+        store.put("us-east-1::i-running", running);
+        EmulatorConfig config = shutdownConfig("memory", null);
+        when(config.services().ec2().enabled()).thenReturn(false);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+
+        shutdownService(config, manager, store).stopManagedContainers();
+
+        verify(manager, never()).stopForShutdown(any());
+        verify(manager, never()).terminateForShutdown(any());
+        assertEquals("running", running.getState().getName());
+    }
+
+    private static Ec2Service shutdownService(EmulatorConfig config, Ec2ContainerManager manager,
+                                              AccountAwareStorageBackend<Instance> store) {
+        return new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", store)), mock(VpcNetworkManager.class));
+    }
+
+    private static EmulatorConfig shutdownConfig(String globalMode, String serviceMode) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.services().ec2().enabled()).thenReturn(true);
+        EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
+        EmulatorConfig.ServiceStorageOverrides services = mock(EmulatorConfig.ServiceStorageOverrides.class);
+        EmulatorConfig.Ec2StorageConfig ec2 = mock(EmulatorConfig.Ec2StorageConfig.class);
+        when(config.storage()).thenReturn(storage);
+        when(storage.mode()).thenReturn(globalMode);
+        when(storage.services()).thenReturn(services);
+        when(services.ec2()).thenReturn(ec2);
+        when(ec2.mode()).thenReturn(Optional.ofNullable(serviceMode));
+        return config;
     }
 
     @Test
@@ -7563,6 +10245,12 @@ class Ec2ServiceTest {
         when(containerManager.commitInstance(any(Instance.class), anyString()))
                 .thenReturn("floci-ami/test-capture:latest");
         return containerManager;
+    }
+
+    private static AmiImageResolver minimalImageResolver() {
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        when(resolver.resolveImage(anyString())).thenReturn(ResolvedAmiImage.minimal("guest:test"));
+        return resolver;
     }
 
     private static Ec2Service liveService(Ec2ContainerManager containerManager, AmiImageResolver resolver) {
@@ -7800,6 +10488,33 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void failedManagedAttachmentKeepsTheVolumeAvailableForRetry() {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, devices);
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        Volume volume = service.createVolume("us-east-1", instance.getPlacement().getAvailabilityZone(),
+                "gp3", 1, false, 3000, 125, null, List.of(new Tag("Owner", "retained")));
+        volume.setManagedFilesystem("ext4");
+        when(devices.attachVolume(volume, instance, "/dev/sdf"))
+                .thenThrow(new AwsException("InternalError", "retained mount is missing", 500));
+
+        assertThrows(AwsException.class, () -> service.attachVolume(
+                "us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf"));
+
+        Volume retained = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals("available", retained.getState());
+        assertTrue(retained.getAttachments().isEmpty());
+        assertEquals("ext4", retained.getManagedFilesystem());
+        assertEquals(1, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(volume.getVolumeId()))).size());
+    }
+
+    @Test
     void attachVolumeThrowsWithDifferentAZ() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
@@ -7838,6 +10553,86 @@ class Ec2ServiceTest {
         assertEquals("IncorrectInstanceState", error.getErrorCode());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void detachFailurePreservesAttachmentForRetry(boolean managed) {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        when(devices.isAvailable()).thenReturn(true);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(), null, null, devices);
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        Volume volume = service.createVolume("us-east-1", instance.getPlacement().getAvailabilityZone(), "gp3", 8,
+                false, 0, null, null, List.of(new Tag("Owner", "retry")));
+        if (managed) {
+            volume.setManagedFilesystem("ext4");
+        }
+        VolumeAttachment attachment = service.attachVolume("us-east-1", volume.getVolumeId(),
+                instance.getInstanceId(), "/dev/sdf");
+        doThrow(new AwsException("InternalError", "busy", 500)).doNothing()
+                .when(devices).detachVolume(volume, instance, "/dev/sdf");
+
+        AwsException dryRun = assertThrows(AwsException.class, () -> service.detachVolume("us-east-1",
+                volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false, true));
+        assertEquals("DryRunOperation", dryRun.getErrorCode());
+        verify(devices, never()).detachVolume(any(), any(), anyString());
+        AwsException failure = assertThrows(AwsException.class, () -> service.detachVolume("us-east-1",
+                volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false));
+        assertEquals("InternalError", failure.getErrorCode());
+        Volume retained = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals("in-use", retained.getState());
+        assertEquals(List.of(attachment), retained.getAttachments());
+        assertEquals("attached", attachment.getState());
+        assertFalse(service.describeTags("us-east-1", Map.of("resource-id", List.of(volume.getVolumeId()))).isEmpty());
+
+        assertSame(attachment, service.detachVolume("us-east-1", volume.getVolumeId(),
+                instance.getInstanceId(), "/dev/sdf", false));
+        assertEquals("available", retained.getState());
+        assertTrue(retained.getAttachments().isEmpty());
+        assertEquals("detached", attachment.getState());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void managedAttachmentRequiresAvailableSupport(boolean detach) {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        Volume volume = service.createVolume("us-east-1", instance.getPlacement().getAvailabilityZone(), "gp3", 8,
+                false, 0, null, null, List.of());
+        if (detach) {
+            service.attachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf");
+        }
+        volume.setManagedFilesystem("ext4");
+
+        AwsException dryRun = assertThrows(AwsException.class, () -> {
+            if (detach) {
+                service.detachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false, true);
+            } else {
+                service.attachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", true);
+            }
+        });
+        assertEquals("DryRunOperation", dryRun.getErrorCode());
+        AwsException error = assertThrows(AwsException.class, () -> {
+            if (detach) {
+                service.detachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false);
+            } else {
+                service.attachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf");
+            }
+        });
+        assertEquals("InternalError", error.getErrorCode());
+        assertEquals(detach ? "in-use" : "available", volume.getState());
+        assertEquals(detach ? 1 : 0, volume.getAttachments().size());
+        if (detach) {
+            assertEquals("attached", volume.getAttachments().getFirst().getState());
+        }
+    }
+
     @Test
     void detachVolumeMarksVolumeAvailableAndClearsAttachment() {
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
@@ -7863,6 +10658,42 @@ class Ec2ServiceTest {
         Volume detached = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
         assertEquals("available", detached.getState());
         assertTrue(detached.getAttachments().isEmpty());
+    }
+
+    @Test
+    void failedManagedDetachPreservesTheAttachmentUntilRetry() {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, devices);
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        Volume volume = service.createVolume("us-east-1", instance.getPlacement().getAvailabilityZone(),
+                "gp3", 1, false, 3000, 125, null, List.of(new Tag("Owner", "retained")));
+        volume.setManagedFilesystem("ext4");
+        service.attachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf");
+        doThrow(new AwsException("InternalError", "Docker volume is still in use", 500)).doNothing()
+                .when(devices).detachVolume(volume, instance, "/dev/sdf");
+
+        assertThrows(AwsException.class, () -> service.detachVolume(
+                "us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false));
+
+        Volume retained = service.describeVolumes("us-east-1", List.of(volume.getVolumeId()), Map.of()).getFirst();
+        assertEquals("in-use", retained.getState());
+        assertEquals(1, retained.getAttachments().size());
+        assertEquals("attached", retained.getAttachments().getFirst().getState());
+        assertEquals(instance.getInstanceId(), retained.getAttachments().getFirst().getInstanceId());
+        assertEquals("ext4", retained.getManagedFilesystem());
+        assertEquals(1, service.describeTags("us-east-1",
+                Map.of("resource-id", List.of(volume.getVolumeId()))).size());
+        assertEquals("VolumeInUse", assertThrows(AwsException.class, () -> service.deleteVolume(
+                "us-east-1", volume.getVolumeId())).getErrorCode());
+
+        service.detachVolume("us-east-1", volume.getVolumeId(), instance.getInstanceId(), "/dev/sdf", false);
+        assertEquals("available", retained.getState());
+        assertTrue(retained.getAttachments().isEmpty());
     }
 
     @Test
@@ -8244,9 +11075,9 @@ class Ec2ServiceTest {
         Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
         AtomicReference<Map<String, List<String>>> policyLists = new AtomicReference<>();
         doAnswer(invocation -> {
-            policyLists.set(invocation.getArgument(2));
+            policyLists.set(invocation.getArgument(3));
             return null;
-        }).when(manager).refreshSecurityGroups(eq(region), anyMap(), anyMap());
+        }).when(manager).refreshSecurityGroups(eq("000000000000"), eq(region), anyMap(), anyMap());
         Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
                 new InMemoryStorageFactory());
@@ -10155,6 +12986,30 @@ class Ec2ServiceTest {
                         .getFirst().getInstances().getFirst().getPublicIpAddress());
     }
 
+    @Test
+    void failedPublicRouteDoesNotPublishAnUnreachableElasticAddressAndCanBeRetried() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        when(manager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.9");
+        Ec2Service service = eipService(manager);
+        String instanceId = launchOne(service);
+        Instance instance = service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                .getFirst().getInstances().getFirst();
+        String previousAddress = instance.getPublicIpAddress();
+        Address allocated = service.allocateAddress("us-east-1");
+        doThrow(new IllegalStateException("Routing namespace unavailable")).doNothing()
+                .when(manager).refreshPublicRouting(instance, "192.168.215.9");
+
+        assertThrows(IllegalStateException.class,
+                () -> service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId));
+        assertEquals(previousAddress, instance.getPublicIpAddress(),
+                "Failed route admission must leave the instance address eligible for retry");
+
+        Address associated = service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId);
+        assertEquals("192.168.215.9", associated.getPublicIp());
+        assertEquals("192.168.215.9", instance.getPublicIpAddress());
+        verify(manager, times(2)).refreshPublicRouting(instance, "192.168.215.9");
+    }
+
     /**
      * DescribeAddresses is where Terraform refreshes public_ip, and Docker hands out a new
      * bridge IP after a stop/start, so the association has to be re-resolved on read.
@@ -10410,6 +13265,244 @@ class Ec2ServiceTest {
                 region, List.of(selected.getGroupId()), List.of(), Map.of()).getFirst().getGroupId());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void imageRegistrySerializesContendingMutations(boolean deregister) throws Exception {
+        ParkingStore<Image> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Image> images = new AccountAwareStorageBackend<>(parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-registered-images.json", images)));
+        Image original = deregister
+                ? service.registerImage("us-east-1", "contested", null, "x86_64", "/dev/xvda", null) : null;
+        if (deregister) {
+            parking.parkNextRead();
+        } else {
+            parking.parkNextWrite();
+        }
+        Callable<Image> request = () -> {
+            if (deregister) {
+                service.deregisterImage("us-east-1", original.getImageId(), true);
+                return original;
+            }
+            return service.registerImage("us-east-1", "contested", null, "x86_64", "/dev/xvda", null);
+        };
+        AtomicReference<Thread> firstWorker = new AtomicReference<>();
+        AtomicReference<Thread> secondWorker = new AtomicReference<>();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        Throwable primaryFailure = null;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        try {
+            Future<Image> firstResult = workers.submit(() -> {
+                firstWorker.set(Thread.currentThread());
+                return request.call();
+            });
+            assertTrue(parking.awaitParked(), "the first mutation never reached the image store");
+            Future<Image> secondResult = workers.submit(() -> {
+                secondWorker.set(Thread.currentThread());
+                return request.call();
+            });
+            // An unlocked contender finishes; a correct contender waits behind the parked owner.
+            Awaitility.await("the competing image mutation to finish or enter the registry monitor")
+                    .atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> secondResult.isDone()
+                            || isBlockedIn(secondWorker.get(), deregister ? "deregisterImageAdmitted" : "registerImage",
+                                    firstWorker.get()));
+            parking.release();
+            assertAll(
+                    () -> assertDoesNotThrow(() -> firstResult.get(
+                            Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)),
+                    () -> {
+                        ExecutionException refusal = assertThrows(ExecutionException.class,
+                                () -> secondResult.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS));
+                        AwsException error = assertInstanceOf(AwsException.class, refusal.getCause());
+                        assertEquals(deregister ? "InvalidAMIID.Unavailable" : "InvalidAMIName.Duplicate",
+                                error.getErrorCode());
+                    },
+                    () -> assertEquals(deregister ? 0 : 1,
+                            service.describeImages("us-east-1", List.of(), List.of("self")).size(),
+                            "the final image inventory must reflect one successful mutation"));
+        } catch (Exception | Error failure) {
+            primaryFailure = failure;
+            throw failure;
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            try {
+                assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS), "image mutation workers must terminate");
+            } catch (Exception | Error cleanupFailure) {
+                if (cleanupFailure instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                if (primaryFailure != null) {
+                    primaryFailure.addSuppressed(cleanupFailure);
+                } else {
+                    throw cleanupFailure;
+                }
+            } finally {
+                if (primaryFailure instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    @Test
+    void aGroupInAVpcWithAnIpv6BlockStartsWithTheIpv6OutboundRule() {
+        // AWS: the default group "allows all outbound IPv6 traffic ... only if your VPC has an associated IPv6 CIDR
+        // block", and a VPC's groups get that rule when the block is associated. Without it, security-group
+        // enforcement drops every outgoing IPv6 packet of a dual-stack guest, neighbor discovery included.
+        Ec2Service service = mockModeService();
+        Vpc dual = service.createVpc("us-east-1", "10.231.0.0/16", false, true);
+        Vpc ipv4 = service.createVpc("us-east-1", "10.232.0.0/16", false, false);
+        SecurityGroup inDual = service.createSecurityGroup("us-east-1", "dual-stack", "d", dual.getVpcId());
+        SecurityGroup inIpv4 = service.createSecurityGroup("us-east-1", "ipv4-only", "v", ipv4.getVpcId());
+        assertEquals(List.of("::/0"), ipv6Egress(inDual));
+        assertEquals(List.of(), ipv6Egress(inIpv4));
+        assertEquals(List.of("::/0"), ipv6Egress(groupNamed(service, dual.getVpcId(), "default")));
+        assertEquals(List.of(), ipv6Egress(groupNamed(service, ipv4.getVpcId(), "default")));
+        assertTrue(service.describeSecurityGroupRules("us-east-1", List.of(inDual.getGroupId()), List.of()).stream()
+                .anyMatch(rule -> rule.isEgress() && "::/0".equals(rule.getCidrIpv6())));
+    }
+
+    @Test
+    void associatingAnIpv6BlockAddsTheIpv6OutboundRuleOnlyToGroupsWithTheirOriginalOutboundRule() {
+        Ec2Service service = mockModeService();
+        Vpc vpc = service.createVpc("us-east-1", "10.233.0.0/16", false, false);
+        service.createSecurityGroup("us-east-1", "untouched", "u", vpc.getVpcId());
+        SecurityGroup changed = service.createSecurityGroup("us-east-1", "changed", "c", vpc.getVpcId());
+        IpPermission https = new IpPermission();
+        https.setIpProtocol("tcp");
+        https.setFromPort(443);
+        https.setToPort(443);
+        https.getIpRanges().add(new IpRange("10.0.0.0/8"));
+        service.authorizeSecurityGroupEgress("us-east-1", changed.getGroupId(), List.of(https));
+
+        service.associateAmazonProvidedIpv6CidrBlock("us-east-1", vpc.getVpcId());
+
+        assertEquals(List.of("::/0"), ipv6Egress(groupNamed(service, vpc.getVpcId(), "untouched")));
+        assertEquals(List.of("::/0"), ipv6Egress(groupNamed(service, vpc.getVpcId(), "default")));
+        assertEquals(List.of(), ipv6Egress(groupNamed(service, vpc.getVpcId(), "changed")));
+    }
+
+    @Test
+    void ipv6AssociationDoesNotRestoreEgressRevokedBeforeItsGroupUpdate() throws Exception {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Method lockFor = Ec2Service.class.getDeclaredMethod("lockFor", String.class);
+        lockFor.setAccessible(true);
+        Object topologyLock = lockFor.invoke(service, region + "::transit-gateway-attachments");
+        Vpc selectedVpc = null;
+        SecurityGroup selectedGroup = null;
+        Object selectedLock = null;
+        for (int attempt = 0; attempt < 32; attempt++) {
+            Vpc candidate = service.createVpc(region, "10.234.0.0/16", false);
+            SecurityGroup group = groupNamed(service, candidate.getVpcId(), "default");
+            Object groupLock = lockFor.invoke(service, region + "::" + group.getGroupId());
+            Object vpcLock = lockFor.invoke(service, region + "::" + candidate.getVpcId());
+            if (groupLock != topologyLock && groupLock != vpcLock) {
+                selectedVpc = candidate;
+                selectedGroup = group;
+                selectedLock = groupLock;
+                break;
+            }
+        }
+        assertNotNull(selectedVpc, "The group lock must be distinct from earlier topology and VPC locks");
+        Vpc vpc = selectedVpc;
+        SecurityGroup group = selectedGroup;
+        Object groupLock = selectedLock;
+        AtomicReference<Thread> associating = new AtomicReference<>();
+        ExecutorService workers = Executors.newSingleThreadExecutor();
+        Future<?> association;
+        try {
+            synchronized (groupLock) {
+                association = workers.submit(() -> {
+                    associating.set(Thread.currentThread());
+                    service.associateAmazonProvidedIpv6CidrBlock(region, vpc.getVpcId());
+                });
+                awaitBlockedOrDone(associating, association);
+                assertFalse(association.isDone());
+                ThreadInfo blocked = ManagementFactory.getThreadMXBean().getThreadInfo(associating.get().threadId());
+                assertNotNull(blocked.getLockInfo());
+                assertEquals(System.identityHashCode(groupLock), blocked.getLockInfo().getIdentityHashCode());
+                service.revokeSecurityGroupEgress(region, group.getGroupId(),
+                        new ArrayList<>(group.getIpPermissionsEgress()));
+            }
+            association.get(5, TimeUnit.SECONDS);
+            assertTrue(groupNamed(service, vpc.getVpcId(), "default").getIpPermissionsEgress().isEmpty(),
+                    "Association must not restore outbound access after the original rule was revoked");
+        } finally {
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void ipv6AssociationRefreshesAllGroupsOnlyOnce() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = enforcingIpv6Service(manager);
+        Vpc vpc = service.createVpc("us-east-1", "10.235.0.0/16", false);
+        service.createSecurityGroup("us-east-1", "first", "first", vpc.getVpcId());
+        service.createSecurityGroup("us-east-1", "second", "second", vpc.getVpcId());
+        clearInvocations(manager);
+
+        service.associateAmazonProvidedIpv6CidrBlock("us-east-1", vpc.getVpcId());
+
+        verify(manager, times(1)).refreshSecurityGroups(eq("000000000000"), eq("us-east-1"), anyMap(), anyMap());
+        for (String name : List.of("default", "first", "second")) {
+            assertEquals(List.of("::/0"), ipv6Egress(groupNamed(service, vpc.getVpcId(), name)));
+        }
+    }
+
+    @Test
+    void ipv6AssociationRetryRefreshesEveryGroupAfterFirewallFailure() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = enforcingIpv6Service(manager);
+        Vpc vpc = service.createVpc("us-east-1", "10.236.0.0/16", false);
+        service.createSecurityGroup("us-east-1", "first", "first", vpc.getVpcId());
+        service.createSecurityGroup("us-east-1", "second", "second", vpc.getVpcId());
+        clearInvocations(manager);
+        doThrow(new IllegalStateException("firewall unavailable")).doNothing().when(manager)
+                .refreshSecurityGroups(eq("000000000000"), eq("us-east-1"), anyMap(), anyMap());
+
+        assertThrows(IllegalStateException.class,
+                () -> service.associateAmazonProvidedIpv6CidrBlock("us-east-1", vpc.getVpcId()));
+        for (String name : List.of("default", "first", "second")) {
+            assertEquals(List.of("::/0"), ipv6Egress(groupNamed(service, vpc.getVpcId(), name)),
+                    "A failed firewall refresh must not leave later groups without their default rule");
+        }
+        assertDoesNotThrow(() -> service.associateAmazonProvidedIpv6CidrBlock("us-east-1", vpc.getVpcId()));
+        verify(manager, times(2)).refreshSecurityGroups(eq("000000000000"), eq("us-east-1"), anyMap(), anyMap());
+        for (String name : List.of("default", "first", "second")) {
+            SecurityGroup group = groupNamed(service, vpc.getVpcId(), name);
+            assertEquals(1, service.describeSecurityGroupRules("us-east-1", List.of(group.getGroupId()), List.of())
+                    .stream().filter(rule -> rule.isEgress() && "::/0".equals(rule.getCidrIpv6())).count());
+        }
+    }
+
+    private static Ec2Service enforcingIpv6Service(Ec2ContainerManager manager) {
+        EmulatorConfig config = mockConfig(false);
+        EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class);
+        EmulatorConfig.SecurityGroupEnforcementConfig enforcement = mock(EmulatorConfig.SecurityGroupEnforcementConfig.class);
+        when(config.network()).thenReturn(network);
+        when(network.securityGroupEnforcement()).thenReturn(enforcement);
+        when(enforcement.enabled()).thenReturn(true);
+        return new Ec2Service(config, manager, mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class),
+                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+    }
+
+    private static List<String> ipv6Egress(SecurityGroup group) {
+        return group.getIpPermissionsEgress().stream().flatMap(permission -> permission.getIpv6Ranges().stream())
+                .map(Ipv6Range::getCidrIpv6).toList();
+    }
+
+    private static SecurityGroup groupNamed(Ec2Service service, String vpcId, String name) {
+        return service.describeSecurityGroups("us-east-1", List.of(), List.of(), Map.of()).stream()
+                .filter(group -> vpcId.equals(group.getVpcId()) && name.equals(group.getGroupName()))
+                .findFirst().orElseThrow();
+    }
+
     private static Ec2Service mockModeService() {
         return mockModeService(mockConfig(true));
     }
@@ -10421,13 +13514,1046 @@ class Ec2ServiceTest {
                 new InMemoryStorageFactory());
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,false,false,start", "true,false,false,start", "false,true,false,start",
+            "true,true,false,start", "false,false,true,start", "false,false,false,restore",
+            "true,false,false,restore", "false,true,false,restore", "true,true,false,restore",
+            "false,false,false,reboot", "true,false,false,reboot",
+            "false,true,false,reboot", "true,true,false,reboot"})
+    void runtimeRestartSynchronizesRetainedInterfaceAddresses(boolean supplied, boolean faithful,
+                                                              boolean deleteOnTermination, String operation) {
+        boolean restore = "restore".equals(operation);
+        boolean reboot = "reboot".equals(operation);
+        EmulatorConfig config = mockConfig(true);
+        when(config.services().ec2().vpcNetworks()).thenReturn(mock(EmulatorConfig.VpcNetworksConfig.class));
+        when(config.services().ec2().awsFaithfulPrivateIp()).thenReturn(faithful);
+        DockerClient docker = mock(DockerClient.class);
+        when(docker.startContainerCmd("runtime-sync")).thenReturn(mock(StartContainerCmd.class, RETURNS_SELF));
+        when(docker.restartContainerCmd("runtime-sync")).thenReturn(mock(RestartContainerCmd.class, RETURNS_SELF));
+        InspectContainerResponse response = mock(InspectContainerResponse.class);
+        NetworkSettings settings = mock(NetworkSettings.class);
+        ContainerNetwork bridge = mock(ContainerNetwork.class);
+        when(bridge.getIpAddress()).thenReturn("172.17.0.99");
+        when(settings.getNetworks()).thenReturn(Map.of("bridge", bridge));
+        when(response.getNetworkSettings()).thenReturn(settings);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("runtime-sync")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        when(lifecycle.isContainerRunning("runtime-sync")).thenReturn(true);
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).execute(any(Runnable.class));
+        Ec2ContainerManager manager = new Ec2ContainerManager(mock(ContainerBuilder.class), lifecycle,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class), mock(DockerHostResolver.class),
+                docker, mock(PortAllocator.class), config, mock(Ec2MetadataServer.class),
+                mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), executor, Duration.ofSeconds(1));
+        RequestContext context = new RequestContext();
+        context.setAccountId("111111111111");
+        // The model Instance is imported; this is CDI's Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(contexts), contexts);
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of("172.31.0.222"), List.of(), List.of(new Tag("retained", "yes"))).getNetworkInterfaceId() : null;
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), supplied ? null : subnet.getSubnetId(), null, List.of(), null, null,
+                null, suppliedId, 0, null, null, null, null, false, null, null, List.of(), false,
+                null, null, deleteOnTermination).getInstances().getFirst();
+        String eniId = host.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        NetworkInterface before = service.describeNetworkInterfaces(region, List.of(eniId), Map.of())
+                .networkInterfaces().getFirst();
+        String allocated = before.getPrivateIpAddress();
+        String attachment = before.getAttachment().getAttachmentId();
+        List<GroupIdentifier> groups = List.copyOf(before.getGroups());
+        List<Tag> interfaceTags = List.copyOf(before.getTagSet());
+        List<String> secondaryAddresses = before.getPrivateIpAddresses().stream().filter(ip -> !ip.isPrimary())
+                .map(NetworkInterfacePrivateIpAddress::getPrivateIpAddress).toList();
+        NetworkInterface secondary = service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of("172.31.0.223"), List.of(), List.of(new Tag("secondary", "preserved")));
+        String secondaryId = secondary.getNetworkInterfaceId();
+        host.setState(InstanceState.running());
+        service.attachNetworkInterface(region, secondaryId, host.getInstanceId(), 1);
+        String secondaryIp = secondary.getPrivateIpAddress();
+        String secondaryDns = secondary.getPrivateDnsName();
+        List<GroupIdentifier> secondaryGroups = List.copyOf(secondary.getGroups());
+        List<Tag> secondaryTags = List.copyOf(secondary.getTagSet());
+        // The primary is selected by device index, not by list position.
+        InstanceNetworkInterface primaryView = host.getNetworkInterfaces().getFirst();
+        InstanceNetworkInterface secondaryView = host.getNetworkInterfaces().getLast();
+        host.setNetworkInterfaces(new ArrayList<>(List.of(secondaryView, primaryView)));
+        host.setDockerContainerId("runtime-sync");
+        host.setState(restore || reboot ? InstanceState.running() : InstanceState.stopped());
+        when(config.services().ec2().mock()).thenReturn(false);
+
+        if (restore) {
+            context.setAccountId("222222222222");
+            service.restoreMetadataRegistrations();
+            assertTrue(tasks.isEmpty());
+        } else {
+            if (reboot) {
+                service.rebootInstances(region, List.of(host.getInstanceId()));
+            } else {
+                service.startInstances(region, List.of(host.getInstanceId()));
+            }
+            assertEquals(1, tasks.size());
+            if (reboot) {
+                context.setAccountId("222222222222");
+            }
+            // Start completion is scoped by RequestScopes, which a mocked request context does
+            // not follow, so only the reboot callback runs under another caller here.
+            tasks.removeFirst().run();
+            context.setAccountId("222222222222");
+        }
+
+        assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+        context.setAccountId("111111111111");
+        assertEquals("running", host.getState().getName());
+        String expected = faithful ? allocated : "172.17.0.99";
+        assertEquals(expected, host.getPrivateIpAddress());
+        NetworkInterface after = service.describeNetworkInterfaces(region, List.of(eniId), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals(expected, after.getPrivateIpAddress());
+        assertEquals(host.getPrivateDnsName(), after.getPrivateDnsName());
+        assertEquals(expected, after.getPrivateIpAddresses().stream().filter(NetworkInterfacePrivateIpAddress::isPrimary)
+                .findFirst().orElseThrow().getPrivateIpAddress());
+        assertEquals(attachment, after.getAttachment().getAttachmentId());
+        assertEquals(groups, after.getGroups());
+        assertEquals(interfaceTags, after.getTagSet());
+        assertEquals(secondaryAddresses, after.getPrivateIpAddresses().stream().filter(ip -> !ip.isPrimary())
+                .map(NetworkInterfacePrivateIpAddress::getPrivateIpAddress).toList());
+        Instance described = service.describeInstances(region, List.of(host.getInstanceId()), Map.of())
+                .getFirst().getInstances().getFirst();
+        InstanceNetworkInterface describedSecondary = described.getNetworkInterfaces().stream()
+                .filter(eni -> eni.getDeviceIndex() == 1).findFirst().orElseThrow();
+        assertEquals(secondaryIp, describedSecondary.getPrivateIpAddress());
+        assertEquals(secondaryDns, describedSecondary.getPrivateDnsName());
+        assertEquals(expected, described.getNetworkInterfaces().stream()
+                .filter(eni -> eni.getDeviceIndex() == 0).findFirst().orElseThrow().getPrivateIpAddress());
+        NetworkInterface storedSecondary = service.describeNetworkInterfaces(region, List.of(secondaryId), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals(secondaryIp, storedSecondary.getPrivateIpAddress());
+        assertEquals(secondaryDns, storedSecondary.getPrivateDnsName());
+        NetworkInterfacePrivateIpAddress secondaryPrimary = storedSecondary.getPrivateIpAddresses().stream()
+                .filter(NetworkInterfacePrivateIpAddress::isPrimary).findFirst().orElseThrow();
+        assertEquals(secondaryIp, secondaryPrimary.getPrivateIpAddress());
+        assertEquals(secondaryDns, secondaryPrimary.getPrivateDnsName());
+        assertEquals("172.31.0.223", storedSecondary.getPrivateIpAddresses().stream()
+                .filter(address -> !address.isPrimary()).findFirst().orElseThrow().getPrivateIpAddress());
+        assertEquals(secondaryGroups, storedSecondary.getGroups());
+        assertEquals(secondaryTags, storedSecondary.getTagSet());
+        if (reboot) {
+            verify(docker.restartContainerCmd("runtime-sync")).exec();
+            verify(docker, never()).startContainerCmd("runtime-sync");
+        } else if (restore) {
+            verify(docker, never()).startContainerCmd("runtime-sync");
+        } else {
+            verify(docker.startContainerCmd("runtime-sync")).exec();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchCallbackSynchronizesRetainedInterfaceAddresses(boolean supplied) {
+        EmulatorConfig config = mockConfig(false);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), supplied ? null : subnet.getSubnetId(), null, List.of(), null, null,
+                null, suppliedId, 0, null, null, null, null, false, null, null, List.of(), false,
+                null, null, false).getInstances().getFirst();
+        ArgumentCaptor<Runnable> callback = ArgumentCaptor.forClass(Runnable.class);
+        verify(manager).launch(eq(host), any(), any(), eq(region), any(Ec2PortForwardManager.DesiredPorts.class), anyList(), anyMap(), any(), any(),
+                callback.capture());
+        // Exercise the service's launch completion hook after the manager's real address transform.
+        Ec2ContainerManager.exposeReachablePrivateAddress(host, "172.17.0.88", false);
+        host.setState(InstanceState.running());
+        callback.getValue().run();
+        NetworkInterface retained = service.describeNetworkInterfaces(region,
+                List.of(host.getNetworkInterfaces().getFirst().getNetworkInterfaceId()), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals("172.17.0.88", retained.getPrivateIpAddress());
+        assertEquals(host.getPrivateDnsName(), retained.getPrivateDnsName());
+    }
+
+    @Test
+    void lateRuntimeAddressCallbackDoesNotRewriteAReusedInterface() {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        String eni = service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(),
+                null, null, List.of(), null, null, null, eni, 0).getInstances().getFirst();
+        host.setState(InstanceState.stopped());
+        when(config.services().ec2().mock()).thenReturn(false);
+        service.startInstances(region, List.of(host.getInstanceId()));
+        ArgumentCaptor<Runnable> callback = ArgumentCaptor.forClass(Runnable.class);
+        verify(manager).start(eq(host), any(), callback.capture());
+        when(config.services().ec2().mock()).thenReturn(true);
+        service.terminateInstances(region, List.of(host.getInstanceId()));
+        Instance replacement = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(),
+                null, null, List.of(), null, null, null, eni, 0).getInstances().getFirst();
+        NetworkInterface current = service.describeNetworkInterfaces(region, List.of(eni), Map.of())
+                .networkInterfaces().getFirst();
+        String attachment = current.getAttachment().getAttachmentId();
+        String privateIp = current.getPrivateIpAddress();
+        callback.getValue().run();
+        NetworkInterface after = service.describeNetworkInterfaces(region, List.of(eni), Map.of())
+                .networkInterfaces().getFirst();
+        assertEquals(replacement.getInstanceId(), after.getAttachment().getInstanceId());
+        assertEquals(attachment, after.getAttachment().getAttachmentId());
+        assertEquals(privateIp, after.getPrivateIpAddress());
+        assertEquals("terminated", host.getState().getName());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,running", "true,running", "false,stopped", "true,stopped"})
+    void primaryInterfaceCannotBeDetachedBeforeTermination(boolean force, String state) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.238.0.0/24");
+        NetworkInterface primary = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        String interfaceId = primary.getNetworkInterfaceId();
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), null, null, List.of(), null, null, null, interfaceId, 0).getInstances().getFirst();
+        owner.setState("stopped".equals(state) ? InstanceState.stopped() : InstanceState.running());
+        String attachment = primary.getAttachment().getAttachmentId();
+        String address = primary.getPrivateIpAddress();
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("retained", "value")));
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.detachNetworkInterface(region, attachment, force));
+        assertEquals("OperationNotPermitted", error.getErrorCode());
+        assertEquals(attachment, readInterface(service, interfaceId).getAttachment().getAttachmentId());
+        assertEquals("in-use", primary.getStatus());
+        assertEquals(address, primary.getPrivateIpAddress());
+        assertEquals(interfaceId, owner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+        assertEquals(address, owner.getPrivateIpAddress());
+        assertEquals(state, owner.getState().getName());
+        assertEquals("value", service.resourceTags(region, interfaceId).getFirst().getValue());
+        service.terminateInstances(region, List.of(owner.getInstanceId()));
+        assertNull(readInterface(service, interfaceId).getAttachment());
+        assertEquals("available", primary.getStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void secondaryInterfaceCanBeDetachedWithoutChangingPrimary(boolean force) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.239.0.0/24");
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        owner.setState(InstanceState.running());
+        String primary = owner.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        String address = owner.getPrivateIpAddress();
+        String secondary = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        String attachment = service.attachNetworkInterface(region, secondary, owner.getInstanceId(), 1)
+                .getAttachmentId();
+        service.detachNetworkInterface(region, attachment, force);
+        assertNull(readInterface(service, secondary).getAttachment());
+        assertEquals("available", readInterface(service, secondary).getStatus());
+        assertEquals(1, owner.getNetworkInterfaces().size());
+        assertEquals(primary, owner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+        assertEquals(address, owner.getPrivateIpAddress());
+        assertEquals("InvalidAttachmentID.NotFound", assertThrows(AwsException.class,
+                () -> service.detachNetworkInterface(region, attachment, force)).getErrorCode());
+        assertEquals("MissingParameter", assertThrows(AwsException.class,
+                () -> service.detachNetworkInterface(region, null, force)).getErrorCode());
+    }
+
+    @Test
+    void deletingStandaloneInterfaceRemovesOnlyItsRegionalTags() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface deleted = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of(new Tag("lifetime", "deleted")));
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of(new Tag("lifetime", "retained")));
+        String otherSubnet = privateSubnet(service, "us-west-2", "10.233.0.0/24");
+        NetworkInterface otherRegion = service.createNetworkInterface("us-west-2", otherSubnet, null, null,
+                List.of(), List.of(), List.of(new Tag("lifetime", "other-region")));
+
+        service.createTags(region, List.of(deleted.getNetworkInterfaceId()), deleted.getTagSet());
+        service.createTags(region, List.of(retained.getNetworkInterfaceId()), retained.getTagSet());
+        service.createTags("us-west-2", List.of(otherRegion.getNetworkInterfaceId()), otherRegion.getTagSet());
+        assertEquals(1, service.resourceTags(region, deleted.getNetworkInterfaceId()).size());
+
+        service.deleteNetworkInterface(region, deleted.getNetworkInterfaceId());
+
+        assertTrue(service.resourceTags(region, deleted.getNetworkInterfaceId()).isEmpty());
+        assertTrue(service.describeTags(region,
+                Map.of("resource-id", List.of(deleted.getNetworkInterfaceId()))).isEmpty());
+        assertEquals("retained", service.resourceTags(region, retained.getNetworkInterfaceId()).getFirst().getValue());
+        assertEquals("other-region", service.resourceTags("us-west-2", otherRegion.getNetworkInterfaceId())
+                .getFirst().getValue());
+        assertEquals("InvalidNetworkInterfaceID.NotFound", assertThrows(AwsException.class,
+                () -> service.deleteNetworkInterface(region, deleted.getNetworkInterfaceId())).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,true", "false,false", "true,true", "true,false"})
+    void terminationRemovesTagsOnlyForDeletedInterfaces(boolean suppliedInterface, boolean deleteOnTermination) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface supplied = suppliedInterface ? service.createNetworkInterface(region, subnet,
+                null, null, List.of(), List.of(), List.of()) : null;
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, supplied != null ? supplied.getNetworkInterfaceId() : null, 0, null,
+                null, null, null, false, null, null, List.of(), false, null, null, suppliedInterface ? null : deleteOnTermination)
+                .getInstances().getFirst();
+        String interfaceId = instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
+        NetworkInterface stored = service.describeNetworkInterfaces(region, List.of(interfaceId), Map.of(), 0, null)
+                .networkInterfaces().getFirst();
+        if (suppliedInterface) {
+            supplied.getAttachment().setDeleteOnTermination(deleteOnTermination);
+        }
+        assertEquals(deleteOnTermination, stored.getAttachment().isDeleteOnTermination());
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("lifetime", "interface")));
+        assertEquals(!suppliedInterface && deleteOnTermination
+                ? "InvalidNetworkInterfaceID.NotFound" : "InvalidParameterValue", assertThrows(AwsException.class,
+                () -> service.deleteNetworkInterface(region, interfaceId)).getErrorCode());
+        assertEquals("interface", service.resourceTags(region, interfaceId).getFirst().getValue());
+
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+
+        assertEquals(deleteOnTermination, service.resourceTags(region, interfaceId).isEmpty());
+        assertEquals(deleteOnTermination, service.describeTags(region,
+                Map.of("resource-id", List.of(interfaceId))).isEmpty());
+        if (!deleteOnTermination) {
+            assertEquals("available", service.describeNetworkInterfaces(region, List.of(interfaceId),
+                    Map.of(), 0, null).networkInterfaces().getFirst().getStatus());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void serviceHeldInterfaceRejectsInstanceClaimsUntilReleased(boolean launch) {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.234.0.0/24");
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        owner.setState(InstanceState.running());
+        String interfaceId = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        service.holdNetworkInterfaceForService(region, interfaceId);
+        int volumes = service.describeVolumes(region, List.of(), Map.of()).size();
+        Runnable claim = () -> {
+            if (launch) {
+                service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                        List.of(), null, null, List.of(), null, null, null, interfaceId, 0);
+            } else {
+                service.attachNetworkInterface(region, interfaceId, owner.getInstanceId(), 1);
+            }
+        };
+        assertEquals("InvalidNetworkInterface.InUse", assertThrows(AwsException.class, claim::run).getErrorCode());
+        assertNull(readInterface(service, interfaceId).getAttachment());
+        assertEquals("in-use", readInterface(service, interfaceId).getStatus());
+        assertEquals(1, service.describeInstances(region, List.of(), Map.of()).size());
+        assertEquals(volumes, service.describeVolumes(region, List.of(), Map.of()).size());
+        service.releaseNetworkInterfaceFromService(region, interfaceId);
+        assertDoesNotThrow(claim::run);
+        assertNotNull(readInterface(service, interfaceId).getAttachment());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "true,false", "false,true"})
+    void suppliedInterfaceAdmissionRechecksAfterConcurrentAttachmentOrDeletion(boolean delete, boolean different) throws Exception {
+        ParkingStore<Subnet> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Subnet> subnetStore = new AccountAwareStorageBackend<>(
+                parking, null, "000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-subnets.json", subnetStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.232.0.0/24");
+        NetworkInterface supplied = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        String interfaceId = supplied.getNetworkInterfaceId();
+        String competingId = different ? service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId() : interfaceId;
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("retained", "value")));
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        parking.parkNextRead();
+        try {
+            Future<Reservation> delayed = worker.submit(() -> service.runInstances(region, "ami-test", "t3.micro",
+                    1, 1, null, List.of(), null, null, List.of(new Tag("delayed", "value")),
+                    null, null, null, interfaceId, 0));
+            assertTrue(parking.awaitParked(), "launch never reached its post-interface subnet lookup");
+            Instance winner = null;
+            if (delete) {
+                service.deleteNetworkInterface(region, interfaceId);
+            } else {
+                winner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                        List.of(), null, null, List.of(), null, null, null, competingId, 0)
+                        .getInstances().getFirst();
+            }
+            int volumesBeforeRelease = service.describeVolumes(region, List.of(), Map.of()).size();
+            int addressesBeforeRelease = service.describeAddresses(region, List.of(), Map.of()).size();
+            List<Map<String, String>> tagsBeforeRelease = service.describeTags(region, Map.of());
+            parking.release();
+            if (different) {
+                Instance first = delayed.get(10, TimeUnit.SECONDS).getInstances().getFirst();
+                assertEquals(2, service.describeInstances(region, List.of(), Map.of()).size());
+                assertEquals(first.getInstanceId(), supplied.getAttachment().getInstanceId());
+                assertEquals(competingId, winner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+                assertNotEquals(first.getInstanceId(), winner.getInstanceId());
+                return;
+            }
+            ExecutionException refusal = assertThrows(ExecutionException.class,
+                    () -> delayed.get(10, TimeUnit.SECONDS));
+            AwsException error = assertInstanceOf(AwsException.class, refusal.getCause());
+            assertEquals(delete ? "InvalidNetworkInterfaceID.NotFound" : "InvalidNetworkInterface.InUse",
+                    error.getErrorCode());
+            assertEquals(volumesBeforeRelease, service.describeVolumes(region, List.of(), Map.of()).size());
+            assertEquals(addressesBeforeRelease, service.describeAddresses(region, List.of(), Map.of()).size());
+            assertEquals(tagsBeforeRelease, service.describeTags(region, Map.of()));
+            assertEquals(delete ? 0 : 1, service.describeInstances(region, List.of(), Map.of()).size());
+            if (delete) {
+                assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+            } else {
+                assertEquals(winner.getInstanceId(), supplied.getAttachment().getInstanceId());
+                assertEquals(interfaceId, winner.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+            }
+        } finally {
+            parking.release();
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"launch", "delete", "hold"})
+    void attachmentPublicationExcludesCompetingInterfaceOwners(String competitor) throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> instanceStore = new AccountAwareStorageBackend<>(
+                parking, null, "000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        Instance owner = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        owner.setState(InstanceState.running());
+        NetworkInterface ni = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        String interfaceId = ni.getNetworkInterfaceId();
+        service.createTags(region, List.of(interfaceId), List.of(new Tag("keep", "value")));
+        int volumes = service.describeVolumes(region, List.of(), Map.of()).size();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        AtomicReference<Thread> competingThread = new AtomicReference<>();
+        parking.parkNextRead();
+        try {
+            Future<?> attachment = workers.submit(() -> service.attachNetworkInterface(region,
+                    interfaceId, owner.getInstanceId(), 1));
+            assertTrue(parking.awaitParked(), "attach did not reach its post-interface instance lookup");
+            Future<?> competing = workers.submit(() -> {
+                competingThread.set(Thread.currentThread());
+                switch (competitor) {
+                    case "launch" -> service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                            List.of(), null, null, List.of(), null, null, null, interfaceId, 0);
+                    case "delete" -> service.deleteNetworkInterface(region, interfaceId);
+                    case "hold" -> service.holdNetworkInterfaceForService(region, interfaceId);
+                    default -> throw new IllegalArgumentException(competitor);
+                }
+            });
+            ThreadStates.awaitBlockedOrDone(competingThread, competing);
+            parking.release();
+            attachment.get(10, TimeUnit.SECONDS);
+            ExecutionException refusal = assertThrows(ExecutionException.class,
+                    () -> competing.get(10, TimeUnit.SECONDS));
+            AwsException error = assertInstanceOf(AwsException.class, refusal.getCause());
+            assertEquals("delete".equals(competitor) ? "InvalidParameterValue" : "InvalidNetworkInterface.InUse",
+                    error.getErrorCode());
+            assertEquals(owner.getInstanceId(), readInterface(service, interfaceId).getAttachment().getInstanceId());
+            assertEquals(2, owner.getNetworkInterfaces().size());
+            assertEquals(1, service.describeInstances(region, List.of(), Map.of()).size());
+            assertEquals(volumes, service.describeVolumes(region, List.of(), Map.of()).size());
+            assertEquals("value", service.resourceTags(region, interfaceId).getFirst().getValue());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void terminationDoesNotReleaseAnInterfaceReattachedAfterItsInstanceSnapshot() {
+        Ec2Service service = tagTestService(new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.235.0.0/24");
+        Instance former = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        Instance current = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        former.setState(InstanceState.running());
+        current.setState(InstanceState.running());
+        String interfaceId = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        service.attachNetworkInterface(region, interfaceId, former.getInstanceId(), 1);
+        InstanceNetworkInterface previous = former.getNetworkInterfaces().getLast();
+        service.detachNetworkInterface(region, previous.getAttachmentId(), false);
+        service.attachNetworkInterface(region, interfaceId, current.getInstanceId(), 1);
+        // A separately loaded termination snapshot can still carry the former attachment.
+        former.getNetworkInterfaces().add(previous);
+        service.terminateInstances(region, List.of(former.getInstanceId()));
+        assertNotNull(readInterface(service, interfaceId).getAttachment());
+        assertEquals(current.getInstanceId(), readInterface(service, interfaceId).getAttachment().getInstanceId());
+        assertEquals(2, current.getNetworkInterfaces().size());
+        assertTrue(former.getNetworkInterfaces().isEmpty());
+    }
+
+    @Test
+    void deletionPublicationExcludesConcurrentLaunchClaim() throws Exception {
+        InMemoryStorage<String, NetworkInterface> backing = spy(new InMemoryStorage<>());
+        AccountAwareStorageBackend<NetworkInterface> interfaceStore = new AccountAwareStorageBackend<>(
+                backing, null, "000000000000");
+        Ec2Service service = tagTestService(new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaceStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.237.0.0/24");
+        String interfaceId = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of()).getNetworkInterfaceId();
+        ParkingStore<Boolean> publication = new ParkingStore<>();
+        publication.parkNextWrite();
+        doAnswer(call -> {
+            publication.put("delete", true);
+            return call.callRealMethod();
+        }).when(backing).delete(anyString());
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        AtomicReference<Thread> launchThread = new AtomicReference<>();
+        try {
+            Future<?> deleting = workers.submit(() -> service.deleteNetworkInterface(region, interfaceId));
+            assertTrue(publication.awaitParked(), "delete did not reach standalone storage removal");
+            Future<?> launching = workers.submit(() -> {
+                launchThread.set(Thread.currentThread());
+                return service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                        List.of(), null, null, List.of(), null, null, null, interfaceId, 0);
+            });
+            ThreadStates.awaitBlockedOrDone(launchThread, launching);
+            publication.release();
+            deleting.get(10, TimeUnit.SECONDS);
+            ExecutionException refusal = assertThrows(ExecutionException.class,
+                    () -> launching.get(10, TimeUnit.SECONDS));
+            assertEquals("InvalidNetworkInterfaceID.NotFound",
+                    assertInstanceOf(AwsException.class, refusal.getCause()).getErrorCode());
+            assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+            assertTrue(service.describeNetworkInterfaces(region, List.of(), Map.of()).networkInterfaces().isEmpty());
+        } finally {
+            publication.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false,false", "false,false,true", "false,true,false", "false,true,true",
+            "true,false,false", "true,false,true", "true,true,false", "true,true,true"})
+    void releaseAddressKeepsVpcContextAfterFailedLaunch(boolean supplied, boolean defaultVpc,
+                                                       boolean clearAttribution) throws Exception {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager manager = new Ec2ContainerManager(mock(ContainerBuilder.class),
+                mock(ContainerLifecycleManager.class), mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class), mock(DockerHostResolver.class), mock(DockerClient.class),
+                mock(PortAllocator.class), config, mock(Ec2MetadataServer.class),
+                mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), mock(ExecutorService.class), Duration.ofSeconds(1));
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String subnet = defaultVpc ? service.describeSubnets(region, List.of(), Map.of()).getFirst().getSubnetId()
+                : service.createSubnet(region, service.createVpc(region, "10.237.0.0/24", false).getVpcId(),
+                        "10.237.0.0/26", "us-east-1a").getSubnetId();
+        String suppliedId = supplied ? service.createNetworkInterface(region, subnet, null,
+                null, List.of(), List.of(), List.of()).getNetworkInterfaceId() : null;
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null, List.of(),
+                subnet, null, List.of(), null, null, null, suppliedId, 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        String association = service.associateAddress(region, address.getAllocationId(), host.getInstanceId()).getAssociationId();
+        String interfaceId = address.getNetworkInterfaceId();
+        Method failLaunch = Ec2ContainerManager.class.getDeclaredMethod("failLaunch", Instance.class);
+        failLaunch.setAccessible(true);
+        failLaunch.invoke(manager, host);
+        assertEquals("terminated", host.getState().getName());
+        if (clearAttribution) {
+            Address described = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).getFirst();
+            assertNull(described.getInstanceId());
+            assertEquals(interfaceId, described.getNetworkInterfaceId());
+            assertEquals(association, described.getAssociationId());
+        }
+        if (!defaultVpc) {
+            AwsException error = assertThrows(AwsException.class,
+                    () -> service.releaseAddress(region, address.getAllocationId()));
+            assertEquals("InvalidIPAddress.InUse", error.getErrorCode());
+            assertEquals(association, address.getAssociationId());
+            assertEquals(interfaceId, address.getNetworkInterfaceId());
+            service.disassociateAddress(region, association);
+        }
+        service.releaseAddress(region, address.getAllocationId());
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void retainedInterfaceAddressTracksItsNewInstanceBeforeDescribe(boolean secondaryAddress) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.236.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, "10.236.0.10",
+                List.of("10.236.0.11"), List.of(), List.of());
+        Instance first = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        String privateIp = secondaryAddress ? "10.236.0.11" : "10.236.0.10";
+        service.associateAddress(region, address.getAllocationId(), first.getInstanceId(), privateIp);
+        String association = address.getAssociationId();
+        service.terminateInstances(region, List.of(first.getInstanceId()));
+        assertNull(address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        assertEquals(privateIp, address.getPrivateIpAddress());
+
+        Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+
+        assertEquals(second.getInstanceId(), address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        assertEquals(privateIp, address.getPrivateIpAddress());
+        assertEquals(1, service.describeAddresses(region, List.of(address.getAllocationId()),
+                Map.of("instance-id", List.of(second.getInstanceId()))).size());
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()),
+                Map.of("instance-id", List.of(first.getInstanceId()))).isEmpty());
+        assertThrows(AwsException.class, () -> service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0));
+        assertEquals(second.getInstanceId(), address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        service.terminateInstances(region, List.of(second.getInstanceId()));
+        assertNull(address.getInstanceId());
+        service.disassociateAddress(region, association);
+        service.releaseAddress(region, address.getAllocationId());
+        service.deleteNetworkInterface(region, retained.getNetworkInterfaceId());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true,false", "true,true", "false,false", "false,true"})
+    void nullStateReconciliationPreservesRestorableContainer(boolean containerPresent, boolean addressFirst) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.234.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, "10.234.0.10",
+                List.of(), List.of(), List.of());
+        Instance host = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), host.getInstanceId(), null);
+        String association = address.getAssociationId();
+        String attachment = retained.getAttachment().getAttachmentId();
+        host.setState(null);
+        host.setDockerContainerId(containerPresent ? "restorable-container" : null);
+
+        if (addressFirst) {
+            service.describeAddresses(region, List.of(address.getAllocationId()), Map.of());
+        }
+        service.describeNetworkInterfaces(region, List.of(retained.getNetworkInterfaceId()), Map.of());
+        Address observed = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).getFirst();
+
+        assertEquals(containerPresent ? host.getInstanceId() : null, observed.getInstanceId());
+        assertEquals(association, observed.getAssociationId());
+        assertEquals(retained.getNetworkInterfaceId(), observed.getNetworkInterfaceId());
+        assertEquals(containerPresent ? "in-use" : "available", retained.getStatus());
+        if (containerPresent) {
+            assertEquals(attachment, retained.getAttachment().getAttachmentId());
+            assertEquals(retained.getNetworkInterfaceId(), host.getNetworkInterfaces().getFirst().getNetworkInterfaceId());
+            AwsException failure = assertThrows(AwsException.class, () -> service.runInstances(region,
+                    "ami-1234567890abcdef0", "t3.micro", 1, 1, null, List.of(), subnet, null,
+                    List.of(), null, null, null, retained.getNetworkInterfaceId(), 0));
+            assertEquals("InvalidNetworkInterface.InUse", failure.getErrorCode());
+        } else {
+            assertNull(retained.getAttachment());
+            assertTrue(host.getNetworkInterfaces().isEmpty());
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"terminated,false", "terminated,true", "missing,false", "missing,true",
+            "shutting-down,false", "shutting-down,true", "running,false", "stopped,true"})
+    void directAddressReadReconcilesDeadHost(String state, boolean secondaryAddress) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.234.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, "10.234.0.10",
+                List.of("10.234.0.11"), List.of(), List.of());
+        Instance first = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        String privateIp = secondaryAddress ? "10.234.0.11" : "10.234.0.10";
+        service.associateAddress(region, address.getAllocationId(), first.getInstanceId(), privateIp);
+        String association = address.getAssociationId();
+        boolean dead = "terminated".equals(state) || "missing".equals(state);
+        first.setState("shutting-down".equals(state) ? InstanceState.shuttingDown() : dead ? InstanceState.terminated()
+                : "stopped".equals(state) ? InstanceState.stopped() : InstanceState.running());
+        if ("missing".equals(state)) {
+            first.setTerminatedAt(System.currentTimeMillis() - 3_600_001L);
+            service.pruneTerminatedInstances();
+        }
+        for (int read = 0; read < 2; read++) {
+            assertEquals(dead ? 0 : 1, service.describeAddresses(region, List.of(address.getAllocationId()),
+                    Map.of("instance-id", List.of(first.getInstanceId()))).size());
+            Address observed = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).getFirst();
+            assertEquals(dead ? null : first.getInstanceId(), observed.getInstanceId());
+            assertEquals(association, observed.getAssociationId());
+            assertEquals(retained.getNetworkInterfaceId(), observed.getNetworkInterfaceId());
+            assertEquals(privateIp, observed.getPrivateIpAddress());
+            assertEquals(address.getAllocationId(), observed.getAllocationId());
+        }
+        if (dead) {
+            Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                    1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                    null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+            assertEquals(second.getInstanceId(), address.getInstanceId());
+            assertThrows(AwsException.class, () -> service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                    1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                    null, retained.getNetworkInterfaceId(), 0));
+            assertEquals(second.getInstanceId(), address.getInstanceId());
+            assertEquals(association, address.getAssociationId());
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"terminated,false", "terminated,true", "missing,false", "missing,true",
+            "running,false", "stopped,true"})
+    void retainedInterfaceAddressReconcilesDeadHost(String state, boolean secondaryAddress) {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.234.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, "10.234.0.10",
+                List.of("10.234.0.11"), List.of(), List.of());
+        Instance first = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        String privateIp = secondaryAddress ? "10.234.0.11" : "10.234.0.10";
+        service.associateAddress(region, address.getAllocationId(), first.getInstanceId(), privateIp);
+        String association = address.getAssociationId();
+        boolean dead = "terminated".equals(state) || "missing".equals(state);
+        first.setState(dead ? InstanceState.terminated()
+                : "stopped".equals(state) ? InstanceState.stopped() : InstanceState.running());
+        if ("missing".equals(state)) {
+            first.setTerminatedAt(System.currentTimeMillis() - 3_600_001L);
+            service.pruneTerminatedInstances();
+        }
+        for (int read = 0; read < 2; read++) {
+            NetworkInterface observed = service.describeNetworkInterfaces(region,
+                    List.of(retained.getNetworkInterfaceId()), Map.of(), 0, null).networkInterfaces().getFirst();
+            assertEquals(dead ? "available" : "in-use", observed.getStatus());
+            assertEquals(dead ? null : first.getInstanceId(), address.getInstanceId());
+            assertEquals(association, address.getAssociationId());
+            assertEquals(retained.getNetworkInterfaceId(), address.getNetworkInterfaceId());
+            assertEquals(privateIp, address.getPrivateIpAddress());
+            assertEquals(dead ? 0 : 1, service.describeAddresses(region, List.of(address.getAllocationId()),
+                    Map.of("instance-id", List.of(first.getInstanceId()))).size());
+        }
+        if (dead) {
+            Instance second = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                    1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                    null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+            assertEquals(second.getInstanceId(), address.getInstanceId());
+            assertThrows(AwsException.class, () -> service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                    1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                    null, retained.getNetworkInterfaceId(), 0));
+            assertEquals(second.getInstanceId(), address.getInstanceId());
+            assertEquals(association, address.getAssociationId());
+        }
+    }
+
+    @Test
+    void directAddressReadCannotClearASuccessfulReuse() throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> instanceStore = new AccountAwareStorageBackend<>(
+                parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.230.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        Instance oldHost = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), oldHost.getInstanceId());
+        String association = address.getAssociationId();
+        oldHost.setState(InstanceState.terminated());
+        AtomicReference<Thread> readingThread = new AtomicReference<>();
+        AtomicReference<Thread> launchingThread = new AtomicReference<>();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        parking.parkNextRead();
+        try {
+            Future<List<Address>> reading = workers.submit(() -> {
+                readingThread.set(Thread.currentThread());
+                return service.describeAddresses(region, List.of(address.getAllocationId()), Map.of());
+            });
+            assertTrue(parking.awaitParked(), "dead-host read did not reach instance storage");
+            Future<Instance> launching = workers.submit(() -> {
+                launchingThread.set(Thread.currentThread());
+                return service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                        1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                        null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+            });
+            Awaitility.await("reuse completes or waits for the reconciling read")
+                    .atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> launching.isDone()
+                            || isBlockedIn(launchingThread.get(), "releaseIfHostIsGone", readingThread.get())
+                            || isBlockedIn(launchingThread.get(), "runInstances", readingThread.get()));
+            parking.release();
+            reading.get(10, TimeUnit.SECONDS);
+            Instance newHost = launching.get(10, TimeUnit.SECONDS);
+            assertEquals(newHost.getInstanceId(), address.getInstanceId());
+            assertNotNull(retained.getAttachment());
+            assertEquals(newHost.getInstanceId(), retained.getAttachment().getInstanceId());
+            assertEquals(association, address.getAssociationId());
+            assertEquals("in-use", retained.getStatus());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void directAddressReadRefreshesSnapshotAfterCompletedReassociation() throws Exception {
+        InMemoryStorage<String, Address> backing = spy(new InMemoryStorage<>());
+        AccountAwareStorageBackend<Address> addressStore = new AccountAwareStorageBackend<>(
+                backing, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-addresses.json", addressStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.229.0.0/24");
+        Instance oldHost = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        Instance newHost = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), oldHost.getInstanceId());
+        oldHost.setState(InstanceState.terminated());
+        AtomicReference<Thread> reader = new AtomicReference<>();
+        CountDownLatch scanned = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        ObjectMapper mapper = new ObjectMapper();
+        doAnswer(call -> {
+            List<Address> values = backing.keys().stream().map(k -> backing.get(k).orElseThrow()).toList();
+            if (Thread.currentThread() == reader.get()) {
+                List<Address> snapshots = values.stream().map(a -> mapper.convertValue(a, Address.class)).toList();
+                scanned.countDown();
+                assertTrue(resume.await(10, TimeUnit.SECONDS));
+                return snapshots;
+            }
+            return values;
+        }).when(backing).scan(any());
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<List<Address>> reading = worker.submit(() -> {
+                reader.set(Thread.currentThread());
+                return service.describeAddresses(region, List.of(address.getAllocationId()), Map.of());
+            });
+            assertTrue(scanned.await(10, TimeUnit.SECONDS));
+            String association = service.associateAddress(region, address.getAllocationId(), newHost.getInstanceId())
+                    .getAssociationId();
+            resume.countDown();
+            Address observed = reading.get(10, TimeUnit.SECONDS).getFirst();
+            assertEquals(newHost.getInstanceId(), observed.getInstanceId());
+            assertEquals(association, observed.getAssociationId());
+            Address stored = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).getFirst();
+            assertEquals(newHost.getInstanceId(), stored.getInstanceId());
+            assertEquals(association, stored.getAssociationId());
+            assertEquals(newHost.getPrivateIpAddress(), stored.getPrivateIpAddress());
+        } finally {
+            resume.countDown();
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void delayedDeadHostReconciliationCannotClearASuccessfulReuse() throws Exception {
+        ParkingStore<Instance> parking = new ParkingStore<>();
+        AccountAwareStorageBackend<Instance> instanceStore = new AccountAwareStorageBackend<>(
+                parking, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-instances.json", instanceStore)));
+        String region = "us-east-1";
+        String subnet = privateSubnet(service, region, "10.230.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        Instance oldHost = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), oldHost.getInstanceId());
+        String association = address.getAssociationId();
+        oldHost.setState(InstanceState.terminated());
+        AtomicReference<Thread> readingThread = new AtomicReference<>();
+        AtomicReference<Thread> launchingThread = new AtomicReference<>();
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        parking.parkNextRead();
+        try {
+            Future<NetworkInterfaceListResult> reading = workers.submit(() -> {
+                readingThread.set(Thread.currentThread());
+                return service.describeNetworkInterfaces(region, List.of(retained.getNetworkInterfaceId()),
+                        Map.of(), 0, null);
+            });
+            assertTrue(parking.awaitParked(), "dead-host read did not reach instance storage");
+            Future<Instance> launching = workers.submit(() -> {
+                launchingThread.set(Thread.currentThread());
+                return service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                        1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                        null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+            });
+            Awaitility.await("reuse completes or waits for the reconciling read")
+                    .atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> launching.isDone()
+                            || isBlockedIn(launchingThread.get(), "releaseIfHostIsGone", readingThread.get())
+                            || isBlockedIn(launchingThread.get(), "runInstances", readingThread.get()));
+            parking.release();
+            reading.get(10, TimeUnit.SECONDS);
+            Instance newHost = launching.get(10, TimeUnit.SECONDS);
+            assertEquals(newHost.getInstanceId(), address.getInstanceId());
+            assertNotNull(retained.getAttachment());
+            assertEquals(newHost.getInstanceId(), retained.getAttachment().getInstanceId());
+            assertEquals(association, address.getAssociationId());
+            assertEquals("in-use", retained.getStatus());
+        } finally {
+            parking.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void directAddressReadDoesNotModifyAnotherAccount() {
+        RequestContext context = new RequestContext();
+        // The EC2 model Instance is already imported; this is the CDI Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        InMemoryStorageFactory factory = new InMemoryStorageFactory(contexts);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), factory, contexts);
+        String owner = "111111111111";
+        String observer = "222222222222";
+        String region = "us-east-1";
+        context.setAccountId(owner);
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        Instance host = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), host.getInstanceId());
+        String association = address.getAssociationId();
+        host.setState(InstanceState.terminated());
+        context.setAccountId(observer);
+        Address unrelated = service.allocateAddress(region);
+        // Matching IDs make a caller-scoped scan or write observable, rather than relying on random IDs.
+        unrelated.setNetworkInterfaceId(retained.getNetworkInterfaceId());
+        unrelated.setInstanceId("i-observer");
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).isEmpty());
+        context.setAccountId(owner);
+        service.describeAddresses(region, List.of(address.getAllocationId()), Map.of());
+        assertNull(address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        assertEquals("i-observer", unrelated.getInstanceId());
+        Address ownerAddress = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertNull(ownerAddress.getInstanceId());
+        assertEquals(association, ownerAddress.getAssociationId());
+        assertEquals(retained.getNetworkInterfaceId(), ownerAddress.getNetworkInterfaceId());
+    }
+
+    @Test
+    void deadHostAddressReconciliationUsesTheExplicitInterfaceOwner() {
+        RequestContext context = new RequestContext();
+        // The EC2 model Instance is already imported; this is the CDI Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        InMemoryStorageFactory factory = new InMemoryStorageFactory(contexts);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), factory, contexts);
+        String owner = "111111111111";
+        String observer = "222222222222";
+        String region = "us-east-1";
+        context.setAccountId(owner);
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface retained = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        Instance host = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null,
+                null, retained.getNetworkInterfaceId(), 0).getInstances().getFirst();
+        Address address = service.allocateAddress(region);
+        service.associateAddress(region, address.getAllocationId(), host.getInstanceId());
+        String association = address.getAssociationId();
+        host.setState(InstanceState.terminated());
+        context.setAccountId(observer);
+        Address unrelated = service.allocateAddress(region);
+        // Matching IDs make a caller-scoped scan or write observable, rather than relying on random IDs.
+        unrelated.setNetworkInterfaceId(retained.getNetworkInterfaceId());
+        unrelated.setInstanceId("i-observer");
+        service.describeNetworkInterfaces(owner, region, List.of(retained.getNetworkInterfaceId()), Map.of());
+        assertNull(address.getInstanceId());
+        assertEquals(association, address.getAssociationId());
+        assertEquals("i-observer", unrelated.getInstanceId());
+        assertTrue(service.describeAddresses(region, List.of(address.getAllocationId()), Map.of()).isEmpty());
+        context.setAccountId(owner);
+        Address ownerAddress = service.describeAddresses(region, List.of(address.getAllocationId()), Map.of())
+                .getFirst();
+        assertNull(ownerAddress.getInstanceId());
+        assertEquals(association, ownerAddress.getAssociationId());
+        assertEquals(retained.getNetworkInterfaceId(), ownerAddress.getNetworkInterfaceId());
+    }
+
     private static EmulatorConfig mockConfig(boolean ec2Mock) {
         EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage()).thenReturn(storage);
+        when(storage.mode()).thenReturn("persistent");
+        when(storage.services().ec2().mode()).thenReturn(Optional.empty());
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
+        when(ec2.enabled()).thenReturn(true);
         when(ec2.mock()).thenReturn(ec2Mock);
         when(ec2.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.DOCUMENTATION);
         when(ec2.mockPublicAddress()).thenReturn(Optional.empty());

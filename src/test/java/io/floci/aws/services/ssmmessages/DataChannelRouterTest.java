@@ -42,7 +42,7 @@ class DataChannelRouterTest {
                 new RejectingHandler("duplicate-session", 401),
                 new RejectingHandler("duplicate-session", 403))).init(router);
         router.route().handler(context -> context.response().setStatusCode(204).end());
-        port = await(vertx.createHttpServer().requestHandler(router).listen(0)).actualPort();
+        port = await(vertx.createHttpServer().requestHandler(router).listen(0, "127.0.0.1")).actualPort();
     }
 
     @AfterEach

@@ -19,6 +19,8 @@
 # documents a facet of another service and deliberately has no row of its own).
 
 aliases:
+  codedeploy-commands: codedeploy        # Default host-agent command protocol
+  codedeploy-commands-secure: codedeploy # IAM-authorized host-agent command protocol
   apigateway: api-gateway               # "API Gateway v1" row title
   apigatewayv2: api-gateway             # v2 facet, documented at api-gateway.md#v2
   aps: managed-prometheus               # AMP's SigV4 signing name is "aps"
@@ -50,7 +52,7 @@ aliases:
   application-autoscaling: applicationautoscaling
   elasticbeanstalk: elastic-beanstalk
   ec2messages: ssm                      # SSM Messages facet, documented alongside ssm.md
-  ssmmessages: ssm                      # Session Manager channels, documented alongside ssm.md
+  ssmmessages: ssm                      # SSM agent and Session Manager channels
   iotdata: iot                          # IoT Data row shares iot.md with IoT Core
   resource-explorer-2: resource-explorer # API version suffix; the page is resource-explorer.md
   bedrock-agentcore-control: bedrock-agentcore  # control plane owns the page; the data-plane row is the facet

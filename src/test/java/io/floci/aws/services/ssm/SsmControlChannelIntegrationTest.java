@@ -4,6 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.Node;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.SessionRequest;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.SessionState;
 import io.floci.aws.testing.MutableClock;
 import io.floci.aws.testing.SignedIamEnforcementProfile;
 import io.floci.aws.testing.SignedIamUsers;
@@ -64,6 +68,8 @@ class SsmControlChannelIntegrationTest {
     RegionResolver regions;
     @Inject
     MutableClock clock;
+    @Inject
+    SsmMessageGateway sessionGateway;
 
     @BeforeEach
     void prepareManagedNode() {
@@ -127,10 +133,100 @@ class SsmControlChannelIntegrationTest {
     }
 
     @Test
+    void oneAuthenticatedControlSocketCarriesCommandsAndNewSessionTasks() throws Exception {
+        Receiver receiver = new Receiver();
+        WebSocket socket = open(instance, ROOT, receiver);
+        handshake(socket, token(instance, ROOT));
+        Node node = new Node(regions.getDefaultAccountId(), REGION, instance);
+        await().atMost(Duration.ofSeconds(5)).until(() -> sessionGateway.isConnected(node));
+        String sessionId = "shared-" + UUID.randomUUID();
+        CompletableFuture<SessionState> completed = new CompletableFuture<>();
+        sessionGateway.startSession(new SessionRequest(sessionId,
+                "arn:aws:ssm:" + REGION + ":" + node.accountId() + ":session/" + sessionId,
+                "arn:aws:iam::" + node.accountId() + ":root", node, "SSM-SessionManagerRunShell",
+                mapper.createObjectNode(), Map.of()), completed::complete);
+        JsonNode task = mapper.readTree(receiver.next("interactive_shell").payload());
+        assertEquals(sessionId, task.path("TaskId").asText());
+
+        Command command = ssm.sendCommand(request -> request.instanceIds(instance).documentName("AWS-RunShellScript")
+                .parameters(Map.of("commands", List.of("printf shared")))).command();
+        SsmAgentMessage delivery = receiver.next("agent_job");
+        String job = mapper.readTree(delivery.payload()).path("JobId").asText();
+        reply(socket, job, """
+                {"documentStatus":"Success","runtimeStatus":{
+                  "aws:runShellScript":{"status":"Success","code":0,"standardOutput":"shared"}
+                }}
+                """);
+        receiver.next("agent_job_reply_ack");
+        assertEquals("shared", invocation(command).standardOutputContent());
+        send(socket, "agent_task_complete", mapper.createObjectNode().put("TaskId", sessionId)
+                .put("Topic", "StartSession").put("FinalTaskStatus", "Success"));
+        JsonNode ack = mapper.readTree(receiver.next("agent_task_acknowledge").payload());
+        assertEquals(sessionId, ack.path("TaskId").asText());
+        assertEquals(SessionState.TERMINATED, completed.get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void sessionDispatchRechecksTheControlCallersPermission() throws Exception {
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "ssm-revoked-", "channel", """
+                {"Statement":{"Effect":"Allow","Action":"ssmmessages:*","Resource":"*"}}
+                """)) {
+            Receiver receiver = new Receiver();
+            WebSocket socket = open(instance, user.signer("ssmmessages"), receiver);
+            handshake(socket, token(instance, user.signer("ssmmessages")));
+            Node node = new Node(regions.getDefaultAccountId(), REGION, instance);
+            await().atMost(Duration.ofSeconds(5)).until(() -> sessionGateway.isConnected(node));
+            SignedIamUsers.iam(endpoint, "DeleteUserPolicy", Map.of("UserName", user.name(),
+                    "PolicyName", user.policyName())).then().statusCode(200);
+            String sessionId = "revoked-" + UUID.randomUUID();
+            CompletableFuture<SessionState> completed = new CompletableFuture<>();
+
+            sessionGateway.startSession(new SessionRequest(sessionId,
+                    "arn:aws:ssm:" + REGION + ":" + node.accountId() + ":session/" + sessionId,
+                    "arn:aws:iam::" + node.accountId() + ":root", node, "SSM-SessionManagerRunShell",
+                    mapper.createObjectNode(), Map.of()), completed::complete);
+
+            assertEquals(1008, receiver.closed.get(5, TimeUnit.SECONDS));
+            assertEquals(SessionState.FAILED, completed.get(5, TimeUnit.SECONDS));
+            assertNull(receiver.messages.poll(100, TimeUnit.MILLISECONDS),
+                    "A revoked control caller received session content");
+        }
+    }
+
+    @Test
+    void sharedSessionCompletionRetainsLegacyFrameValidation() throws Exception {
+        Receiver receiver = new Receiver();
+        WebSocket socket = open(instance, ROOT, receiver);
+        handshake(socket, token(instance, ROOT));
+        Node node = new Node(regions.getDefaultAccountId(), REGION, instance);
+        await().atMost(Duration.ofSeconds(5)).until(() -> sessionGateway.isConnected(node));
+        String sessionId = "invalid-frame-" + UUID.randomUUID();
+        CompletableFuture<SessionState> completed = new CompletableFuture<>();
+        sessionGateway.startSession(new SessionRequest(sessionId,
+                "arn:aws:ssm:" + REGION + ":" + node.accountId() + ":session/" + sessionId,
+                "arn:aws:iam::" + node.accountId() + ":root", node, "SSM-SessionManagerRunShell",
+                mapper.createObjectNode(), Map.of()), completed::complete);
+        receiver.next("interactive_shell");
+        byte[] frame = SsmAgentMessage.create("agent_task_complete", mapper.writeValueAsBytes(
+                Map.of("TaskId", sessionId, "Topic", "StartSession", "FinalTaskStatus", "Success"))).encode();
+        ByteBuffer.wrap(frame).putLong(40, 0);
+
+        socket.sendBinary(ByteBuffer.wrap(frame), true).get(5, TimeUnit.SECONDS);
+
+        assertEquals(1002, receiver.closed.get(5, TimeUnit.SECONDS));
+        assertNotEquals(SessionState.TERMINATED, completed.getNow(null));
+        assertNull(receiver.messages.poll(100, TimeUnit.MILLISECONDS),
+                "A malformed completion frame was acknowledged");
+    }
+
+    @Test
     void anotherNodeCannotConsumeTheTokenAndTheOwnerCanStillUseIt() throws Exception {
         String token = token(instance, ROOT);
+        String other = "i-fedcba98765432100";
+        RequestScopes.runAs(regions.getDefaultAccountId(), REGION, () -> commands.updateInstanceInformation(
+                mapper.createObjectNode().put("InstanceId", other), REGION));
         Receiver wrong = new Receiver();
-        handshake(open("i-fedcba98765432100", ROOT, wrong), token);
+        handshake(open(other, ROOT, wrong), token);
         assertEquals(1008, wrong.closed.get(5, TimeUnit.SECONDS));
         Receiver owner = new Receiver();
         handshake(open(instance, ROOT, owner), token);
@@ -253,7 +349,7 @@ class SsmControlChannelIntegrationTest {
 
     private String token(String node, AwsRequestSigner signer) {
         return given().filter(signer).contentType("application/json").body(schema()).post(channel(node))
-                .then().statusCode(201).extract().xmlPath().getString("CreateControlChannelResponse.TokenValue");
+                .then().statusCode(201).extract().xmlPath().getString("ChannelOutput.TokenValue");
     }
 
     private WebSocket open(String node, AwsRequestSigner signer, Receiver receiver) throws Exception {

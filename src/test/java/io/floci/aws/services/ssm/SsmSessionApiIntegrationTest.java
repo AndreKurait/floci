@@ -139,7 +139,7 @@ class SsmSessionApiIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"mi-0123456789abcdef0", "ecs:cluster_container_runtime"})
+    @ValueSource(strings = {"mi-invalid", "ecs:cluster_container_runtime"})
     void unsupportedTargetCannotStartASession(String target) {
         when(gateway.isConnected(new Node("000000000000", "us-east-1", target))).thenReturn(true);
         SsmException error = assertThrows(SsmException.class, () -> ssm.startSession(r -> r.target(target)));
