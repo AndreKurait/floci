@@ -32,7 +32,8 @@ class Ec2DestructiveDryRunTest {
             "DeleteLaunchTemplate", "CancelSpotInstanceRequests"})
     void aDryRunAnswersDryRunOperationThroughTheCorrectValidationBoundary(String action) {
         boolean validatesInService = Set.of("TerminateInstances", "StartInstances", "StopInstances", "RebootInstances",
-                "DeleteTags", "DeleteRoute", "DetachVolume", "CancelSpotInstanceRequests").contains(action);
+                "DeleteTags", "DeleteRoute", "DetachVolume", "DeleteLaunchTemplate",
+                "CancelSpotInstanceRequests").contains(action);
         AtomicInteger validationCalls = new AtomicInteger();
         Ec2Service service = mock(Ec2Service.class, invocation -> {
             assertEquals(true, validatesInService, "This operation must stop before reaching its service");
