@@ -4282,6 +4282,7 @@ public class Ec2QueryHandler {
      * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeregisterImage.html">DeregisterImage</a>
      */
     private Response handleDeregisterImage(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<Ec2Service.SnapshotDeletion> deletions = service.deregisterImage(
                 region,
                 p.getFirst("ImageId"),
@@ -5201,6 +5202,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleReleaseAddress(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.releaseAddress(region, p.getFirst("AllocationId"));
         return booleanResponse("ReleaseAddress");
     }
@@ -5710,6 +5712,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteNetworkInterface(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.deleteNetworkInterface(region, p.getFirst("NetworkInterfaceId"));
         return booleanResponse("DeleteNetworkInterface");
     }
