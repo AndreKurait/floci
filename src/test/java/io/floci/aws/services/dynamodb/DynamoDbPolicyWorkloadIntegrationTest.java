@@ -485,19 +485,21 @@ class DynamoDbPolicyWorkloadIntegrationTest {
                 if (policyAttempted) {
                     cleanup(failures, () -> {
                         for (MetricAlarm alarm : alarms()) {
-                            assertTrue(alarm.alarmArn().contains(":" + account + ":alarm:"));
-                            assertTrue(alarm.alarmName().startsWith("TargetTracking-" + resource + "-"));
-                            assertEquals(1, alarm.alarmActions().size());
-                            String action = alarm.alarmActions().getFirst();
-                            assertTrue(action.contains(":" + account + ":scalingPolicy:"));
-                            assertTrue(action.endsWith(":resource/dynamodb/" + resource + ":policyName/" + policyName));
-                            if (policyArn != null) {
-                                assertEquals(policyArn, action);
-                            }
-                            String existing = ownedAlarms.putIfAbsent(alarm.alarmName(), alarm.alarmArn());
-                            if (existing != null) {
-                                assertEquals(existing, alarm.alarmArn());
-                            }
+                            cleanup(failures, () -> {
+                                assertTrue(alarm.alarmArn().contains(":" + account + ":alarm:"));
+                                assertTrue(alarm.alarmName().startsWith("TargetTracking-" + resource + "-"));
+                                assertEquals(1, alarm.alarmActions().size());
+                                String action = alarm.alarmActions().getFirst();
+                                assertTrue(action.contains(":" + account + ":scalingPolicy:"));
+                                assertTrue(action.endsWith(":resource/dynamodb/" + resource + ":policyName/" + policyName));
+                                if (policyArn != null) {
+                                    assertEquals(policyArn, action);
+                                }
+                                String existing = ownedAlarms.putIfAbsent(alarm.alarmName(), alarm.alarmArn());
+                                if (existing != null) {
+                                    assertEquals(existing, alarm.alarmArn());
+                                }
+                            });
                         }
                     });
                 }

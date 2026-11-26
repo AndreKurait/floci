@@ -14,8 +14,10 @@ import software.amazon.awssdk.services.applicationautoscaling.model.DescribeScal
 import software.amazon.awssdk.services.applicationautoscaling.model.DescribeScalingPoliciesRequest;
 import software.amazon.awssdk.services.applicationautoscaling.model.DescribeScalingPoliciesResponse;
 import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
+import software.amazon.awssdk.services.cloudwatch.model.DeleteAlarmsRequest;
 import software.amazon.awssdk.services.cloudwatch.model.DescribeAlarmsRequest;
 import software.amazon.awssdk.services.cloudwatch.model.DescribeAlarmsResponse;
+import software.amazon.awssdk.services.cloudwatch.model.MetricAlarm;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.DeleteTableRequest;
 import software.amazon.awssdk.services.dynamodb.model.DeleteTableResponse;
@@ -84,7 +86,17 @@ class DynamoDbPolicyReceiptCleanupTest {
         exercise(suite, false, "deleting");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract"})
+    void ownershipFailureDoesNotPreventLaterOwnedAlarmCleanup(String suite) throws Exception {
+        exercise(suite, false, "none", true);
+    }
+
     private void exercise(String suite, boolean incomplete, String deletion) throws Exception {
+        exercise(suite, incomplete, deletion, false);
+    }
+
+    private void exercise(String suite, boolean incomplete, String deletion, boolean alarmFailure) throws Exception {
         Object fixture = switch (suite) {
             case "Workload" -> new DynamoDbPolicyWorkloadIntegrationTest();
             case "ReadAdmission" -> new DynamoDbPolicyReadAdmissionIntegrationTest();
@@ -117,6 +129,29 @@ class DynamoDbPolicyReceiptCleanupTest {
         }
         String table = "receipt-control-" + UUID.randomUUID();
         set(fixture, "table", table);
+        String ownedAlarmName = "TargetTracking-table/" + table + "-owned";
+        if (alarmFailure) {
+            String account = "123456789012";
+            String resource = "table/" + table;
+            String policyName = "owned-policy";
+            String policyArn = "arn:aws:autoscaling:us-east-1:" + account
+                    + ":scalingPolicy:owned:resource/dynamodb/" + resource + ":policyName/" + policyName;
+            set(fixture, "account", account);
+            set(fixture, "resource", resource);
+            set(fixture, "policyName", policyName);
+            set(fixture, "policyArn", policyArn);
+            set(fixture, "policyAttempted", true);
+            MetricAlarm owned = MetricAlarm.builder().alarmName(ownedAlarmName)
+                    .alarmArn("arn:aws:cloudwatch:us-east-1:" + account + ":alarm:" + ownedAlarmName)
+                    .alarmActions(policyArn).build();
+            MetricAlarm unowned = owned.toBuilder().alarmName("TargetTracking-" + resource + "-unowned")
+                    .alarmArn("arn:aws:cloudwatch:us-east-1:" + account + ":alarm:unowned")
+                    .alarmActions(policyArn + "-unexpected").build();
+            when(metrics.describeAlarms(ArgumentMatchers.<Consumer<DescribeAlarmsRequest.Builder>>any()))
+                    .thenReturn(DescribeAlarmsResponse.builder().metricAlarms(unowned, owned).build())
+                    .thenReturn(DescribeAlarmsResponse.builder().metricAlarms(owned).build())
+                    .thenReturn(DescribeAlarmsResponse.builder().metricAlarms(unowned).build());
+        }
         if (!deletion.equals("none")) {
             set(fixture, "createAttempted", true);
             TableDescription owned = TableDescription.builder().tableName(table).tableId("owned-id").build();
@@ -180,6 +215,19 @@ class DynamoDbPolicyReceiptCleanupTest {
                 assertEquals(2, suppressed.size());
                 assertTrue(suppressed.stream().anyMatch(failure -> failure instanceof AssertionError
                         && failure.getMessage().contains("Every attempted exchange")));
+            } else if (alarmFailure) {
+                InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                        () -> teardown.invoke(fixture));
+                AssertionError aggregate = assertInstanceOf(AssertionError.class, thrown.getCause());
+                assertEquals(2, aggregate.getSuppressed().length,
+                        "Both the unowned action and the retained alarm inventory must be reported");
+                verify(metrics).deleteAlarms(ArgumentMatchers.<Consumer<DeleteAlarmsRequest.Builder>>argThat(action -> {
+                    DeleteAlarmsRequest.Builder request = DeleteAlarmsRequest.builder();
+                    action.accept(request);
+                    return request.build().alarmNames().equals(List.of(ownedAlarmName));
+                }));
+                verify(metrics, times(1)).deleteAlarms(
+                        ArgumentMatchers.<Consumer<DeleteAlarmsRequest.Builder>>any());
             } else if (deletion.equals("replacement")) {
                 InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
                         () -> teardown.invoke(fixture));
@@ -206,7 +254,7 @@ class DynamoDbPolicyReceiptCleanupTest {
             JsonNode saved = new ObjectMapper().readTree(receipt.toFile());
             assertEquals(1, saved.get("calls").size());
             assertEquals(!incomplete, saved.get("calls").get(0).has("responseBase64"));
-            assertEquals(incomplete || deletion.equals("replacement") ? 1 : 0,
+            assertEquals(alarmFailure ? 2 : incomplete || deletion.equals("replacement") ? 1 : 0,
                     saved.get("observations").get("cleanupFailures").size());
         } finally {
             Files.deleteIfExists(receipt);
