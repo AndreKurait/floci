@@ -8,6 +8,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.DockerBridgeAddress;
+import io.netty.util.NetUtil;
 import io.quarkus.runtime.Startup;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -34,6 +35,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.SequencedSet;
@@ -114,6 +116,7 @@ public class EmbeddedDnsServer {
 
     private volatile String serverIp;
     private final SequencedSet<String> suffixes = new LinkedHashSet<>();
+    private List<String> authoritativeSuffixes = List.of();
     private volatile List<String> upstreamDnsServers = List.of();
     private volatile WorkerExecutor forwardPool;
     // Held as the Iterable a CDI Instance already is, so iterating resolves the beans lazily on
@@ -166,6 +169,14 @@ public class EmbeddedDnsServer {
         this.clientVpcSources = clientVpcSources;
     }
 
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, List<String> authoritativeSuffixes) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources);
+        this.authoritativeSuffixes = authoritativeSuffixes.stream()
+                .map(EmbeddedDnsServer::authoritativeSuffix).distinct().toList();
+    }
+
     @Inject
     public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
                              Instance<DnsRecordSource> recordSources,
@@ -176,6 +187,8 @@ public class EmbeddedDnsServer {
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
+        authoritativeSuffixes = config.dns().authoritativeSuffixes().orElse(List.of()).stream()
+                .map(EmbeddedDnsServer::authoritativeSuffix).distinct().toList();
         try {
             if (containerDetector.isRunningInContainer()) {
                 prepare(config);
@@ -335,11 +348,12 @@ public class EmbeddedDnsServer {
                             return;
                         }
                         DnsAnswer records = plan.answer().orElseThrow();
-                        if (records.isPublicAuthorityAnswer() && !standardQuery) {
+                        if ((records.isPublicAuthorityAnswer() || plan.reservedAuthority()) && !standardQuery) {
                             records = DnsAnswer.refused();
                         }
-                        byte[] response = records.isPublicAuthorityAnswer()
-                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records)
+                        byte[] response = records.isPublicAuthorityAnswer() || plan.reservedAuthority()
+                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records,
+                                        plan.reservedAuthority())
                                 : !records.isEmpty()
                                 ? buildAResponse(data, txId, questionOffset, questionEnd, records)
                                 : buildEmptyResponse(data, txId, questionOffset, questionEnd,
@@ -402,6 +416,9 @@ public class EmbeddedDnsServer {
 
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp);
+        if (hasAuthoritativeSuffix(name)) {
+            return Optional.of(authoritativeAnswer(stored.or(() -> resolveFromRecordSources(name, type))));
+        }
         if (stored.isPresent()) {
             return stored;
         }
@@ -414,16 +431,21 @@ public class EmbeddedDnsServer {
      * storage: an answer Floci owns, a set of resolvers a rule forwards the query to, or neither,
      * which leaves it to the upstream resolvers.
      */
-    record QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets) {
+    record QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets,
+                     boolean reservedAuthority) {
 
-        static final QueryPlan UPSTREAM = new QueryPlan(Optional.empty(), List.of());
+        static final QueryPlan UPSTREAM = new QueryPlan(Optional.empty(), List.of(), false);
 
         static QueryPlan answering(DnsAnswer answer) {
-            return new QueryPlan(Optional.of(answer), List.of());
+            return new QueryPlan(Optional.of(answer), List.of(), false);
+        }
+
+        static QueryPlan answeringReservedAuthority(DnsAnswer answer) {
+            return new QueryPlan(Optional.of(answer), List.of(), true);
         }
 
         static QueryPlan forwardingTo(List<DnsForwardingRule.Target> targets) {
-            return new QueryPlan(Optional.empty(), targets);
+            return new QueryPlan(Optional.empty(), targets, false);
         }
     }
 
@@ -448,7 +470,8 @@ public class EmbeddedDnsServer {
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type, boolean standardQuery) {
         DnsClientVpcSource.ClientVpc origin = vpcForClient(clientAddress).orElse(null);
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp, origin);
-        Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
+        boolean authoritative = hasAuthoritativeSuffix(name);
+        Optional<DnsAnswer> emulatorName = authoritative ? Optional.empty() : resolveEmulatorName(name, myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
@@ -458,12 +481,60 @@ public class EmbeddedDnsServer {
         if (rule.isPresent() && rule.orElseThrow().forwards()) {
             return QueryPlan.forwardingTo(rule.orElseThrow().targets());
         }
+        if (authoritative) {
+            return QueryPlan.answeringReservedAuthority(authoritativeAnswer(stored.or(
+                    () -> resolveFromRecordSources(name, type, false, myIp, origin))));
+        }
         if (standardQuery && matchesSuffix(name) && (type == 1 || type == 28)
                 && stored.filter(answer -> answer.responseCode() == 5).isPresent()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
         return stored.or(() -> resolveFromRecordSources(name, type, false, myIp, origin))
                 .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
+    }
+
+    /** Resolve a stored resource before wildcard endpoint spoofing or upstream lookup. */
+    public Optional<DnsAnswer> resolveOwnedName(String name, int type, String listenerAddress,
+                                               DnsClientVpcSource.ClientVpc origin) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, listenerAddress, origin);
+        if (hasAuthoritativeSuffix(name)) {
+            return Optional.of(authoritativeAnswer(stored.or(
+                    () -> resolveFromRecordSources(name, type, false, listenerAddress, origin))));
+        }
+        return stored.or(() -> resolveFromRecordSources(name, type, false, listenerAddress, origin));
+    }
+
+    private boolean hasAuthoritativeSuffix(String name) {
+        String normalized = name.toLowerCase(Locale.ROOT);
+        if (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        String query = normalized;
+        return authoritativeSuffixes.stream().anyMatch(suffix -> DomainNames.isWithin(query, suffix));
+    }
+
+    private static DnsAnswer authoritativeAnswer(Optional<DnsAnswer> resource) {
+        return resource.map(answer -> answer.upstream() ? DnsAnswer.refused() : answer)
+                .orElseGet(DnsAnswer::nxDomain);
+    }
+
+    private static String authoritativeSuffix(String value) {
+        if (value == null) {
+            throw new IllegalArgumentException("floci.dns.authoritative-suffixes requires exact DNS suffixes");
+        }
+        String host = value.toLowerCase(Locale.ROOT);
+        if (host.endsWith(".")) {
+            host = host.substring(0, host.length() - 1);
+        }
+        if (host.length() > 253
+                || !host.matches("[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?"
+                        + "(?:\\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*")
+                || NetUtil.isValidIpV4Address(host)
+                || Arrays.stream(host.split("\\.")).anyMatch(label ->
+                        label.length() > 63 || label.startsWith("-") || label.endsWith("-"))) {
+            throw new IllegalArgumentException("floci.dns.authoritative-suffixes requires exact DNS suffixes");
+        }
+        return host;
     }
 
     private Optional<DnsAnswer> resolveEmulatorName(String name, String myIp, int type) {
@@ -685,6 +756,11 @@ public class EmbeddedDnsServer {
     }
 
     byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        return buildAResponse(query, txId, questionOffset, questionEnd, answer, false);
+    }
+
+    private byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                  DnsAnswer answer, boolean reservedAuthority) {
         List<DnsRecord> records = answer.records();
         int questionLength = questionEnd - questionOffset;
         List<byte[]> data = records.stream().map(DnsRecord::data).toList();
@@ -703,7 +779,8 @@ public class EmbeddedDnsServer {
 
         // header
         resp.putShort(txId);
-        int flags = answer.authority() == null ? 0x8180 : 0x8400 | (query[2] & 1) << 8;
+        int flags = answer.authority() == null && !reservedAuthority
+                ? 0x8180 : 0x8400 | (query[2] & 1) << 8;
         resp.putShort((short) (flags | (truncated ? 0x0200 : 0)));
         resp.putShort((short) 1);           // qdcount
         resp.putShort((short) answerCount); // ancount
@@ -727,10 +804,18 @@ public class EmbeddedDnsServer {
     }
 
     byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        return buildPublicResponse(query, txId, questionOffset, questionEnd, answer, false);
+    }
+
+    private byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                       DnsAnswer answer, boolean reservedAuthority) {
         if (!answer.isEmpty()) {
-            return buildAResponse(query, txId, questionOffset, questionEnd, answer);
+            return buildAResponse(query, txId, questionOffset, questionEnd, answer, reservedAuthority);
         }
         int flags = 0x8000 | (query[2] & 0x79) << 8 | answer.responseCode();
+        if (reservedAuthority && answer.responseCode() != 5) {
+            flags |= 0x0400;
+        }
         DnsAnswer.Authority authority = answer.authority();
         if (authority == null) {
             return buildAnswerlessResponse(query, txId, questionOffset, questionEnd, (short) flags);

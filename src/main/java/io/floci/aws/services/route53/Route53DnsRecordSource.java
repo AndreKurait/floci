@@ -24,7 +24,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
+import java.util.function.LongUnaryOperator;
 import java.util.function.ToIntFunction;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -41,6 +43,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private static final Logger LOG = Logger.getLogger(Route53DnsRecordSource.class);
     private static final int MAX_CNAME_DEPTH = 8;
     private static final int MAX_DNS_ANSWERS = 8;
+    private static final ThreadLocal<Integer> OWNED_TARGET_HOPS = ThreadLocal.withInitial(() -> 0);
     private static final Pattern EC2_PRIVATE_DNS_NAME =
             Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.ec2\\.internal$", Pattern.CASE_INSENSITIVE);
 
@@ -49,6 +52,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private final Route53Service route53Service;
     private final DnsLookupHelper dnsLookupHelper;
     private final EmbeddedDnsServer embeddedDnsServer;
+    private final LongUnaryOperator weightedDraw;
     private final Set<String> flociSuffixes = new LinkedHashSet<>();
 
     public Route53DnsRecordSource(Route53Service route53Service) {
@@ -62,9 +66,16 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     @Inject
     public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper,
                                   EmbeddedDnsServer embeddedDnsServer) {
+        this(route53Service, config, dnsLookupHelper, embeddedDnsServer,
+                bound -> ThreadLocalRandom.current().nextLong(bound));
+    }
+
+    Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper,
+                          EmbeddedDnsServer embeddedDnsServer, LongUnaryOperator weightedDraw) {
         this.route53Service = route53Service;
         this.dnsLookupHelper = dnsLookupHelper != null ? dnsLookupHelper : new DnsLookupHelper(config);
         this.embeddedDnsServer = embeddedDnsServer;
+        this.weightedDraw = weightedDraw;
         this.flociSuffixes.addAll(BUILTIN_SUFFIXES);
         if (config != null) {
             config.hostname().ifPresent(this.flociSuffixes::add);
@@ -108,11 +119,11 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         String normalized = Route53Service.normalizeName(name).toLowerCase(Locale.ROOT);
         String apex = Route53Service.normalizeName(zone.name()).toLowerCase(Locale.ROOT);
         // A delegation ends this zone's authority. Serving the parent's negative answer below
-        // that cut, or flattening an unsupported CNAME/routing policy, would hide real records.
+        // that cut, or flattening an unsupported routing policy, would hide real records.
         boolean delegated = zone.records().stream().anyMatch(record -> "NS".equals(record.getType())
                 && !Route53Service.normalizeName(record.getName()).equalsIgnoreCase(apex)
                 && DomainNames.isWithin(normalized, Route53Service.normalizeName(record.getName())));
-        if (delegated || zone.matchingRecords().stream().anyMatch(record -> "CNAME".equals(record.getType()))) {
+        if (delegated) {
             return Optional.of(DnsAnswer.refused());
         }
         ResourceRecordSet soaSet = zone.records().stream()
@@ -135,9 +146,32 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             case 6 -> DnsRecord.Soa::new;
             default -> DnsRecord.Txt::new;
         };
-        DnsAnswer answer = buildPublicRecords(name, type, zone.matchingRecords().stream()
-                .filter(record -> record.getType().equals(recordType)).toList(),
-                recordFactory, listenerAddress);
+        DnsAnswer answer;
+        try {
+            answer = buildPublicRecords(name, type, selectPublicRecords(zone.matchingRecords(), recordType),
+                    recordFactory, listenerAddress);
+            if (answer.responseCode() == 0) {
+                List<DnsRecord> cnameAnswers = new ArrayList<>(answer.records());
+                int cnameTtl = answer.isEmpty() ? Integer.MAX_VALUE : answer.ttlSeconds();
+                List<ResourceRecordSet> cnames = selectPublicRecords(zone.matchingRecords(), "CNAME");
+                for (ResourceRecordSet record : cnames) {
+                    Optional<DnsAnswer> target = record.getAliasTarget() != null ? Optional.empty()
+                            : resolveCnameTarget(record, new HashSet<>(), 0, origin, listenerAddress);
+                    if (target.isEmpty()) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    if (type == 1) {
+                        cnameAnswers.addAll(target.orElseThrow().records());
+                        cnameTtl = Math.min(cnameTtl, target.orElseThrow().ttlSeconds());
+                    }
+                }
+                if (!cnames.isEmpty() && !cnameAnswers.isEmpty()) {
+                    answer = DnsAnswer.typedRecords(cnameAnswers, cnameTtl);
+                }
+            }
+        } catch (IllegalArgumentException malformed) {
+            return Optional.of(DnsAnswer.refused());
+        }
         if (answer.responseCode() != 0) {
             return Optional.of(answer);
         }
@@ -164,15 +198,14 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private DnsAnswer buildPublicRecords(String name, int type, List<ResourceRecordSet> sets,
                                         Function<String, DnsRecord> recordFactory, String listenerAddress) {
         if (sets.stream().noneMatch(record -> record.getAliasTarget() != null)) {
-            return buildRecords(name, sets, recordFactory, Route53DnsRecordSource::publicTtlOf);
+            return buildRecords(name, sets, recordFactory, Route53DnsRecordSource::publicTtlOf, true);
         }
         if (sets.size() != 1 || embeddedDnsServer == null || (type != 1 && type != 28)) {
             return DnsAnswer.refused();
         }
         ResourceRecordSet record = sets.getFirst();
         AliasTarget alias = record.getAliasTarget();
-        if (record.getSetIdentifier() != null || record.getWeight() != null || record.getRegion() != null
-                || record.getFailover() != null || record.getHealthCheckId() != null
+        if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null
                 || Boolean.TRUE.equals(record.getMultiValueAnswer())
                 || record.getTtl() != null
                 || record.getRecords() != null && !record.getRecords().isEmpty()) {
@@ -219,12 +252,18 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private static DnsAnswer buildRecords(String name, List<ResourceRecordSet> sets,
                                          Function<String, DnsRecord> recordFactory,
                                          ToIntFunction<ResourceRecordSet> ttlReader) {
+        return buildRecords(name, sets, recordFactory, ttlReader, false);
+    }
+
+    private static DnsAnswer buildRecords(String name, List<ResourceRecordSet> sets,
+                                         Function<String, DnsRecord> recordFactory,
+                                         ToIntFunction<ResourceRecordSet> ttlReader, boolean routingValidated) {
         List<DnsRecord> records = new ArrayList<>();
         int ttl = Integer.MAX_VALUE;
         try {
             for (ResourceRecordSet set : sets) {
-                if (set.getSetIdentifier() != null || set.getAliasTarget() != null
-                        || set.getWeight() != null || set.getRegion() != null
+                if (!routingValidated && (set.getSetIdentifier() != null || set.getWeight() != null)
+                        || set.getAliasTarget() != null || set.getRegion() != null
                         || set.getFailover() != null || set.getHealthCheckId() != null
                         || set.getRecords() == null) {
                     return DnsAnswer.refused();
@@ -245,6 +284,51 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         }
         return records.isEmpty() ? DnsAnswer.noData() : DnsAnswer.typedRecords(records, ttl);
     }
+
+    private List<ResourceRecordSet> selectPublicRecords(List<ResourceRecordSet> records, String type) {
+        List<ResourceRecordSet> matching = records.stream().filter(record -> type.equals(record.getType())).toList();
+        Set<String> identifiers = new HashSet<>();
+        long totalWeight = 0;
+        for (ResourceRecordSet record : matching) {
+            if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null
+                    || record.getWeight() != null && record.getAliasTarget() != null
+                    && record.getAliasTarget().isEvaluateTargetHealth()) {
+                throw new IllegalArgumentException("Unsupported public DNS routing policy");
+            }
+            Long weight = record.getWeight();
+            if (weight == null) {
+                if (record.getSetIdentifier() != null) {
+                    throw new IllegalArgumentException("Unsupported public DNS routing identifier");
+                }
+            } else {
+                String identifier = record.getSetIdentifier();
+                if (weight < 0 || weight > 255 || identifier == null || identifier.isBlank()
+                        || !identifiers.add(identifier)) {
+                    throw new IllegalArgumentException("Invalid weighted DNS record");
+                }
+                totalWeight += weight;
+            }
+        }
+        if (identifiers.isEmpty()) {
+            return matching;
+        }
+        if (identifiers.size() != matching.size()) {
+            throw new IllegalArgumentException("Mixed simple and weighted DNS records");
+        }
+        // Zero-weight records participate only when the entire group has weight zero.
+        long draw = weightedDraw.applyAsLong(totalWeight == 0 ? matching.size() : totalWeight);
+        if (totalWeight == 0) {
+            return List.of(matching.get(Math.toIntExact(draw)));
+        }
+        for (ResourceRecordSet record : matching) {
+            if (draw < record.getWeight()) {
+                return List.of(record);
+            }
+            draw -= record.getWeight();
+        }
+        throw new IllegalArgumentException("Weighted DNS selection is outside the group");
+    }
+
 
     @Override
     public Optional<DnsAnswer> resolveIpv4(String name) {
@@ -329,30 +413,62 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         // 2. CNAME records
         for (ResourceRecordSet rrs : recordSets) {
             if ("CNAME".equalsIgnoreCase(rrs.getType())) {
-                if (rrs.getRecords() != null && !rrs.getRecords().isEmpty()) {
-                    String target = rrs.getRecords().get(0).getValue();
-                    if (target != null && !target.isBlank()) {
-                        String cleanTarget = DnsLookupHelper.normalizeTarget(target);
-                        // The answer is flattened to A records, so it can be cached only as long
-                        // as the shortest-lived record in the chain.
-                        int cnameTtl = ttlOf(rrs);
-                        if (route53Service.isCoveredByPrivateZone(cleanTarget, origin)) {
-                            DnsAnswer targetAnswer = resolveAddresses(cleanTarget, visited, depth + 1, origin);
-                            if (targetAnswer.isEmpty()) {
-                                return targetAnswer;
-                            }
-                            return DnsAnswer.records(targetAnswer.addresses(),
-                                    Math.min(cnameTtl, targetAnswer.ttlSeconds()));
-                        }
-                        return DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget),
-                                Math.min(cnameTtl, DnsAnswer.DEFAULT_TTL_SECONDS));
-                    }
+                Optional<DnsAnswer> target = resolveCnameTarget(rrs, visited, depth, origin, null);
+                if (target.isPresent()) {
+                    return target.orElseThrow();
                 }
             }
         }
 
         return DnsAnswer.noData();
     }
+
+
+    private Optional<DnsAnswer> resolveCnameTarget(ResourceRecordSet rrs, Set<String> visited, int depth,
+                                                   ClientVpc origin, String listenerAddress) {
+        if (rrs.getRecords() == null || rrs.getRecords().isEmpty()) {
+            return Optional.empty();
+        }
+        String target = rrs.getRecords().get(0).getValue();
+        if (target == null || target.isBlank()) {
+            return Optional.empty();
+        }
+        String cleanTarget = DnsLookupHelper.normalizeTarget(target);
+        // The answer is flattened to A records, so it can be cached only as long
+        // as the shortest-lived record in the chain.
+        int cnameTtl = ttlOf(rrs);
+        if (route53Service.isCoveredByPrivateZone(cleanTarget, origin)) {
+            DnsAnswer targetAnswer = resolveAddresses(cleanTarget, visited, depth + 1, origin);
+            if (targetAnswer.isEmpty()) {
+                return Optional.of(targetAnswer);
+            }
+            return Optional.of(DnsAnswer.records(targetAnswer.addresses(),
+                    Math.min(cnameTtl, targetAnswer.ttlSeconds())));
+        }
+        // A target a record source owns (a public zone, or a load balancer name) answers as a direct
+        // query for it would, ahead of spoofing. A public target can chase back into this source, so
+        // the hops through the server count against the same depth limit as a private chain.
+        int hops = OWNED_TARGET_HOPS.get();
+        if (embeddedDnsServer != null && hops >= MAX_CNAME_DEPTH) {
+            return Optional.of(DnsAnswer.noData());
+        }
+        Optional<DnsAnswer> owned = Optional.empty();
+        if (embeddedDnsServer != null) {
+            OWNED_TARGET_HOPS.set(hops + 1);
+            try {
+                owned = embeddedDnsServer.resolveOwnedName(cleanTarget, 1, listenerAddress, origin);
+            } finally {
+                OWNED_TARGET_HOPS.set(hops);
+            }
+        }
+        if (owned != null && owned.isPresent()) {
+            DnsAnswer answer = owned.orElseThrow();
+            return Optional.of(DnsAnswer.records(answer.addresses(), Math.min(cnameTtl, answer.ttlSeconds())));
+        }
+        return Optional.of(DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget),
+                Math.min(cnameTtl, DnsAnswer.DEFAULT_TTL_SECONDS)));
+    }
+
 
     private List<String> resolveOutsidePrivateZones(String name) {
         if (matchesFlociSuffix(name)) {
