@@ -144,6 +144,18 @@ public interface EmulatorConfig {
 
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
+        VpcRoutingConfig vpcRouting();
+    }
+
+    interface VpcRoutingConfig {
+        String PUBLIC_AWS_API_ADDRESS = "192.0.2.1";
+
+        @WithDefault("false")
+        boolean enabled();
+
+        /** Routes spoofed AWS API names from known VPC clients through their public NAT gateways. */
+        @WithDefault("false")
+        boolean publicAwsApi();
     }
 
     interface SecurityGroupEnforcementConfig {
@@ -211,6 +223,13 @@ public interface EmulatorConfig {
          * </pre>
          */
         Optional<List<String>> extraSuffixes();
+
+        /**
+         * Suffixes served only from live resource records or a matching VPC forwarding rule.
+         * Unknown names return NXDOMAIN instead of wildcard spoofing or upstream recursion.
+         * Env: {@code FLOCI_DNS_AUTHORITATIVE_SUFFIXES}, comma-separated.
+         */
+        Optional<List<String>> authoritativeSuffixes();
 
         /**
          * When {@code true} (default), the configured {@link #containerFallbackServers()} are
@@ -3734,6 +3753,14 @@ public interface EmulatorConfig {
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
 
+        /**
+         * Additional existing Docker networks joined before a Lambda container starts.
+         * The primary network remains selected by docker-network or docker-flags.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
+
         /** Additional Docker create flags applied to every Lambda execution container. */
         Optional<String> dockerFlags();
 
@@ -3960,11 +3987,58 @@ public interface EmulatorConfig {
     }
 
     interface Ec2ServiceConfig {
+        /** Trusted network helper that prepares IMDS before the guest image starts. */
+        @WithDefault("floci/network-helper:local")
+        String metadataHelperImage();
+
         /** Optional full EC2 catalog file for locally built guest images. */
         Optional<String> imageCatalogPath();
 
         /** Optional JSON file of additional regional AWS-managed prefix lists. */
         Optional<String> managedPrefixListCatalogPath();
+
+        /**
+         * Explicit guest environment entries, each {@code KEY=VALUE}. Duplicate keys and
+         * Floci-owned identity, credential, region, endpoint and IMDS settings are rejected.
+         * Env: {@code FLOCI_SERVICES_EC2_EXTRA_ENV}, comma-separated; escape a comma as {@code \,}.
+         */
+        Optional<List<String>> extraEnv();
+
+        /**
+         * Guest process limits, each {@code name=soft[:hard]}; omitted hard equals soft and
+         * {@code -1} means unlimited. Unset keeps Docker's defaults.
+         * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
+         */
+        Optional<List<String>> ulimits();
+
+        /**
+         * Docker privileged mode for guest containers. Security-group enforcement always
+         * disables it. Network and volume helpers retain their own privilege settings.
+         * Env: {@code FLOCI_SERVICES_EC2_PRIVILEGED}.
+         */
+        @WithDefault("true")
+        boolean privileged();
+
+        /**
+         * Linux capabilities to drop from guest containers, in addition to mandatory
+         * security-group restrictions. Set privileged=false for capability restrictions.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_DROP}, comma-separated.
+         */
+        Optional<List<String>> capDrop();
+
+        /**
+         * Read-only bind mounts supplied by the deployment before the guest starts.
+         * Sources are absolute Linux paths on the Docker daemon host, not the Floci process host.
+         * Indexed environment entries use {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE}
+         * and {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET}.
+         */
+        @WithDefault("")
+        List<GuestReadOnlyBind> readOnlyBinds();
+
+        interface GuestReadOnlyBind {
+            String source();
+            String target();
+        }
 
         @WithDefault("true")
         boolean enabled();
@@ -4135,6 +4209,15 @@ public interface EmulatorConfig {
         boolean enabled();
 
         /**
+         * Preserve native IPv4 ranges in independent protected VPC namespaces, including
+         * overlapping ranges. Requires Docker Engine 28+, native private IPs and security-group
+         * enforcement, with non-internal Docker transport bridges.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES}.
+         */
+        @WithDefault("false")
+        boolean isolateAddressSpaces();
+
+        /**
          * Private range that substituted CIDRs are allocated from, used when a declared VPC CIDR
          * is absent, malformed, outside RFC 1918, or already claimed on the Docker daemon. Must
          * itself be RFC 1918. The default sits high in 10/8, away from both Docker's default
@@ -4158,6 +4241,14 @@ public interface EmulatorConfig {
         /** Docker network driver for VPC networks. */
         @WithDefault("bridge")
         String driver();
+
+        /**
+         * Create internal Docker VPC networks without external connectivity through that network.
+         * Other guest attachments retain their own connectivity.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL}.
+         */
+        @WithDefault("false")
+        boolean internal();
     }
 
     interface AppConfigServiceConfig {
@@ -4230,6 +4321,13 @@ public interface EmulatorConfig {
         /** When true, no health check is ever probed and a registered instance is InService at once. */
         @WithDefault("false")
         boolean mock();
+
+        /** Serve supported Classic frontends inside their own protected VPC namespaces. */
+        @WithDefault("false")
+        boolean vpcFrontends();
+
+        @WithDefault("haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b")
+        String proxyImage();
     }
 
     interface ElbV2ServiceConfig {
