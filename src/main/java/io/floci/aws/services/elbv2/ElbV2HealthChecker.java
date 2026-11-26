@@ -8,6 +8,7 @@ import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.elbv2.model.TargetDescription;
 import io.floci.aws.services.elbv2.model.TargetGroup;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.quarkus.runtime.Startup;
 import io.vertx.core.Vertx;
 import io.vertx.core.WorkerExecutor;
 import jakarta.annotation.PreDestroy;
@@ -33,6 +34,7 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 
+@Startup
 @ApplicationScoped
 public class ElbV2HealthChecker implements Resettable {
 
@@ -41,6 +43,7 @@ public class ElbV2HealthChecker implements Resettable {
 
     private final Vertx vertx;
     private final WorkerExecutor probeWorkers;
+    private final long maxHealthCheckIntervalMillis;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
     private final Ec2InstancePorts instancePorts;
@@ -63,6 +66,11 @@ public class ElbV2HealthChecker implements Resettable {
         this.config = config;
         this.ec2Service = ec2Service;
         this.instancePorts = instancePorts;
+        maxHealthCheckIntervalMillis = config.services().elbv2().maxHealthCheckIntervalMillis();
+        if (maxHealthCheckIntervalMillis < 0) {
+            throw new IllegalArgumentException(
+                    "floci.services.elbv2.max-health-check-interval-millis must not be negative");
+        }
         this.probeWorkers = vertx.createSharedWorkerExecutor("floci-elbv2-health-probes", MAX_CONCURRENT_PROBES);
     }
 
@@ -95,6 +103,9 @@ public class ElbV2HealthChecker implements Resettable {
         states.computeIfAbsent(tgArn, k -> new ConcurrentHashMap<>());
 
         long intervalMs = (tg.getHealthCheckIntervalSeconds() != null ? tg.getHealthCheckIntervalSeconds() : 30) * 1000L;
+        if (maxHealthCheckIntervalMillis > 0) {
+            intervalMs = Math.min(intervalMs, maxHealthCheckIntervalMillis);
+        }
         long timerId = vertx.setPeriodic(intervalMs, id -> {
             if (Objects.equals(timers.get(tgArn), id)) {
                 probeAll(tgArn, tg);
