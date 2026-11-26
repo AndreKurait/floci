@@ -17,14 +17,14 @@ import io.floci.aws.services.kms.model.KmsKey;
 import io.floci.aws.services.rds.RdsService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,6 +52,7 @@ class DocDbClusterSnapshotServiceTest {
     private DocDbService docDbService;
     private DocDbContainerManager containerManager;
     private EmulatorConfig.DocDbServiceConfig docdbConfig;
+    private EmulatorConfig.StorageConfig storageConfig;
     private StorageBackend<String, String> archives;
 
     @BeforeEach
@@ -71,9 +72,12 @@ class DocDbClusterSnapshotServiceTest {
         when(servicesConfig.docdb()).thenReturn(docdbConfig);
         when(docdbConfig.mock()).thenReturn(false);
         when(docdbConfig.defaultImage()).thenReturn("mongo:7.0");
+        storageConfig = mock(EmulatorConfig.StorageConfig.class);
+        when(config.storage()).thenReturn(storageConfig);
+        when(storageConfig.mode()).thenReturn("memory");
         containerManager = mock(DocDbContainerManager.class);
         // Every cluster gets a container named after it.
-        when(containerManager.tryStart(anyString(), anyString(), anyString(), anyString(), anyString()))
+        when(containerManager.tryStart(anyString(), anyString(), anyString(), anyString(), anyString(), any()))
                 .thenAnswer(inv -> new DocDbContainerHandle("container-" + inv.getArgument(0),
                         inv.getArgument(0), "localhost", 27017));
         when(containerManager.dumpCluster("container-source")).thenReturn(ARCHIVE);
@@ -98,7 +102,7 @@ class DocDbClusterSnapshotServiceTest {
 
         docDbService.restoreDbClusterFromSnapshot("restored", "snap", null, DocDbClusterSettings.defaults(), Map.of());
 
-        verify(containerManager).tryStart(eq("restored"), anyString(), eq("admin"), eq("source-password"), anyString());
+        verify(containerManager).tryStart(eq("restored"), anyString(), eq("admin"), eq("source-password"), anyString(), any());
         verify(containerManager).restoreCluster("container-restored", ARCHIVE);
     }
 
@@ -109,7 +113,7 @@ class DocDbClusterSnapshotServiceTest {
         docDbService.restoreDbClusterToPointInTime("copy", "source", DocDbClusterSettings.defaults(), Map.of());
 
         verify(containerManager).dumpCluster("container-source");
-        verify(containerManager).tryStart(eq("copy"), anyString(), eq("admin"), eq("source-password"), anyString());
+        verify(containerManager).tryStart(eq("copy"), anyString(), eq("admin"), eq("source-password"), anyString(), any());
         verify(containerManager).restoreCluster("container-copy", ARCHIVE);
     }
 
@@ -124,7 +128,7 @@ class DocDbClusterSnapshotServiceTest {
         assertEquals("InvalidDBClusterStateFault", e.getErrorCode());
         assertEquals(400, e.getHttpStatus());
         assertThrows(AwsException.class, () -> docDbService.getDbCluster("copy"));
-        verify(containerManager, never()).tryStart(eq("copy"), anyString(), anyString(), anyString(), anyString());
+        verify(containerManager, never()).tryStart(eq("copy"), anyString(), anyString(), anyString(), anyString(), any());
     }
 
     @Test
@@ -145,36 +149,23 @@ class DocDbClusterSnapshotServiceTest {
         verify(containerManager).stop(argThat(handle -> "container-restored".equals(handle.getContainerId())));
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void anUnavailableRestoreTargetFailsAndLeavesItsSourceAndArchiveIntact(boolean pointInTime) {
+    @Test
+    void aFailedLoadDiscardsTheRestoredClustersVolumeWhateverTheStoragePolicy() {
+        when(storageConfig.mode()).thenReturn("persistent");
         source(DocDbClusterSettings.defaults());
-        DocDbClusterSnapshot snapshot = docDbService.createDbClusterSnapshot("snap", "source", Map.of("saved", "yes"));
-        List<String> savedArchives = List.copyOf(archives.scan(value -> true));
-        when(containerManager.tryStart(eq("restored"), anyString(), anyString(), anyString(), anyString()))
-                .thenReturn(null);
-        DocDbClusterSettings protectedCluster = new DocDbClusterSettings(null, null, null, null, null, null,
-                null, null, true);
+        docDbService.createDbClusterSnapshot("snap", "source", Map.of());
+        doThrow(new IllegalStateException("mongorestore exited 1"))
+                .when(containerManager).restoreCluster("container-restored", ARCHIVE);
 
-        AwsException failure = assertThrows(AwsException.class, () -> {
-            if (pointInTime) {
-                docDbService.restoreDbClusterToPointInTime("restored", "source", protectedCluster, Map.of());
-            } else {
-                docDbService.restoreDbClusterFromSnapshot("restored", "snap", null, protectedCluster, Map.of());
-            }
-        });
+        assertThrows(AwsException.class, () -> docDbService.restoreDbClusterFromSnapshot(
+                "restored", "snap", null, DocDbClusterSettings.defaults(), Map.of()));
 
-        assertEquals("InvalidRestoreFault", failure.getErrorCode());
-        assertEquals(400, failure.getHttpStatus());
-        AwsException absent = assertThrows(AwsException.class, () -> docDbService.getDbCluster("restored"));
-        assertEquals("DBClusterNotFoundFault", absent.getErrorCode());
-        assertEquals("container-source", docDbService.getDbCluster("source").getContainerId());
-        assertEquals("available", docDbService.getDbCluster("source").getStatus());
-        assertEquals(snapshot, docDbService.getDbClusterSnapshot("snap"));
-        assertEquals(Map.of("saved", "yes"), docDbService.getDbClusterSnapshot("snap").getTags());
-        assertEquals(savedArchives, archives.scan(value -> true));
-        verify(containerManager, never()).restoreCluster(anyString(), anyString());
-        verify(containerManager, never()).stop(any());
+        ArgumentCaptor<String> volume = ArgumentCaptor.forClass(String.class);
+        verify(containerManager).tryStart(eq("restored"), anyString(), anyString(), anyString(), anyString(),
+                volume.capture());
+        assertNotNull(volume.getValue());
+        verify(containerManager).discardStorage(volume.getValue());
+        verify(containerManager, never()).removeStorage(any());
     }
 
     @Test
@@ -230,7 +221,7 @@ class DocDbClusterSnapshotServiceTest {
 
         assertEquals("InvalidDBClusterSnapshotStateFault", e.getErrorCode());
         assertThrows(AwsException.class, () -> docDbService.getDbCluster("restored"));
-        verify(containerManager, never()).tryStart(eq("restored"), anyString(), anyString(), anyString(), anyString());
+        verify(containerManager, never()).tryStart(eq("restored"), anyString(), anyString(), anyString(), anyString(), any());
     }
 
     @Test
