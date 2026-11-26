@@ -88,6 +88,7 @@ class DynamoDbPolicyReconcilerTest {
         ApplicationAutoScalingService service = mock(ApplicationAutoScalingService.class);
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch interrupted = new CountDownLatch(1);
+        CountDownLatch completed = new CountDownLatch(1);
         CountDownLatch emergencyRelease = new CountDownLatch(1);
         AtomicReference<String> threadName = new AtomicReference<>();
         AtomicReference<Thread> actualThread = new AtomicReference<>();
@@ -102,6 +103,8 @@ class DynamoDbPolicyReconcilerTest {
             } catch (InterruptedException expected) {
                 interrupted.countDown();
                 Thread.currentThread().interrupt();
+            } finally {
+                completed.countDown();
             }
             return null;
         }).when(service).reconcileDynamoDbPolicies(any(Instant.class));
@@ -115,7 +118,10 @@ class DynamoDbPolicyReconcilerTest {
             assertFalse(observed.get().isBefore(started));
             worker.onStop(null);
             assertEquals(0, interrupted.getCount());
+            assertEquals(0, completed.getCount(), "Shutdown must drain the interrupted callback");
             assertNotNull(actualThread.get());
+            // Executor termination is signalled just before its last worker thread returns.
+            actualThread.get().join(Duration.ofSeconds(5));
             assertFalse(actualThread.get().isAlive(), "Shutdown must return after the actual worker thread terminates");
             verify(service, times(1)).reconcileDynamoDbPolicies(any(Instant.class));
         } finally {
