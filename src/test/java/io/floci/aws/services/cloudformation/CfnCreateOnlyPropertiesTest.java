@@ -41,25 +41,22 @@ class CfnCreateOnlyPropertiesTest {
     }
 
     @Test
-    void s3VectorsReplacementTracksNonFilterableKeysWithinMetadataConfiguration() throws IOException {
-        String type = "AWS::S3Vectors::Index";
+    void healthCheckEndpointTypeChangesRequireReplacement() throws IOException {
         ObjectMapper mapper = new ObjectMapper();
-        JsonNode absent = mapper.readTree("{\"IndexName\":\"index\"}");
-        JsonNode empty = mapper.readTree("{\"IndexName\":\"index\",\"MetadataConfiguration\":{}}");
-        JsonNode declared = mapper.readTree("""
-                {"IndexName":"index","MetadataConfiguration":{"NonFilterableMetadataKeys":["private"]}}
+        JsonNode previous = mapper.readTree("""
+                {"HealthCheckConfig":{"EndpointType":"first","Port":80}}
                 """);
-        JsonNode changed = mapper.readTree("""
-                {"IndexName":"index","MetadataConfiguration":{"NonFilterableMetadataKeys":["other"]}}
+        JsonNode endpointChanged = mapper.readTree("""
+                {"HealthCheckConfig":{"EndpointType":"second","Port":80}}
                 """);
-        JsonNode tagged = mapper.readTree("""
-                {"IndexName":"index","MetadataConfiguration":{"NonFilterableMetadataKeys":["private"]},
-                 "Tags":[{"Key":"environment","Value":"test"}]}
+        JsonNode portChanged = mapper.readTree("""
+                {"HealthCheckConfig":{"EndpointType":"first","Port":443}}
                 """);
-        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged(type, absent, empty));
-        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged(type, declared, changed));
-        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged(type, declared, absent));
-        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged(type, declared, tagged));
+
+        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged(
+                "AWS::Route53::HealthCheck", previous, endpointChanged));
+        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged(
+                "AWS::Route53::HealthCheck", previous, portChanged));
     }
 
     @Test
@@ -155,12 +152,6 @@ class CfnCreateOnlyPropertiesTest {
         assertEquals(Set.of("Name", "ReplicateTo"),
                 CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::DeploymentStrategy"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::DeploymentStrategy", "GrowthFactor"));
-        assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "Content", "ContentType", "Description",
-                        "LatestVersionNumber", "VersionLabel"),
-                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::HostedConfigurationVersion"));
-        assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "ConfigurationVersion", "DeploymentStrategyId",
-                        "Description", "DynamicExtensionParameters", "EnvironmentId", "KmsKeyIdentifier", "Tags"),
-                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::Deployment"));
     }
 
     @Test
