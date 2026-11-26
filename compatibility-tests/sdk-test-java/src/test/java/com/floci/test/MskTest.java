@@ -64,7 +64,7 @@ class MskTest {
 
     @Test
     @Order(1)
-    void createCluster() {
+    void createCluster() throws InterruptedException {
         CreateClusterResponse response = kafka.createCluster(CreateClusterRequest.builder()
                 .clusterName(CLUSTER_NAME)
                 .kafkaVersion("3.6.1")
@@ -79,7 +79,19 @@ class MskTest {
         assertThat(response.clusterName()).isEqualTo(CLUSTER_NAME);
         assertThat(response.state()).isIn(ClusterState.CREATING, ClusterState.ACTIVE);
         clusterArn = response.clusterArn();
+        awaitActive(kafka, clusterArn, Duration.ofMinutes(5), 1000);
     }
+
+    static void awaitActive(KafkaClient client, String arn, Duration timeout, long pollMillis)
+            throws InterruptedException {
+        TestFixtures.await(() -> {
+            ClusterState state = client.describeCluster(request -> request.clusterArn(arn)).clusterInfo().state();
+            assertThat(state).as("MSK cluster %s must become ACTIVE", arn)
+                    .isNotIn(ClusterState.FAILED, ClusterState.DELETING);
+            return state == ClusterState.ACTIVE;
+        }, arn, "ACTIVE", timeout.toNanos(), pollMillis);
+    }
+
 
     @Test
     @Order(2)
