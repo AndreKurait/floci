@@ -3047,6 +3047,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * the returned object carries the settled state for the same reason creation does.
      */
     public TransitGateway deleteTransitGateway(String region, String transitGatewayId) {
+        return deleteTransitGateway(region, transitGatewayId, false);
+    }
+
+    /** As above; with {@code dryRun} every check is made and the gateway is left available. */
+    public TransitGateway deleteTransitGateway(String region, String transitGatewayId, boolean dryRun) {
         // Outermost first: the attachment check below and a concurrent attachment create have to
         // agree on who goes first.
         synchronized (attachmentTopologyLock(region)) {
@@ -3077,6 +3082,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (!peered.isEmpty()) {
                 throw new AwsException("IncorrectState", transitGatewayId
                         + " has non-deleted Peering Attachments: " + String.join(", ", peered) + ".", 400);
+            }
+            if (dryRun) {
+                throw dryRunOperation();
             }
             live.stream()
                     .filter(attachment -> isGateway(attachment.getAccepterTgwInfo(), region, transitGatewayId))
@@ -3412,6 +3420,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    /** The id's presence and form, which AWS checks ahead of a DryRun answered before the lookup. */
+    static void requirePeeringAttachmentIdForm(String attachmentId) {
+        if (!isSet(attachmentId)) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter TransitGatewayAttachmentId.", 400);
+        }
+        requireWellFormedAttachmentId(attachmentId);
+    }
+
     /**
      * Verified live: an id of the wrong shape is rejected before any lookup, and the message does
      * not echo it back, unlike the transit gateway's equivalent.
@@ -3564,11 +3581,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * {@link #allVpcPeeringConnections} uses.
      */
     private OwnedPeeringAttachment getRequiredPeeringAttachment(String region, String attachmentId) {
-        if (!isSet(attachmentId)) {
-            throw new AwsException("MissingParameter",
-                    "The request must contain the parameter TransitGatewayAttachmentId.", 400);
-        }
-        requireWellFormedAttachmentId(attachmentId);
+        requirePeeringAttachmentIdForm(attachmentId);
         return findPeeringAttachment(attachmentId)
                 .filter(owned -> isPartyTo(owned.attachment(), callerAccountId(), region))
                 .orElseThrow(() -> peeringAttachmentNotFound(attachmentId));
@@ -3730,6 +3743,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     /** An attachment associates with exactly one route table, so a second attempt is refused. */
     public TransitGatewayVpcAttachment associateTransitGatewayRouteTable(
             String region, String routeTableId, String attachmentId) {
+        return associateTransitGatewayRouteTable(region, routeTableId, attachmentId, false);
+    }
+
+    /** As above; with {@code dryRun} the checks are made and nothing is associated. */
+    public TransitGatewayVpcAttachment associateTransitGatewayRouteTable(
+            String region, String routeTableId, String attachmentId, boolean dryRun) {
         synchronized (attachmentTopologyLock(region)) {
             TransitGatewayRouteTable routeTable = getRequiredTransitGatewayRouteTable(region, routeTableId);
             TransitGatewayVpcAttachment attachment =
@@ -3737,6 +3756,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (attachment.getAssociationRouteTableId() != null) {
                 throw new AwsException("Resource.AlreadyAssociated", "Transit Gateway Attachment "
                         + attachmentId + " is already associated to a route table.", 400);
+            }
+            if (dryRun) {
+                throw dryRunOperation();
             }
             attachment.setAssociationRouteTableId(routeTableId);
             attachment.setAssociationState("associated");
@@ -3798,6 +3820,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public TransitGatewayRouteTablePropagation disableTransitGatewayRouteTablePropagation(
             String region, String routeTableId, String attachmentId) {
+        return disableTransitGatewayRouteTablePropagation(region, routeTableId, attachmentId, false);
+    }
+
+    /** As above; with {@code dryRun} the checks are made and the propagation is left enabled. */
+    public TransitGatewayRouteTablePropagation disableTransitGatewayRouteTablePropagation(
+            String region, String routeTableId, String attachmentId, boolean dryRun) {
         synchronized (attachmentTopologyLock(region)) {
             TransitGatewayRouteTable routeTable = getRequiredTransitGatewayRouteTable(region, routeTableId);
             requireAttachmentOfSameGateway(region, routeTable, attachmentId);
@@ -3806,6 +3834,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .orElseThrow(() -> new AwsException("InvalidparameterValue", "Propagation "
                             + attachmentId + " does not exist in Transit Gateway Route Table "
                             + routeTableId + ".", 400));
+            if (dryRun) {
+                throw dryRunOperation();
+            }
             transitGatewayPropagations.delete(propagationKey(region, routeTableId, attachmentId));
             propagation.setState("disabled");
             return propagation;
@@ -3841,6 +3872,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public TransitGatewayRoute createTransitGatewayRoute(String region, String routeTableId,
                                                          String destinationCidrBlock, String attachmentId,
                                                          boolean blackhole) {
+        return createTransitGatewayRoute(region, routeTableId, destinationCidrBlock, attachmentId, blackhole, false);
+    }
+
+    /** As above; with {@code dryRun} the checks are made and no route is written. */
+    public TransitGatewayRoute createTransitGatewayRoute(String region, String routeTableId,
+                                                         String destinationCidrBlock, String attachmentId,
+                                                         boolean blackhole, boolean dryRun) {
         synchronized (attachmentTopologyLock(region)) {
             getRequiredTransitGatewayRouteTable(region, routeTableId);
             if (destinationCidrBlock == null || destinationCidrBlock.isBlank()) {
@@ -3865,6 +3903,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 route.setTransitGatewayAttachmentId(attachmentId);
                 route.setResourceId(attachment.getVpcId());
                 route.setResourceType("vpc");
+            }
+            if (dryRun) {
+                throw dryRunOperation();
             }
             transitGatewayRoutes.put(routeKey(region, routeTableId, destinationCidrBlock), route);
             return route;
@@ -11226,9 +11267,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public LaunchTemplate deleteLaunchTemplate(String region, String id, String name) {
+        return deleteLaunchTemplate(region, id, name, false);
+    }
+
+    /** As above; with {@code dryRun} the template is resolved and then answered with DryRunOperation, kept. */
+    public LaunchTemplate deleteLaunchTemplate(String region, String id, String name, boolean dryRun) {
         ensureDefaultResources(region);
         LaunchTemplate launchTemplate = findLaunchTemplate(region, id, name);
         synchronized (launchTemplate) {
+            if (dryRun) {
+                throw dryRunOperation();
+            }
             launchTemplates.delete(key(region, launchTemplate.getLaunchTemplateId()));
             removeTags(region, launchTemplate.getLaunchTemplateId());
             return launchTemplate;
@@ -12879,7 +12928,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * (the AWS provider's own update path) never asks for that, so nothing here re-checks it.
      */
     public CapacityReservation modifyCapacityReservation(String region, String capacityReservationId,
-            Integer instanceCount, java.time.Instant endDate, String endDateType, String instanceMatchCriteria) {
+            Integer instanceCount, Instant endDate, String endDateType, String instanceMatchCriteria) {
+        return modifyCapacityReservation(region, capacityReservationId, instanceCount, endDate, endDateType,
+                instanceMatchCriteria, false);
+    }
+
+    /** As above; with {@code dryRun} the checks are made and the reservation is left as it is. */
+    public CapacityReservation modifyCapacityReservation(String region, String capacityReservationId,
+            Integer instanceCount, Instant endDate, String endDateType, String instanceMatchCriteria,
+            boolean dryRun) {
         synchronized (capacityReservationLock) {
             ensureDefaultResources(region);
             reconcileCapacityMembership(region);
@@ -12916,6 +12973,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             if (instanceMatchCriteria != null) {
                 reservation.setInstanceMatchCriteria(instanceMatchCriteria);
+            }
+            if (dryRun) {
+                throw dryRunOperation();
             }
             capacityReservations.put(key(region, capacityReservationId), reservation);
             return reservation;
@@ -15127,6 +15187,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public void disassociateAddress(String region, String associationId) {
+        disassociateAddress(region, associationId, false);
+    }
+
+    /** As above; with {@code dryRun} the checks are made and the address stays associated. */
+    public void disassociateAddress(String region, String associationId, boolean dryRun) {
         ensureDefaultResources(region);
         // Under the lock NAT create and delete take, so the gateway check and the clear see the
         // same association.
@@ -15140,6 +15205,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         throw new AwsException("InvalidParameterValue", "The association " + associationId
                                 + " belongs to a NAT gateway and cannot be disassociated; delete the NAT gateway.",
                                 400);
+                    }
+                    if (dryRun) {
+                        throw dryRunOperation();
                     }
                     // An address a retained interface carries names no instance; the instance that
                     // interface is attached to now holds it.
@@ -15168,6 +15236,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     }
                     return;
                 }
+            }
+            // An association that is not there is no error, as for the real call.
+            if (dryRun) {
+                throw dryRunOperation();
             }
         }
     }
