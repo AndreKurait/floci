@@ -149,7 +149,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         DnsAnswer answer;
         try {
             answer = buildPublicRecords(name, type, selectPublicRecords(zone.matchingRecords(), recordType),
-                    recordFactory, listenerAddress);
+                    recordFactory, listenerAddress, origin);
             if (answer.responseCode() == 0) {
                 List<DnsRecord> cnameAnswers = new ArrayList<>(answer.records());
                 int cnameTtl = answer.isEmpty() ? Integer.MAX_VALUE : answer.ttlSeconds();
@@ -196,7 +196,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     }
 
     private DnsAnswer buildPublicRecords(String name, int type, List<ResourceRecordSet> sets,
-                                        Function<String, DnsRecord> recordFactory, String listenerAddress) {
+                                        Function<String, DnsRecord> recordFactory, String listenerAddress, ClientVpc origin) {
         if (sets.stream().noneMatch(record -> record.getAliasTarget() != null)) {
             return buildRecords(name, sets, recordFactory, Route53DnsRecordSource::publicTtlOf, true);
         }
@@ -212,8 +212,11 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             return DnsAnswer.refused();
         }
         // A single simple alias still answers when unhealthy, since there is no alternative record.
-        DnsAnswer target = embeddedDnsServer.resolveAliasTarget(
-                alias.getDnsName(), alias.getHostedZoneId(), type, listenerAddress).orElseGet(DnsAnswer::refused);
+        Optional<DnsAnswer> resolved = origin == null
+                ? embeddedDnsServer.resolveAliasTarget(alias.getDnsName(), alias.getHostedZoneId(), type, listenerAddress)
+                : embeddedDnsServer.resolveAliasTarget(
+                        alias.getDnsName(), alias.getHostedZoneId(), type, listenerAddress, origin);
+        DnsAnswer target = resolved.orElseGet(DnsAnswer::refused);
         if (target.responseCode() != 0 || target.records().stream().anyMatch(value -> value.type() != type)) {
             return DnsAnswer.refused();
         }

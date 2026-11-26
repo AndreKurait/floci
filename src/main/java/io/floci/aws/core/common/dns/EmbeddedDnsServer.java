@@ -536,11 +536,18 @@ public class EmbeddedDnsServer {
 
     /** Only one stored resource may claim an alias target; failures cannot fall through to DNS. */
     public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, String listenerAddress) {
+        return resolveAliasTarget(name, hostedZoneId, type, listenerAddress, null);
+    }
+
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                 String listenerAddress, DnsClientVpcSource.ClientVpc origin) {
         DnsAnswer resolved = null;
         if (recordSources != null) {
             for (DnsRecordSource source : recordSources) {
                 try {
-                    Optional<DnsAnswer> candidate = source.resolveAliasTarget(name, hostedZoneId, type, listenerAddress);
+                    Optional<DnsAnswer> candidate = origin == null
+                            ? source.resolveAliasTarget(name, hostedZoneId, type, listenerAddress)
+                            : source.resolveAliasTarget(name, hostedZoneId, type, listenerAddress, origin);
                     if (candidate.isPresent()) {
                         if (resolved != null) {
                             return Optional.of(DnsAnswer.refused());
@@ -555,6 +562,15 @@ public class EmbeddedDnsServer {
             }
         }
         return Optional.ofNullable(resolved);
+    }
+
+    /** Public API aliases use the same VPC routing rules as ordinary API queries. */
+    public Optional<String> publicApiAddress(String listenerAddress, DnsClientVpcSource.ClientVpc origin) {
+        if (publicAwsApi && origin != null && isUsableOrigin(origin)) {
+            return Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS);
+        }
+        return listenerAddress != null && !listenerAddress.isBlank()
+                ? Optional.of(listenerAddress) : getServerIp();
     }
 
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {

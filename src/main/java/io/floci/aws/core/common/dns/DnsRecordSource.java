@@ -28,6 +28,12 @@ public interface DnsRecordSource {
         return Optional.empty();
     }
 
+    /** Carries both the receiving listener and the caller's VPC to an owned alias target. */
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                  String listenerAddress, DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, listenerAddress);
+    }
+
     /** A null origin identifies a query outside any known VPC. */
     default Optional<DnsAnswer> resolveAuthoritative(String name, int type, DnsClientVpcSource.ClientVpc origin) {
         return resolveAuthoritative(name, type);

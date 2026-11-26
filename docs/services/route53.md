@@ -86,6 +86,19 @@ For a Docker host client, publish DNS separately from HTTP on loopback, for exam
 
 The longest matching public zone answers. Missing names return NXDOMAIN; existing names without the requested supported type return NOERROR with no answers. Both include the zone SOA with the smaller of its TTL and minimum field for negative caching. Changes and deletes affect DNS through the same stored record sets as the Route 53 API.
 
+Public `A` aliases can target an existing API Gateway custom domain's reported regional
+or edge endpoint. Resolution verifies its reported hosted-zone ID and refuses unknown,
+deleted or ambiguous targets. The source does not infer ownership from a hostname suffix.
+Deleting the alias while keeping its hosted zone returns NXDOMAIN; an external transport
+fallback does not conceal that missing native record.
+
+The answer uses Floci's API listener. With native public routing enabled, a known VPC
+caller receives the public API bridge address and remains subject to its NAT, route and
+security-group rules. Unknown callers retain the ordinary listener address. This uses
+the existing custom-domain API routing; it does not add CloudFront distribution behavior
+or private API Gateway custom-domain support.
+
+
 Simple public `A` aliases to stored Application Load Balancers resolve to the receiving DNS listener's IPv4 address with a 60-second TTL, including the loopback address when only the native host listener is enabled. The target DNS name and canonical hosted-zone ID must match exactly one stored load balancer, including when the zone and balancer have different owners. Names are case-insensitive and accept the load balancer's `dualstack.` prefix. An `AAAA` alias to a valid target returns NOERROR without addresses because this listener has no IPv6 address. Deleted, ambiguous, unsupported, and mismatched targets return REFUSED without recursive DNS, except under an emulator suffix as described below.
 
 A single simple ALB alias resolves with either `EvaluateTargetHealth` setting. Route 53 still answers when all records are unhealthy, so the setting does not change the answer when there is only one record.
