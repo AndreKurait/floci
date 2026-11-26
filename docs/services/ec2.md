@@ -262,9 +262,38 @@ When the image lacks `sshd` or `scp`, Floci first installs OpenSSH with the imag
 
 ## Security Group Port Publishing
 
-With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. This filters packets but does not emulate VPC routing, NACLs, NAT gateways, or peering. Rootless Docker and Windows containers are unsupported.
+With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. Security-group enforcement alone does not implement VPC routes or NAT; see [NAT Gateways](#nat-gateways) for the optional public routing path. NACLs, peering, rootless Docker and Windows containers are unsupported.
 
 An ENI's IPv6 addresses are part of its identity too. A rule naming an IPv6 range matches a managed peer on any IPv6 address its ENI holds, and admits that peer's traffic only on its helper's Docker IPv6 address, never on its IPv4 one. On a Docker network without IPv6 the helper has no IPv6 address, so such a rule has nothing to match. `AssignIpv6Addresses` and `UnassignIpv6Addresses` update the ENI's firewall identity at once.
+
+With VPC Docker networks enabled, the protected EC2 namespace also joins its VPC
+at the instance's allocated private IP. Guests can bind and reach that address;
+the private and primary Docker addresses share the same ENI permissions.
+A failed VPC attachment stops the launch. Stop/start retains the private interface.
+
+When embedded DNS is available, the protected namespace supplies its address as
+the sole nameserver before starting workloads. Workloads inherit that resolver
+file, so ordinary DNS works on an internal Docker network without an external
+gateway. Floci handles recursive lookups and the workload VPC's Resolver rules.
+The existing DNS packet exception still permits only port 53 at that resolver.
+
+Rule and prefix-list updates refresh protected workloads in the caller's account and region.
+Workloads in other accounts keep their own groups and prefix-list entries.
+
+An observer detects externally stopped, removed, or disconnected namespace helpers.
+It retires their DNS identity and removes their addresses from peer security-group rules,
+so an unrelated container reusing an address does not inherit the former ENI's membership.
+Losing either registered interface withdraws both addresses, including a surviving primary interface.
+Detection is asynchronous; failed policy updates quarantine peers and are retried.
+The owning workload retains responsibility for removing its retired helper; failed
+Docker removal is reported and remains retryable.
+
+VPC-connected Docker Lambda environments use the same policy engine. Their Runtime API
+has an exact IP and TCP-port exception, while their application traffic remains filtered.
+See [Lambda VPC configuration](lambda.md#vpcconfig-snapstart-loggingconfig-and-durableconfig)
+for execution and lifecycle limits.
+
+
 
 Security-group permissions on a host-published port use the source visible inside Docker, and Docker can replace the original client address (Docker Desktop shows every host client as its gateway). So while enforcement is enabled, host-published access counts as traffic from outside the VPC: Floci publishes an application port only when an ingress rule opens it to every address, `0.0.0.0/0` or `::/0`, since such a rule admits a client whatever address it arrives with. A client's family is still seen on the host, so a port only `0.0.0.0/0` opens is published on the host's IPv4 addresses, one only `::/0` opens on its IPv6 addresses, and one both open on every address. The socat sidecar described below dials the instance through its protected namespace, on the instance's IPv4 address, or on its Docker IPv6 address when only `::/0` opens the port; on a Docker network without IPv6 such a port is not published. A port that only a narrower CIDR, a prefix list or a referenced group opens stays reachable on the direct container path, where the firewall sees the peer's own ENI identity. Authorizing a world-open rule after launch publishes the port. Revoking the last world-open rule closes the host listener. If egress permits TCP to every address and port in the address family the relay uses to reach the guest, revocation also closes existing connections immediately. With narrower egress, established connections can finish until the instance stops or terminates. SSH is published directly by the protected namespace.
 
@@ -892,7 +921,7 @@ Route table ids follow the live API's own inconsistency: an id that does not exi
 |--------|-------------|
 | CreateNatGateway | Creates a NAT gateway record. |
 | DescribeNatGateways | Lists or returns stored NAT gateways. |
-| DeleteNatGateway | Deletes a NAT gateway record. |
+| DeleteNatGateway | Deletes a NAT gateway record and marks routes targeting it as `blackhole`. The routes retain their destination and gateway ID until replaced or deleted. Other routes stay unchanged. |
 
 Every NAT gateway Floci creates is zonal: it sits in the subnet it was created in, and responses
 report `availabilityMode` as `zonal`. Regional NAT gateways are not supported: `CreateNatGateway` with
@@ -931,6 +960,23 @@ back, and a new address that is already held fails the update and leaves the gat
 | DeleteInstanceConnectEndpoint | Deletes an endpoint and answers with it in `delete-in-progress`. |
 
 A repeated `ClientToken` returns the endpoint the first call created (`IdempotentParameterMismatch` when reused with another subnet, security group set, `IpAddressType`, `PreserveClientIp` or tag set; tags added later with `CreateTags` do not count). While an endpoint exists, `DeleteSubnet` on its subnet and `DeleteVpc` on its VPC fail with `DependencyViolation`, as on AWS. The interface ID in an endpoint's `networkInterfaceIdSet` resolves in `DescribeNetworkInterfaces` while the endpoint exists: a requester-managed `ec2_instance_connect_endpoint` interface carrying the endpoint's private address, subnet, VPC and security groups. An unknown filter name is `InvalidParameterValue` even when no endpoint exists. `DescribeInstanceConnectEndpoints` pages by `MaxResults`/`NextToken` in endpoint ID order (`MaxResults` outside 1-50 is `InvalidMaxResults`), and `publicDnsNames` carries only the `ipv4` names. The endpoint's tunnel is real: see [EC2 Instance Connect](ec2-instance-connect.md#instance-connect-endpoint-tunnels).
+
+`FLOCI_NETWORK_VPC_ROUTING_ENABLED=true` additionally enables an experimental IPv4
+packet path from protected workloads through public NAT gateways to managed
+internet-facing [Classic frontends](elb-classic.md#protected-frontends).
+It requires EC2 VPC networks, native private addresses and security-group enforcement.
+The frontend observes the allocated NAT Elastic IP. The workload's NAT route and
+both the NAT and frontend subnets' internet-gateway routes must exist; missing or
+unsupported routes drop traffic. Frontend security-group ingress remains a
+separate requirement.
+
+In this mode, public NAT creation without an attached internet gateway returns a
+failed gateway with failure code `Gateway.NotAttached`. Runtime programming errors fail route API calls.
+Deleting a NAT removes forwarding before releasing its addresses; a remaining
+namespace consumer prevents retirement and keeps the reservation for a retry.
+This is limited to managed public destinations, with no general internet,
+private NAT, multi-address NAT, IPv6/NAT64, peering or NACL forwarding.
+See the [routing design and qualification limits](../design/vpc-public-routing.md).
 
 ### Capacity Reservations
 
@@ -1592,6 +1638,8 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_PREFIX_LENGTH` | `16` | Prefix length of each block handed out of that pool |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator. Whatever its value, the network a previous run created for a VPC that still exists is kept, and goes when that VPC is deleted |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER` | `bridge` | Docker network driver used for VPC networks |
+| `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
+| `FLOCI_NETWORK_VPC_ROUTING_ENABLED` | `false` | Enforce native IPv4 routes and public NAT for protected workloads reaching managed Classic frontends |
 
 ## VPC Docker networks
 
@@ -1606,6 +1654,16 @@ network attachment. This keeps management calls responsive even when the Docker 
 For overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the declared range;
 later VPCs use the fallback pool. Within one emulator run, allocated addresses remain on the
 same effective range.
+
+Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL=true` to create internal Docker VPC
+bridges. This deployment setting does not change EC2 request or response fields.
+A retained VPC network with a different internal setting refuses attachment and
+is preserved; use a fresh deployment when changing this option.
+Other guest network attachments retain their own connectivity, so this option
+alone does not isolate a guest attached to an external bridge. Configure the
+guest's primary network accordingly. Docker host access and explicit forwarding
+also remain separate from this network setting.
+Publishing the guest's SSH port does not add Docker's default bridge.
 
 When Floci runs in Docker, deleting a VPC disconnects Floci's own container before removing
 the VPC network. Other endpoints are not forcibly disconnected: removal retries while they
@@ -1638,9 +1696,9 @@ true or it is in the log.
 
 Limits worth knowing before reading a passing test as evidence:
 
-- **Security groups and NACLs are not enforced by this.** Within one Docker network every
-  container reaches every other on every port.
-- **Between-VPC isolation is the daemon's, not Floci's.** It comes from Docker's own
+- **VPC networks alone do not enforce security groups or NACLs.** Enable security-group
+  enforcement to protect EC2 namespaces on these networks. NACLs remain unemulated.
+- **Without packet enforcement, between-VPC isolation depends on the daemon.** It comes from Docker's own
   `DOCKER-ISOLATION-STAGE` rules. OrbStack does not apply them: measured on OrbStack 29.4.0,
   two containers on separate networks reach each other in both directions, `--internal` included.
   On such a host the VPC boundary is an addressing boundary only.

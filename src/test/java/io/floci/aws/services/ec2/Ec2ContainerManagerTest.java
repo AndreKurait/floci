@@ -37,6 +37,7 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.core.common.docker.ContainerSpec;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.PortAllocator;
 import io.floci.aws.core.common.docker.UserDataPipeline;
@@ -153,6 +154,53 @@ class Ec2ContainerManagerTest {
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
             verify(firewall).unregister("eni-firewall-teardown");
+        } finally {
+            manager.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"111111111111", "222222222222"})
+    void restoringProtectedEndpointUsesTheInstanceOwnerOutsideItsRequestScope(String owner) {
+        DockerClient docker = guestDocker(null, "10.88.1.10");
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        when(firewall.enabled()).thenReturn(true);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.port()).thenReturn(4566);
+        RegionResolver resolver = mock(RegionResolver.class);
+        when(resolver.getAccountId()).thenReturn("999999999999");
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), config,
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), resolver,
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), firewall);
+        Instance instance = serviceNetworkInstance();
+        instance.setOwnerId(owner);
+        instance.setContainerBridgeIp("10.88.1.10");
+        instance.setVpcId("vpc-owner");
+        instance.setSecurityGroups(List.of());
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-owner");
+        eni.setPrivateIpAddress("10.88.1.10");
+        instance.setNetworkInterfaces(List.of(eni));
+        ContainerConfig helperConfig = new ContainerConfig().withLabels(Map.of(
+                Ec2ContainerManager.LABEL_OWNER, "4566",
+                Ec2ContainerManager.LABEL_SERVICE, "ec2",
+                Ec2ContainerManager.LABEL_RESOURCE_ID, instance.getInstanceId(),
+                ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true"));
+        when(docker.inspectContainerCmd("helper-1").exec().getConfig()).thenReturn(helperConfig);
+        try {
+            manager.restoreSecurityGroups(instance, "us-west-2", List.of(), Map.of());
+            ArgumentCaptor<SecurityGroupNftCompiler.Endpoint> endpoint =
+                    ArgumentCaptor.forClass(SecurityGroupNftCompiler.Endpoint.class);
+            verify(firewall).register(endpoint.capture(), eq("helper-1"), eq(Map.of()));
+            assertEquals(owner, endpoint.getValue().accountId());
+            assertEquals("us-west-2", endpoint.getValue().region());
+            assertEquals("vpc-owner", endpoint.getValue().vpcId());
+            assertEquals("eni-owner", endpoint.getValue().eniId());
+            assertEquals("10.88.1.10", endpoint.getValue().logicalAddress());
         } finally {
             manager.stop();
         }

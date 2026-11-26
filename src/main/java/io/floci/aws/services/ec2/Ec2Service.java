@@ -108,6 +108,7 @@ import io.floci.aws.services.ec2.model.VpcPeeringConnectionStateReason;
 import io.floci.aws.services.ec2.model.VpcPeeringConnectionVpcInfo;
 import io.floci.aws.services.ec2.net.Cidr4;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
+import io.floci.aws.services.ec2.net.VpcRoutingManager;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamService;
@@ -391,6 +392,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private Ec2EbsEncryptionService ebsEncryptionService;
     private jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance;
     private final List<VpcRouteTableListener> routeTableListeners = new CopyOnWriteArrayList<>();
+    // The EC2 model also uses the simple name Instance; defer this runtime to avoid a CDI cycle.
+    @Inject
+    jakarta.enterprise.inject.Instance<VpcRoutingManager> vpcRoutingManagers;
     private jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance;
     private final List<Ec2InstanceLaunchListener> instanceLaunchListeners = new CopyOnWriteArrayList<>();
     // Fully qualified to tell the CDI Instance from the EC2 model Instance. Only the CDI constructor
@@ -638,6 +642,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     LOG.warnv("CDI route table listener failed for {0}: {1}", routeTable.getRouteTableId(), e.getMessage());
                 }
             }
+        }
+        notifyPacketTopologyChanged();
+    }
+
+    private VpcRoutingManager packetRouting() {
+        if (vpcRoutingManagers == null || vpcRoutingManagers.isUnsatisfied()) {
+            return null;
+        }
+        VpcRoutingManager routing = vpcRoutingManagers.get();
+        return routing.enabled() ? routing : null;
+    }
+
+    private void notifyPacketTopologyChanged() {
+        VpcRoutingManager routing = packetRouting();
+        if (routing != null) {
+            routing.reconcile();
         }
     }
 
@@ -7289,17 +7309,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             egressOnlyInternetGateways.delete(key(region, eigwId));
             removeTags(region, eigwId);
         }
+        blackholeRoutes(region, route -> eigwId.equals(route.getEgressOnlyInternetGatewayId()));
+    }
+
+    private void blackholeRoutes(String region, Predicate<Route> targetsGateway) {
         for (RouteTable table : routeTables.scan(k -> k.startsWith(region + "::"))) {
-            if (table.getRoutes().stream().noneMatch(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))) {
+            if (table.getRoutes().stream().noneMatch(targetsGateway)) {
                 continue;
             }
             synchronized (lockFor(key(region, table.getRouteTableId()))) {
                 RouteTable current = routeTables.get(key(region, table.getRouteTableId())).orElse(null);
-                if (current == null) {
+                if (current == null || current.getRoutes().stream().noneMatch(targetsGateway)) {
                     continue;
                 }
                 current.getRoutes().stream()
-                        .filter(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))
+                        .filter(targetsGateway)
                         .forEach(r -> r.setState("blackhole"));
                 routeTables.put(key(region, current.getRouteTableId()), current);
                 notifyRouteTableUpdated(region, current);
@@ -12305,6 +12329,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             igw.getAttachments().add(new InternetGatewayAttachment(vpcId, "available"));
             internetGateways.put(key(region, igwId), igw);
         }
+        notifyPacketTopologyChanged();
     }
 
     public void detachInternetGateway(String region, String igwId, String vpcId) {
@@ -12324,6 +12349,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         igw.getAttachments().removeIf(a -> a.getVpcId().equals(vpcId));
         internetGateways.put(key(region, igwId), igw);
+        notifyPacketTopologyChanged();
     }
 
     private InternetGateway getRequiredInternetGateway(String region, String igwId) {
@@ -13158,11 +13184,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public void deleteRouteTable(String region, String routeTableId, boolean dryRun) {
         ensureDefaultResources(region);
-        RouteTable rt = getRequiredRouteTable(region, routeTableId);
-        if (dryRun) {
-            throw dryRunOperation();
+        RouteTable rt;
+        synchronized (lockFor(key(region, routeTableId))) {
+            rt = getRequiredRouteTable(region, routeTableId);
+            if (dryRun) {
+                throw dryRunOperation();
+            }
+            routeTables.delete(key(region, routeTableId));
         }
-        routeTables.delete(key(region, routeTableId));
         notifyRouteTableUpdated(region, rt);
     }
 
@@ -14025,6 +14054,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ensureDefaultResources(region);
         Subnet subnet = requireSubnet(region, subnetId);
         boolean privateGateway = "private".equalsIgnoreCase(connectivityType);
+        VpcRoutingManager routing = packetRouting();
+        if (routing != null) {
+            routing.validateConfiguration();
+            if (privateGateway) {
+                throw new AwsException("UnsupportedOperation", "Private NAT packet routing is not implemented.", 400);
+            }
+            if (!isSet(allocationId)) {
+                throw new AwsException("MissingParameter", "A public NAT gateway requires AllocationId.", 400);
+            }
+        }
         List<String> secondaryEips = secondaryAllocationIds == null ? List.of() : secondaryAllocationIds;
         if (privateGateway && (isSet(allocationId) || !secondaryEips.isEmpty())) {
             // A private NAT gateway has no route to the internet and so nothing to attach an
@@ -14053,6 +14092,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         natGateway.setConnectivityType(connectivityType != null && !connectivityType.isBlank() ? connectivityType : "public");
         natGateway.setCreateTime(Instant.now());
         natGateway.setRegion(region);
+        if (routing != null) {
+            natGateway.setState("pending");
+            if (!routing.hasInternetGateway(region, subnet.getVpcId())) {
+                natGateway.setState("failed");
+                natGateway.setFailureCode("Gateway.NotAttached");
+                natGateway.setFailureMessage("Network " + subnet.getVpcId() + " has no internet gateway attached");
+            }
+        }
         synchronized (privateIpAllocationLock) {
             // Checked under the same lock that writes the association below, so two gateways
             // cannot both see the allocation free. As on AWS, an allocation already held by an
@@ -14082,6 +14129,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 putTags(region, natGateway.getNatGatewayId(), new ArrayList<>(natGatewayTags));
             }
             natGateways.put(key(region, natGateway.getNatGatewayId()), natGateway);
+        }
+        if (routing != null && !"failed".equals(natGateway.getState())) {
+            try {
+                routing.createNat(callerAccountId(), region, natGateway);
+                natGateway.setState("available");
+                natGateways.put(key(region, natGateway.getNatGatewayId()), natGateway);
+                routing.reconcile();
+            } catch (RuntimeException failure) {
+                natGateway.setState("failed");
+                natGateway.setFailureCode("InternalError");
+                natGateway.setFailureMessage("Cannot prepare the local NAT packet runtime");
+                natGateways.put(key(region, natGateway.getNatGatewayId()), natGateway);
+                LOG.errorv(failure, "Failed to prepare NAT gateway {0}", natGateway.getNatGatewayId());
+            }
         }
         return natGateway;
     }
@@ -14591,6 +14652,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public NatGateway deleteNatGateway(String region, String natGatewayId) {
         ensureDefaultResources(region);
+        getRequiredNatGateway(region, natGatewayId);
+        VpcRoutingManager routing = packetRouting();
+        if (routing != null) {
+            routing.prepareNatDeletion(callerAccountId(), region, natGatewayId);
+        }
+        NatGateway deleted;
         // Read under the lock createNatGateway and updateNatGatewaySecondaryAddresses take, so what
         // is given back is what the gateway holds now. The Elastic IP is handed back only if the
         // association is still the gateway's own, so a concurrent create cannot have it wiped.
@@ -14611,8 +14678,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             natGateways.delete(key(region, natGatewayId));
             removeTags(region, natGatewayId);
             natGateway.getNatGatewayAddresses().forEach(a -> removeTags(region, a.getNetworkInterfaceId()));
-            return natGateway;
+            deleted = natGateway;
         }
+        blackholeRoutes(region, route -> natGatewayId.equals(route.getNatGatewayId()));
+        if (routing != null) {
+            routing.natDeleted(callerAccountId(), region, natGatewayId);
+        }
+        return deleted;
     }
 
     /**
@@ -16946,6 +17018,32 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                     List<String> ipv6Addresses, Integer ipv6AddressCount,
                                                     List<String> securityGroupIds, List<Tag> tagList,
                                                     Integer secondaryCount) {
+        return createNetworkInterface(region, subnetId, description, privateIpAddress, privateIpAddresses,
+                ipv6Addresses, ipv6AddressCount, securityGroupIds, tagList, secondaryCount, null);
+    }
+
+    public NetworkInterface createServiceNetworkInterface(String region, String subnetId, String description,
+                                                           List<String> securityGroupIds, String allocationToken) {
+        if (allocationToken == null || allocationToken.isBlank()) {
+            throw new IllegalArgumentException("Service interface allocation token is required");
+        }
+        return createNetworkInterface(region, subnetId, description, null, List.of(), List.of(), null,
+                securityGroupIds, List.of(), null, allocationToken);
+    }
+
+    public List<NetworkInterface> findServiceNetworkInterfaces(String region, String allocationToken) {
+        if (allocationToken == null || allocationToken.isBlank()) {
+            throw new IllegalArgumentException("Service interface allocation token is required");
+        }
+        return networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(eni -> allocationToken.equals(eni.getServiceAllocationToken())).toList();
+    }
+
+    private NetworkInterface createNetworkInterface(String region, String subnetId, String description,
+                                                     String privateIpAddress, List<String> privateIpAddresses,
+                                                     List<String> ipv6Addresses, Integer ipv6AddressCount,
+                                                     List<String> securityGroupIds, List<Tag> tagList,
+                                                     Integer secondaryCount, String allocationToken) {
         if (secondaryCount != null && secondaryCount < 0) {
             throw new AwsException("InvalidParameterValue", "SecondaryPrivateIpAddressCount must not be negative", 400);
         }
@@ -17022,6 +17120,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 String primaryDns = AwsRegions.ec2PrivateIpDnsName(primaryIp, region);
 
                 NetworkInterface ni = new NetworkInterface();
+                ni.setServiceAllocationToken(allocationToken);
                 ni.setIpv6Addresses(new ArrayList<>(ipv6));
                 ni.setNetworkInterfaceId(eniId);
                 ni.setSubnetId(subnetId);

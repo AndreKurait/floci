@@ -1,6 +1,7 @@
 package io.floci.aws.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ListNetworksCmd;
 import io.floci.aws.config.EmulatorConfig;
@@ -44,6 +45,7 @@ import io.floci.aws.services.ec2.model.PrefixList;
 import io.floci.aws.services.ec2.model.PrefixListEntry;
 import io.floci.aws.services.ec2.model.PrefixListId;
 import io.floci.aws.services.ec2.model.Reservation;
+import io.floci.aws.services.ec2.model.Route;
 import io.floci.aws.services.ec2.model.RouteTable;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.SecurityGroupRule;
@@ -172,6 +174,41 @@ import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
 
+    @Test
+    void serviceInterfaceOwnershipSurvivesSerializationAndCannotBeForgedByTags() throws Exception {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.94.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.94.1.0/24", region + "a");
+        NetworkInterface owned = service.createServiceNetworkInterface(region, subnet.getSubnetId(),
+                "Classic frontend", List.of(), "allocation-token");
+        NetworkInterface unrelated = service.createNetworkInterface(region, subnet.getSubnetId(),
+                "Classic frontend", null, List.of(), List.of(),
+                List.of(new Tag("floci:elb-classic:allocation", "allocation-token")));
+
+        assertEquals(List.of(owned.getNetworkInterfaceId()), service.findServiceNetworkInterfaces(region,
+                "allocation-token").stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        assertNull(unrelated.getServiceAllocationToken());
+        assertTrue(service.findServiceNetworkInterfaces("us-west-2", "allocation-token").isEmpty());
+        assertTrue(service.findServiceNetworkInterfaces(region, "other-token").isEmpty());
+        ObjectMapper mapper = new ObjectMapper();
+        NetworkInterface restored = mapper.readValue(mapper.writeValueAsBytes(owned), NetworkInterface.class);
+        assertEquals("allocation-token", restored.getServiceAllocationToken());
+        service.deleteNetworkInterface(region, owned.getNetworkInterfaceId());
+        assertTrue(service.findServiceNetworkInterfaces(region, "allocation-token").isEmpty());
+        assertEquals(List.of(unrelated.getNetworkInterfaceId()), service.describeNetworkInterfaces(region,
+                List.of(), Map.of()).networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+    }
+
+    @Test
+    void serviceInterfaceOwnershipRejectsMissingTokenBeforeAllocation() {
+        Ec2Service service = mockModeService();
+        assertThrows(IllegalArgumentException.class,
+                () -> service.createServiceNetworkInterface("us-east-1", "subnet", null, List.of(), null));
+        assertThrows(IllegalArgumentException.class,
+                () -> service.findServiceNetworkInterfaces("us-east-1", " "));
+    }
+
     @ParameterizedTest
     @CsvSource({"false, us-east-1", "true, us-east-1", "false, eu-west-1", "true, eu-west-1"})
     void ipv6AllocationWaitsForThePreviousVpcPublication(boolean associate, String secondRegion) throws Exception {
@@ -214,6 +251,70 @@ class Ec2ServiceTest {
             assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
         }
     }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void routeTableDeleteWaitsForGatewayRetirementWithoutResurrection(boolean nat) throws Exception {
+        String region = "us-east-1";
+        ParkingStore<RouteTable> parked = new ParkingStore<>();
+        AccountAwareStorageBackend<RouteTable> tables =
+                new AccountAwareStorageBackend<>(parked, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-route-tables.json", tables)));
+        String vpc = service.createVpc(region, "10.134.0.0/16", false).getVpcId();
+        String gateway;
+        if (nat) {
+            String subnet = service.createSubnet(region, vpc, "10.134.1.0/24", region + "a").getSubnetId();
+            gateway = service.createNatGateway(region, subnet, null, "private", List.of()).getNatGatewayId();
+        } else {
+            gateway = service.createEgressOnlyInternetGateway(region, vpc, null, List.of())
+                    .getEgressOnlyInternetGatewayId();
+        }
+        RouteTable table = service.createRouteTable(region, vpc);
+        Route route = new Route();
+        route.setDestinationCidrBlock("0.0.0.0/0");
+        route.setState("active");
+        if (nat) {
+            route.setNatGatewayId(gateway);
+        } else {
+            route.setEgressOnlyInternetGatewayId(gateway);
+        }
+        table.getRoutes().add(route);
+        tables.put(region + "::" + table.getRouteTableId(), table);
+        parked.parkNextWrite();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> retirement = pool.submit(() -> {
+                if (nat) {
+                    service.deleteNatGateway(region, gateway);
+                } else {
+                    service.deleteEgressOnlyInternetGateway(region, gateway);
+                }
+            });
+            assertTrue(parked.awaitParked(), "gateway retirement must reach the route write");
+            AtomicReference<Thread> deleting = new AtomicReference<>();
+            Future<?> deletion = pool.submit(() -> {
+                deleting.set(Thread.currentThread());
+                service.deleteRouteTable(region, table.getRouteTableId());
+            });
+            awaitBlockedOrDone(deleting, deletion);
+            assertFalse(deletion.isDone(), "deletion must wait for the in-flight route write");
+            parked.release();
+            retirement.get(2, TimeUnit.SECONDS);
+            deletion.get(2, TimeUnit.SECONDS);
+            assertTrue(tables.get(region + "::" + table.getRouteTableId()).isEmpty());
+            assertTrue(service.describeRouteTables(region, List.of(table.getRouteTableId()), Map.of()).isEmpty());
+            AwsException missing = assertThrows(AwsException.class,
+                    () -> service.deleteRouteTable(region, table.getRouteTableId()));
+            assertEquals("InvalidRouteTableID.NotFound", missing.getErrorCode());
+        } finally {
+            parked.release();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
 
     @ParameterizedTest
     @CsvSource({

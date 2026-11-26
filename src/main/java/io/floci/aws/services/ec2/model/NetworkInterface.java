@@ -10,6 +10,7 @@ import java.util.List;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class NetworkInterface {
 
+    private String serviceAllocationToken;
     private String networkInterfaceId;
     private String subnetId;
     private String vpcId;
@@ -45,6 +46,9 @@ public class NetworkInterface {
     private List<NetworkInterfacePermission> permissions = new ArrayList<>();
 
     public NetworkInterface() {}
+
+    public String getServiceAllocationToken() { return serviceAllocationToken; }
+    public void setServiceAllocationToken(String token) { serviceAllocationToken = token; }
 
     public String getNetworkInterfaceId() { return networkInterfaceId; }
     public void setNetworkInterfaceId(String networkInterfaceId) { this.networkInterfaceId = networkInterfaceId; }
