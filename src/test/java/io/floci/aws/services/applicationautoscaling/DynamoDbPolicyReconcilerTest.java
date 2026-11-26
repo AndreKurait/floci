@@ -92,6 +92,7 @@ class DynamoDbPolicyReconcilerTest {
         CountDownLatch emergencyRelease = new CountDownLatch(1);
         AtomicReference<String> threadName = new AtomicReference<>();
         AtomicReference<Thread> actualThread = new AtomicReference<>();
+        AtomicReference<Thread> stoppingThread = new AtomicReference<>();
         AtomicReference<Instant> observed = new AtomicReference<>();
         doAnswer(invocation -> {
             threadName.set(Thread.currentThread().getName());
@@ -102,6 +103,7 @@ class DynamoDbPolicyReconcilerTest {
                 emergencyRelease.await(20, TimeUnit.SECONDS);
             } catch (InterruptedException expected) {
                 interrupted.countDown();
+                assertTrue(emergencyRelease.await(5, TimeUnit.SECONDS));
                 Thread.currentThread().interrupt();
             } finally {
                 completed.countDown();
@@ -110,23 +112,36 @@ class DynamoDbPolicyReconcilerTest {
         }).when(service).reconcileDynamoDbPolicies(any(Instant.class));
         DynamoDbPolicyReconciler worker = new DynamoDbPolicyReconciler(service, config(true, true));
         Instant started = Instant.now();
-        try {
-            worker.onStart(null);
-            assertTrue(entered.await(15, TimeUnit.SECONDS));
-            assertEquals("dynamodb-policy-reconciliation", threadName.get());
-            assertNotNull(observed.get());
-            assertFalse(observed.get().isBefore(started));
-            worker.onStop(null);
-            assertEquals(0, interrupted.getCount());
-            assertEquals(0, completed.getCount(), "Shutdown must drain the interrupted callback");
-            assertNotNull(actualThread.get());
-            // Executor termination is signalled just before its last worker thread returns.
-            actualThread.get().join(Duration.ofSeconds(5));
-            assertFalse(actualThread.get().isAlive(), "Shutdown must return after the actual worker thread terminates");
-            verify(service, times(1)).reconcileDynamoDbPolicies(any(Instant.class));
-        } finally {
-            emergencyRelease.countDown();
-            worker.onStop(null);
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            try {
+                worker.onStart(null);
+                assertTrue(entered.await(15, TimeUnit.SECONDS));
+                assertEquals("dynamodb-policy-reconciliation", threadName.get());
+                assertNotNull(observed.get());
+                assertFalse(observed.get().isBefore(started));
+                Future<?> stopping = executor.submit(() -> {
+                    stoppingThread.set(Thread.currentThread());
+                    worker.onStop(null);
+                });
+                assertTrue(interrupted.await(3, TimeUnit.SECONDS));
+                Awaitility.await().pollInSameThread().atMost(Duration.ofSeconds(3)).untilAsserted(() -> {
+                    assertNotNull(stoppingThread.get());
+                    assertEquals(Thread.State.TIMED_WAITING, stoppingThread.get().getState());
+                    assertFalse(stopping.isDone(), "Shutdown must wait while the interrupted callback is held");
+                });
+                assertEquals(1, completed.getCount());
+                emergencyRelease.countDown();
+                stopping.get(3, TimeUnit.SECONDS);
+                assertEquals(0, completed.getCount(), "Shutdown must drain the interrupted callback");
+                assertNotNull(actualThread.get());
+                // Executor termination is signalled just before its last worker thread returns.
+                actualThread.get().join(Duration.ofSeconds(5));
+                assertFalse(actualThread.get().isAlive(), "Shutdown must return after the actual worker thread terminates");
+                verify(service, times(1)).reconcileDynamoDbPolicies(any(Instant.class));
+            } finally {
+                emergencyRelease.countDown();
+                worker.onStop(null);
+            }
         }
     }
 
