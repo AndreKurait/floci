@@ -104,9 +104,9 @@ public class AlarmSnsNotifier {
         Map<String, Object> trigger = new LinkedHashMap<>();
         trigger.put("MetricName", alarm.getMetricName());
         trigger.put("Namespace", alarm.getNamespace());
-        trigger.put("StatisticType", "Statistic");
-        trigger.put("Statistic", alarm.getStatistic() != null
-                ? alarm.getStatistic().toUpperCase(Locale.ROOT) : null);
+        trigger.put("StatisticType", alarm.getExtendedStatistic() != null ? "ExtendedStatistic" : "Statistic");
+        trigger.put("Statistic", alarm.getExtendedStatistic() != null ? alarm.getExtendedStatistic()
+                : alarm.getStatistic() != null ? alarm.getStatistic().toUpperCase(Locale.ROOT) : null);
         trigger.put("Unit", alarm.getUnit());
         trigger.put("Dimensions", alarm.getDimensions());
         trigger.put("Period", alarm.getPeriod());

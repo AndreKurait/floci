@@ -492,7 +492,17 @@ invalid values and non-object statistics return `InvalidParameterValue`; combini
 statistics returns `InvalidParameterCombination`. JSON bodies use the corresponding SDK exception
 shape names. `Values` accepts 1 to 150 numeric samples with optional matching, nonnegative
 `Counts`; omitted counts default to one. The public JSON and Query APIs normalize these weighted
-samples without expanding their counts and reject combinations with `Value` or `StatisticValues`.
+samples without expanding their counts. A `StatisticValues` set sent with `Values` summarizes the same
+distribution and is not counted again. Combining `Value` and `Values` is rejected.
+
+Set `FLOCI_SERVICES_CLOUDWATCHMETRICS_PACK_WEIGHTED_VALUES=true`
+(`floci.services.cloudwatchmetrics.pack-weighted-values`, default `false`) to store a multi-value
+batch in one record and reduce its retained memory. Queries reconstruct the per-value distribution.
+Scalar metrics and single-value batches keep the existing record format.
+
+Packed records require a reader that understands their sample arrays. Disabling the option changes
+future writes only; it does not convert existing packed records. Keep a compatible reader for storage
+written while this option was enabled.
 The console's supported numeric values use the same bounds.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
@@ -608,6 +618,28 @@ Alarms stored before Floci recorded it report their last state update.
 `StateReason` and 4000 characters for `StateReasonData` before changing alarm state.
 Length checks count Unicode code points and preserve empty and whitespace values.
 
+### Percentile statistics and alarms
+
+The current Query and JSON APIs, and `AWS::CloudWatch::Alarm`, preserve a single metric's
+`ExtendedStatistic`, such as `p50` or `p90`. The evaluator uses that percentile, and the usual
+`TreatMissingData` policy applies when a period has no eligible samples. An update can switch
+between `Statistic` and `ExtendedStatistic`; specifying both, or combining an extended statistic
+with `Metrics`, is rejected before changing the alarm.
+
+`GetMetricStatistics` accepts either `Statistics` or `ExtendedStatistics`, with up to ten
+percentiles from `p0` through `p100`, and returns the latter in each datapoint's
+`ExtendedStatistics` map. `GetMetricData` accepts the same percentiles in `MetricStat.Stat`.
+Floci computes weighted nearest-rank percentiles from nonnegative scalar samples and statistic
+sets whose minimum and maximum are equal and whose sum agrees with the sample count.
+It does not expand repeated samples in memory. Periods containing negative values or statistic
+sets with an unrecoverable distribution have no percentile datapoint. Exact AWS interpolation
+and precision have not been qualified.
+
+Omitted `EvaluateLowSampleCountPercentile` and explicit `evaluate` are supported. The `ignore`
+policy is rejected because suppression for statistically insignificant samples is not implemented.
+Other extended statistics, such as trimmed means, and the console API's `ExtendedStatistics`
+request shape remain unsupported.
+
 ### Composite alarm evaluation
 
 A composite alarm is evaluated when it is created, when `PutCompositeAlarm` updates it, and when
@@ -654,17 +686,51 @@ Scaling action retries remain independent.
 Failures are logged per target without blocking other targets. Notifications include a
 single-metric `Trigger`; durable retries, FIFO topics, and metric-math payloads are not covered.
 
-### Metric-math alarm definitions
+### Metric math and alarms
 
 `PutMetricAlarm` stores the `Metrics` query definitions and `DescribeAlarms` returns them over
-both JSON and Query protocols. Expressions, labels, `ReturnData`, account IDs, query periods,
+both JSON and Query protocols. `AWS::CloudWatch::Alarm` resolves and stores the same definitions.
+Expressions, labels, `ReturnData`, the current account ID, query periods,
 and nested metric statistics (including dimensions and units) survive storage reloads.
 Metric-math alarm responses omit the single-metric fields, including top-level `Period`.
 Updating an alarm replaces its metric definition, so changing between `Metrics` and a single
 metric does not retain the previous definition.
 
-This is management-plane support: the alarm evaluator currently evaluates only single-metric
-alarms, not metric-math expressions. `SetAlarmState` remains available for manual transitions.
+`GetMetricData` and the periodic alarm evaluator share arithmetic support for `+`, `-`, `*`,
+`/`, `^`, unary signs, parentheses and references to other query IDs. Hidden queries can supply
+operands, and dependencies can appear in any order. Missing arithmetic operands are zero;
+division by zero drops that point. An alarm watches one returned time series and applies its
+normal threshold, evaluation range and `TreatMissingData` policy to the calculated values.
+
+`PERIOD(metric)` returns the metric's period in seconds. `SERVICE_QUOTA(metric)` supports
+account-wide `AWS/Lambda` `ConcurrentExecutions` and reads the current Lambda concurrency
+value from Floci's Service Quotas service. That service's existing catalog value is synthetic;
+this does not infer or fetch a production account's quota.
+
+`FILL(series, filler)` fills the missing values of one time series. The first argument is any
+expression that yields a time series; the filler is a scalar expression (`FILL(m, 0)`,
+`FILL(m, PERIOD(m) / 60)`), `REPEAT` (the most recent earlier value) or `LINEAR` (interpolation
+between the values on both sides of a gap). A missing value is a period of the requested range,
+on the same epoch-aligned grid the metric's datapoints use, that has no value, so `FILL(m, 0)`
+over a metric with no data returns zeros for every period. An alarm on such an expression
+therefore evaluates the filled values and does not reach `TreatMissingData`. As AWS warns, a
+period whose datapoints arrive after the alarm evaluates it is filled too, so a FILL alarm on a
+short period can briefly read the filler; use an M out of N alarm (`DatapointsToAlarm`) for such
+alarms. AWS leaves some details open, and Floci takes these readings: a gap
+before the first value in range stays empty for `REPEAT` and `LINEAR`, a gap after the last value
+stays empty for `LINEAR`, values before `StartTime` are not consulted, and a non-finite filler
+(such as `1/0`) fills nothing. The array forms (`FILL(METRICS(), ...)`) and a time-series filler
+are refused.
+
+The supported expressions require matching metric periods. Cyclic references, unsupported
+functions, scalar-only results, mixed periods and cross-account queries are refused.
+Invalid updates preserve the existing alarm. Other functions, arrays, search, anomaly
+detection and other service-quota metric bindings remain unsupported. Expressions have bounded
+syntax size and depth. Each generated series (`FILL` or `SERVICE_QUOTA`) is limited to 100800
+points, and the series a request's expressions compute (arithmetic, `FILL` and `SERVICE_QUOTA`
+results) to 1008000 points in total; AWS paginates larger `GetMetricData` results, while Floci
+refuses them.
+`SetAlarmState` remains available for manual transitions.
 
 ### DescribeAlarms filters {#describealarms-filters}
 

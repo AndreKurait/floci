@@ -44,7 +44,7 @@ class CloudWatchMetricMathAlarmTest {
     }
 
     private void initialize(StorageBackend<String, Alarm> alarmStore) {
-        RegionResolver resolver = new RegionResolver(REGION, "000000000000");
+        RegionResolver resolver = new RegionResolver(REGION, "123456789012");
         CloudWatchMetricsService service = new CloudWatchMetricsService(new InMemoryStorage<>(), alarmStore, resolver);
         CloudWatchDashboardsService dashboards = new CloudWatchDashboardsService(new InMemoryStorage<>(), resolver);
         jsonHandler = new CloudWatchMetricsJsonHandler(service, dashboards, null, MAPPER);
@@ -57,6 +57,17 @@ class CloudWatchMetricMathAlarmTest {
         ObjectNode request = metricMathRequest();
         put(request, queryProtocol);
         assertMetricMathAlarm(request);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void fillExpressionsAreAcceptedAndRoundTripThroughBothProtocols(boolean queryProtocol) throws Exception {
+        ObjectNode request = metricMathRequest();
+        ((ObjectNode) request.path("Metrics").get(0)).put("Expression", "FILL(errors, 0) + FILL(requests, 0)");
+        put(request, queryProtocol);
+        assertMetricMathAlarm(request);
+        assertEquals("FILL(errors, 0) + FILL(requests, 0)",
+                describeJson().path("Metrics").get(0).path("Expression").asText());
     }
 
     @ParameterizedTest

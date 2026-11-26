@@ -298,6 +298,7 @@ floci:
       max-events-per-query: 10000
     cloudwatchmetrics:
       enabled: true
+      pack-weighted-values: false
     paymentcryptography:
       enabled: true
     secretsmanager:
