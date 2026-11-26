@@ -11,7 +11,12 @@ import java.util.List;
  * shares that service's TTL, which is how Route 53 publishes a record set.
  */
 public record DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExists,
-                        Authority authority, int responseCode) {
+                        Authority authority, int responseCode, boolean upstream) {
+
+    public DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExists,
+                     Authority authority, int responseCode) {
+        this(records, ttlSeconds, nameExists, authority, responseCode, false);
+    }
 
     /** The zone's SOA supplies the authority section and cache lifetime of negative answers. */
     public record Authority(String name, DnsRecord.Soa soa, int ttlSeconds) {}
@@ -33,6 +38,9 @@ public record DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExi
             throw new IllegalArgumentException("DNS TTL must not be negative: " + ttlSeconds);
         }
         records = List.copyOf(records);
+        if (upstream && (records.isEmpty() || !nameExists || responseCode != 0)) {
+            throw new IllegalArgumentException("Only a resolved alias can select upstream transport");
+        }
     }
 
     /** A records for an existing name, all published with the same TTL. */
@@ -48,7 +56,12 @@ public record DnsAnswer(List<DnsRecord> records, int ttlSeconds, boolean nameExi
     public DnsAnswer withAuthority(String zoneName, DnsRecord.Soa soa, int soaTtl) {
         int negativeTtl = (int) Math.min(soaTtl, soa.minimum());
         return new DnsAnswer(records, ttlSeconds, nameExists,
-                new Authority(zoneName, soa, negativeTtl), responseCode);
+                new Authority(zoneName, soa, negativeTtl), responseCode, upstream);
+    }
+
+    /** Keeps the validated alias evidence while the query planner selects its configured front door. */
+    public DnsAnswer viaUpstream() {
+        return new DnsAnswer(records, ttlSeconds, nameExists, authority, responseCode, true);
     }
 
     /** An owned public query whose type, routing policy, or zone identity cannot be served. */

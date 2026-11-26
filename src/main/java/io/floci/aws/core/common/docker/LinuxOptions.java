@@ -20,6 +20,7 @@ import java.util.Map;
  * @param memorySwapBytes memory plus swap the container may use, in bytes; equal to the memory
  *        limit means no swap (null = daemon default)
  * @param memorySwappiness swappiness from 0 to 100 (null = daemon default)
+ * @param networkSysctls settings for the container's own network namespace
  */
 public record LinuxOptions(
         List<String> capAdd,
@@ -28,8 +29,24 @@ public record LinuxOptions(
         Long shmSizeBytes,
         Map<String, String> tmpfs,
         Long memorySwapBytes,
-        Long memorySwappiness
+        Long memorySwappiness,
+        Map<String, String> networkSysctls
 ) {
+    public LinuxOptions {
+        networkSysctls = Map.copyOf(networkSysctls);
+        networkSysctls.forEach((key, value) -> {
+            if (!key.matches("net\\.[a-zA-Z0-9_.]+") || value.isBlank()) {
+                throw new IllegalArgumentException("Expected a network-namespace sysctl and value");
+            }
+        });
+    }
+
+    public LinuxOptions(List<String> capAdd, List<String> capDrop, List<Device> devices,
+                        Long shmSizeBytes, Map<String, String> tmpfs,
+                        Long memorySwapBytes, Long memorySwappiness) {
+        this(capAdd, capDrop, devices, shmSizeBytes, tmpfs, memorySwapBytes, memorySwappiness, Map.of());
+    }
+
     public static final LinuxOptions NONE =
             new LinuxOptions(List.of(), List.of(), List.of(), null, Map.of(), null, null);
 }
