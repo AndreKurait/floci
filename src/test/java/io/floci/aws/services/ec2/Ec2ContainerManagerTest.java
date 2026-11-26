@@ -106,6 +106,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -7466,7 +7467,15 @@ class Ec2ContainerManagerTest {
 
     @Test
     void concurrentTerminationRetriesClaimTheSamePhysicalCleanup() throws Exception {
-        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch firstCleanupFinished = new CountDownLatch(1);
+        ExecutorService executor = new ThreadPoolExecutor(2, 2, 0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>()) {
+            @Override
+            protected void afterExecute(Runnable task, Throwable failure) {
+                super.afterExecute(task, failure);
+                firstCleanupFinished.countDown();
+            }
+        };
         LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         Instance instance = instance("i-singleflight-termination");
         instance.setDockerContainerId(TEST_CONTAINER_ID);
@@ -7499,6 +7508,8 @@ class Ec2ContainerManagerTest {
             });
             assertTrue(terminalSaved.await(5, TimeUnit.SECONDS));
             assertEquals("terminated", instance.getState().getName());
+            // Persistence occurs before the worker releases its cleanup claim.
+            assertTrue(firstCleanupFinished.await(5, TimeUnit.SECONDS));
             refuse.set(false);
             harness.manager.terminate(instance, callbacks::incrementAndGet);
             assertTrue(retryEntered.await(5, TimeUnit.SECONDS));
