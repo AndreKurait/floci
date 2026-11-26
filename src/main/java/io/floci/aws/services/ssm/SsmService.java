@@ -37,6 +37,8 @@ import io.floci.aws.services.ssm.model.PatchBaselineIdentity;
 import io.floci.aws.services.ssm.model.ServiceSetting;
 import io.floci.aws.services.ssm.model.SsmAssociation;
 import io.floci.aws.services.ssm.model.SsmDocument;
+import io.floci.aws.services.ssm.session.SessionDocumentResolver;
+import io.floci.aws.services.ssm.session.SsmSessionService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -362,12 +364,7 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
 
         long version = (existing != null) ? existing.getVersion() + 1 : 1;
 
-        String effectiveType = type;
-        if (effectiveType == null) {
-            // Type is not needed on an overwrite: the parameter keeps the type it has.
-            effectiveType = existing != null ? existing.getType() : "String";
-        }
-        Parameter parameter = new Parameter(name, value, effectiveType);
+        Parameter parameter = new Parameter(name, value, type != null ? type : "String");
         parameter.setVersion(version);
         parameter.setDescription(description);
         parameter.setKeyId(keyIdOf(parameter.getType(), keyId));
@@ -427,24 +424,6 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
                     parameter.getArn(), parameter.getKeyId(), e.getMessage());
             return null;
         }
-    }
-
-    /**
-     * Removes leading and trailing ASCII spaces. Other whitespace is preserved for the operation's validation.
-     */
-    public static String withoutSurroundingSpaces(String name) {
-        if (name == null) {
-            return null;
-        }
-        int start = 0;
-        int end = name.length();
-        while (start < end && name.charAt(start) == ' ') {
-            start++;
-        }
-        while (end > start && name.charAt(end - 1) == ' ') {
-            end--;
-        }
-        return name.substring(start, end);
     }
 
     /** AWS's form is {@code parameter/<name>} whether or not the name starts with a slash. */
@@ -1249,6 +1228,23 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
         LOG.debugv("Added tags to parameter: {0}", resourceId);
     }
 
+    /**
+     * Removes leading and trailing ASCII spaces. Other whitespace is preserved for the operation's validation.
+     */
+    public static String withoutSurroundingSpaces(String name) {
+        if (name == null) {
+            return null;
+        }
+        int start = 0;
+        int end = name.length();
+        while (start < end && name.charAt(start) == ' ') {
+            start++;
+        }
+        while (end > start && name.charAt(end - 1) == ' ') {
+            end--;
+        }
+        return name.substring(start, end);
+    }
 
     /**
      * The key constraint AWS checks before any lookup, naming the offending key by its 1-based
@@ -1614,23 +1610,23 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
      */
     private SsmDocument associatedDocument(String nameOrArn, String region) {
         if (!AwsArnUtils.looksLikeArn(nameOrArn)) {
-            return getDocument(nameOrArn, region);
+            return requireOwnedDocument(nameOrArn, region);
         }
         AwsArnUtils.Arn arn;
         try {
             arn = AwsArnUtils.parse(nameOrArn);
         } catch (IllegalArgumentException e) {
             LOG.debugv("Failed to parse document name as ARN: {0}", nameOrArn);
-            return getDocument(nameOrArn, region);
+            return requireOwnedDocument(nameOrArn, region);
         }
         if (!"ssm".equals(arn.service()) || !arn.resource().startsWith(DOCUMENT_PREFIX)
                 || !arn.region().equals(region) || !arn.partition().equals(regionResolver.partitionForRegion(region))) {
-            return getDocument(nameOrArn, region);
+            return requireOwnedDocument(nameOrArn, region);
         }
         String name = arn.resource().substring(DOCUMENT_PREFIX.length());
         String caller = regionResolver.getAccountId();
         if (arn.accountId().equals(caller)) {
-            return getDocument(name, region);
+            return requireOwnedDocument(name, region);
         }
         if (!documentSharedWith(arn.accountId(), name, region).contains(caller)) {
             throw new AwsException("InvalidDocument", "Document " + nameOrArn + " does not exist.", 400);
@@ -1641,27 +1637,45 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
     }
 
     public SsmDocument getDocument(String name, String region) {
-        SsmDocument document = documentStore.get(regionKey(region, name))
-                .orElseThrow(() -> new AwsException("InvalidDocument",
-                        "Document " + name + " does not exist.", 400));
-        if (document.getOwner() == null) {
-            document.setOwner(regionResolver.getAccountId());
-        }
-        return document;
+        return findDocument(name, region).orElseThrow(() -> missingDocument(name));
+    }
+
+    public Optional<SsmDocument> findDocument(String name, String region) {
+        return BuiltinSessionDocuments.find(name).or(() -> findOwnedDocument(name, region));
+    }
+
+    public static String documentArn(String region, String accountId, String name) {
+        String owner = BuiltinSessionDocuments.contains(name) ? "" : accountId;
+        return AwsArnUtils.Arn.of("ssm", region, owner, DOCUMENT_PREFIX + name).toString();
+    }
+
+    private SsmDocument requireOwnedDocument(String name, String region) {
+        return findOwnedDocument(name, region).orElseThrow(() -> missingDocument(name));
+    }
+
+    private Optional<SsmDocument> findOwnedDocument(String name, String region) {
+        return documentStore.get(regionKey(region, name)).map(document -> {
+            if (document.getOwner() == null) {
+                document.setOwner(regionResolver.getAccountId());
+            }
+            return document;
+        });
+    }
+
+    private static AwsException missingDocument(String name) {
+        return new AwsException("InvalidDocument", "Document " + name + " does not exist.", 400);
     }
 
     public synchronized SsmDocument createDocument(String name, String content, String documentType, String region) {
         return createDocument(name, content, documentType, Map.of(), region);
     }
 
-    public synchronized SsmDocument createDocument(String name, String content, String documentType, String region,
-                                                   Map<String, String> tags) {
-        return createDocument(name, content, documentType, tags, region);
-    }
-
     public synchronized SsmDocument createDocument(String name, String content, String documentType,
                                                    Map<String, String> tags, String region) {
         validateTagKeys(tags);
+        if (BuiltinSessionDocuments.contains(name)) {
+            throw new AwsException("InvalidDocumentName", "Document name " + name + " is reserved.", 400);
+        }
         String storageKey = regionKey(region, name);
         if (documentStore.get(storageKey).isPresent()) {
             throw new AwsException("DocumentAlreadyExists",
@@ -1674,44 +1688,7 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
         return document;
     }
 
-    public synchronized Map<String, String> listDocumentTags(String name, String region) {
-        return documentForTags(name, region).getTags();
-    }
-
-    public synchronized void addDocumentTags(String name, Map<String, String> tags, String region) {
-        validateTagKeys(tags);
-        SsmDocument document = documentForTags(name, region);
-        Map<String, String> merged = document.getTags();
-        merged.putAll(tags);
-        document.setTags(merged);
-        documentStore.put(regionKey(region, name), document);
-    }
-
-    public synchronized void removeDocumentTags(String name, List<String> keys, String region) {
-        SsmDocument document = documentForTags(name, region);
-        Map<String, String> remaining = document.getTags();
-        keys.forEach(remaining::remove);
-        document.setTags(remaining);
-        documentStore.put(regionKey(region, name), document);
-    }
-
-    private SsmDocument documentForTags(String name, String region) {
-        return documentStore.get(regionKey(region, name))
-                .orElseThrow(() -> new AwsException("InvalidResourceId",
-                        "Document " + name + " does not exist.", 400));
-    }
-
-    /** The built-in Session documents StartSession starts are owned by AWS; their ARNs have no account. */
-    public static boolean isAwsSessionDocument(String name) {
-        return SsmSessionDocument.isAwsSessionDocument(name);
-    }
-
-    /** The built-in command documents this emulator executes are owned by AWS. */
-    public static boolean isAwsCommandDocument(String name) {
-        return "AWS-RunShellScript".equals(name) || "AWS-RunPowerShellScript".equals(name);
-    }
-
-    public synchronized SsmDocument updateDocument(String name, String content, String region) {
+    public SsmDocument updateDocument(String name, String content, String region) {
         String storageKey = regionKey(region, name);
         SsmDocument document = documentStore.get(storageKey)
                 .orElseThrow(() -> new AwsException("InvalidDocument",
@@ -1722,30 +1699,10 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
                             + "Change the content of the document and try again.", 400);
         }
         long newVersion = document.getDocumentVersion() + 1;
-        document.getVersions();
-        document.setDefaultVersion(document.getDefaultVersion());
         document.setContent(content);
         document.setDocumentVersion(newVersion);
         document.getVersions().put(String.valueOf(newVersion), content);
         documentStore.put(storageKey, document);
-        return document;
-    }
-
-    public synchronized SsmDocument updateDocumentDefaultVersion(String name, String version, String region) {
-        SsmDocument document = getDocument(name, region);
-        long selectedVersion;
-        try {
-            selectedVersion = Long.parseLong(version);
-        } catch (NumberFormatException e) {
-            throw new AwsException("InvalidDocumentVersion",
-                    "The document version is not valid or does not exist.", 400);
-        }
-        if (selectedVersion < 1 || !Long.toString(selectedVersion).equals(version) || !document.hasVersion(version)) {
-            throw new AwsException("InvalidDocumentVersion",
-                    "The document version is not valid or does not exist.", 400);
-        }
-        document.setDefaultVersion(selectedVersion);
-        documentStore.put(regionKey(region, name), document);
         return document;
     }
 
@@ -1755,7 +1712,7 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
      * is resolved first.
      */
     public List<String> describeDocumentPermission(String name, String region) {
-        getDocument(name, region);
+        requireOwnedDocument(name, region);
         return documentPermissionStore.get(regionKey(region, name))
                 .map(List::copyOf)
                 .orElse(List.of());
@@ -1767,7 +1724,7 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
      * <p>Only the document's owner may share it. Ownership here <em>is</em> the storage
      * partition: {@code documentStore} is an {@code AccountAwareStorageBackend}, whose key
      * prefix is the caller's account from {@code RequestContext} — the same resolution
-     * {@code RegionResolver.getAccountId()} performs — so {@link #getDocument} can only
+     * {@code RegionResolver.getAccountId()} performs — so {@link #requireOwnedDocument} can only
      * resolve a document in the caller's own partition. A caller that does not own the
      * document therefore gets InvalidDocument, which is AWS's answer for a document the
      * caller cannot see. Deriving the check from the partition rather than a second stored
@@ -1775,7 +1732,7 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
      */
     public synchronized void modifyDocumentPermission(String name, List<String> accountIdsToAdd,
                                          List<String> accountIdsToRemove, String region) {
-        getDocument(name, region);
+        requireOwnedDocument(name, region);
         String storageKey = regionKey(region, name);
         List<String> accountIds = new ArrayList<>(
                 documentPermissionStore.get(storageKey).orElse(List.of()));
@@ -1791,13 +1748,14 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
 
     public List<SsmDocument> listDocuments(String region, Map<String, List<String>> filters) {
         String prefix = regionKey(region, "");
-        List<SsmDocument> docs = documentStore.scan(k -> k.startsWith(prefix));
+        List<SsmDocument> docs = new ArrayList<>(documentStore.scan(k -> k.startsWith(prefix)));
         String accountId = regionResolver.getAccountId();
         for (SsmDocument d : docs) {
             if (d.getOwner() == null) {
                 d.setOwner(accountId);
             }
         }
+        docs.addAll(BuiltinSessionDocuments.list());
         if (filters == null || filters.isEmpty()) {
             return docs;
         }
@@ -1821,26 +1779,14 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
                 .toList();
     }
 
-    /**
-     * Every document visible through {@code documentStore} already belongs to the caller's
-     * account (it is an account-partitioned store), so "Self"/"Private"/"All" and the caller's own
-     * account id all match every visible document; "Amazon"/"Public"/"ThirdParty" match none, since
-     * no AWS-owned or other-account documents are ever visible here. Documents created before the
-     * {@code Owner} field existed persist with a null owner; since the store already guarantees the
-     * caller's own partition, such a document is normalized to the current caller's account ID so
-     * that it both matches owner filters and serializes its effective owner in list responses.
-     */
     private boolean matchesOwner(String filterValue, String documentOwner, String accountId) {
-        if ("Self".equalsIgnoreCase(filterValue) || "Private".equalsIgnoreCase(filterValue)
-                || "All".equalsIgnoreCase(filterValue)) {
-            return true;
-        }
-        if ("Amazon".equalsIgnoreCase(filterValue) || "Public".equalsIgnoreCase(filterValue)
-                || "ThirdParty".equalsIgnoreCase(filterValue)) {
-            return false;
-        }
-        String effectiveOwner = documentOwner != null ? documentOwner : accountId;
-        return filterValue.equals(effectiveOwner);
+        return switch (filterValue.toLowerCase(Locale.ROOT)) {
+            case "all" -> true;
+            case "self", "private" -> accountId.equals(documentOwner);
+            case "amazon" -> BuiltinSessionDocuments.OWNER.equals(documentOwner);
+            case "public", "thirdparty" -> false;
+            default -> filterValue.equals(documentOwner);
+        };
     }
 
     private List<String> findFilterValues(Map<String, List<String>> filters, String targetKey) {
@@ -1859,7 +1805,7 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
      * Rejects a {@code DocumentVersion} that cannot resolve on the target document.
      * Stored document versions are retained across updates, so numeric versions are accepted
      * when they exist in the document's version history; {@code $LATEST}/{@code $DEFAULT}
-     * reference the latest or selected default version. {@link SsmDocument#hasVersion} also accepts a
+     * always resolve to the current version. {@link SsmDocument#hasVersion} also accepts a
      * numeric version that predates the retained history (see its javadoc) rather than rejecting
      * a version that legitimately existed just because its content was never captured.
      * Non-existent versions or malformed inputs throw {@code InvalidDocumentVersion}, matching
@@ -1957,11 +1903,13 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
         association.setComplianceSeverity(complianceSeverity);
         association.setAssociationVersion("1");
         association.setTags(tags);
-        // Execution starts only when a targeted agent discovers this association.
-        association.setStatus(new SsmAssociation.AssociationStatus(
-                "Pending", "Awaiting association execution", now, null));
-        association.setOverview(new SsmAssociation.AssociationOverview("Pending", "Creating"));
+        // Real SSM starts an association at "Pending" and transitions it to "Success"/"Failed" once
+        // its execution engine runs it. This emulator has no execution engine, so it reports
+        // "Success" immediately rather than modeling a state that would never change on its own.
+        association.setStatus(new SsmAssociation.AssociationStatus("Success", "Success", now, null));
+        association.setOverview(new SsmAssociation.AssociationOverview("Success", "Success"));
         association.setCreatedDate(now);
+        association.setLastExecutionDate(now);
 
         associationStore.put(regionKey(region, associationId), association);
         LOG.infov("Created association {0} ({1}) for document {2} in region {3}",
@@ -1980,60 +1928,26 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
             String maxConcurrency,
             String complianceSeverity,
             String region) {
-        return updateAssociation(associationId, null, associationName, documentVersion, targets, parameters,
-                scheduleExpression, maxErrors, maxConcurrency, complianceSeverity, null, region);
-    }
-
-    public synchronized SsmAssociation updateAssociation(
-            String associationId,
-            String name,
-            String associationName,
-            String documentVersion,
-            List<SsmAssociation.Target> targets,
-            Map<String, List<String>> parameters,
-            String scheduleExpression,
-            String maxErrors,
-            String maxConcurrency,
-            String complianceSeverity,
-            String expectedAssociationVersion,
-            String region) {
         String storageKey = regionKey(region, associationId);
         SsmAssociation association = associationStore.get(storageKey)
                 .orElseThrow(() -> new AwsException("AssociationDoesNotExist",
                         "The specified association does not exist.", 400));
 
-        long currentVersion = parseAssociationVersion(association.getAssociationVersion());
-        if (expectedAssociationVersion != null && !"$LATEST".equals(expectedAssociationVersion)
-                && !Long.toString(currentVersion).equals(expectedAssociationVersion)) {
-            throw new AwsException("InvalidAssociationVersion",
-                    "The association version must match the latest version.", 400);
+        if (documentVersion != null) {
+            validateDocumentVersion(associatedDocument(association.getName(), region), documentVersion);
         }
 
-        String selectedName = name == null ? association.getName() : name;
-        boolean documentChanged = !Objects.equals(selectedName, association.getName());
-        String selectedVersion = documentVersion;
-        if (selectedVersion == null) {
-            selectedVersion = documentChanged ? "$DEFAULT" : association.getDocumentVersion();
-        }
-        if (name != null || documentVersion != null) {
-            validateDocumentVersion(associatedDocument(selectedName, region), selectedVersion);
-        }
-
-        // Validate against the new document before mutating the stored association.
-        if (name != null) association.setName(name);
-        association.setAssociationName(associationName);
-        if (documentVersion != null || documentChanged) association.setDocumentVersion(selectedVersion);
+        if (associationName != null) association.setAssociationName(associationName);
+        if (documentVersion != null) association.setDocumentVersion(documentVersion);
         if (targets != null) association.setTargets(targets);
-        association.setParameters(parameters);
-        association.setScheduleExpression(scheduleExpression);
-        association.setMaxErrors(maxErrors);
-        association.setMaxConcurrency(maxConcurrency);
-        association.setComplianceSeverity(complianceSeverity);
+        if (parameters != null) association.setParameters(parameters);
+        if (scheduleExpression != null) association.setScheduleExpression(scheduleExpression);
+        if (maxErrors != null) association.setMaxErrors(maxErrors);
+        if (maxConcurrency != null) association.setMaxConcurrency(maxConcurrency);
+        if (complianceSeverity != null) association.setComplianceSeverity(complianceSeverity);
 
+        long currentVersion = parseAssociationVersion(association.getAssociationVersion());
         association.setAssociationVersion(String.valueOf(currentVersion + 1));
-        association.setStatus(new SsmAssociation.AssociationStatus(
-                "Pending", "Awaiting association execution", Instant.now(), null));
-        association.setOverview(new SsmAssociation.AssociationOverview("Pending", "Updating"));
 
         associationStore.put(storageKey, association);
         LOG.infov("Updated association {0} in region {1}", associationId, region);
@@ -2050,68 +1964,6 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
 
     public List<SsmAssociation> listAssociations(String region) {
         return listAssociations(region, Map.of());
-    }
-
-    synchronized void recordAssociationExecution(String associationId, String expectedVersion, String instanceId,
-                                                 SsmAssociation.InstanceExecution execution,
-                                                 Set<String> targetedInstances, String region) {
-        SsmAssociation association = describeAssociation(associationId, null, null, region);
-        if (!Objects.equals(expectedVersion, associationVersion(association))) {
-            throw new AwsException("InvalidAssociationVersion",
-                    "The association version must match the latest version.", 400);
-        }
-        Map<String, SsmAssociation.InstanceExecution> executions = new HashMap<>(association.getInstanceExecutions());
-        SsmAssociation.InstanceExecution previous = executions.get(instanceId);
-        if (previous != null && expectedVersion.equals(previous.associationVersion())
-                && (previous.executionDate().isAfter(execution.executionDate())
-                || (previous.executionDate().equals(execution.executionDate())
-                && isTerminalExecution(previous.status()) && !isTerminalExecution(execution.status())))) {
-            return;
-        }
-        executions.put(instanceId, execution);
-        association.setInstanceExecutions(executions);
-        List<String> statuses = targetedInstances.stream().map(id -> {
-            SsmAssociation.InstanceExecution reported = executions.get(id);
-            return reported != null && expectedVersion.equals(reported.associationVersion())
-                    ? reported.status() : "Pending";
-        }).toList();
-        boolean failed = statuses.stream().anyMatch(status ->
-                isTerminalExecution(status) && !"Success".equals(status));
-        String status = failed ? "Failed"
-                : !statuses.isEmpty() && statuses.stream().allMatch("Success"::equals) ? "Success" : "Pending";
-        String detail = "Pending".equals(status) && statuses.contains("InProgress") ? "InProgress" : status;
-        Instant last = association.getLastExecutionDate();
-        if (last == null || execution.executionDate().isAfter(last)) {
-            association.setLastExecutionDate(execution.executionDate());
-        }
-        association.setStatus(new SsmAssociation.AssociationStatus(
-                status, "Latest execution reported by targeted agents", association.getLastExecutionDate(), null));
-        association.setOverview(new SsmAssociation.AssociationOverview(status, detail));
-        associationStore.put(regionKey(region, associationId), association);
-    }
-
-    private static boolean isTerminalExecution(String status) {
-        return !"Pending".equals(status) && !"InProgress".equals(status);
-    }
-
-    static String associationVersion(SsmAssociation association) {
-        return Long.toString(parseAssociationVersion(association.getAssociationVersion()));
-    }
-
-    static String resolveDocumentVersion(SsmDocument document, String requested) {
-        String version;
-        if (requested == null || requested.isBlank() || "$DEFAULT".equals(requested)) {
-            version = String.valueOf(document.getDefaultVersion());
-        } else if ("$LATEST".equals(requested)) {
-            version = String.valueOf(document.getDocumentVersion());
-        } else {
-            version = requested;
-        }
-        if (!document.hasRetainedContent(version)) {
-            throw new AwsException("InvalidDocumentVersion",
-                    "The document version is not valid or does not exist.", 400);
-        }
-        return version;
     }
 
     public List<SsmAssociation> listAssociations(String region, Map<String, List<String>> filters) {
@@ -2204,12 +2056,11 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
 
     /**
      * Return AWS-owned predefined patch baselines matching the given DescribePatchBaselines filters
-     * (supported keys: OWNER, OPERATING_SYSTEM, NAME_PREFIX).
-     * SsmPatchBaselineService owns customer baselines and combines their identities with this catalog.
+     * (supported keys: OWNER, OPERATING_SYSTEM, NAME_PREFIX). There are no customer-owned baselines.
      */
     public List<PatchBaselineIdentity> describePatchBaselines(Map<String, List<String>> filters) {
         List<String> owners = filters.getOrDefault("OWNER", List.of());
-        // This catalog contains only AWS-owned baseline identities.
+        // OWNER=Self matches only customer-owned baselines, of which there are none.
         if (!owners.isEmpty() && !owners.contains("AWS") && !owners.contains("All")) {
             return List.of();
         }
@@ -2360,27 +2211,45 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
 
     /**
      * The {@code parameter/<name>} ARN a legacy {@code parameter<name>} ARN of the caller's partition, Region and
-     * account names, which the tagging operations act on as {@link #parameterTagName} reads it; empty for any other
-     * value, whose ARN is the one its name renders.
+     * account names, which the tagging operations act on as {@link #parameterTagName} reads it, or the ARN of an
+     * AWS-owned Session document. Other resource identifiers use their regular ARN template.
      */
     @Override
     public Optional<String> find(String type, List<String> names, String region) {
-        if (!"parameter".equals(type) || names.size() != 1) {
+        if (names.size() != 1) {
             return Optional.empty();
         }
         String name = names.getFirst();
+        if ("document".equals(type) && BuiltinSessionDocuments.contains(name)) {
+            return Optional.of(documentArn(region, regionResolver.getAccountId(), name));
+        }
+        if (!"parameter".equals(type)) {
+            return Optional.empty();
+        }
         String arn = withLegacyParameterSlash(name, regionResolver.partitionForRegion(region), region,
                 regionResolver.getAccountId());
         return arn == null || arn.equals(name) ? Optional.empty() : Optional.of(arn);
     }
 
     @Override
-    public Optional<String> resolveNamedForOperation(String operation, String type, String name, String region) {
-        if ("ssm:SendCommand".equals(operation) && "document".equals(type) && isAwsCommandDocument(name)) {
-            return Optional.of(new AwsArnUtils.Arn(regionResolver.partitionForRegion(region), "ssm", region,
-                    "", "document/" + name).toString());
-        }
+    public Optional<String> findDefault(String type, String region) {
+        return "document".equals(type)
+                ? Optional.of(regionResolver.buildArn("ssm", region,
+                        DOCUMENT_PREFIX + SessionDocumentResolver.DEFAULT_DOCUMENT_NAME))
+                : Optional.empty();
+    }
+
+    @Override
+    public Optional<String> findImplicitDefault(String type, String region) {
+        // Only a request with a declared default can select the shell document by omitting its name.
         return Optional.empty();
     }
 
+    @Override
+    public List<String> through(String member, String value, String region) {
+        if (!"Target".equals(member) || !SsmSessionService.isEc2Target(value)) {
+            return List.of();
+        }
+        return List.of(regionResolver.buildArn("ec2", region, "instance/" + value));
+    }
 }
