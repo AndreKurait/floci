@@ -22,6 +22,9 @@ import org.junit.jupiter.params.provider.CsvSource;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.route53.Route53Client;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -505,6 +508,36 @@ class Route53DnsPacketIntegrationTest {
         assertHeader(query(edns.array()), 0, true, 1, 0);
     }
 
+    @Test
+    void tcpReturnsTheFullStoredTxtRecordAfterUdpTruncation() throws Exception {
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        String value = "\"" + "x".repeat(255) + "\" \"" + "y".repeat(255) + "\"";
+        change(id, "CREATE", record("text." + name, "TXT", 90, value));
+        byte[] request = DnsTestQuery.query("text." + name, 16, 0x1234);
+        byte[] udp = query(request);
+        assertEquals(0x0200, ByteBuffer.wrap(udp).getShort(2) & 0x0200);
+        byte[] tcp = queryTcp(request);
+        assertTrue(tcp.length > 512);
+        assertEquals(0, ByteBuffer.wrap(tcp).getShort(2) & 0x0200);
+        assertHeader(tcp, 0, true, 1, 0);
+        assertEquals(512, Short.toUnsignedInt(ByteBuffer.wrap(tcp).getShort(request.length + 10)));
+    }
+
+    @Test
+    void tcpChasesStoredPublicCnamesAndPreservesTheMinimumTtl() throws Exception {
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        change(id, "CREATE", record("target." + name, "A", 17, "192.0.2.17"));
+        change(id, "CREATE", record("alias." + name, "CNAME", 30, "target." + name + "."));
+        byte[] request = DnsTestQuery.query("alias." + name, 1, 0x1234);
+        byte[] tcp = queryTcp(request);
+        assertHeader(tcp, 0, true, 1, 0);
+        assertEquals(17, ByteBuffer.wrap(tcp).getInt(request.length + 6));
+        assertArrayEquals(new DnsRecord.Address(1, "192.0.2.17").data(),
+                Arrays.copyOfRange(tcp, request.length + 12, tcp.length));
+    }
+
     private String createZone(String name) {
         String id = route53.createHostedZone(name, UUID.randomUUID().toString(), null, null).zone().getId();
         zoneIds.add(id);
@@ -600,6 +633,26 @@ class Route53DnsPacketIntegrationTest {
         } finally {
             server.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             client.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private byte[] queryTcp(byte[] request) throws Exception {
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of("amazonaws.com"), List.of(source),
+                List.of(), List.of());
+        EmbeddedDnsServer.Listeners listeners = dns.bindAll(vertx, "127.0.0.1", 0, false)
+                .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        try (Socket socket = new Socket("127.0.0.1", listeners.tcp().actualPort())) {
+            socket.setSoTimeout(5000);
+            DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+            output.writeShort(request.length);
+            output.write(request);
+            output.flush();
+            DataInputStream input = new DataInputStream(socket.getInputStream());
+            byte[] response = new byte[input.readUnsignedShort()];
+            input.readFully(response);
+            return response;
+        } finally {
+            listeners.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         }
     }
 }
