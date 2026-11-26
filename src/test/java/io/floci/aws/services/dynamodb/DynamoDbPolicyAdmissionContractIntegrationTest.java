@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.interceptor.Context;
 import software.amazon.awssdk.core.interceptor.ExecutionAttribute;
 import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
@@ -44,6 +45,7 @@ import software.amazon.awssdk.services.dynamodb.model.GlobalSecondaryIndex;
 import software.amazon.awssdk.services.dynamodb.model.ListTablesResponse;
 import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.dynamodb.model.TableDescription;
+import software.amazon.awssdk.services.dynamodb.model.TableStatus;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -61,6 +63,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.await;
@@ -517,20 +520,25 @@ class DynamoDbPolicyAdmissionContractIntegrationTest {
                         activities().stream().map(ScalingActivity::activityId).toList()));
             }
             if (dynamo != null && createAttempted) {
-                cleanup(failures, () -> {
-                    try {
-                        TableDescription current = describe();
-                        if (initialTable != null && initialTable.tableId() != null) {
-                            assertEquals(initialTable.tableId(), current.tableId());
-                        }
-                        dynamo.deleteTable(request -> request.tableName(table));
-                    } catch (ResourceNotFoundException absent) {
-                        assertEquals(400, absent.statusCode());
-                    }
-                });
+                AtomicBoolean deletionAcknowledged = new AtomicBoolean();
                 cleanup(failures, () -> await().pollInSameThread().atMost(Duration.ofSeconds(3))
-                        .pollInterval(Duration.ofMillis(50)).untilAsserted(() ->
-                                assertEquals(400, assertThrows(ResourceNotFoundException.class, this::describe).statusCode())));
+                        .pollInterval(Duration.ofMillis(50)).ignoreExceptionsInstanceOf(SdkClientException.class)
+                        .until(() -> {
+                            try {
+                                TableDescription current = describe();
+                                if (initialTable != null && initialTable.tableId() != null) {
+                                    assertEquals(initialTable.tableId(), current.tableId());
+                                }
+                                if (!deletionAcknowledged.get() && current.tableStatus() != TableStatus.DELETING) {
+                                    dynamo.deleteTable(request -> request.tableName(table));
+                                    deletionAcknowledged.set(true);
+                                }
+                                return false;
+                            } catch (ResourceNotFoundException absent) {
+                                assertEquals(400, absent.statusCode());
+                                return true;
+                            }
+                        }));
             }
             if (dynamo != null) {
                 cleanup(failures, () -> {

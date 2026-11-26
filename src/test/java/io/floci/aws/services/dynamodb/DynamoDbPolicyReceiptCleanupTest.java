@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentMatchers;
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.services.applicationautoscaling.ApplicationAutoScalingClient;
 import software.amazon.awssdk.services.applicationautoscaling.model.DescribeScalableTargetsRequest;
 import software.amazon.awssdk.services.applicationautoscaling.model.DescribeScalableTargetsResponse;
@@ -16,7 +17,14 @@ import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
 import software.amazon.awssdk.services.cloudwatch.model.DescribeAlarmsRequest;
 import software.amazon.awssdk.services.cloudwatch.model.DescribeAlarmsResponse;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.DeleteTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.DeleteTableResponse;
+import software.amazon.awssdk.services.dynamodb.model.DescribeTableRequest;
+import software.amazon.awssdk.services.dynamodb.model.DescribeTableResponse;
 import software.amazon.awssdk.services.dynamodb.model.ListTablesResponse;
+import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
+import software.amazon.awssdk.services.dynamodb.model.TableDescription;
+import software.amazon.awssdk.services.dynamodb.model.TableStatus;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -37,16 +45,46 @@ class DynamoDbPolicyReceiptCleanupTest {
     @ParameterizedTest
     @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
     void incompleteReceiptPreservesCleanupFailureAndClosesClients(String suite) throws Exception {
-        exercise(suite, true);
+        exercise(suite, true, "none");
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
     void completeReceiptAndSuccessfulCleanupCloseClients(String suite) throws Exception {
-        exercise(suite, false);
+        exercise(suite, false, "none");
     }
 
-    private void exercise(String suite, boolean incomplete) throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void retriesDeletionAfterTransportRecovery(String suite) throws Exception {
+        exercise(suite, false, "recover");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void alreadyAbsentTableNeedsNoDeletion(String suite) throws Exception {
+        exercise(suite, false, "absent");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void replacementTableIsNeverDeletedAfterTransportFailure(String suite) throws Exception {
+        exercise(suite, false, "replacement");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void acknowledgedDeletionOnlyPollsForAbsence(String suite) throws Exception {
+        exercise(suite, false, "acknowledged");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void deletingTableAfterLostResponseOnlyPollsForAbsence(String suite) throws Exception {
+        exercise(suite, false, "deleting");
+    }
+
+    private void exercise(String suite, boolean incomplete, String deletion) throws Exception {
         Object fixture = switch (suite) {
             case "Workload" -> new DynamoDbPolicyWorkloadIntegrationTest();
             case "ReadAdmission" -> new DynamoDbPolicyReadAdmissionIntegrationTest();
@@ -79,6 +117,35 @@ class DynamoDbPolicyReceiptCleanupTest {
         }
         String table = "receipt-control-" + UUID.randomUUID();
         set(fixture, "table", table);
+        if (!deletion.equals("none")) {
+            set(fixture, "createAttempted", true);
+            TableDescription owned = TableDescription.builder().tableName(table).tableId("owned-id").build();
+            TableDescription replacement = owned.toBuilder().tableId("replacement-id").build();
+            set(fixture, "initialTable", owned);
+            ResourceNotFoundException absent = ResourceNotFoundException.builder().statusCode(400).build();
+            if (deletion.equals("absent")) {
+                when(dynamo.describeTable(ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any()))
+                        .thenThrow(absent);
+            } else if (deletion.equals("recover") || deletion.equals("acknowledged") || deletion.equals("deleting")) {
+                when(dynamo.describeTable(ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any()))
+                        .thenReturn(DescribeTableResponse.builder().table(owned).build())
+                        .thenReturn(DescribeTableResponse.builder().table(deletion.equals("deleting")
+                                ? owned.toBuilder().tableStatus(TableStatus.DELETING).build() : owned).build())
+                        .thenThrow(absent);
+            } else {
+                when(dynamo.describeTable(ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any()))
+                        .thenReturn(DescribeTableResponse.builder().table(owned).build())
+                        .thenReturn(DescribeTableResponse.builder().table(replacement).build());
+            }
+            if (deletion.equals("acknowledged")) {
+                when(dynamo.deleteTable(ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any()))
+                        .thenReturn(DeleteTableResponse.builder().build());
+            } else {
+                when(dynamo.deleteTable(ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any()))
+                        .thenThrow(SdkClientException.create("Delete received no response"))
+                        .thenReturn(DeleteTableResponse.builder().build());
+            }
+        }
         Object wire = get(fixture, "wire");
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> calls = (List<Map<String, Object>>) get(wire, "calls");
@@ -113,8 +180,23 @@ class DynamoDbPolicyReceiptCleanupTest {
                 assertEquals(2, suppressed.size());
                 assertTrue(suppressed.stream().anyMatch(failure -> failure instanceof AssertionError
                         && failure.getMessage().contains("Every attempted exchange")));
+            } else if (deletion.equals("replacement")) {
+                InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                        () -> teardown.invoke(fixture));
+                AssertionError aggregate = assertInstanceOf(AssertionError.class, thrown.getCause());
+                assertTrue(Arrays.stream(aggregate.getSuppressed()).anyMatch(failure ->
+                        failure instanceof AssertionError && failure.getMessage().contains("replacement-id")));
             } else {
                 teardown.invoke(fixture);
+            }
+            if (!deletion.equals("none")) {
+                int deletions = switch (deletion) {
+                    case "recover" -> 2;
+                    case "absent" -> 0;
+                    default -> 1;
+                };
+                verify(dynamo, times(deletions)).deleteTable(
+                        ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any());
             }
             verify(dynamo).close();
             verify(metrics).close();
@@ -124,7 +206,8 @@ class DynamoDbPolicyReceiptCleanupTest {
             JsonNode saved = new ObjectMapper().readTree(receipt.toFile());
             assertEquals(1, saved.get("calls").size());
             assertEquals(!incomplete, saved.get("calls").get(0).has("responseBase64"));
-            assertEquals(incomplete ? 1 : 0, saved.get("observations").get("cleanupFailures").size());
+            assertEquals(incomplete || deletion.equals("replacement") ? 1 : 0,
+                    saved.get("observations").get("cleanupFailures").size());
         } finally {
             Files.deleteIfExists(receipt);
         }
