@@ -1,5 +1,8 @@
 package io.floci.aws.services.applicationautoscaling;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.floci.aws.services.applicationautoscaling.model.Alarm;
 import io.floci.aws.services.applicationautoscaling.model.PredefinedMetricSpecification;
 import io.floci.aws.services.applicationautoscaling.model.ScalableTarget;
@@ -32,6 +35,7 @@ import static org.mockito.Mockito.*;
 
 /** Synthetic decision inputs are separate from the real-request SDK producer workload. */
 class DynamoDbTargetTrackingDecisionTest {
+    private static final ObjectMapper JSON = new ObjectMapper().registerModule(new JavaTimeModule());
     private static final String REGION = "us-east-1";
     private static final long NOW = 1800000000L;
     private final ApplicationAutoScalingService service = mock(ApplicationAutoScalingService.class);
@@ -294,7 +298,10 @@ class DynamoDbTargetTrackingDecisionTest {
     @ParameterizedTest
     @ValueSource(strings = {"name", "arn", "metric", "statistic", "action", "period", "disabled", "datapoints"})
     void aChangedAlarmIdentityOrConfigurationCannotTriggerCapacity(String changed) {
-        MetricAlarm alarm = alarm(0);
+        MetricAlarm storedAlarm = alarm(0);
+        JsonNode before = JSON.valueToTree(storedAlarm);
+        MetricAlarm alarm = JSON.convertValue(storedAlarm, MetricAlarm.class);
+        assertNotSame(storedAlarm, alarm);
         switch (changed) {
             case "name" -> alarm.setAlarmName("unowned");
             case "arn" -> alarm.setAlarmArn("arn:aws:cloudwatch:us-east-1:740000000002:alarm:unowned");
@@ -306,7 +313,9 @@ class DynamoDbTargetTrackingDecisionTest {
             case "datapoints" -> alarm.setDatapointsToAlarm(1);
             default -> throw new AssertionError(changed);
         }
+        assertEquals(before, JSON.valueToTree(storedAlarm));
         helper.execute(policy, target, alarm, 9000, REGION);
+        assertEquals(before, JSON.valueToTree(storedAlarm));
         assertEquals(3, capacity.get());
         verifyNoInteractions(dynamo, service);
     }
