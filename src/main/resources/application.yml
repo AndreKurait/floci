@@ -95,6 +95,7 @@ quarkus:
         - bedrock/*.yaml
         - eks/*.json
         - aws/*.json
+        - ssm/*.json
         - proto/**/*.proto
         - iam/service-linked-roles.tsv
         - cloudformation/*.json

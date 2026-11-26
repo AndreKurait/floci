@@ -14,6 +14,7 @@ import io.floci.aws.services.appsync.graphql.SchemaCreationWorker;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsExportService;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.codeartifact.CodeArtifactService;
+import io.floci.aws.services.docdb.DocDbService;
 import io.floci.aws.services.docdb.container.DocDbContainerManager;
 import io.floci.aws.services.dynamodb.DynamoDbRuntime;
 import io.floci.aws.services.ec2.Ec2MetadataServer;
@@ -109,6 +110,7 @@ public class EmulatorLifecycle {
     private final MemoryDbProxyManager memoryDbProxyManager;
     private final MemoryDbService memoryDbService;
     private final DocDbContainerManager docDbContainerManager;
+    private final DocDbService docDbService;
     private final NeptuneContainerManager neptuneContainerManager;
     private final NeptuneProxyManager neptuneProxyManager;
     private final RabbitMqManager rabbitMqManager;
@@ -163,6 +165,7 @@ public class EmulatorLifecycle {
                              MemoryDbProxyManager memoryDbProxyManager,
                              MemoryDbService memoryDbService,
                              DocDbContainerManager docDbContainerManager,
+                             DocDbService docDbService,
                              NeptuneContainerManager neptuneContainerManager,
                              NeptuneProxyManager neptuneProxyManager,
                              RabbitMqManager rabbitMqManager,
@@ -214,6 +217,7 @@ public class EmulatorLifecycle {
         this.memoryDbProxyManager = memoryDbProxyManager;
         this.memoryDbService = memoryDbService;
         this.docDbContainerManager = docDbContainerManager;
+        this.docDbService = docDbService;
         this.neptuneContainerManager = neptuneContainerManager;
         this.neptuneProxyManager = neptuneProxyManager;
         this.rabbitMqManager = rabbitMqManager;
@@ -367,6 +371,13 @@ public class EmulatorLifecycle {
             // Starts the environments' containers in the background, failing the future with the ones it could not.
             mwaaService.restorePersistedRuntime().exceptionally(ex -> {
                 LOG.error("Failed to restore persisted MWAA environments at startup", ex);
+                return null;
+            });
+        }
+        if (config.services().docdb().enabled()) {
+            // Starts the clusters' containers in the background, failing the future with the ones it could not.
+            docDbService.restorePersistedRuntime().exceptionally(ex -> {
+                LOG.error("Failed to restore persisted DocumentDB clusters at startup", ex);
                 return null;
             });
         }
