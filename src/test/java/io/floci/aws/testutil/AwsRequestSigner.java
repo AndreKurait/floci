@@ -58,6 +58,10 @@ public final class AwsRequestSigner implements Filter {
         return new AwsRequestSigner(accessKeyId, secretKey, null, service, null, false, "us-east-1");
     }
 
+    public AwsRequestSigner withSessionToken(String token) {
+        return new AwsRequestSigner(accessKeyId, secretKey, token, service, signedAt, signContentType, region);
+    }
+
     /** Signs as of a fixed instant instead of now; used to trip the clock-skew window. */
     public AwsRequestSigner signedAt(Instant instant) {
         return new AwsRequestSigner(accessKeyId, secretKey, sessionToken, service, instant, signContentType, region);

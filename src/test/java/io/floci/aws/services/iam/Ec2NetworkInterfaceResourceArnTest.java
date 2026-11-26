@@ -51,6 +51,15 @@ class Ec2NetworkInterfaceResourceArnTest {
     }
 
     @Test
+    void ipv6AddressAssignmentNamesTheInterface() {
+        assertResources(List.of(PREFIX + "network-interface/eni-11111111"),
+                resources("AssignIpv6Addresses", "NetworkInterfaceId=eni-11111111&Ipv6AddressCount=1"));
+        assertResources(List.of(PREFIX + "network-interface/eni-11111111"),
+                resources("UnassignIpv6Addresses", "NetworkInterfaceId=eni-11111111"
+                        + "&Ipv6Addresses.1=2600:1f18:ce5c:4301::10"));
+    }
+
+    @Test
     void attachNamesTheInstanceAndTheInterface() {
         assertResources(List.of(PREFIX + "instance/i-11111111", PREFIX + "network-interface/eni-11111111"),
                 resources("AttachNetworkInterface", "NetworkInterfaceId=eni-11111111&InstanceId=i-11111111"
@@ -101,7 +110,8 @@ class Ec2NetworkInterfaceResourceArnTest {
             assertEquals(IamPolicyEvaluator.Decision.ALLOW,
                     evaluator.evaluate(policy, "ec2:CreateNetworkInterface", resource), resource);
         }
-        for (String operation : List.of("DeleteNetworkInterface", "CreateTags")) {
+        for (String operation : List.of("DeleteNetworkInterface", "CreateTags", "AssignIpv6Addresses",
+                "UnassignIpv6Addresses")) {
             for (String resource : resources(operation, "NetworkInterfaceId=eni-11111111&ResourceId.1=eni-11111111")) {
                 assertEquals(IamPolicyEvaluator.Decision.ALLOW,
                         evaluator.evaluate(policy, "ec2:" + operation, resource), operation + " " + resource);

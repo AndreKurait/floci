@@ -8,6 +8,7 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -141,7 +142,7 @@ class StepFunctionsContextObjectPathIntegrationTest {
     }
 
     /** Runs the definition and returns the DescribeExecution response once the execution has ended. */
-    private Response execute(String definition, String input) throws InterruptedException {
+    private Response execute(String definition, String input) {
         String name = "context-path-" + System.nanoTime();
         Response create = given()
                 .header("X-Amz-Target", "AWSStepFunctions.CreateStateMachine")
@@ -160,20 +161,7 @@ class StepFunctionsContextObjectPathIntegrationTest {
         start.then().statusCode(200);
         String execArn = start.jsonPath().getString("executionArn");
 
-        for (int i = 0; i < 100; i++) {
-            Response describe = given()
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CONTENT_TYPE)
-                    .body("{\"executionArn\":\"" + execArn + "\"}")
-                    .when().post("/");
-            String status = describe.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status) || "FAILED".equals(status)) {
-                return describe;
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete");
-        return null;
+        return waitForTerminalState(execArn);
     }
 
     private static String quote(String raw) {

@@ -1,5 +1,8 @@
 package io.floci.aws.core.common.dns;
 
+
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.TlsConfigSource;
 import io.floci.aws.testing.ParallelLocks;
 import io.vertx.core.Vertx;
 import io.vertx.core.datagram.DatagramSocket;
@@ -81,6 +84,36 @@ class EmbeddedDnsReplySourceTest {
             ByteBuffer response = ByteBuffer.wrap(reply.getData(), 0, reply.getLength());
             assertEquals((short) 0x4321, response.getShort(0));
             assertEquals(5, response.getShort(2) & 0x000F, "REFUSED");
+        } finally {
+            close(server, vertx);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true,true", "true,false", "false,true", "false,false"})
+    void publicRoutingUsesTheKnownVpcOnly(boolean enabled, boolean knownClient) throws Exception {
+        Vertx vertx = Vertx.vertx();
+        DnsClientVpcSource clients = address -> knownClient
+                ? Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-client"))
+                : Optional.empty();
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.copyOf(TlsConfigSource.awsEndpointSuffixes()),
+                List.of(), List.of(), List.of(clients), enabled);
+        InetAddress loopback = InetAddress.getByName(EmbeddedDnsServer.LOOPBACK);
+        DatagramSocket server = null;
+        // The JDK socket is the client; Vert.x owns the listener of the same class name.
+        try (java.net.DatagramSocket client = new java.net.DatagramSocket(0, loopback)) {
+            server = dns.listen(vertx, EmbeddedDnsServer.LOOPBACK, 0)
+                    .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            byte[] request = DnsTestQuery.query("sts.us-east-1.amazonaws.com", 1, 0x1234);
+            DatagramPacket reply = exchange(client, loopback, server.localAddress().port(), request);
+            ByteBuffer response = ByteBuffer.wrap(reply.getData(), 0, reply.getLength());
+            assertEquals((short) 0x1234, response.getShort(0));
+            assertEquals(0, response.getShort(2) & 0x000F);
+            assertEquals(1, response.getShort(6));
+            String expected = enabled && knownClient
+                    ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : EmbeddedDnsServer.LOOPBACK;
+            assertArrayEquals(InetAddress.getByName(expected).getAddress(),
+                    Arrays.copyOfRange(reply.getData(), request.length + 12, request.length + 16));
         } finally {
             close(server, vertx);
         }

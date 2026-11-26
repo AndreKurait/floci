@@ -327,6 +327,7 @@ class CognitoIdentityIntegrationTest {
                 {
                   "IdentityPoolId": "%s",
                   "IdentityPoolName": "floci integration pool renamed",
+                  "DeveloperProviderName": "login.floci.test",
                   "AllowUnauthenticatedIdentities": false
                 }
                 """.formatted(identityPoolId))
@@ -336,6 +337,7 @@ class CognitoIdentityIntegrationTest {
             .statusCode(200)
             .body("IdentityPoolId", equalTo(identityPoolId))
             .body("IdentityPoolName", equalTo("floci integration pool renamed"))
+            .body("DeveloperProviderName", equalTo("login.floci.test"))
             .body("AllowUnauthenticatedIdentities", equalTo(false))
             .body("AllowClassicFlow", equalTo(false))
             .body("CognitoIdentityProviders", emptyIterable())
@@ -354,7 +356,7 @@ class CognitoIdentityIntegrationTest {
     @Test
     @Order(14)
     void unimplementedOperationReturnsUnknownOperation() {
-        action("GetCredentialsForIdentity")
+        action("MergeDeveloperIdentities")
             .body("{\"IdentityId\": \"us-east-1:00000000-0000-0000-0000-000000000000\"}")
         .when()
             .post("/")

@@ -20,11 +20,10 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Verifies RS256-signed web-identity JWTs against a Floci-known OIDC issuer.
+ * Verifies RSA-signed web-identity JWTs against a Floci-known issuer.
  *
  * <p>Deliberately hand-rolled rather than pulling in a JOSE library: Floci already signs Cognito
- * JWTs with plain {@code java.security} primitives, and this only needs the one algorithm EKS IRSA
- * uses.
+ * JWTs with plain {@code java.security} primitives, with a fixed algorithm selected by each trusted issuer integration.
  *
  * <p>Two-stage design lets the caller select a trusted key before verification. {@link #peekIssuer}
  * reads the {@code iss} claim <em>without</em> verifying anything. The caller must reject tokens
@@ -104,15 +103,23 @@ public class WebIdentityTokenVerifier {
      */
     public WebIdentityToken verify(String token, RSAPublicKey publicKey, String expectedIssuer,
                                    String requiredAudience) throws InvalidTokenException {
-        return verify(token, publicKey, expectedIssuer, List.of(requiredAudience));
+        return verify(token, publicKey, expectedIssuer, List.of(requiredAudience), "RS256", "SHA256withRSA");
     }
 
-    /**
-     * As {@link #verify(String, RSAPublicKey, String, String)}, with {@code aud} holding at least one
-     * of {@code acceptedAudiences}, the client IDs an IAM OIDC provider lists.
-     */
+    /** Verifies Cognito identity pool tokens with its separately selected RS512 algorithm. */
+    public WebIdentityToken verifyRs512(String token, RSAPublicKey publicKey, String expectedIssuer,
+                                        String requiredAudience) throws InvalidTokenException {
+        return verify(token, publicKey, expectedIssuer, List.of(requiredAudience), "RS512", "SHA512withRSA");
+    }
+
     public WebIdentityToken verify(String token, RSAPublicKey publicKey, String expectedIssuer,
                                    List<String> acceptedAudiences) throws InvalidTokenException {
+        return verify(token, publicKey, expectedIssuer, acceptedAudiences, "RS256", "SHA256withRSA");
+    }
+
+    private WebIdentityToken verify(String token, RSAPublicKey publicKey, String expectedIssuer,
+                                    List<String> acceptedAudiences, String expectedAlgorithm, String signatureAlgorithm)
+            throws InvalidTokenException {
         // Limit -1 keeps trailing empty segments, so an unsigned "header.payload." token is seen as
         // three parts and rejected by the algorithm check below rather than as malformed.
         String[] parts = token == null ? new String[0] : token.split("\\.", -1);
@@ -123,12 +130,12 @@ public class WebIdentityTokenVerifier {
         JsonNode header = decodeJson(parts[0])
                 .orElseThrow(() -> new InvalidTokenException("The web identity token header is not valid JSON"));
         String alg = header.path("alg").asText("");
-        if (!"RS256".equals(alg)) {
+        if (!expectedAlgorithm.equals(alg)) {
             throw new InvalidTokenException("Unsupported web identity token algorithm: "
                     + (alg.isEmpty() ? "none" : alg));
         }
 
-        if (!signatureValid(parts[0] + "." + parts[1], parts[2], publicKey)) {
+        if (!signatureValid(parts[0] + "." + parts[1], parts[2], publicKey, signatureAlgorithm)) {
             throw new InvalidTokenException("The web identity token signature is invalid");
         }
 
@@ -154,8 +161,12 @@ public class WebIdentityTokenVerifier {
             throw new InvalidTokenException("The web identity token has no subject claim");
         }
 
+        JsonNode sourceIdentity = claims.get("https://aws.amazon.com/source_identity");
+        if (sourceIdentity != null && !sourceIdentity.isTextual()) {
+            throw new InvalidTokenException("The source identity claim must be a string");
+        }
         return new WebIdentityToken(issuer, subject, audiences, readPrincipalTags(claims),
-                readTransitiveTagKeys(claims));
+                readTransitiveTagKeys(claims), sourceIdentity == null ? null : sourceIdentity.textValue());
     }
 
     private void verifyValidityWindow(JsonNode claims) throws InvalidTokenException {
@@ -175,9 +186,10 @@ public class WebIdentityTokenVerifier {
         }
     }
 
-    private boolean signatureValid(String signingInput, String encodedSignature, RSAPublicKey publicKey) {
+    private boolean signatureValid(String signingInput, String encodedSignature, RSAPublicKey publicKey,
+                                   String signatureAlgorithm) {
         try {
-            Signature signature = Signature.getInstance("SHA256withRSA");
+            Signature signature = Signature.getInstance(signatureAlgorithm);
             signature.initVerify(publicKey);
             signature.update(signingInput.getBytes(StandardCharsets.UTF_8));
             return signature.verify(Base64.getUrlDecoder().decode(encodedSignature));

@@ -25,6 +25,10 @@ public class CloudFormationStoredResourceArns implements StoredResourceArns {
         this.stackSets = stackSets;
     }
 
+    public CloudFormationStoredResourceArns(CloudFormationService stacks) {
+        this(stacks, null);
+    }
+
     @Override
     public String namespace() {
         return "cloudformation";
@@ -37,7 +41,7 @@ public class CloudFormationStoredResourceArns implements StoredResourceArns {
         }
         return switch (type) {
             case "stack" -> stacks.stackArn(names.getFirst(), region);
-            case "stackset" -> stackSets.stackSetArn(names.getFirst(), region);
+            case "stackset" -> stackSets == null ? Optional.empty() : stackSets.stackSetArn(names.getFirst(), region);
             default -> Optional.empty();
         };
     }
@@ -45,6 +49,12 @@ public class CloudFormationStoredResourceArns implements StoredResourceArns {
     /** The tags of the stack, stack set or change set {@code arn} names, which a resource-tag condition reads. */
     @Override
     public Map<String, String> storedTags(String arn) {
-        return arn.contains(":stackset/") ? stackSets.storedTags(arn) : stacks.storedTags(arn);
+        return arn.contains(":stackset/")
+                ? (stackSets == null ? Map.of() : stackSets.storedTags(arn)) : stacks.storedTags(arn);
+    }
+
+    @Override
+    public List<String> through(String member, String value, String region) {
+        return "ChangeSetName".equals(member) ? stacks.changeSetStackArn(value, region).stream().toList() : List.of();
     }
 }

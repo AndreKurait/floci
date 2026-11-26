@@ -20,6 +20,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** {@code PathPatternConfig.RegexValues}: validation and the data plane's full-path match. */
 class ElbV2PathRegexTest {
 
+    static final List<String> READ_REGEXES = List.of(
+            "^(.*/_search.*|.*/_msearch.*|.*/_count.*|.*/_mget.*|.*/_explain.*|.*/_validate.*|.*/_field_caps.*|.*/_terms_enum.*)$",
+            "^(.*/_rank_eval.*|.*/_render.*)$");
+
     @Test
     void alternativesAndMultipleExpressionsMatchTheExpectedPaths() {
         List<Compiled> patterns = ElbV2DataPlane.compilePathRegexes(MATCH_PATTERNS);
@@ -141,4 +145,24 @@ class ElbV2PathRegexTest {
         assertTrue(legacy.getPathPatternRegexValues().isEmpty());
         assertEquals(List.of("/assets/*"), legacy.getPathPatternValues());
     }
+
+    @Test
+    void readRegexesMatchReadPathsOnly() {
+        List<Compiled> patterns = ElbV2DataPlane.compilePathRegexes(READ_REGEXES);
+        for (String read : List.of("/_search", "/idx/_search", "/idx/_search/template", "/a,b/_count",
+                "/_mget", "/idx/_explain/1", "/idx/_validate/query", "/_field_caps", "/idx/_terms_enum",
+                "/idx/_rank_eval", "/_render/template", "/_msearch")) {
+            assertTrue(ElbV2DataPlane.pathRegexMatches(patterns, read), read);
+        }
+        for (String other : List.of("/", "/idx/_doc/1", "/_bulk", "/idx", "/_cluster/health", "_search")) {
+            assertFalse(ElbV2DataPlane.pathRegexMatches(patterns, other), other);
+        }
+    }
+
+
+    @Test
+    void validationAcceptsTheReadRegexes() {
+        assertDoesNotThrow(() -> ElbV2QueryHandler.validatePathPatternRegexValues(READ_REGEXES, false));
+    }
+
 }

@@ -30,7 +30,8 @@ class AutoScalingDetachLoadBalancersIntegrationTest {
              ElasticLoadBalancingClient classic = AwsTestClients.create(
                      ElasticLoadBalancingClient.builder(), "000000000000", Region.US_EAST_1)) {
             List<String> instanceIds = ec2.runInstances(request -> request.imageId("ami-12345678")
-                    .instanceType("t3.micro").minCount(3).maxCount(3)).instances().stream()
+                    .instanceType("t3.micro").minCount(3).maxCount(3)
+                    .placement(placement -> placement.availabilityZone("us-east-1a"))).instances().stream()
                     .map(instance -> instance.instanceId()).toList();
             try (AutoCloseable instances = () -> ec2.terminateInstances(request -> request.instanceIds(instanceIds))) {
                 verifyDetach(scaling, classic, name, instanceIds);

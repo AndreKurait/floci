@@ -18,10 +18,14 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.InstanceProfile;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -146,6 +150,36 @@ class EksAutoModeComputeTest {
         verify(iam).addRoleToInstanceProfile(profileName.getValue(), "auto-node");
         assertEquals("arn:aws:iam::000000000000:instance-profile/eks/us-east-1/prod/" + profileName.getValue(),
                 profile.getValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {1, 181})
+    void registrationWindowUsesTheSameClockAsEc2(long ageSeconds) {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+        EksAutoModeCompute controlled = new EksAutoModeCompute(eksService, clusterManager, ec2,
+                iam, instanceTypes, mock(EmulatorConfig.class), Clock.fixed(now, ZoneOffset.UTC));
+        Instance instance = new Instance();
+        instance.setInstanceId("i-awaiting-registration");
+        instance.setInstanceType("c7a.large");
+        instance.setLaunchTime(now.minusSeconds(ageSeconds));
+        instance.setTags(List.of(new Tag(EksAutoModeCompute.POOL_TAG, "general-purpose")));
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(instance));
+        when(ec2.describeInstances(eq(REGION), anyList(), any())).thenReturn(List.of(reservation));
+        when(clusterManager.deriveInstanceNodeName(any(), eq(REGION))).thenReturn("node-1");
+        CatalogInstanceType type = instanceTypes.instanceTypes().getFirst();
+        when(instanceTypes.find("c7a.large")).thenReturn(Optional.of(type));
+
+        controlled.reconcile(cluster("prod"), REGION);
+
+        if (ageSeconds < EksAutoModeCompute.REGISTRATION_WAIT.toSeconds()) {
+            verify(ec2, never()).terminateInstances(anyString(), anyList());
+            verify(ec2, never()).runInstances(anyString(), anyString(), anyString(), anyInt(), anyInt(), any(), anyList(),
+                    anyString(), anyString(), anyList(), anyString(), anyString(), any(), any(), anyInt(), any(), any(),
+                    any(), anyString(), anyBoolean(), any(), any(), any(), anyBoolean(), any(), any());
+        } else {
+            verify(ec2).terminateInstances(REGION, List.of(instance.getInstanceId()));
+        }
     }
 
     @Test

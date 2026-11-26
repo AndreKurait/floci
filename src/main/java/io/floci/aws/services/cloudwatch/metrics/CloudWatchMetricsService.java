@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Digests;
@@ -25,15 +26,18 @@ import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.core.storage.WriteProfile;
 import io.floci.aws.services.cloudwatch.metrics.model.Alarm;
 import io.floci.aws.services.cloudwatch.metrics.model.AlarmHistoryItem;
+import io.floci.aws.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
 import io.floci.aws.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricDatum;
+import io.floci.aws.services.servicequotas.ServiceQuotasService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.math.BigInteger;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -90,6 +94,9 @@ public class CloudWatchMetricsService implements Resettable {
     private final StorageBackend<String, AlarmHistoryItem> historyStore;
     private final RegionResolver regionResolver;
     private final AlarmSnsNotifier alarmSnsNotifier;
+    private final ServiceQuotasService serviceQuotas;
+    private final Clock clock;
+    private final boolean packWeightedValues;
     private long lastHistorySequence;
     private Instant nextHistoryPrune = Instant.MIN;
 
@@ -97,9 +104,27 @@ public class CloudWatchMetricsService implements Resettable {
         this(storageFactory, regionResolver, null);
     }
 
-    @Inject
     public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
                                     AlarmSnsNotifier alarmSnsNotifier) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, null);
+    }
+
+    public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                    AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, serviceQuotas, false);
+    }
+
+    @Inject
+    public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                    AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas,
+                                    EmulatorConfig config) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, serviceQuotas,
+                config.services().cloudwatchmetrics().packWeightedValues());
+    }
+
+    private CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                     AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas,
+                                     boolean packWeightedValues) {
         // Services publish into this store every minute, SQS for every active queue, so under
         // persistent mode it is journaled rather than rewritten in full on every datum.
         this.metricStore = storageFactory.create("cloudwatchmetrics", "cwmetrics.json",
@@ -110,12 +135,22 @@ public class CloudWatchMetricsService implements Resettable {
                 new TypeReference<Map<String, AlarmHistoryItem>>() {}, WriteProfile.APPEND_HEAVY);
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
+        this.serviceQuotas = serviceQuotas;
+        this.clock = Clock.systemUTC();
+        this.packWeightedValues = packWeightedValues;
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
                              StorageBackend<String, Alarm> alarmStore,
                              RegionResolver regionResolver) {
         this(metricStore, alarmStore, regionResolver, null);
+    }
+
+    CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                             StorageBackend<String, Alarm> alarmStore,
+                             RegionResolver regionResolver, boolean packWeightedValues) {
+        this(metricStore, alarmStore, new InMemoryStorage<>(), regionResolver, null, Clock.systemUTC(),
+                packWeightedValues);
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
@@ -128,11 +163,30 @@ public class CloudWatchMetricsService implements Resettable {
                              StorageBackend<String, Alarm> alarmStore,
                              StorageBackend<String, AlarmHistoryItem> historyStore,
                              RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier) {
+        this(metricStore, alarmStore, historyStore, regionResolver, alarmSnsNotifier, Clock.systemUTC());
+    }
+
+    /** As above, with the clock that dates datums, alarms and alarm history and measures its retention. */
+    CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                             StorageBackend<String, Alarm> alarmStore,
+                             StorageBackend<String, AlarmHistoryItem> historyStore,
+                             RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier, Clock clock) {
+        this(metricStore, alarmStore, historyStore, regionResolver, alarmSnsNotifier, clock, false);
+    }
+
+    private CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                                     StorageBackend<String, Alarm> alarmStore,
+                                     StorageBackend<String, AlarmHistoryItem> historyStore,
+                                     RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier, Clock clock,
+                                     boolean packWeightedValues) {
+        this.clock = clock;
         this.metricStore = metricStore;
         this.alarmStore = alarmStore;
         this.historyStore = historyStore;
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
+        this.serviceQuotas = null;
+        this.packWeightedValues = packWeightedValues;
         // A store handed in directly has nothing left to load.
         buildMetricKeyIndex();
     }
@@ -184,7 +238,10 @@ public class CloudWatchMetricsService implements Resettable {
      * streamed on another account's behalf. A null account is the caller's own.
      */
     public void putMetricDataForAccount(String accountId, String namespace, List<MetricDatum> datums, String region) {
-        long nowSeconds = Instant.now().getEpochSecond();
+        if (!packWeightedValues && datums.stream().anyMatch(MetricDatum::hasPackedSamples)) {
+            datums = datums.stream().flatMap(MetricValues::expand).toList();
+        }
+        long nowSeconds = clock.instant().getEpochSecond();
         for (MetricDatum datum : datums) {
             datum.setNamespace(namespace);
             if (datum.getTimestamp() == 0) {
@@ -212,6 +269,16 @@ public class CloudWatchMetricsService implements Resettable {
      */
     public void publishMetricForAccount(String accountId, String namespace, MetricDatum datum,
                                         String region, String publicationId) {
+        publishRepeatedMetricForAccount(accountId, namespace, datum, region, publicationId, 1);
+    }
+
+    /** Replace one internal publication with repeated identical samples, retaining recoverable percentiles. */
+    public void publishRepeatedMetricForAccount(String accountId, String namespace, MetricDatum datum,
+                                                String region, String publicationId, double sampleCount) {
+        if (!(sampleCount > 0) || !Double.isFinite(sampleCount)
+                || !Double.isFinite(datum.getValue() * sampleCount)) {
+            throw new IllegalArgumentException("Repeated publication requires a positive finite count and finite sum");
+        }
         if (accountId == null || accountId.isBlank() || publicationId == null || publicationId.isBlank()) {
             throw new IllegalArgumentException("Internal publication requires an explicit account and publication ID");
         }
@@ -222,8 +289,8 @@ public class CloudWatchMetricsService implements Resettable {
         sample.setDimensions(List.copyOf(datum.getDimensions()));
         sample.setTimestamp(datum.getTimestamp());
         sample.setValue(datum.getValue());
-        sample.setSampleCount(1);
-        sample.setSum(datum.getValue());
+        sample.setSampleCount(sampleCount);
+        sample.setSum(datum.getValue() * sampleCount);
         sample.setMinimum(datum.getValue());
         sample.setMaximum(datum.getValue());
         storeDatum(accountId, namespace, sample, region, "publication-" + publicationId);
@@ -347,7 +414,17 @@ public class CloudWatchMetricsService implements Resettable {
     }
 
     public record Datapoint(Instant timestamp, double sampleCount, double sum,
-                             double average, double minimum, double maximum, String unit) {}
+                             double average, double minimum, double maximum, String unit,
+                             Map<String, Double> extendedStatistics) {
+        public Datapoint {
+            extendedStatistics = Map.copyOf(extendedStatistics);
+        }
+
+        public Datapoint(Instant timestamp, double sampleCount, double sum,
+                         double average, double minimum, double maximum, String unit) {
+            this(timestamp, sampleCount, sum, average, minimum, maximum, unit, Map.of());
+        }
+    }
 
     public record MetricStat(
             String namespace,
@@ -363,8 +440,14 @@ public class CloudWatchMetricsService implements Resettable {
             MetricStat metricStat,
             String expression,
             String label,
-            boolean returnData
-    ) {}
+            boolean returnData,
+            Integer period,
+            String accountId
+    ) {
+        public MetricDataQuery(String id, MetricStat metricStat, String expression, String label, boolean returnData) {
+            this(id, metricStat, expression, label, returnData, null, null);
+        }
+    }
 
     public record MetricDataResult(
             String id,
@@ -380,6 +463,9 @@ public class CloudWatchMetricsService implements Resettable {
                                                 int periodSeconds,
                                                 List<String> statistics,
                                                 String unit, String region) {
+        List<String> percentiles = statistics == null ? List.of()
+                : statistics.stream().filter(stat -> stat != null && stat.startsWith("p")).toList();
+        percentiles.forEach(MetricPercentiles::percentile);
         String dimKey = dimensions != null ? buildDimKey(dimensions) : "";
         String prefix = region + "::" + namespace + "::" + metricName + "::" + dimKey + "::";
 
@@ -398,6 +484,8 @@ public class CloudWatchMetricsService implements Resettable {
                     .collect(Collectors.toList());
         }
 
+        matching = matching.stream().flatMap(MetricValues::expand).toList();
+
         // Group by period bucket
         Map<Long, List<MetricDatum>> buckets = new LinkedHashMap<>();
         for (MetricDatum d : matching) {
@@ -408,6 +496,10 @@ public class CloudWatchMetricsService implements Resettable {
         List<Datapoint> result = new ArrayList<>();
         for (Map.Entry<Long, List<MetricDatum>> entry : buckets.entrySet()) {
             List<MetricDatum> group = entry.getValue();
+            Map<String, Double> extended = MetricPercentiles.calculate(group, percentiles);
+            if (!percentiles.isEmpty() && percentiles.size() == statistics.size() && extended.isEmpty()) {
+                continue;
+            }
             double sc = group.stream().mapToDouble(MetricDatum::getSampleCount).sum();
             double sum = group.stream().mapToDouble(MetricDatum::getSum).sum();
             double min = group.stream().mapToDouble(MetricDatum::getMinimum).min().orElse(0);
@@ -419,7 +511,7 @@ public class CloudWatchMetricsService implements Resettable {
                     .findFirst().orElse("None");
             result.add(new Datapoint(
                     Instant.ofEpochSecond(entry.getKey()),
-                    sc, sum, avg, min, max, resolvedUnit
+                    sc, sum, avg, min, max, resolvedUnit, extended
             ));
         }
         result.sort(Comparator.comparing(Datapoint::timestamp));
@@ -459,34 +551,90 @@ public class CloudWatchMetricsService implements Resettable {
             Instant endTime,
             String region) {
 
-        List<MetricDataResult> results = new ArrayList<>();
+        return metricMathData(metricMath(queries), startTime, endTime, region);
+    }
 
+    private MetricMath metricMath(List<MetricDataQuery> queries) {
         for (MetricDataQuery query : queries) {
-            if (!query.returnData()) {
-                continue;
+            if (query != null && query.accountId() != null
+                    && !query.accountId().equals(regionResolver.getAccountId())) {
+                throw CloudWatchMetricsException.invalidParameterValue(
+                        "Cross-account metric math is not currently supported.");
             }
-            if (query.metricStat() != null) {
-                MetricStat stat = query.metricStat();
-                int period = stat.period() > 0 ? stat.period() : 60;
-
-                List<Datapoint> datapoints = getMetricStatistics(
-                        stat.namespace(), stat.metricName(), stat.dimensions(),
-                        startTime, endTime, period,
-                        List.of(stat.stat()), stat.unit(), region);
-
-                List<Instant> timestamps = new ArrayList<>();
-                List<Double> values = new ArrayList<>();
-                for (Datapoint dp : datapoints) {
-                    timestamps.add(dp.timestamp());
-                    values.add(resolveStatValue(dp, stat.stat()));
-                }
-
-                String label = query.label() != null ? query.label() : stat.metricName();
-                results.add(new MetricDataResult(query.id(), label, timestamps, values, "Complete"));
-            }
-            // Expression-based queries are out of scope for this implementation
         }
-        return results;
+        MetricMath plan = new MetricMath(queries);
+        plan.quotaMetrics().forEach(CloudWatchMetricsService::quotaFor);
+        return plan;
+    }
+
+    MetricMath alarmMath(MetricAlarm alarm) {
+        List<MetricDataQuery> queries = new ArrayList<>();
+        for (AlarmMetricDataQuery query : alarm.getMetrics()) {
+            if (query == null) {
+                throw CloudWatchMetricsException.invalidParameterValue("Metric queries cannot be null.");
+            }
+            MetricStat stat = null;
+            if (query.metricStat() != null) {
+                AlarmMetricDataQuery.MetricStat supplied = query.metricStat();
+                AlarmMetricDataQuery.Metric metric = supplied.metric();
+                if (metric == null) {
+                    throw CloudWatchMetricsException.invalidParameterValue("MetricStat requires a Metric.");
+                }
+                List<Dimension> dimensions = metric.dimensions() == null ? List.of()
+                        : metric.dimensions().stream().map(dimension ->
+                                new Dimension(dimension.name(), dimension.value())).toList();
+                stat = new MetricStat(metric.namespace(), metric.metricName(), dimensions,
+                        supplied.period() == null ? 0 : supplied.period(), supplied.stat(), supplied.unit());
+            }
+            queries.add(new MetricDataQuery(query.id(), stat, query.expression(), query.label(),
+                    !Boolean.FALSE.equals(query.returnData()), query.period(), query.accountId()));
+        }
+        MetricMath plan = metricMath(queries);
+        plan.alarmPeriod();
+        return plan;
+    }
+
+    List<MetricDataResult> metricMathData(MetricMath plan, Instant startTime, Instant endTime, String region) {
+        if (startTime == null || endTime == null || !startTime.isBefore(endTime)) {
+            throw CloudWatchMetricsException.invalidParameterValue("StartTime must be before EndTime.");
+        }
+        return plan.evaluate(startTime, endTime, stat -> {
+            Map<Instant, Double> values = new LinkedHashMap<>();
+            for (Datapoint point : getMetricStatistics(stat.namespace(), stat.metricName(), stat.dimensions(),
+                    startTime, endTime, stat.period(), List.of(stat.stat()), stat.unit(), region)) {
+                values.put(point.timestamp(), resolveStatValue(point, stat.stat()));
+            }
+            return values;
+        }, stat -> quotaValue(stat, region));
+    }
+
+    /**
+     * The quota {@code SERVICE_QUOTA(metric)} reads: the one whose Service Quotas
+     * {@code UsageMetric} is this metric, namespace, name and dimensions alike. The function takes
+     * "TS that is a usage metric" and "Returns the service quota for the given usage metric"
+     * (CloudWatch User Guide, "Using metric math"). A metric no quota in Floci's catalog uses is
+     * refused, since there is no quota to return.
+     */
+    private static ServiceQuotasService.QuotaReference quotaFor(MetricStat metric) {
+        Map<String, String> dimensions = new LinkedHashMap<>();
+        if (metric.dimensions() != null) {
+            metric.dimensions().forEach(dimension -> dimensions.put(dimension.name(), dimension.value()));
+        }
+        return ServiceQuotasService.quotaForUsageMetric(metric.namespace(), metric.metricName(), dimensions)
+                .orElseThrow(() -> CloudWatchMetricsException.invalidParameterValue(
+                        "SERVICE_QUOTA requires a usage metric that a service quota tracks; no quota in "
+                                + "Floci's Service Quotas catalog has the usage metric " + metric.namespace()
+                                + " " + metric.metricName() + " " + dimensions + "."));
+    }
+
+    private double quotaValue(MetricStat metric, String region) {
+        ServiceQuotasService.QuotaReference quota = quotaFor(metric);
+        if (serviceQuotas == null) {
+            throw CloudWatchMetricsException.invalidParameterValue("The Service Quotas reader is unavailable.");
+        }
+        return serviceQuotas.getServiceQuota(quota.serviceCode(), quota.quotaCode(), region,
+                        regionResolver.getAccountId())
+                .path("Quota").path("Value").asDouble(Double.NaN);
     }
 
     /** Shared with {@link AlarmEvaluator}, which resolves the same statistic against
@@ -499,8 +647,15 @@ public class CloudWatchMetricsService implements Resettable {
             case "Maximum" -> dp.maximum();
             case "SampleCount" -> dp.sampleCount();
             default -> {
-                if (stat.startsWith("p")) yield dp.maximum();
-                else yield dp.average();
+                if (stat.startsWith("p")) {
+                    Double value = dp.extendedStatistics().get(stat);
+                    if (value == null) {
+                        throw CloudWatchMetricsException.invalidParameterValue(
+                                "Percentile requires recoverable nonnegative samples.");
+                    }
+                    yield value;
+                }
+                yield dp.average();
             }
         };
     }
@@ -529,6 +684,27 @@ public class CloudWatchMetricsService implements Resettable {
             throw new AwsException("ValidationError",
                     "PutMetricAlarm request can not be made with both Statistic and ExtendedStatistic parameters. "
                             + "Only one of them should be present", 400);
+        }
+        if (!alarm.getMetrics().isEmpty()) {
+            if (alarm.getNamespace() != null || alarm.getMetricName() != null || alarm.getStatistic() != null
+                    || alarm.getExtendedStatistic() != null) {
+                throw CloudWatchMetricsException.invalidParameterCombination(
+                        "Metrics cannot be combined with Namespace, MetricName, Statistic or ExtendedStatistic.");
+            }
+            alarmMath(alarm);
+        }
+        if (alarm.getExtendedStatistic() != null) {
+            if (alarm.getStatistic() != null || !alarm.getMetrics().isEmpty()) {
+                throw CloudWatchMetricsException.invalidParameterCombination(
+                        "ExtendedStatistic cannot be combined with Statistic or Metrics.");
+            }
+            MetricPercentiles.percentile(alarm.getExtendedStatistic());
+        }
+        String lowSampleCount = alarm.getEvaluateLowSampleCountPercentile();
+        if (lowSampleCount != null && !MetricPercentiles.EVALUATE.equals(lowSampleCount)
+                && !MetricPercentiles.IGNORE.equals(lowSampleCount)) {
+            throw CloudWatchMetricsException.invalidParameterValue(
+                    "EvaluateLowSampleCountPercentile must be evaluate or ignore.");
         }
         boolean created = alarmStore.get(region + "::" + alarm.getAlarmName()).isEmpty();
         putAlarm(alarm, region);
@@ -639,7 +815,7 @@ public class CloudWatchMetricsService implements Resettable {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + name));
         }
         alarm.setRegion(region);
-        alarm.setAlarmConfigurationUpdatedTimestamp(Instant.now().getEpochSecond());
+        alarm.setAlarmConfigurationUpdatedTimestamp(clock.instant().getEpochSecond());
         alarmStore.put(region + "::" + name, alarm);
         ObjectNode after = snapshot(alarm);
         ObjectNode data = MAPPER.createObjectNode().put("version", "1.0");
@@ -690,6 +866,19 @@ public class CloudWatchMetricsService implements Resettable {
             return Optional.of(alarm);
         }
         return Optional.empty();
+    }
+
+    public record OwnedAlarm(String accountId, MetricAlarm alarm) {}
+
+    /** Background evaluation must retain the stored owner instead of using the default account. */
+    public List<OwnedAlarm> allOwnedAlarms() {
+        if (alarmStore instanceof AccountAwareStorageBackend<Alarm> aware) {
+            return aware.scanAllAccountEntries(ignored -> true).stream()
+                    .filter(entry -> entry.value() instanceof MetricAlarm)
+                    .map(entry -> new OwnedAlarm(entry.accountId(), (MetricAlarm) entry.value())).toList();
+        }
+        return allAlarms().stream()
+                .map(alarm -> new OwnedAlarm(regionResolver.getAccountId(), alarm)).toList();
     }
 
     public List<MetricAlarm> describeAlarms(List<String> names, String prefix, String region) {
@@ -1116,7 +1305,7 @@ public class CloudWatchMetricsService implements Resettable {
         ObjectNode data = MAPPER.createObjectNode().put("version", "1.0");
         data.set("oldState", stateNode(oldState, alarm.getStateReason(), alarm.getStateReasonData()));
         data.set("newState", stateNode(state, reason, reasonData));
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         alarm.setStateValue(state);
         alarm.setStateReason(reason);
         alarm.setStateReasonData(reasonData);
@@ -1151,7 +1340,7 @@ public class CloudWatchMetricsService implements Resettable {
 
     /** Called only under this service's monitor, which also guards the sequence and the prune deadline. */
     private void recordHistory(Alarm alarm, String region, String type, String summary, ObjectNode data) {
-        recordHistory(alarm, region, type, summary, data, Instant.now());
+        recordHistory(alarm, region, type, summary, data, clock.instant());
     }
 
     /** As above, stamped with {@code now}: a state change passes the instant it gave the alarm. */
@@ -1201,7 +1390,7 @@ public class CloudWatchMetricsService implements Resettable {
             return new PaginatedResult<>(List.of(), null);
         }
         List<String> types = alarmTypes == null || alarmTypes.isEmpty() ? List.of("MetricAlarm") : alarmTypes;
-        long retained = Instant.now().minus(HISTORY_RETENTION).toEpochMilli();
+        long retained = clock.instant().minus(HISTORY_RETENTION).toEpochMilli();
         long start = startDate == null ? retained : Math.max(retained, startDate.toEpochMilli());
         long end = endDate == null ? Long.MAX_VALUE : endDate.toEpochMilli();
         List<AlarmHistoryItem> matching = historyStore.scan(k -> k.startsWith(region + "::")).stream()
@@ -1225,10 +1414,8 @@ public class CloudWatchMetricsService implements Resettable {
      * so the tag path uses the longer one rather than the code used elsewhere in this service.
      *
      * <p>The message names the ARN rather than asserting it was an alarm, because both tag
-     * handlers route every ARN that is not a dashboard and not a metric stream here. That
-     * includes kinds AWS considers taggable and Floci does not serve, a Contributor Insights
-     * {@code insight-rule/} ARN being the one AWS documents; reporting that no resource
-     * matches the ARN is true of those, where "alarm not found" would not be.
+     * handlers route ARNs here after their dashboard, metric stream and insight rule routes.
+     * Reporting that no resource matches the ARN also describes an unknown resource kind.
      */
     private Alarm requireAlarm(String resourceArn, String region) {
         return alarmStore.scan(k -> k.startsWith(region + "::"))
@@ -1268,8 +1455,21 @@ public class CloudWatchMetricsService implements Resettable {
     }
 
     private boolean matchesDimensions(List<Dimension> actual, List<Dimension> required) {
-        String requiredKey = buildDimKey(required);
-        String actualKey = buildDimKey(actual);
-        return actualKey.contains(requiredKey);
+        for (Dimension wanted : required) {
+            boolean present = false;
+            if (actual != null) {
+                for (Dimension candidate : actual) {
+                    if (candidate.name().equals(wanted.name())
+                            && (wanted.value() == null || wanted.value().equals(candidate.value()))) {
+                        present = true;
+                        break;
+                    }
+                }
+            }
+            if (!present) {
+                return false;
+            }
+        }
+        return true;
     }
 }

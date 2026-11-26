@@ -12,7 +12,6 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.HexFormat;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +21,7 @@ import java.util.Optional;
 /** Owns credentials for the lifetime of each registered EC2 guest. */
 final class Ec2InstanceCredentials {
     private static final String IDENTITY_ROLE_NAME = "aws:ec2-instance";
+    private static final String BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
     private final IamService iam;
     private final SecureRandom random = new SecureRandom();
@@ -34,6 +34,20 @@ final class Ec2InstanceCredentials {
 
     synchronized void register(Instance instance) {
         sessions.computeIfAbsent(instance, ignored -> new ArrayList<>());
+    }
+
+    synchronized void refresh(Instance previous, Instance current) {
+        if (previous == current) {
+            return;
+        }
+        List<Issued> issued = sessions.remove(previous);
+        if (issued != null) {
+            sessions.computeIfAbsent(current, ignored -> new ArrayList<>()).addAll(issued);
+        }
+        List<SessionCredential> identities = identitySessions.remove(previous);
+        if (identities != null) {
+            identitySessions.computeIfAbsent(current, ignored -> new ArrayList<>()).addAll(identities);
+        }
     }
 
     synchronized void unregister(Instance instance) {
@@ -78,10 +92,14 @@ final class Ec2InstanceCredentials {
         }
         String partition = AwsRegions.partitionFor(instance.getRegion());
         String roleArn = AwsArnUtils.Arn.global(partition, "iam", accountId, "role/" + IDENTITY_ROLE_NAME).toString();
-        SessionCredential session = new SessionCredential(newAccessKey(), randomString(30), randomString(48),
+        SessionCredential session = new SessionCredential(newAccessKey(accountId), randomString(30), randomString(48),
                 roleArn, now.plusSeconds(3600), null, accountId);
         session.setRoleSessionName(instance.getInstanceId());
         session.setEc2InstanceId(instance.getInstanceId());
+        if (instance.getRegion() != null && !instance.getRegion().isBlank()) {
+            session.setEc2InstanceArn(AwsArnUtils.Arn.of(
+                    "ec2", instance.getRegion(), accountId, "instance/" + instance.getInstanceId()).toString());
+        }
         session.setAssumedRoleId(accountId + ":" + IDENTITY_ROLE_NAME + ":" + instance.getInstanceId());
         iam.registerEc2InstanceSession(session);
         history.add(session);
@@ -167,20 +185,37 @@ final class Ec2InstanceCredentials {
         }
         IamRole role = resolved.get();
         String account = AwsArnUtils.parse(role.getArn()).accountId();
-        SessionCredential session = new SessionCredential(newAccessKey(), randomString(30), randomString(48),
+        SessionCredential session = new SessionCredential(newAccessKey(account), randomString(30), randomString(48),
                 role.getArn(), now.plusSeconds(3600), null, account);
         session.setEc2InstanceId(instance.getInstanceId());
         session.setEc2RoleId(role.getRoleId());
+        if (instance.getRegion() != null && !instance.getRegion().isBlank()) {
+            session.setEc2InstanceArn(AwsArnUtils.Arn.of(
+                    "ec2", instance.getRegion(), account, "instance/" + instance.getInstanceId()).toString());
+        }
         session.setAssumedRoleId(role.getRoleId() + ":" + instance.getInstanceId());
         iam.registerEc2InstanceSession(session);
         history.add(new Issued(session, role.getRoleId(), instance.getIamInstanceProfileArn()));
         return Optional.of(session);
     }
 
-    private String newAccessKey() {
-        byte[] key = new byte[10];
-        random.nextBytes(key);
-        return "ASIA" + HexFormat.of().withUpperCase().formatHex(key).substring(0, 16);
+    private String newAccessKey(String accountId) {
+        if (accountId == null || !accountId.matches("[0-9]{12}")) {
+            throw new IllegalArgumentException("EC2 credential issuance requires a 12-digit account ID");
+        }
+        long account = Long.parseLong(accountId);
+        // Modern IDs carry a version bit and the account, followed by 39 random bits.
+        long encoded = (1L << 39) | (account >>> 1);
+        char[] key = new char[16];
+        for (int index = 7; index >= 0; index--) {
+            key[index] = BASE32.charAt((int) (encoded & 31));
+            encoded >>>= 5;
+        }
+        key[8] = BASE32.charAt((int) (account & 1) * 16 + random.nextInt(16));
+        for (int index = 9; index < key.length; index++) {
+            key[index] = BASE32.charAt(random.nextInt(32));
+        }
+        return "ASIA" + new String(key);
     }
 
     private String randomString(int size) {

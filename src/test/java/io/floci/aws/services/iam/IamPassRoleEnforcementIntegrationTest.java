@@ -30,6 +30,7 @@ import java.util.zip.GZIPOutputStream;
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -616,7 +617,11 @@ class IamPassRoleEnforcementIntegrationTest {
 
     @Test
     void aStackNeedsPassRoleOnAServiceRoleTheRequestNames() {
-        String role = role("cloudformation");
+        String role = EnforcementFixtures.createRole(cleanup, baseUri.getPort(), ACCOUNT, "/",
+                "cloudformation-" + suffix(), """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                          "Principal":{"Service":"cloudformation.amazonaws.com"}}]}""", """
+                        {"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}""");
         User user = user("passrole-stack");
         String stack = "passrole-stack-" + suffix();
         String stacks = allow("cloudformation:CreateStack", "*") + "," + allow("cloudformation:DeleteStack", "*");
@@ -708,6 +713,47 @@ class IamPassRoleEnforcementIntegrationTest {
                 .formParam("InstanceId", instanceId).post("/").then().statusCode(200);
         cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteLaunchConfiguration")
                 .formParam("LaunchConfigurationName", name).post("/"));
+    }
+
+    @Test
+    void omittedLaunchTemplateVersionChecksTheDefaultProfileBeforeCreatingAGroup() {
+        String role = role("asg-default");
+        String templateId = launchTemplate(instanceProfile(roleName(role)), null);
+        User user = user("passrole-asg-default");
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*"));
+        String name = "passrole-default-" + suffix();
+        cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteAutoScalingGroup")
+                .formParam("AutoScalingGroupName", name).formParam("ForceDelete", "true").post("/"));
+
+        denied(group(user, "CreateAutoScalingGroup", name)
+                .formParam("LaunchTemplate.LaunchTemplateId", templateId).post("/").then());
+        String mixed = "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.";
+        denied(group(user, "CreateAutoScalingGroup", name)
+                .formParam(mixed + "LaunchTemplateId", templateId).post("/").then());
+        admin("autoscaling").formParam("Action", "DescribeAutoScalingGroups")
+                .formParam("AutoScalingGroupNames.member.1", name).post("/").then().statusCode(200)
+                .body("DescribeAutoScalingGroupsResponse.DescribeAutoScalingGroupsResult.AutoScalingGroups.member.size()",
+                        equalTo(0));
+
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*") + "," + passRole(role, "ec2.amazonaws.com"));
+        group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .post("/").then().statusCode(200);
+    }
+
+    @Test
+    void omittedLaunchTemplateVersionDoesNotCheckAnUnselectedLatestProfile() {
+        String role = role("asg-latest-only");
+        String templateId = launchTemplate(null, instanceProfile(roleName(role)));
+        User user = user("passrole-asg-plain-default");
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*"));
+        String name = "passrole-plain-default-" + suffix();
+        cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteAutoScalingGroup")
+                .formParam("AutoScalingGroupName", name).formParam("ForceDelete", "true").post("/"));
+
+        denied(group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .formParam("LaunchTemplate.Version", "$Latest").post("/").then());
+        group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .post("/").then().statusCode(200);
     }
 
     @Test
@@ -814,7 +860,19 @@ class IamPassRoleEnforcementIntegrationTest {
     @Test
     void aScalableTargetNeedsPassRoleOnTheRoleItNamesForApplicationAutoScaling() {
         String role = role("scalable-target");
-        String table = "table/passrole-" + suffix();
+        String tableName = "passrole-" + suffix();
+        String table = "table/" + tableName;
+        cleanup.register(() -> given().header("Authorization", auth(ADMIN, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+                .contentType("application/x-amz-json-1.0")
+                .body("{\"TableName\":\"" + tableName + "\"}").post("/"));
+        given().header("Authorization", auth(ADMIN, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+                .contentType("application/x-amz-json-1.0").body("""
+                        {"TableName":"%s","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                         "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                         "ProvisionedThroughput":{"ReadCapacityUnits":3,"WriteCapacityUnits":3}}
+                        """.formatted(tableName)).post("/").then().statusCode(200);
         String target = "AnyScaleFrontendService.RegisterScalableTarget";
         String body = """
                 {"ServiceNamespace":"dynamodb","ResourceId":"%s","ScalableDimension":"dynamodb:table:ReadCapacityUnits",
@@ -1161,9 +1219,12 @@ class IamPassRoleEnforcementIntegrationTest {
 
         // A grant to pass the role to Lambda does not cover SSM.
         user.policy(actions + "," + passRole(role, LAMBDA));
-        deniedJson(ssm(user, "CreateAssociation").body(association).post("/").then());
-        deniedJson(ssm(user, "UpdateAssociation").body(update).post("/").then());
-        deniedJson(ssm(user, "SendCommand").body(command).post("/").then());
+        ssm(user, "CreateAssociation").body(association).post("/").then()
+                .statusCode(403).body(containsString("AccessDeniedException")).body(containsString("iam:PassRole"));
+        ssm(user, "UpdateAssociation").body(update).post("/").then()
+                .statusCode(403).body(containsString("AccessDeniedException")).body(containsString("iam:PassRole"));
+        ssm(user, "SendCommand").body(command).post("/").then()
+                .statusCode(403).body(containsString("AccessDeniedException")).body(containsString("iam:PassRole"));
 
         user.policy(actions + "," + passRole(role, SSM));
         ssm(user, "CreateAssociation").body(association).post("/").then()

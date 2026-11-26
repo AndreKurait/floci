@@ -20,7 +20,6 @@ import io.floci.aws.services.ssm.model.Parameter;
 import io.floci.aws.services.ssm.model.ParameterHistory;
 import io.floci.aws.services.ssm.model.ParameterResourcePolicy;
 import io.floci.aws.services.ssm.model.ParameterStringFilter;
-import io.floci.aws.services.ssm.model.PatchBaselineIdentity;
 import io.floci.aws.services.ssm.model.ServiceSetting;
 import io.floci.aws.services.ssm.model.SsmAssociation;
 import io.floci.aws.services.ssm.model.SsmDocument;
@@ -50,22 +49,94 @@ public class SsmJsonHandler {
 
     private final SsmService ssmService;
     private final SsmCommandService commandService;
+    private final SsmInventoryService inventoryService;
     private final SsmSessionJsonHandler sessionHandler;
     private final ObjectMapper objectMapper;
     private final IamEnforcementFilter iamEnforcementFilter;
+    private final SsmPatchBaselineService patchBaselines;
+    private final SsmResourceDataSyncService resourceDataSyncs;
+    private final SsmAgentAssociationService agentAssociations;
+    private final SsmManagedNodeDiscovery managedNodeDiscovery;
+    private final SsmEc2RegistrationService ec2Registrations;
+    private final SsmSessionService sessions;
 
-    @Inject
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
+                          SsmInventoryService inventoryService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
+                          SsmResourceDataSyncService resourceDataSyncs,
+                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
+                          SsmEc2RegistrationService ec2Registrations) {
+        this(ssmService, commandService, inventoryService, objectMapper, iamEnforcementFilter, patchBaselines,
+                resourceDataSyncs, agentAssociations, managedNodeDiscovery, ec2Registrations, null);
+    }
+
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
+                          SsmInventoryService inventoryService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter, SsmManagedNodeDiscovery managedNodeDiscovery,
+                          SsmEc2RegistrationService ec2Registrations) {
+        this(ssmService, commandService, inventoryService, objectMapper, iamEnforcementFilter, null,
+                null, null, managedNodeDiscovery, ec2Registrations, null);
+    }
+
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
+                          SsmInventoryService inventoryService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
+                          SsmResourceDataSyncService resourceDataSyncs,
+                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
+                          SsmEc2RegistrationService ec2Registrations, SsmSessionService sessions) {
+        this(ssmService, commandService, inventoryService, objectMapper, iamEnforcementFilter, patchBaselines,
+                resourceDataSyncs, agentAssociations, managedNodeDiscovery, ec2Registrations, sessions, null);
+    }
+
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
                           IamEnforcementFilter iamEnforcementFilter, SsmSessionJsonHandler sessionHandler) {
+        this(ssmService, commandService, null, objectMapper, iamEnforcementFilter, null, null,
+                null, null, null, null, sessionHandler);
+    }
+
+    @Inject
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
+                          SsmInventoryService inventoryService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
+                          SsmResourceDataSyncService resourceDataSyncs,
+                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
+                          SsmEc2RegistrationService ec2Registrations, SsmSessionService sessions,
+                          SsmSessionJsonHandler sessionHandler) {
         this.ssmService = ssmService;
         this.commandService = commandService;
+        this.inventoryService = inventoryService;
         this.sessionHandler = sessionHandler;
         this.objectMapper = objectMapper;
         this.iamEnforcementFilter = iamEnforcementFilter;
+        this.patchBaselines = patchBaselines;
+        this.resourceDataSyncs = resourceDataSyncs;
+        this.agentAssociations = agentAssociations;
+        this.managedNodeDiscovery = managedNodeDiscovery;
+        this.ec2Registrations = ec2Registrations;
+        this.sessions = sessions;
+    }
+
+    public Response handle(String action, JsonNode request, String region, String authorization) {
+        return handle(action, request, region, authorization, null);
+    }
+
+    private Response handleSession(String action, JsonNode request, String region, URI baseUri) {
+        if (sessionHandler != null) {
+            return sessionHandler.handle(action, request, region, baseUri);
+        }
+        return Response.ok(switch (action) {
+            case "StartSession" -> sessions.start(request, region);
+            case "ResumeSession" -> sessions.resume(request, region);
+            case "TerminateSession" -> sessions.terminate(request, region);
+            case "DescribeSessions" -> sessions.describe(request, region);
+            case "GetConnectionStatus" -> sessions.connectionStatus(request, region);
+            default -> throw new IllegalArgumentException("Unknown session operation " + action);
+        }).build();
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization, URI baseUri) {
         return switch (action) {
+            case "RegisterManagedInstance" -> Response.ok(ec2Registrations.register(request, region)).build();
             // Parameter Store
             case "PutParameter" -> handlePutParameter(request, region);
             case "GetParameter" -> handleGetParameter(request, region, authorization);
@@ -91,25 +162,59 @@ public class SsmJsonHandler {
             case "CancelCommand" -> handleCancelCommand(request, region);
             case "DescribeInstanceInformation" -> handleDescribeInstanceInformation(request, region);
             case "StartSession", "ResumeSession", "TerminateSession", "DescribeSessions", "GetConnectionStatus" ->
-                    sessionHandler.handle(action, request, region, baseUri);
+                    handleSession(action, request, region, baseUri);
+            case "PutInventory" -> {
+                inventoryService.putInventory(request, region);
+                yield Response.ok(objectMapper.createObjectNode()).build();
+            }
+            case "ListInventoryEntries" -> Response.ok(inventoryService.listInventoryEntries(request, region)).build();
+            case "CreateResourceDataSync" -> {
+                resourceDataSyncs.create(request, region);
+                yield Response.ok(Map.of()).build();
+            }
+            case "UpdateResourceDataSync" -> {
+                resourceDataSyncs.update(request, region);
+                yield Response.ok(Map.of()).build();
+            }
+            case "ListResourceDataSync" -> Response.ok(resourceDataSyncs.list(request, region)).build();
+            case "DeleteResourceDataSync" -> {
+                resourceDataSyncs.delete(request, region);
+                yield Response.ok(Map.of()).build();
+            }
+
             // Service settings (LZA ssm-block-public-document-sharing)
             case "GetServiceSetting" -> handleGetServiceSetting(request, region);
             case "UpdateServiceSetting" -> handleUpdateServiceSetting(request, region);
             case "ResetServiceSetting" -> handleResetServiceSetting(request, region);
-            // Patch Manager (read-only: AWS-owned predefined baselines)
-            case "DescribePatchBaselines" -> handleDescribePatchBaselines(request, region);
-            case "GetDefaultPatchBaseline" -> handleGetDefaultPatchBaseline(request, region);
+            // Patch Manager configuration
+            case "CreatePatchBaseline" -> Response.ok(patchBaselines.create(request, region)).build();
+            case "GetPatchBaseline" -> Response.ok(patchBaselines.get(request, region)).build();
+            case "UpdatePatchBaseline" -> Response.ok(patchBaselines.update(request, region)).build();
+            case "DeletePatchBaseline" -> Response.ok(patchBaselines.delete(request, region)).build();
+            case "DescribePatchBaselines" -> Response.ok(patchBaselines.describe(request, region)).build();
+            case "GetDefaultPatchBaseline" -> Response.ok(patchBaselines.getDefault(request, region)).build();
+            case "RegisterDefaultPatchBaseline" -> Response.ok(patchBaselines.registerDefault(request, region)).build();
+            case "RegisterPatchBaselineForPatchGroup" -> Response.ok(patchBaselines.registerGroup(request, region)).build();
+            case "DeregisterPatchBaselineForPatchGroup" -> Response.ok(patchBaselines.deregisterGroup(request, region)).build();
+            case "GetPatchBaselineForPatchGroup" -> Response.ok(patchBaselines.getForGroup(request, region)).build();
+            case "DescribePatchGroups" -> Response.ok(patchBaselines.describeGroups(request, region)).build();
             // Documents
             case "GetDocument" -> handleGetDocument(request, region);
             case "DescribeDocument" -> handleDescribeDocument(request, region);
             case "DeleteDocument" -> handleDeleteDocument(request, region);
             case "CreateDocument" -> handleCreateDocument(request, region);
             case "UpdateDocument" -> handleUpdateDocument(request, region);
+            case "UpdateDocumentDefaultVersion" -> handleUpdateDocumentDefaultVersion(request, region);
             // Document share permissions
             case "ModifyDocumentPermission" -> handleModifyDocumentPermission(request, region);
             case "DescribeDocumentPermission" -> handleDescribeDocumentPermission(request, region);
             case "ListDocuments" -> handleListDocuments(request, region);
             // Associations
+            case "ListInstanceAssociations" -> Response.ok(agentAssociations.list(request, region)).build();
+            case "UpdateInstanceAssociationStatus" -> {
+                agentAssociations.updateStatus(request, region);
+                yield Response.ok(objectMapper.createObjectNode()).build();
+            }
             case "CreateAssociation" -> handleCreateAssociation(request, region);
             case "UpdateAssociation" -> handleUpdateAssociation(request, region);
             case "DescribeAssociation" -> handleDescribeAssociation(request, region);
@@ -132,7 +237,8 @@ public class SsmJsonHandler {
     private Response handlePutParameter(JsonNode request, String region) {
         String name = request.path("Name").asText();
         String value = request.path("Value").asText();
-        String type = request.path("Type").asText("String");
+        // Null when the request has no Type, so an overwrite keeps the type the parameter has.
+        String type = request.hasNonNull("Type") ? request.path("Type").asText() : null;
         String description = request.has("Description") ? request.path("Description").asText() : null;
         boolean overwrite = request.path("Overwrite").asBoolean(false);
 
@@ -486,47 +592,6 @@ public class SsmJsonHandler {
         return result;
     }
 
-    private Response handleDescribePatchBaselines(JsonNode request, String region) {
-        Map<String, List<String>> filters = new HashMap<>();
-        JsonNode filtersNode = request.path("Filters");
-        if (filtersNode.isArray()) {
-            for (JsonNode f : filtersNode) {
-                String key = f.path("Key").asText("");
-                List<String> values = new ArrayList<>();
-                f.path("Values").forEach(v -> values.add(v.asText()));
-                if (!key.isEmpty()) {
-                    filters.put(key, values);
-                }
-            }
-        }
-
-        List<PatchBaselineIdentity> baselines = ssmService.describePatchBaselines(filters);
-
-        ObjectNode response = objectMapper.createObjectNode();
-        ArrayNode identities = objectMapper.createArrayNode();
-        for (PatchBaselineIdentity b : baselines) {
-            ObjectNode node = objectMapper.createObjectNode();
-            node.put("BaselineId", b.baselineId());
-            node.put("BaselineName", b.baselineName());
-            node.put("OperatingSystem", b.operatingSystem());
-            node.put("BaselineDescription", b.baselineDescription());
-            node.put("DefaultBaseline", b.defaultBaseline());
-            identities.add(node);
-        }
-        response.set("BaselineIdentities", identities);
-        return Response.ok(response).build();
-    }
-
-    private Response handleGetDefaultPatchBaseline(JsonNode request, String region) {
-        String operatingSystem = request.has("OperatingSystem") ? request.path("OperatingSystem").asText() : null;
-        String baselineId = ssmService.getDefaultPatchBaseline(operatingSystem);
-
-        ObjectNode response = objectMapper.createObjectNode();
-        response.put("BaselineId", baselineId);
-        response.put("OperatingSystem", (operatingSystem == null || operatingSystem.isBlank()) ? "WINDOWS" : operatingSystem);
-        return Response.ok(response).build();
-    }
-
     /**
      * Reads the required {@code Name} member of a document operation.
      *
@@ -657,28 +722,19 @@ public class SsmJsonHandler {
     private Response handleGetDocument(JsonNode request, String region) {
         String name = requireDocumentNameOrArn(request);
         SsmDocument document = ssmService.getDocument(name, region);
-
-        String requestedVersion = request.hasNonNull("DocumentVersion") ? request.path("DocumentVersion").asText() : null;
-        String effectiveVersion = String.valueOf(document.getDocumentVersion());
-        String effectiveContent = document.getContent();
-
-        if (requestedVersion != null && !requestedVersion.isBlank()
-                && !"$LATEST".equals(requestedVersion) && !"$DEFAULT".equals(requestedVersion)) {
-            if (!document.hasRetainedContent(requestedVersion)) {
-                throw new AwsException("InvalidDocumentVersion",
-                        "The document version is not valid or does not exist.", 400);
-            }
-            effectiveVersion = requestedVersion;
-            effectiveContent = document.getContentForVersion(requestedVersion);
-        }
+        String effectiveVersion = resolveDocumentVersion(request, document);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("Name", document.getName());
         response.put("DocumentType", document.getDocumentType());
         response.put("DocumentVersion", effectiveVersion);
-        response.put("Content", effectiveContent);
+        response.put("Content", document.getContentForVersion(effectiveVersion));
         response.put("Status", document.getStatus());
         return Response.ok(response).build();
+    }
+
+    private String resolveDocumentVersion(JsonNode request, SsmDocument document) {
+        return SsmService.resolveDocumentVersion(document, optionalText(request, "DocumentVersion"));
     }
 
     private Response handleCreateDocument(JsonNode request, String region) {
@@ -715,6 +771,22 @@ public class SsmJsonHandler {
         return Response.ok(documentDescriptionResponse(document)).build();
     }
 
+    private Response handleUpdateDocumentDefaultVersion(JsonNode request, String region) {
+        String name = requireDocumentName(request);
+        JsonNode version = request.path("DocumentVersion");
+        if (!version.isTextual() || !version.textValue().matches("[1-9][0-9]*")) {
+            throw SmithyValidationErrors.validationException(
+                    "Value at 'documentVersion' failed to satisfy constraint: "
+                            + "Member must satisfy regular expression pattern: [1-9][0-9]*");
+        }
+        SsmDocument document = ssmService.updateDocumentDefaultVersion(name, version.textValue(), region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.putObject("Description")
+                .put("Name", document.getName())
+                .put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
+        return Response.ok(response).build();
+    }
+
     private ObjectNode documentDescriptionResponse(SsmDocument document) {
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode description = objectMapper.createObjectNode();
@@ -723,7 +795,7 @@ public class SsmJsonHandler {
         description.put("DocumentVersion", String.valueOf(document.getDocumentVersion()));
         description.put("Status", document.getStatus());
         description.put("LatestVersion", String.valueOf(document.getDocumentVersion()));
-        description.put("DefaultVersion", String.valueOf(document.getDocumentVersion()));
+        description.put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
         description.set("Tags", tagList(document.getTags()));
         response.set("DocumentDescription", description);
         return response;
@@ -906,7 +978,10 @@ public class SsmJsonHandler {
                     SmithyValidationErrors.notNull("associationId"));
         }
 
+        String name = request.hasNonNull("Name") ? requireDocumentNameOrArn(request) : null;
         String associationName = request.hasNonNull("AssociationName") ? request.path("AssociationName").asText() : null;
+        String associationVersion = request.hasNonNull("AssociationVersion")
+                ? request.path("AssociationVersion").asText() : null;
         String documentVersion = request.hasNonNull("DocumentVersion") ? request.path("DocumentVersion").asText() : null;
         String scheduleExpression = request.hasNonNull("ScheduleExpression") ? request.path("ScheduleExpression").asText() : null;
         String maxErrors = request.hasNonNull("MaxErrors") ? request.path("MaxErrors").asText() : null;
@@ -916,8 +991,8 @@ public class SsmJsonHandler {
         Map<String, List<String>> parameters = parseParameters(request);
 
         SsmAssociation assoc = ssmService.updateAssociation(
-                associationId, associationName, documentVersion, targets, parameters, scheduleExpression,
-                maxErrors, maxConcurrency, complianceSeverity, region);
+                associationId, name, associationName, documentVersion, targets, parameters, scheduleExpression,
+                maxErrors, maxConcurrency, complianceSeverity, associationVersion, region);
 
         return Response.ok(associationDescriptionResponse(assoc)).build();
     }
@@ -1231,6 +1306,9 @@ public class SsmJsonHandler {
     }
 
     private Response handleAddTagsToResource(JsonNode request, String region) {
+        if (request.path("ResourceType").asText().equals("PatchBaseline")) {
+            return Response.ok(patchBaselines.resourceTags("AddTagsToResource", request, region)).build();
+        }
         requireTaggedResourceType(request);
         ssmService.addTagsToResource(request.path("ResourceType").asText(), request.path("ResourceId").asText(),
                 requestTags(request), region);
@@ -1238,6 +1316,9 @@ public class SsmJsonHandler {
     }
 
     private Response handleListTagsForResource(JsonNode request, String region) {
+        if (request.path("ResourceType").asText().equals("PatchBaseline")) {
+            return Response.ok(patchBaselines.resourceTags("ListTagsForResource", request, region)).build();
+        }
         requireTaggedResourceType(request);
         Map<String, String> tags = ssmService.listTagsForResource(request.path("ResourceType").asText(),
                 request.path("ResourceId").asText(), region);
@@ -1247,6 +1328,9 @@ public class SsmJsonHandler {
     }
 
     private Response handleRemoveTagsFromResource(JsonNode request, String region) {
+        if (request.path("ResourceType").asText().equals("PatchBaseline")) {
+            return Response.ok(patchBaselines.resourceTags("RemoveTagsFromResource", request, region)).build();
+        }
         requireTaggedResourceType(request);
         List<String> tagKeys = new ArrayList<>();
         request.path("TagKeys").forEach(k -> tagKeys.add(k.asText()));
@@ -1496,7 +1580,8 @@ public class SsmJsonHandler {
         String commandId = request.path("CommandId").asText();
         String instanceId = request.path("InstanceId").asText();
         CommandInvocation inv = commandService.getCommandInvocation(commandId, instanceId, region);
-        return Response.ok(invocationToDetailNode(inv)).build();
+        String pluginName = request.has("PluginName") ? request.path("PluginName").asText() : null;
+        return Response.ok(invocationToDetailNode(inv, pluginName)).build();
     }
 
     private Response handleListCommands(JsonNode request, String region) {
@@ -1521,7 +1606,22 @@ public class SsmJsonHandler {
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode invArray = objectMapper.createArrayNode();
         for (CommandInvocation inv : invocations) {
-            invArray.add(invocationToNode(inv));
+            ObjectNode node = invocationToNode(inv);
+            if (request.path("Details").asBoolean(false)) {
+                synchronized (inv) {
+                    ArrayNode plugins = node.putArray("CommandPlugins");
+                    inv.getPluginResults().forEach((name, plugin) -> {
+                        ObjectNode detail = plugins.addObject().put("Name", name)
+                                .put("Status", SsmCommandService.toInvocationStatus(plugin.path("status").asText("Pending")))
+                                .put("ResponseCode", plugin.path("code").asInt(plugin.path("returnCode").asInt(-1)));
+                        detail.put("StatusDetails", plugin.path("statusDetails").asText(detail.path("Status").asText()));
+                        detail.put("Output", SsmCommandService.truncateOutput(
+                                plugin.path("output").asText(plugin.path("standardOutput").asText("")),
+                                SsmCommandService.MAX_STDOUT_CHARS));
+                    });
+                }
+            }
+            invArray.add(node);
         }
         response.set("CommandInvocations", invArray);
         return Response.ok(response).build();
@@ -1536,13 +1636,14 @@ public class SsmJsonHandler {
     }
 
     private Response handleDescribeInstanceInformation(JsonNode request, String region) {
-        List<InstanceInformation> instances = commandService.describeInstanceInformation(region);
+        PaginatedResult<InstanceInformation> page = managedNodeDiscovery.describe(request, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode list = objectMapper.createArrayNode();
-        for (InstanceInformation info : instances) {
+        for (InstanceInformation info : page.items()) {
             list.add(instanceInfoToNode(info));
         }
         response.set("InstanceInformationList", list);
+        putNextToken(response, page);
         return Response.ok(response).build();
     }
 
@@ -1568,6 +1669,7 @@ public class SsmJsonHandler {
         node.put("TargetCount", c.getTargetCount());
         node.put("CompletedCount", c.getCompletedCount());
         node.put("ErrorCount", c.getErrorCount());
+        node.put("DeliveryTimedOutCount", c.getDeliveryTimedOutCount());
         node.put("TimeoutSeconds", c.getTimeoutSeconds());
         if (c.getInstanceIds() != null) {
             ArrayNode ids = objectMapper.createArrayNode();
@@ -1603,18 +1705,54 @@ public class SsmJsonHandler {
         return node;
     }
 
-    private ObjectNode invocationToDetailNode(CommandInvocation inv) {
-        ObjectNode node = invocationToNode(inv);
-        node.put("StandardOutputContent", inv.getStandardOutputContent() != null ? inv.getStandardOutputContent() : "");
-        node.put("StandardErrorContent", inv.getStandardErrorContent() != null ? inv.getStandardErrorContent() : "");
-        node.put("ResponseCode", inv.getResponseCode());
-        if (inv.getExecutionStartDateTime() != null) {
-            node.put("ExecutionStartDateTime", inv.getExecutionStartDateTime().toString());
+    private ObjectNode invocationToDetailNode(CommandInvocation inv, String requestedPlugin) {
+        synchronized (inv) {
+            Map<String, JsonNode> plugins = inv.getPluginResults();
+            if ((requestedPlugin == null && plugins.size() > 1)
+                    || (requestedPlugin != null && !plugins.containsKey(requestedPlugin))) {
+                throw new AwsException("InvalidPluginName", "Specify a step name from the command document.", 400);
+            }
+            String selected = requestedPlugin != null ? requestedPlugin
+                    : plugins.isEmpty() ? null : plugins.keySet().iterator().next();
+            ObjectNode node = invocationToNode(inv);
+            node.put("StandardOutputContent", inv.getStandardOutputContent() != null ? inv.getStandardOutputContent() : "");
+            node.put("StandardErrorContent", inv.getStandardErrorContent() != null ? inv.getStandardErrorContent() : "");
+            node.put("ResponseCode", inv.getResponseCode());
+            if (inv.getExecutionStartDateTime() != null) {
+                node.put("ExecutionStartDateTime", inv.getExecutionStartDateTime().toString());
+            }
+            if (inv.getExecutionEndDateTime() != null) {
+                node.put("ExecutionEndDateTime", inv.getExecutionEndDateTime().toString());
+            }
+            if (selected != null) {
+                node.put("PluginName", selected);
+                JsonNode plugin = plugins.get(selected);
+                if (!inv.isDirectExecution() || !"Pending".equals(plugin.path("status").asText("Pending"))) {
+                    String status = SsmCommandService.toInvocationStatus(plugin.path("status").asText("Pending"));
+                    if ("Pending".equals(status) && plugins.size() == 1
+                            && ("InProgress".equals(inv.getStatus()) || "Cancelling".equals(inv.getStatus()))) {
+                        status = inv.getStatus();
+                    }
+                    node.put("Status", status).put("StatusDetails",
+                            plugin.path("statusDetails").asText(SsmCommandService.statusDetails(status)));
+                    node.put("StandardOutputContent", SsmCommandService.truncateOutput(
+                            plugin.path("standardOutput").asText(plugin.path("output").asText("")),
+                            SsmCommandService.MAX_STDOUT_CHARS));
+                    node.put("StandardErrorContent", SsmCommandService.truncateOutput(
+                            plugin.path("standardError").asText(""), SsmCommandService.MAX_STDERR_CHARS));
+                    node.put("ResponseCode", plugin.path("code").asInt(plugin.path("returnCode").asInt(-1)));
+                    node.remove("ExecutionStartDateTime");
+                    node.remove("ExecutionEndDateTime");
+                    if (plugin.path("startDateTime").isTextual()) {
+                        node.put("ExecutionStartDateTime", plugin.path("startDateTime").asText());
+                    }
+                    if (plugin.path("endDateTime").isTextual()) {
+                        node.put("ExecutionEndDateTime", plugin.path("endDateTime").asText());
+                    }
+                }
+            }
+            return node;
         }
-        if (inv.getExecutionEndDateTime() != null) {
-            node.put("ExecutionEndDateTime", inv.getExecutionEndDateTime().toString());
-        }
-        return node;
     }
 
     private ObjectNode instanceInfoToNode(InstanceInformation info) {
@@ -1636,20 +1774,7 @@ public class SsmJsonHandler {
     private Response handleDescribeDocument(JsonNode request, String region) {
         String name = requireDocumentNameOrArn(request);
         SsmDocument document = ssmService.getDocument(name, region);
-
-        String requestedVersion = request.hasNonNull("DocumentVersion") ? request.path("DocumentVersion").asText() : null;
-        String effectiveVersion = String.valueOf(document.getDocumentVersion());
-        String effectiveContent = document.getContent();
-
-        if (requestedVersion != null && !requestedVersion.isBlank()
-                && !"$LATEST".equals(requestedVersion) && !"$DEFAULT".equals(requestedVersion)) {
-            if (!document.hasRetainedContent(requestedVersion)) {
-                throw new AwsException("InvalidDocumentVersion",
-                        "The document version is not valid or does not exist.", 400);
-            }
-            effectiveVersion = requestedVersion;
-            effectiveContent = document.getContentForVersion(requestedVersion);
-        }
+        String effectiveVersion = resolveDocumentVersion(request, document);
 
         ObjectNode response = objectMapper.createObjectNode();
         ObjectNode documentNode = objectMapper.createObjectNode();
@@ -1661,8 +1786,12 @@ public class SsmJsonHandler {
         }
         documentNode.put("DefaultVersion", String.valueOf(document.getDocumentVersion()));
         documentNode.put("DocumentVersion", effectiveVersion);
-        documentNode.put("Content", effectiveContent);
+        documentNode.put("Content", document.getContentForVersion(effectiveVersion));
         documentNode.put("Status", document.getStatus());
+        documentNode.put("DefaultVersion", String.valueOf(document.getDefaultVersion()));
+        documentNode.put("LatestVersion", String.valueOf(document.getDocumentVersion()));
+        ArrayNode tags = documentNode.putArray("Tags");
+        document.getTags().forEach((key, value) -> tags.addObject().put("Key", key).put("Value", value));
         if (document.getCreatedDate() != null) {
             documentNode.put("CreatedDate", EpochSeconds.fromInstant(document.getCreatedDate()));
         }

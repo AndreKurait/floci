@@ -70,6 +70,7 @@ final class RestApiOpenApiExporter {
                 ObjectNode definition = scheme.putObject("x-amazon-apigateway-authorizer");
                 definition.put("type", authorizer.getType().toLowerCase(Locale.ROOT));
                 put(definition, "authorizerUri", authorizer.getAuthorizerUri());
+                put(definition, "authorizerCredentials", authorizer.getAuthorizerCredentials());
                 put(definition, "identitySource", source);
                 if (authorizer.getAuthorizerResultTtlInSeconds() != null) {
                     definition.put("authorizerResultTtlInSeconds",

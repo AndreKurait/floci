@@ -30,18 +30,14 @@ import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.HostBlindPortAllocator;
 import io.floci.aws.core.common.docker.PortAllocator;
-import io.floci.aws.core.common.docker.SidecarHealthHelper;
 import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.ParallelLocks;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.mockito.MockMakers;
-import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.io.Closeable;
@@ -57,7 +53,11 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -102,11 +102,9 @@ class EcrRegistryManagerTest {
     private InspectImageCmd inspectImage;
     private RegionResolver regionResolver;
     private EcrRegistryManager manager;
-    private MockedStatic<SidecarHealthHelper> health;
 
     @BeforeEach
     void setUp() {
-        health = Mockito.mockStatic(SidecarHealthHelper.class, Mockito.withSettings().mockMaker(MockMakers.INLINE));
         portAllocator = new HostBlindPortAllocator();
 
         containerBuilder = Mockito.mock(ContainerBuilder.class);
@@ -138,6 +136,7 @@ class EcrRegistryManagerTest {
         storage = Mockito.mock(EmulatorConfig.StorageConfig.class);
         when(config.services()).thenReturn(Mockito.mock(EmulatorConfig.ServicesConfig.class));
         when(config.services().ecr()).thenReturn(ecr);
+        when(config.services().iam()).thenReturn(Mockito.mock(EmulatorConfig.IamServiceConfig.class));
         when(config.port()).thenReturn(4566);
         when(config.docker()).thenReturn(docker);
         when(config.storage()).thenReturn(storage);
@@ -153,13 +152,109 @@ class EcrRegistryManagerTest {
         when(ecr.preferLocalImages()).thenReturn(true);
         when(ecr.enabled()).thenReturn(true);
 
-        manager = new EcrRegistryManager(containerBuilder, lifecycleManager, logStreamer,
-                containerDetector, currentContainerNetworkResolver, portAllocator, config, regionResolver);
+        manager = Mockito.spy(new EcrRegistryManager(containerBuilder, lifecycleManager, logStreamer,
+                containerDetector, currentContainerNetworkResolver, portAllocator, config, regionResolver));
+        Mockito.doAnswer(invocation -> {
+            RegistryHttpClient client = Mockito.spy((RegistryHttpClient) invocation.callRealMethod());
+            Mockito.doReturn(true).when(client).ping(any(Duration.class));
+            return client;
+        }).when(manager).httpClient();
     }
 
-    @AfterEach
-    void tearDown() {
-        health.close();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void startupWaitsForRegistryWithoutReconciliation(boolean adopt) throws Exception {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        CountDownLatch waiting = new CountDownLatch(1);
+        CountDownLatch ready = new CountDownLatch(1);
+        AtomicInteger probes = new AtomicInteger();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            if (probes.getAndIncrement() == 0) {
+                return false;
+            }
+            waiting.countDown();
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            return true;
+        });
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> startup = executor.submit(manager::ensureStarted);
+            try {
+                assertTrue(waiting.await(2, TimeUnit.SECONDS),
+                        "Startup must keep checking an unready registry even without a reconciliation hook");
+                assertFalse(startup.isDone());
+                assertFalse(manager.isStarted(), "An unready registry must not be published as started");
+                ready.countDown();
+                startup.get(2, TimeUnit.SECONDS);
+                assertTrue(manager.isStarted());
+            } finally {
+                ready.countDown();
+                startup.cancel(true);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void readinessTimeoutCanRecoverTheSameContainer(boolean adopt) {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            Duration timeout = invocation.getArgument(0);
+            assertTrue(timeout.isPositive() && timeout.compareTo(Duration.ofSeconds(1)) <= 0);
+            return false;
+        });
+
+        RuntimeException error = assertThrows(RuntimeException.class, manager::ensureStarted);
+        assertTrue(error.getMessage().contains("did not become ready within 10 seconds"));
+        assertFalse(manager.isStarted());
+
+        configureStartup(true);
+        when(registry.ping(any(Duration.class))).thenReturn(true);
+        manager.ensureStarted();
+        assertTrue(manager.isStarted());
+        verify(lifecycleManager, times(adopt ? 0 : 1)).createAndStart(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void interruptedStartupPreservesCancellationAndOwnedCleanup(boolean adopt) {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            Thread.currentThread().interrupt();
+            return false;
+        });
+
+        try {
+            RuntimeException error = assertThrows(RuntimeException.class, manager::ensureStarted);
+            assertTrue(error.getMessage().contains("Interrupted while waiting"));
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertFalse(manager.isStarted());
+        } finally {
+            Thread.interrupted();
+        }
+        manager.shutdown();
+        verify(lifecycleManager).stopAndRemove(eq("startup-registry"), any());
+    }
+
+    private void configureStartup(boolean adopt) {
+        ContainerLifecycleManager.ContainerInfo info =
+                new ContainerLifecycleManager.ContainerInfo("startup-registry", Map.of());
+        if (adopt) {
+            Container container = Mockito.mock(Container.class);
+            when(container.getId()).thenReturn(info.containerId());
+            when(container.getPorts()).thenReturn(new ContainerPort[] {
+                    new ContainerPort().withPrivatePort(5000).withPublicPort(BASE_PORT)
+                            .withType("tcp").withIp("127.0.0.1")});
+            when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(container));
+            when(lifecycleManager.adopt(info.containerId(), List.of(5000), Optional.empty())).thenReturn(info);
+        } else {
+            when(lifecycleManager.createAndStart(any())).thenReturn(info);
+        }
     }
 
     @ParameterizedTest
@@ -179,25 +274,27 @@ class EcrRegistryManagerTest {
             when(lifecycleManager.createAndStart(any())).thenReturn(info);
         }
 
+        RegistryHttpClient client = registryClient();
         manager.ensureStarted();
 
-        health.verify(() -> SidecarHealthHelper.waitForHealth("http://localhost:" + BASE_PORT, "/v2/"));
+        verify(client).ping(any(Duration.class));
         manager.ensureStarted();
-        health.verifyNoMoreInteractions();
+        verify(client).ping(any(Duration.class));
     }
 
     @Test
     void ensureStartedRetriesReadinessAfterHealthCheckFails() {
         when(lifecycleManager.createAndStart(any())).thenReturn(
                 new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
-        health.when(() -> SidecarHealthHelper.waitForHealth("http://localhost:" + BASE_PORT, "/v2/"))
+        RegistryHttpClient client = registryClient();
+        when(client.ping(any(Duration.class)))
                 .thenThrow(new IllegalStateException("Registry is not healthy"))
-                .thenAnswer(invocation -> null);
+                .thenReturn(true);
 
         assertFalse(manager.tryEnsureStarted());
         assertTrue(manager.tryEnsureStarted());
 
-        health.verify(() -> SidecarHealthHelper.waitForHealth("http://localhost:" + BASE_PORT, "/v2/"), times(2));
+        verify(client, times(2)).ping(any(Duration.class));
         verify(lifecycleManager).createAndStart(any());
     }
 
@@ -212,13 +309,11 @@ class EcrRegistryManagerTest {
             events.add("catalog");
             return List.of("repository");
         });
-        manager = Mockito.spy(manager);
         Mockito.doReturn(client).when(manager).httpClient();
-        health.when(() -> SidecarHealthHelper.waitForHealth(client.baseUrl(), "/v2/"))
-                .thenAnswer(invocation -> {
-                    events.add("healthy");
-                    return null;
-                });
+        when(client.ping(any(Duration.class))).thenAnswer(invocation -> {
+            events.add("healthy");
+            return true;
+        });
         manager.setReconcileHook(repositories -> {
             assertEquals(List.of("repository"), repositories);
             events.add("reconciled");
@@ -309,8 +404,8 @@ class EcrRegistryManagerTest {
     /** A registry client the manager uses in place of HTTP, answering the health check at once. */
     private RegistryHttpClient registryClient() {
         RegistryHttpClient client = Mockito.mock(RegistryHttpClient.class);
+        when(client.ping(any(Duration.class))).thenReturn(true);
         when(client.baseUrl()).thenReturn("http://localhost:" + BASE_PORT);
-        manager = Mockito.spy(manager);
         Mockito.doReturn(client).when(manager).httpClient();
         return client;
     }
@@ -989,6 +1084,19 @@ class EcrRegistryManagerTest {
     }
 
     @Test
+    void rewriteImageUri_enforcedPullOfLocallyPresentAwsReferenceStillUsesEmulatorRegistry() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+        verify(dockerClient, never()).inspectImageCmd(AWS_ECR_IMAGE);
+        verify(lifecycleManager).createAndStart(any());
+    }
+
+    @Test
     void rewriteImageUri_imagePresentOnDaemon_preferLocalImagesOff_rewritesWithoutInspecting() {
         when(ecr.preferLocalImages()).thenReturn(false);
         Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
@@ -1231,4 +1339,21 @@ class EcrRegistryManagerTest {
                 null)), EcrRegistryManager.ecrImage("000000000000.dkr.ecr.eu-west-1.localhost:4566/spark"));
         assertEquals(Optional.empty(), EcrRegistryManager.ecrImage("python:3.12"));
     }
+    @ParameterizedTest
+    @CsvSource({"us-east-1,amazonaws.com", "cn-north-1,amazonaws.com.cn", "us-gov-west-1,amazonaws.com"})
+    void nativeRegistryAddressesMatchAuthorizationAndPartition(String region, String suffix) {
+        when(ecr.nativeUri()).thenReturn(true);
+        when(ecr.uriStyle()).thenReturn("path");
+        String host = "123456789012.dkr.ecr." + region + "." + suffix;
+        assertEquals(host + "/team/image", manager.getRepositoryUri("123456789012", region, "team/image"));
+        assertEquals("https://" + host, manager.getProxyEndpoint("123456789012", region));
+        verify(lifecycleManager, never()).getDockerClient();
+    }
+
+    @Test
+    void explicitRegistryAuthorizationPreservesDefaultLocalEndpointStyle() {
+        assertEquals("http://123456789012.dkr.ecr.eu-west-1.localhost:4566",
+                manager.getProxyEndpoint("123456789012", "eu-west-1"));
+    }
+
 }

@@ -7470,6 +7470,26 @@ class CognitoServiceTest {
             AwsException lookup = assertThrows(AwsException.class, () -> svc.adminGetUser(pool.getId(), "alice"));
             assertEquals("UserNotFoundException", lookup.getErrorCode());
         }
+        @Test
+        void duplicateUsernameIsRefusedBeforeInvitationAndPreservesItsHolder() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "AliasInvitePool",
+                    "UsernameAttributes", List.of("email")), "us-east-1");
+            CognitoUser holder = create(pool, "alice@example.com", Map.of("email_verified", "true"),
+                    "Temp1234!", "SUPPRESS", List.of("EMAIL"));
+            failDelivery();
+
+            AwsException failure = assertThrows(AwsException.class, () -> svc.adminCreateUser(pool.getId(),
+                    "alice@example.com", Map.of("email_verified", "true"), null, null, true, List.of("EMAIL"),
+                    Map.of(), Map.of()));
+
+            assertEquals("UsernameExistsException", failure.getErrorCode());
+            verify(messageDispatcher, never()).dispatchInvitation(any(), any(), any(), any(), any());
+            CognitoUser after = svc.adminGetUser(pool.getId(), holder.getUsername());
+            assertEquals("alice@example.com", after.getAttributes().get("email"));
+            assertEquals("true", after.getAttributes().get("email_verified"));
+            assertEquals(holder.getUsername(), svc.adminGetUser(pool.getId(), "alice@example.com").getUsername());
+            assertEquals(1, svc.listUsers(pool.getId(), null).size());
+        }
     }
 
     // --- replaceGroupDescription: a service method that does not exist on main ---

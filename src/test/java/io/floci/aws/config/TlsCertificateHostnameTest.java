@@ -20,6 +20,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -68,6 +69,12 @@ class TlsCertificateHostnameTest {
     // ==================== Custom Hostname Tests ====================
 
     @Test
+    void tlsDisabledDoesNotRequireProxyProtocol() {
+        System.setProperty("floci.tls.enabled", "false");
+        assertNull(new TlsConfigSource().getValue("quarkus.http.proxy.use-proxy-protocol"));
+    }
+
+    @Test
     void testFlociHostnameIncludedInCertificateSans() throws Exception {
         // Arrange
         System.setProperty("floci.hostname", "floci");
@@ -76,7 +83,9 @@ class TlsCertificateHostnameTest {
         System.setProperty("floci.storage.persistent-path", tempDir.toString());
 
         // Act
-        new TlsConfigSource();
+        TlsConfigSource source = new TlsConfigSource();
+        assertEquals("true", source.getValue("quarkus.http.proxy.use-proxy-protocol"));
+        assertEquals("127.0.0.1", source.getValue("quarkus.http.host"));
 
         // Assert
         Path certFile = tempDir.resolve("tls/floci-server.crt");
@@ -334,10 +343,12 @@ class TlsCertificateHostnameTest {
         new TlsConfigSource();
 
         Path certFile = tempDir.resolve("tls/floci-server.crt");
+        // A regenerated certificate would carry the time of its rewrite, so the existing one is
+        // dated a minute back instead of waiting for the clock to move past it.
+        Files.setLastModifiedTime(certFile,
+                FileTime.fromMillis(Files.getLastModifiedTime(certFile).toMillis() - 60_000));
         long initialModifiedTime = Files.getLastModifiedTime(certFile).toMillis();
         String initialMetadata = Files.readString(tempDir.resolve("tls/floci-server.metadata.json"));
-
-        Thread.sleep(100);
 
         // Act: Restart with same configuration
         new TlsConfigSource();

@@ -169,7 +169,8 @@ public class SqsJsonHandler {
 
     private Response handleGetQueueUrl(JsonNode request, String region) {
         String queueName = request.path("QueueName").asText(null);
-        String queueUrl = sqsService.getQueueUrl(queueName, region);
+        String owner = request.path("QueueOwnerAWSAccountId").asText(null);
+        String queueUrl = sqsService.getQueueUrl(queueName, region, owner);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("QueueUrl", queueUrl);
         return Response.ok(response).build();

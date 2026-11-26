@@ -25,11 +25,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -39,6 +42,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -83,7 +87,7 @@ class AthenaServiceTest {
         when(services.athena()).thenReturn(athena);
         when(athena.mock()).thenReturn(false);
 
-        regionResolver = mock(RegionResolver.class);
+        regionResolver = spy(new RegionResolver("us-east-1", "000000000000"));
         service = new AthenaService(storageFactory, duckClient, glueService, s3Service,
                 config, vertx, ddlBuilder, regionResolver, icebergStatements,
                 mock(IamEnforcementFilter.class));
@@ -476,14 +480,8 @@ class AthenaServiceTest {
         return service.getQueryResults(REGION, id);
     }
 
-    private void awaitState(String id, QueryExecutionState expected) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (System.nanoTime() < deadline) {
-            if (service.getQueryExecution(REGION, id).getStatus().getState() == expected) {
-                return;
-            }
-            Thread.sleep(10);
-        }
-        assertEquals(expected, service.getQueryExecution(REGION, id).getStatus().getState());
+    private void awaitState(String id, QueryExecutionState expected) {
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> service.getQueryExecution(REGION, id).getStatus().getState(), equalTo(expected));
     }
 }

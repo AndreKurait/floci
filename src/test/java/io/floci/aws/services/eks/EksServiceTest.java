@@ -9,7 +9,6 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.PersistentStorage;
 import io.floci.aws.core.storage.StorageBackend;
@@ -1500,6 +1499,22 @@ class EksServiceTest {
                 }
             }
         }
+    }
+
+    @Test
+    void deleteCluster_forgetsItsNodeGroupsAndFargateProfiles() {
+        CreateClusterRequest req = new CreateClusterRequest();
+        req.setName("recreated");
+        req.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        eksService.createCluster(req);
+        eksService.createNodeGroup("recreated", nodeGroupRequest("old-group"));
+        eksService.createFargateProfile("recreated", fargateProfileRequest("old-profile"));
+
+        eksService.deleteCluster("recreated");
+        eksService.createCluster(req);
+
+        assertEquals(List.of(), eksService.listNodeGroups("recreated"));
+        assertEquals(List.of(), eksService.listFargateProfiles("recreated"));
     }
 
     @Test

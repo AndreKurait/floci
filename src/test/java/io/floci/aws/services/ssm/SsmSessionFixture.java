@@ -8,6 +8,7 @@ import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.testing.AwsTestClients;
+import io.floci.aws.testing.MutableClock;
 import org.junit.jupiter.api.function.Executable;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.regions.Region;
@@ -15,6 +16,7 @@ import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.iam.model.AccessKey;
 import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.ssm.model.InvalidInstanceIdException;
 import software.amazon.awssdk.services.ssm.model.SsmException;
 import software.amazon.awssdk.services.ssm.model.StartSessionResponse;
 
@@ -24,6 +26,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -52,6 +55,7 @@ final class SsmSessionFixture implements AutoCloseable {
     final Ec2Service instances;
     final URI endpoint;
     final int tlsPort;
+    final MutableClock clock;
     final Path logs = Path.of("target", "ssm-session-logs", name);
     final List<String> documents = new ArrayList<>();
     final List<AccessKey> users = new ArrayList<>();
@@ -68,12 +72,13 @@ final class SsmSessionFixture implements AutoCloseable {
     boolean profileCreated;
 
     SsmSessionFixture(DockerClient docker, ContainerBuilder builder, ContainerLifecycleManager lifecycle,
-                      Ec2Service instances, int httpPort, int tlsPort) {
+                      Ec2Service instances, int httpPort, int tlsPort, MutableClock clock) {
         this.docker = docker;
         this.builder = builder;
         this.lifecycle = lifecycle;
         this.instances = instances;
         this.tlsPort = tlsPort;
+        this.clock = clock;
         String gateway = docker.inspectNetworkCmd().withNetworkId("bridge").exec().getIpam().getConfig()
                 .getFirst().getGateway();
         endpoint = URI.create("http://" + gateway + ":" + httpPort);
@@ -85,6 +90,8 @@ final class SsmSessionFixture implements AutoCloseable {
             docker.buildImageCmd(Path.of("src/test/resources/ssm/session-manager").toFile())
                     .withTags(Set.of(IMAGE)).withRemove(true).exec(callback).awaitImageId(600, TimeUnit.SECONDS);
         }
+        clock.reset();
+        clock.advance(Duration.between(clock.instant(), Instant.now()));
         ec2 = AwsTestClients.create(Ec2Client.builder(), "test", REGION, endpoint);
         iam = AwsTestClients.create(IamClient.builder(), "test", REGION, endpoint);
         iam.createRole(r -> r.roleName(name).assumeRolePolicyDocument("""
@@ -124,7 +131,8 @@ final class SsmSessionFixture implements AutoCloseable {
                 .metadataOptions(m -> m.httpTokens("required").httpEndpoint("enabled"))
                 .userData(Base64.getEncoder().encodeToString(userData.getBytes(StandardCharsets.UTF_8))))
                 .instances().getFirst().instanceId();
-        await().pollInterval(Duration.ofMillis(500)).atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
+        await().ignoreException(InvalidInstanceIdException.class)
+                .pollInterval(Duration.ofMillis(500)).atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
             assertTrue(ssm.describeInstanceInformation(r -> r.filters(f -> f.key("InstanceIds").values(instance)))
                     .instanceInformationList().stream().anyMatch(i -> instance.equals(i.instanceId())
                             && AGENT_VERSION.equals(i.agentVersion()) && "Online".equals(i.pingStatusAsString())));
@@ -185,7 +193,10 @@ final class SsmSessionFixture implements AutoCloseable {
         String network = docker.createNetworkCmd().withName(name + "-remote-" + networks.size())
                 .withInternal(true).exec().getId();
         networks.add(network);
-        docker.connectToNetworkCmd().withNetworkId(network).withContainerId(guest).exec();
+        String networkMode = docker.inspectContainerCmd(guest).exec().getHostConfig().getNetworkMode();
+        String networkContainer = networkMode != null && networkMode.startsWith("container:")
+                ? networkMode.substring("container:".length()) : guest;
+        docker.connectToNetworkCmd().withNetworkId(network).withContainerId(networkContainer).exec();
         ContainerBuilder.Builder spec = builder.newContainer(postgres ? "postgres:17" : IMAGE)
                 .withName(name + "-remote-" + containers.size()).withDockerNetwork(Optional.of(network));
         if (postgres) {
@@ -199,7 +210,7 @@ final class SsmSessionFixture implements AutoCloseable {
         String networkName = docker.inspectNetworkCmd().withNetworkId(network).exec().getName();
         String address = docker.inspectContainerCmd(id).exec().getNetworkSettings().getNetworks()
                 .get(networkName).getIpAddress();
-        String guestAddress = docker.inspectContainerCmd(guest).exec().getNetworkSettings().getNetworks()
+        String guestAddress = docker.inspectContainerCmd(networkContainer).exec().getNetworkSettings().getNetworks()
                 .get(networkName).getIpAddress();
         if (postgres) {
             // The image starts a temporary Unix socket server to initialise the database.

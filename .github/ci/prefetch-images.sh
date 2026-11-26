@@ -127,7 +127,10 @@ REGISTRY_IMAGE="$(test_image REGISTRY)"
 starts EcsImagePullDockerIntegrationTest && [ -n "$REGISTRY_IMAGE" ] && pull "$REGISTRY_IMAGE"
 PYTHON_ALPINE_IMAGE="$(test_image PYTHON_ALPINE)"
 starts ContainerCaBundleDockerIntegrationTest EcsCredentialsProxyDockerNightlyIntegrationTest SageMakerDockerNightlyIntegrationTest \
+       SecurityGroupFirewallDockerNightlyIntegrationTest \
     && [ -n "$PYTHON_ALPINE_IMAGE" ] && pull "$PYTHON_ALPINE_IMAGE"
+# Firewall fixtures also start lightweight network clients in this pinned Alpine image.
+starts SecurityGroupFirewallDockerNightlyIntegrationTest && pull alpine:3.21
 CORRETTO_8_IMAGE="$(test_image CORRETTO_8)"
 starts ContainerCaBundleDockerIntegrationTest && [ -n "$CORRETTO_8_IMAGE" ] && pull "$CORRETTO_8_IMAGE"
 # The Firelens test names the log router image itself rather than taking it from config.
@@ -228,12 +231,12 @@ grep -q 'RdsAwsDockerNightlyIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_I
 REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resources/application.yml | awk '{print $2}')"
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
 grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
-# The template-database restore fixture selects its own PostgreSQL image.
+# The template-database restore fixture gets its PostgreSQL image from its test profile.
 # Read that override so its first CreateDBInstance does not also have to pull PostGIS.
-POSTGIS_TEST="$(find src/test/java -name RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest.java -print -quit)"
-POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4 }' "${POSTGIS_TEST:-/dev/null}")"
+POSTGIS_PROFILE="$(find src/test/java -path '*/testing/CloudFormationSettingsProfile.java' -print -quit)"
+POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4 }' "${POSTGIS_PROFILE:-/dev/null}")"
 [ -n "$POSTGIS_IMAGE" ] \
-    || echo "$(date -u +%H:%M:%S) prefetch skipped: RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest default-postgres-image not readable" >> "$PREFETCH_LOG"
+    || echo "$(date -u +%H:%M:%S) prefetch skipped: CloudFormationSettingsProfile default-postgres-image not readable" >> "$PREFETCH_LOG"
 starts RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest \
     && [ -n "$POSTGIS_IMAGE" ] && pull "$POSTGIS_IMAGE"
 # These DSQL fixtures start the configured PostgreSQL sidecar; unit-only shards do not.

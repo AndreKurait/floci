@@ -42,6 +42,25 @@ public class SAMLTrustPolicyEvaluator {
                 roleSessionName, roleTags);
     }
 
+    public boolean allows(String document, String providerArn, Map<String, List<String>> claims) {
+        return allows(document, providerArn, claims, null, Map.of());
+    }
+
+    public boolean allows(String document, String providerArn, Map<String, List<String>> claims,
+                          String roleSessionName) {
+        return allows(document, providerArn, claims, roleSessionName, Map.of());
+    }
+
+    public boolean allowsAction(String document, String providerArn, Map<String, List<String>> claims,
+                                String roleSessionName, String action) {
+        return allowsAction(document, providerArn, claims, roleSessionName, action, Map.of());
+    }
+
+    public boolean allowsAction(String document, String providerArn, Map<String, List<String>> claims,
+                                String roleSessionName, String action, Map<String, List<String>> roleTags) {
+        return allows(action, document, providerArn, claims, roleSessionName, roleTags);
+    }
+
     private boolean allows(String action, String document, String providerArn,
                            Map<String, List<String>> claims, String roleSessionName,
                            Map<String, List<String>> roleTags) {
@@ -121,7 +140,7 @@ public class SAMLTrustPolicyEvaluator {
         }
         int colon = key.indexOf(':');
         String claimName = colon < 0 ? key : key.substring(colon + 1);
-        return claims.getOrDefault(claimName, List.of());
+        return claims.getOrDefault(key, claims.getOrDefault(claimName, List.of()));
     }
 
     private boolean operatorMatches(String operator, List<String> actual, List<String> expected) {

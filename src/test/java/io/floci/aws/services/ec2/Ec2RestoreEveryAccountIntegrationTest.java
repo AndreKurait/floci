@@ -1,6 +1,8 @@
 package io.floci.aws.services.ec2;
 
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.services.ec2.Ec2SystemdV1Runtime.GuestIdentityChangedException;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.services.ec2.model.PublishedPortFamily;
@@ -28,12 +30,13 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Startup restore runs from {@code @PostConstruct}, on a thread with no request, where account-aware
+ * The startup observer restores instances on a thread with no request, where account-aware
  * storage resolves to the default account. These tests run it the same way, on a bare thread, for
  * an instance owned by another account. {@link ContainerBackedEc2Profile} runs EC2 container-backed,
  * and security groups are enforced by test default, so restore resolves the instance's groups.
@@ -47,6 +50,9 @@ class Ec2RestoreEveryAccountIntegrationTest {
 
     @Inject
     Ec2Service service;
+
+    @Inject
+    RequestContext requestContext;
 
     @InjectMock
     Ec2ContainerManager containerManager;
@@ -79,6 +85,22 @@ class Ec2RestoreEveryAccountIntegrationTest {
         verify(containerManager, never()).stopForShutdown(argThat(stopped -> isSame(stopped, instance)));
         assertEquals("running", RequestScopes.callAs(OTHER_ACCOUNT,
                 () -> describe(instance.getInstanceId()).getFirst().getState().getName()));
+    }
+
+    @Test
+    void foreignNativeGuestIsLeftUntouchedAndOtherInstancesStillRecover() throws Throwable {
+        Instance foreign = runningInstanceOf(OTHER_ACCOUNT);
+        Instance valid = runningInstanceOf("444455556666");
+        doThrow(new GuestIdentityChangedException("EC2 init guest ownership changed"))
+                .when(containerManager).restoreSecurityGroups(
+                        argThat(restored -> isSame(restored, foreign)), any(), any(), any());
+
+        restoreOutsideAnyRequest();
+
+        verify(containerManager, never()).stopForShutdown(argThat(stopped -> isSame(stopped, foreign)));
+        verify(containerManager, never()).restoreMetadataRegistration(argThat(restored -> isSame(restored, foreign)));
+        verify(portForwardManager, never()).restore(argThat(restored -> isSame(restored, foreign)));
+        verify(containerManager).restoreMetadataRegistration(argThat(restored -> isSame(restored, valid)));
     }
 
     @Test
@@ -119,7 +141,7 @@ class Ec2RestoreEveryAccountIntegrationTest {
     }
 
     @Test
-    void shutdownWritesAnotherAccountsInstanceOnlyToItsOwnAccount() throws Throwable {
+    void memoryShutdownRemovesAnotherAccountsInstanceOnlyInItsOwnAccount() throws Throwable {
         Instance instance = runningInstanceOf(OTHER_ACCOUNT);
         restoreOutsideAnyRequest();
         // Stopping a container unpublishes its forwards, and the port-forward manager persists that.
@@ -135,10 +157,31 @@ class Ec2RestoreEveryAccountIntegrationTest {
         runOutsideAnyRequest(service::stopManagedContainers);
 
         verify(containerManager).stopForShutdown(argThat(stopped -> isSame(stopped, instance)));
-        assertEquals("stopped", RequestScopes.callAs(OTHER_ACCOUNT,
+        verify(containerManager).terminateForShutdown(argThat(removed -> isSame(removed, instance)));
+        assertEquals("terminated", RequestScopes.callAs(OTHER_ACCOUNT,
                 () -> describe(instance.getInstanceId()).getFirst().getState().getName()));
         assertFalse(RequestScopes.callAs("000000000000", () -> describe(null).stream()
                 .anyMatch(listed -> listed.getInstanceId().equals(instance.getInstanceId()))));
+    }
+
+    @Test
+    void resetRetiresAnotherAccountsGuestInItsOwnRequestScope() throws Throwable {
+        Instance instance = runningInstanceOf(OTHER_ACCOUNT);
+        doAnswer(invocation -> {
+            Instance retiring = invocation.getArgument(0);
+            if (isSame(retiring, instance)) {
+                assertEquals(OTHER_ACCOUNT, requestContext.getAccountId());
+                assertEquals(REGION, requestContext.getRegion());
+            }
+            return null;
+        }).when(containerManager).terminateForShutdown(any());
+
+        try {
+            runOutsideAnyRequest(service::beforeReset);
+            verify(containerManager).terminateForShutdown(argThat(retiring -> isSame(retiring, instance)));
+        } finally {
+            service.afterReset();
+        }
     }
 
     @Test

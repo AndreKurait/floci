@@ -1922,4 +1922,19 @@ class SecretsManagerJsonHandlerTest {
         assertThat(listed.get("SecretList").size(), is(1));
         assertThat(listed.get("SecretList").get(0).get("Name").asText(), is("database"));
     }
+
+    @Test
+    void describeSecretReportsWhenTheSecretWasLastRead() {
+        ObjectNode createReq = MAPPER.createObjectNode();
+        createReq.put("Name", "read-secret");
+        createReq.put("SecretString", "value");
+        handler.handle("CreateSecret", createReq, REGION);
+        ObjectNode secretId = MAPPER.createObjectNode();
+        secretId.put("SecretId", "read-secret");
+        handler.handle("GetSecretValue", secretId, REGION);
+
+        ObjectNode body = (ObjectNode) handler.handle("DescribeSecret", secretId, REGION).getEntity();
+
+        assertThat(body.has("LastAccessedDate"), is(true));
+    }
 }

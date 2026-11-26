@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -47,6 +48,7 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
     private static final String GROUP = "AWS::AutoScaling::AutoScalingGroup";
 
     private static final String LAUNCH_CONFIGURATION = "AWS::AutoScaling::LaunchConfiguration";
+    private static final String LC_PROPERTIES = CfnRollback.USES_ATTR_PREFIX + "LaunchConfigurationProperties";
 
     private static final Logger LOG = Logger.getLogger(AutoScalingGroupCfnProvisioner.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -205,14 +207,25 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
         String region = ctx.region();
         String explicitName = ctx.resolveOptional(props, "LaunchConfigurationName");
         String name = ctx.stablePhysicalName(explicitName, r.getLogicalId(), 255, false);
+        JsonNode resolved = ctx.engine().resolveNode(props);
         List<LaunchConfigurationBlockDeviceMapping> mappings = blockDeviceMappings(props, ctx);
         LaunchTemplateData.MetadataOptions metadata = metadataOptions(props, ctx);
         LaunchConfiguration prior = existingEntity(ctx, ctx.priorPhysicalId(),
                 n -> requireLaunchConfiguration(region, n));
         if (ctx.isUpdate()) {
             ReplacementCleanup.endRollbackRetry(r);
-            if (!ctx.changes(LAUNCH_CONFIGURATION, props).requiresReplacement()
-                    && ctx.reusesPriorEntity(name) && prior != null) {
+            String stored = r.getAttributes().get(LC_PROPERTIES);
+            JsonNode previous = stored == null ? null : readLaunchConfigurationProperties(stored);
+            boolean unchanged = ctx.changes() != null ? !ctx.changes().requiresReplacement()
+                    : previous == null ? legacyLaunchConfigurationMatches(prior, props, ctx, mappings, metadata)
+                    : resolved.equals(previous);
+            boolean explicitNameRemoved = (explicitName == null || explicitName.isBlank())
+                    && (previous == null
+                            ? !ctx.isGeneratedPhysicalName(ctx.priorPhysicalId(), r.getLogicalId(), 255, false)
+                            : previous.hasNonNull("LaunchConfigurationName"));
+            if (unchanged && !ctx.changes(LAUNCH_CONFIGURATION, props).requiresReplacement()
+                    && ctx.reusesPriorEntity(name) && !explicitNameRemoved && prior != null) {
+                r.getAttributes().put(LC_PROPERTIES, resolved.toString());
                 return;
             }
             if (explicitName != null && !explicitName.isBlank() && ctx.reusesPriorEntity(name)) {
@@ -233,7 +246,41 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
                         : Boolean.parseBoolean(associatePublicIp), null, mappings, metadata);
         r.setPhysicalId(name);
         r.getAttributes().put("Arn", lc.getLaunchConfigurationArn());
+        r.getAttributes().put(LC_PROPERTIES, resolved.toString());
         ReplacementCleanup.record(r, ctx, before);
+    }
+
+    private JsonNode readLaunchConfigurationProperties(String stored) {
+        try {
+            return MAPPER.readTree(stored);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Invalid persisted launch configuration properties", e);
+        }
+    }
+
+    private boolean legacyLaunchConfigurationMatches(LaunchConfiguration prior, JsonNode props,
+            ProvisionContext ctx, List<LaunchConfigurationBlockDeviceMapping> mappings,
+            LaunchTemplateData.MetadataOptions metadata) {
+        if (prior == null) {
+            return false;
+        }
+        if (ctx.resolveOptional(props, "InstanceId") != null) {
+            JsonNode previous = ctx.priorProperties();
+            // A prior literal template proves the source without resolving old references using new parameters.
+            return previous != null && previous.path("InstanceId").isTextual()
+                    && previous.equals(ctx.engine().resolveNode(props));
+        }
+        String publicIp = ctx.resolveOptional(props, "AssociatePublicIpAddress");
+        Boolean associatePublicIp = publicIp == null || publicIp.isBlank() ? null : Boolean.parseBoolean(publicIp);
+        return Objects.equals(prior.getImageId(), ctx.resolveOptional(props, "ImageId"))
+                && Objects.equals(prior.getInstanceType(), ctx.resolveOptional(props, "InstanceType"))
+                && Objects.equals(prior.getKeyName(), ctx.resolveOptional(props, "KeyName"))
+                && Objects.equals(prior.getSecurityGroups(), ctx.resolveStringList(props, "SecurityGroups"))
+                && Objects.equals(prior.getUserData(), ctx.resolveOptional(props, "UserData"))
+                && Objects.equals(prior.getIamInstanceProfile(), ctx.resolveOptional(props, "IamInstanceProfile"))
+                && Objects.equals(prior.getAssociatePublicIpAddress(), associatePublicIp)
+                && MAPPER.valueToTree(prior.getBlockDeviceMappings()).equals(MAPPER.valueToTree(mappings))
+                && MAPPER.valueToTree(prior.getMetadataOptions()).equals(MAPPER.valueToTree(metadata));
     }
 
     @Override
@@ -350,7 +397,8 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
         MixedInstancesPolicy mixedInstancesPolicy = resolveMixedInstancesPolicy(props, engine);
         int minSize = parseIntProp(props, "MinSize", ctx, 0);
         int maxSize = parseIntProp(props, "MaxSize", ctx, 0);
-        int desiredCapacity = parseIntProp(props, "DesiredCapacity", ctx, 0);
+        Integer desiredCapacity = props != null && props.has("DesiredCapacity")
+                ? parseIntProp(props, "DesiredCapacity", ctx, 0) : null;
         int cooldown = parseIntProp(props, "Cooldown", ctx, 0);
         List<String> availabilityZones = ctx.resolveStringList(props, "AvailabilityZones");
         List<String> subnetIds = ctx.resolveStringList(props, "VPCZoneIdentifier");
@@ -415,7 +463,7 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
             asg = autoScalingService.createAutoScalingGroup(region, name,
                     blankToNull(launchConfigName),
                     blankToNull(launchTemplateId), blankToNull(launchTemplateName), blankToNull(launchTemplateVersion),
-                    mixedInstancesPolicy, minSize, maxSize, desiredCapacity, cooldown,
+                    mixedInstancesPolicy, minSize, maxSize, desiredCapacity != null ? desiredCapacity : minSize, cooldown,
                     availabilityZones, subnetIds,
                     ctx.resolveStringList(props, "TargetGroupARNs"),
                     ctx.resolveStringList(props, "LoadBalancerNames"),

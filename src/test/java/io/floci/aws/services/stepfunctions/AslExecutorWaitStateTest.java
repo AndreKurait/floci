@@ -1,6 +1,8 @@
 package io.floci.aws.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.stepfunctions.model.Execution;
 import io.floci.aws.services.stepfunctions.model.HistoryEvent;
 import io.floci.aws.services.stepfunctions.model.StateMachine;
@@ -12,9 +14,13 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Wait states must honor {@code Seconds}, {@code SecondsPath}, {@code Timestamp}, and
@@ -177,6 +183,104 @@ class AslExecutorWaitStateTest {
         assertTrue(sleeper.sleeps().isEmpty());
     }
 
+    @Test
+    void millisecondCeilingAppliesToEveryWaitForm() {
+        for (String state : List.of(
+                "\"Seconds\":10",
+                "\"SecondsPath\":\"$.seconds\"",
+                "\"Timestamp\":\"2026-01-01T00:00:10Z\"",
+                "\"TimestampPath\":\"$.wake\"",
+                "\"QueryLanguage\":\"JSONata\",\"Seconds\":\"{% $states.input.seconds %}\"",
+                "\"QueryLanguage\":\"JSONata\",\"Timestamp\":\"{% $states.input.wake %}\"")) {
+            RecordingSleeper sleeper = new RecordingSleeper();
+            AslExecutor executor = configuredExecutor(sleeper, 30, 100);
+            Execution execution = run(executor,
+                    "{\"StartAt\":\"W\",\"States\":{\"W\":{\"Type\":\"Wait\",\"End\":true," + state + "}}}",
+                    "{\"seconds\":10,\"wake\":\"2026-01-01T00:00:10Z\"}");
+
+            assertEquals("SUCCEEDED", execution.getStatus(), state);
+            assertEquals(TimeUnit.MILLISECONDS.toNanos(100), sleeper.singleSleep(), state);
+        }
+    }
+
+    @Test
+    void nonPositiveMillisecondsKeepTheSecondsCeiling() {
+        for (long millis : new long[] {0, -1, Long.MIN_VALUE}) {
+            RecordingSleeper sleeper = new RecordingSleeper();
+            run(configuredExecutor(sleeper, 2, millis),
+                    "{\"StartAt\":\"W\",\"States\":{\"W\":{\"Type\":\"Wait\",\"Seconds\":10,\"End\":true}}}", "{}");
+            assertEquals(TimeUnit.SECONDS.toNanos(2), sleeper.singleSleep());
+        }
+    }
+
+    @Test
+    void positiveMillisecondsOverrideTheSecondsSetting() {
+        RecordingSleeper sleeper = new RecordingSleeper();
+        run(configuredExecutor(sleeper, 1, 2000),
+                "{\"StartAt\":\"W\",\"States\":{\"W\":{\"Type\":\"Wait\",\"Seconds\":10,\"End\":true}}}", "{}");
+        assertEquals(TimeUnit.SECONDS.toNanos(2), sleeper.singleSleep());
+    }
+
+    @Test
+    void largeMillisecondCeilingDoesNotOverflowIntoAnImmediateWait() {
+        RecordingSleeper sleeper = new RecordingSleeper();
+        run(configuredExecutor(sleeper, 1, Long.MAX_VALUE),
+                "{\"StartAt\":\"W\",\"States\":{\"W\":{\"Type\":\"Wait\",\"Seconds\":2,\"End\":true}}}", "{}");
+        assertEquals(TimeUnit.SECONDS.toNanos(2), sleeper.singleSleep());
+    }
+
+    @Test
+    void shorterAbsoluteWaitIsNotLengthenedToTheMillisecondCeiling() {
+        RecordingSleeper sleeper = new RecordingSleeper();
+        run(configuredExecutor(sleeper, 30, 100), """
+                {"StartAt":"W","States":{"W":{"Type":"Wait",
+                  "Timestamp":"2026-01-01T00:00:00.050Z","End":true}}}
+                """, "{}");
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(50), sleeper.singleSleep());
+    }
+
+    @Test
+    void subsecondWaitsStillExhaustTheOriginalExecutionBudget() {
+        AtomicLong elapsed = new AtomicLong();
+        AslExecutor executor = AslExecutorFixture.builder()
+                .config(waitConfig(30, 100))
+                .clock(Clock.fixed(NOW, ZoneOffset.UTC))
+                .nanoTime(elapsed::get)
+                .sleeper(elapsed::addAndGet)
+                .build();
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode definition = mapper.createObjectNode().put("StartAt", "W0").put("TimeoutSeconds", 1);
+        ObjectNode states = definition.putObject("States");
+        for (int index = 0; index < 12; index++) {
+            ObjectNode state = states.putObject("W" + index).put("Type", "Wait").put("Seconds", 10);
+            if (index == 11) {
+                state.put("End", true);
+            } else {
+                state.put("Next", "W" + (index + 1));
+            }
+        }
+
+        Execution execution = run(executor, definition.toString(), "{}");
+
+        assertEquals("TIMED_OUT", execution.getStatus());
+        assertEquals(TimeUnit.SECONDS.toNanos(1), elapsed.get());
+    }
+
+    private static AslExecutor configuredExecutor(RecordingSleeper sleeper, int seconds, long millis) {
+        return AslExecutorFixture.builder()
+                .config(waitConfig(seconds, millis))
+                .clock(Clock.fixed(NOW, ZoneOffset.UTC))
+                .sleeper(sleeper)
+                .build();
+    }
+
+    private static EmulatorConfig waitConfig(int seconds, long millis) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().stepfunctions().maxWaitSeconds()).thenReturn(seconds);
+        when(config.services().stepfunctions().maxWaitMillis()).thenReturn(millis);
+        return config;
+    }
+
     private static AslExecutor newExecutor(RecordingSleeper sleeper, int maxWaitSeconds) {
         ObjectMapper objectMapper = new ObjectMapper();
         return AslExecutorFixture.builder()
@@ -224,5 +328,23 @@ class AslExecutorWaitStateTest {
             assertEquals(1, sleeps.size(), "expected exactly one recorded sleep");
             return sleeps.getFirst();
         }
+    }
+
+
+    @Test
+    void timestampCenturiesAwayWaitsTheCappedTimeAndOneCenturiesAgoDoesNotWait() {
+        RecordingSleeper farFuture = new RecordingSleeper();
+        Execution future = run(newExecutor(farFuture, 120), """
+                {"StartAt":"W","States":{"W":{"Type":"Wait","Timestamp":"2400-01-01T00:00:00Z","End":true}}}
+                """, "{}");
+        assertEquals("SUCCEEDED", future.getStatus());
+        assertEquals(TimeUnit.SECONDS.toNanos(120), farFuture.singleSleep());
+
+        RecordingSleeper farPast = new RecordingSleeper();
+        Execution past = run(newExecutor(farPast, 120), """
+                {"StartAt":"W","States":{"W":{"Type":"Wait","Timestamp":"1700-01-01T00:00:00Z","End":true}}}
+                """, "{}");
+        assertEquals("SUCCEEDED", past.getStatus());
+        assertTrue(farPast.sleeps().isEmpty());
     }
 }

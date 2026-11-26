@@ -1131,7 +1131,8 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 "-d", "postgres",
                 "-c", sql
         };
-        execUntilSuccess(containerName, containerId, cmd, "PostgreSQL IAM role");
+        PostgresIamReadiness.await(lifecycleManager.getDockerClient(), containerId, cmd);
+        LOG.infov("Initialized PostgreSQL IAM role in RDS container {0}", containerName);
         return new RdsContainerHandle.PostgresSuperuser(superuser, password);
     }
 

@@ -23,6 +23,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.Resettable;
 import io.floci.aws.core.common.ServicePrincipals;
+import io.floci.aws.core.common.StripedLocks;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.core.resource.ExplorerResource;
@@ -159,16 +160,19 @@ public class S3Service implements Resettable, ResourceProvider {
     private final AtomicLong lastEventSequencer = new AtomicLong();
     private final AtomicLong dataGenerations = new AtomicLong();
 
-    record RequestAuthorization(boolean signed, String accessKeyId, String sessionToken) {
+    record RequestAuthorization(boolean signed, String accessKeyId, String sessionToken,
+                                Boolean secureTransport, String signatureVersion) {
+        RequestAuthorization(boolean signed, String accessKeyId, String sessionToken) {
+            this(signed, accessKeyId, sessionToken, null, null);
+        }
+
+        Map<String, List<String>> signatureConditions() {
+            return signed ? S3SignatureConditions.forAlgorithm(signatureVersion) : Map.of();
+        }
+
         static RequestAuthorization unsigned() {
             return new RequestAuthorization(false, null, null);
         }
-    }
-
-    record SignedPrincipalResourcePolicyEvaluation(
-            ResourcePolicyDecision decision,
-            String resourceOwnerAccountId
-    ) {
     }
 
     private final StorageBackend<String, Bucket> bucketStore;
@@ -186,25 +190,19 @@ public class S3Service implements Resettable, ResourceProvider {
     // copyLegacyFileIfPresent()). Fixed-size stripes keep memory bounded, unlike a per-path
     // map that would need reference counting to ever shrink safely.
     private static final int DISK_FILE_LOCK_STRIPES = 256;
-    private final ReentrantLock[] diskFileLocks = newLockStripes(DISK_FILE_LOCK_STRIPES);
+    private final StripedLocks.Typed<ReentrantLock> diskFileLocks =
+            new StripedLocks.Typed<>(DISK_FILE_LOCK_STRIPES, ReentrantLock::new);
     // Bucket deletion must not sweep an upload while a multipart operation is creating or using it.
     // Read locks preserve parallel multipart writes; fair, fixed stripes avoid writer starvation
     // and retaining a lock for every bucket name ever seen.
-    private final ReentrantReadWriteLock[] multipartBucketLocks = newMultipartBucketLocks(256);
+    private final StripedLocks.Typed<ReentrantReadWriteLock> multipartBucketLocks =
+            new StripedLocks.Typed<>(256, () -> new ReentrantReadWriteLock(true));
     // A second, finer-grained lock prevents part writes, completion and abort from racing on
     // the same upload without serializing independent uploads in the bucket.
-    private final ReentrantLock[] multipartUploadLocks = newLockStripes(256);
-
-    private static ReentrantReadWriteLock[] newMultipartBucketLocks(int count) {
-        ReentrantReadWriteLock[] locks = new ReentrantReadWriteLock[count];
-        for (int i = 0; i < count; i++) {
-            locks[i] = new ReentrantReadWriteLock(true);
-        }
-        return locks;
-    }
+    private final StripedLocks.Typed<ReentrantLock> multipartUploadLocks = new StripedLocks.Typed<>(256, ReentrantLock::new);
 
     private ReentrantReadWriteLock multipartBucketLock(String bucketName) {
-        return multipartBucketLocks[Math.floorMod(bucketName.hashCode(), multipartBucketLocks.length)];
+        return multipartBucketLocks.lockFor(bucketName);
     }
 
     private static <T> T withLock(Lock lock, Supplier<T> operation) {
@@ -236,7 +234,7 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     private ReentrantLock multipartUploadLock(String uploadId) {
-        return multipartUploadLocks[Math.floorMod(uploadId.hashCode(), multipartUploadLocks.length)];
+        return multipartUploadLocks.lockFor(uploadId);
     }
 
     private <T> T withMultipartOperationLock(String bucketName, String uploadId, Supplier<T> operation) {
@@ -247,13 +245,6 @@ public class S3Service implements Resettable, ResourceProvider {
         withMultipartBucketReadLock(bucketName, () -> withLock(multipartUploadLock(uploadId), operation));
     }
 
-    private static ReentrantLock[] newLockStripes(int count) {
-        ReentrantLock[] locks = new ReentrantLock[count];
-        for (int i = 0; i < count; i++) {
-            locks[i] = new ReentrantLock();
-        }
-        return locks;
-    }
     // Memory mode keeps an object in one byte array; this is the largest the JDK reliably allocates.
     static final long MAX_IN_MEMORY_OBJECT_SIZE = Integer.MAX_VALUE - 8;
     // Directory under .multipart where a streamed part or object body is written before it is
@@ -294,10 +285,29 @@ public class S3Service implements Resettable, ResourceProvider {
     private final boolean enforceAuth;
     private final boolean enforceIam;
     private final IamService iamService;
+    private final S3KmsEncryption kmsEncryption;
     private final boolean globalBucketNamespace;
     private final IamPolicyEvaluator policyEvaluator;
     private final Clock clock;
     private final long restoreCompletionDelaySeconds;
+
+    public S3Service(StorageFactory storageFactory, EmulatorConfig config,
+                     SqsService sqsService, SnsService snsService,
+                     Instance<LambdaService> lambdaServiceProvider, EventBridgeService eventBridgeService,
+                     Event<S3ObjectUpdatedEvent> s3UpdatedEvent, RegionResolver regionResolver,
+                     ObjectMapper objectMapper, IamService iamService, Clock clock) {
+        this(storageFactory, config, sqsService, snsService, lambdaServiceProvider,
+                eventBridgeService, s3UpdatedEvent, regionResolver, objectMapper, iamService, clock, null);
+    }
+
+    public S3Service(StorageFactory storageFactory, EmulatorConfig config,
+                     SqsService sqsService, SnsService snsService,
+                     Instance<LambdaService> lambdaServiceProvider, EventBridgeService eventBridgeService,
+                     Event<S3ObjectUpdatedEvent> s3UpdatedEvent, RegionResolver regionResolver,
+                     ObjectMapper objectMapper, IamService iamService, S3KmsEncryption kmsEncryption) {
+        this(storageFactory, config, sqsService, snsService, lambdaServiceProvider,
+                eventBridgeService, s3UpdatedEvent, regionResolver, objectMapper, iamService, Clock.systemUTC(), kmsEncryption);
+    }
 
     @Inject
     public S3Service(StorageFactory storageFactory, EmulatorConfig config,
@@ -307,7 +317,7 @@ public class S3Service implements Resettable, ResourceProvider {
                      Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
                      RegionResolver regionResolver,
                      ObjectMapper objectMapper,
-                     IamService iamService, Clock clock) {
+                     IamService iamService, Clock clock, S3KmsEncryption kmsEncryption) {
         this(
                 storageFactory.create("s3", "s3-buckets.json",
                         new TypeReference<Map<String, Bucket>>() {
@@ -329,7 +339,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 config.effectiveBaseUrl(), objectMapper,
                 config.services().s3().enforceAuth(), config.services().iam().enforcementEnabled(), iamService,
                 config.services().s3().globalBucketNamespace(), clock,
-                config.services().s3().restoreCompletionDelaySeconds()
+                config.services().s3().restoreCompletionDelaySeconds(), kmsEncryption
         );
     }
 
@@ -342,7 +352,7 @@ public class S3Service implements Resettable, ResourceProvider {
                      ObjectMapper objectMapper,
                      IamService iamService) {
         this(storageFactory, config, sqsService, snsService, lambdaServiceProvider,
-                eventBridgeService, s3UpdatedEvent, regionResolver, objectMapper, iamService, Clock.systemUTC());
+                eventBridgeService, s3UpdatedEvent, regionResolver, objectMapper, iamService, Clock.systemUTC(), null);
     }
 
     /**
@@ -353,7 +363,7 @@ public class S3Service implements Resettable, ResourceProvider {
               Path dataRoot, boolean inMemory) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -371,7 +381,7 @@ public class S3Service implements Resettable, ResourceProvider {
               boolean enforceAuth, IamService iamService) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), enforceAuth, false, iamService, false);
+                null, "http://localhost:4566", new ObjectMapper(), enforceAuth, false, iamService, false, null);
     }
 
     /** Package-private constructor for testing account-level Block Public Access persistence. */
@@ -381,7 +391,7 @@ public class S3Service implements Resettable, ResourceProvider {
               Path dataRoot, boolean inMemory) {
         this(bucketStore, objectStore, defaultAnnotationStore(), accountPublicAccessBlockStore,
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     /** Package-private constructor for testing the global-bucket-namespace resolution flag. */
@@ -390,7 +400,7 @@ public class S3Service implements Resettable, ResourceProvider {
               Path dataRoot, boolean inMemory, boolean globalBucketNamespace) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), false, false, null, globalBucketNamespace);
+                null, "http://localhost:4566", new ObjectMapper(), false, false, null, globalBucketNamespace, null);
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -400,7 +410,7 @@ public class S3Service implements Resettable, ResourceProvider {
               RegionResolver regionResolver) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, lambdaService, null, null, null, null,
-                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -410,7 +420,7 @@ public class S3Service implements Resettable, ResourceProvider {
               RegionResolver regionResolver) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, lambdaInvoker, null, null,
-                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     /** In-memory account-level Block Public Access store for the package-private test constructors. */
@@ -456,6 +466,47 @@ public class S3Service implements Resettable, ResourceProvider {
                       RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper,
                       boolean enforceAuth, boolean enforceIam, IamService iamService,
                       boolean globalBucketNamespace, Clock clock, long restoreCompletionDelaySeconds) {
+        this(bucketStore, objectStore, annotationStore, accountPublicAccessBlockStore,
+                dataRoot, inMemory, sqsService, snsService, lambdaService, lambdaServiceProvider,
+                lambdaInvoker, eventBridgeService, s3UpdatedEvent, regionResolver, baseUrl,
+                objectMapper, enforceAuth, enforceIam, iamService, globalBucketNamespace,
+                clock, restoreCompletionDelaySeconds, null);
+    }
+
+    private S3Service(StorageBackend<String, Bucket> bucketStore,
+                      StorageBackend<String, S3Object> objectStore,
+                      AccountAwareStorageBackend<ObjectAnnotation> annotationStore,
+                      AccountAwareStorageBackend<String> accountPublicAccessBlockStore,
+                      Path dataRoot, boolean inMemory, SqsService sqsService, SnsService snsService,
+                      LambdaService lambdaService,
+                      Instance<LambdaService> lambdaServiceProvider,
+                      LambdaInvoker lambdaInvoker,
+                      EventBridgeService eventBridgeService,
+                      Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
+                      RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper,
+                      boolean enforceAuth, boolean enforceIam, IamService iamService,
+                      boolean globalBucketNamespace, S3KmsEncryption kmsEncryption) {
+        this(bucketStore, objectStore, annotationStore, accountPublicAccessBlockStore,
+                dataRoot, inMemory, sqsService, snsService, lambdaService, lambdaServiceProvider,
+                lambdaInvoker, eventBridgeService, s3UpdatedEvent, regionResolver, baseUrl,
+                objectMapper, enforceAuth, enforceIam, iamService, globalBucketNamespace,
+                Clock.systemUTC(), 0, kmsEncryption);
+    }
+
+    private S3Service(StorageBackend<String, Bucket> bucketStore,
+                      StorageBackend<String, S3Object> objectStore,
+                      AccountAwareStorageBackend<ObjectAnnotation> annotationStore,
+                      AccountAwareStorageBackend<String> accountPublicAccessBlockStore,
+                      Path dataRoot, boolean inMemory, SqsService sqsService, SnsService snsService,
+                      LambdaService lambdaService,
+                      Instance<LambdaService> lambdaServiceProvider,
+                      LambdaInvoker lambdaInvoker,
+                      EventBridgeService eventBridgeService,
+                      Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
+                      RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper,
+                      boolean enforceAuth, boolean enforceIam, IamService iamService,
+                      boolean globalBucketNamespace, Clock clock, long restoreCompletionDelaySeconds,
+                      S3KmsEncryption kmsEncryption) {
         this.bucketStore = bucketStore;
         this.objectStore = objectStore;
         this.annotationStore = annotationStore;
@@ -475,10 +526,12 @@ public class S3Service implements Resettable, ResourceProvider {
         this.enforceAuth = enforceAuth;
         this.enforceIam = enforceIam;
         this.iamService = iamService;
+        this.kmsEncryption = kmsEncryption;
         this.globalBucketNamespace = globalBucketNamespace;
         this.policyEvaluator = new IamPolicyEvaluator(objectMapper);
         this.clock = clock;
         this.restoreCompletionDelaySeconds = Math.max(0, restoreCompletionDelaySeconds);
+        S3HistoryKeys.migrate(objectStore);
         if (!inMemory) {
             try {
                 Files.createDirectories(dataRoot);
@@ -489,7 +542,133 @@ public class S3Service implements Resettable, ResourceProvider {
         }
     }
 
+
+    /** A read-only native bucket receipt. It is valid only for the captured local export lifetime. */
+    public record LogExportDestination(String accountId, String region, String bucketName,
+                                       Instant creationDate, Long epoch, String policy) {
+        public List<String> policyDocuments() {
+            return policy == null || policy.isBlank() ? List.of() : List.of(policy);
+        }
+
+        public String objectArn(String key) {
+            return AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "s3", "", bucketName + "/" + key).toString();
+        }
+    }
+
+    private final ConcurrentHashMap<String, Long> logExportEpochs = new ConcurrentHashMap<>();
+    private final AtomicLong logExportEpochSequence = new AtomicLong();
+
+    public LogExportDestination readLogExportDestination(String account, String region, String bucketName) {
+        return withLock(multipartBucketLock(bucketName).readLock(), () -> {
+            Bucket bucket = nativeLogExportBucket(account, region, bucketName);
+            synchronized (bucket) {
+                return new LogExportDestination(account, region, bucketName, bucket.getCreationDate(),
+                        logExportEpochs.get(account + "/" + bucketName), bucket.getPolicy());
+            }
+        });
+    }
+
+    public LogExportDestination admitLogExportDestination(LogExportDestination receipt, String sourceArn,
+                                                           List<String> keys) {
+        return withLock(multipartBucketLock(receipt.bucketName()).writeLock(), () -> {
+            Bucket bucket = currentLogExportBucket(receipt);
+            synchronized (bucket) {
+                for (String key : keys) {
+                    requireLogExportGrant(receipt, bucket, sourceArn, key);
+                }
+                Long epoch = logExportEpochs.computeIfAbsent(receipt.accountId() + "/" + receipt.bucketName(),
+                        ignored -> logExportEpochSequence.incrementAndGet());
+                return new LogExportDestination(receipt.accountId(), receipt.region(), receipt.bucketName(),
+                        bucket.getCreationDate(), epoch, bucket.getPolicy());
+            }
+        });
+    }
+
+    public void writeLogExportObject(LogExportDestination receipt, String sourceArn, String key, byte[] bytes) {
+        S3Object written = RequestScopes.callAs(receipt.accountId(), () ->
+                withLock(multipartBucketLock(receipt.bucketName()).readLock(), () -> {
+                    Bucket bucket = currentLogExportBucket(receipt);
+                    synchronized (bucket) {
+                        requireLogExportGrant(receipt, bucket, sourceArn, key);
+                        // This core never invokes notifications. Both the stripe and monitor are released below.
+                        return storeObjectInternal(receipt.accountId(), bucket, receipt.bucketName(), key,
+                                new BytesBody(bytes), "application/gzip", Map.of(), null, null,
+                                new PutObjectOptions().withAcl("bucket-owner-full-control").withIfNoneMatch("*")
+                                        .withServerSideEncryption(bucket.getEncryptionConfiguration() == null
+                                                || bucket.getEncryptionConfiguration().isBlank() ? null : "AES256"),
+                                null, receipt.accountId(), null);
+                    }
+                }));
+        RequestScopes.runAs(receipt.accountId(), receipt.region(), () ->
+                fireNotifications(receipt.bucketName(), key, "ObjectCreated:Put", written));
+    }
+
+    private Bucket currentLogExportBucket(LogExportDestination receipt) {
+        Bucket bucket = nativeLogExportBucket(receipt.accountId(), receipt.region(), receipt.bucketName());
+        if (!receipt.creationDate().equals(bucket.getCreationDate())
+                || !Objects.equals(receipt.epoch(), logExportEpochs.get(receipt.accountId() + "/" + receipt.bucketName()))) {
+            throw logExportDestinationError("The destination bucket lifetime changed.");
+        }
+        return bucket;
+    }
+
+    private Bucket nativeLogExportBucket(String account, String region, String bucketName) {
+        Optional<Bucket> found;
+        if (bucketStore instanceof AccountAwareStorageBackend<?> raw) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<Bucket> aware = (AccountAwareStorageBackend<Bucket>) raw;
+            found = aware.getForAccount(account, bucketName);
+        } else {
+            found = ownerId().equals(account) ? bucketStore.get(bucketName) : Optional.empty();
+        }
+        Bucket bucket = found.filter(value -> bucketName.equals(value.getName())
+                && region.equals(value.getRegion()) && value.getCreationDate() != null)
+                .orElseThrow(() -> logExportDestinationError(
+                        "The destination must be a native bucket in the source account and Region."));
+        String encryption = bucket.getEncryptionConfiguration();
+        if (encryption != null && !encryption.isBlank()
+                && !XmlParser.extractAll(encryption, "SSEAlgorithm").equals(List.of("AES256"))) {
+            throw logExportDestinationError("This local export supports unencrypted or SSE-S3 destinations only.");
+        }
+        return bucket;
+    }
+
+    private void requireLogExportGrant(LogExportDestination receipt, Bucket bucket, String sourceArn, String key) {
+        if (!AwsArnUtils.isArnFor(sourceArn, "logs")) {
+            throw logExportDestinationError("Invalid export source.");
+        }
+        AwsArnUtils.Arn source = AwsArnUtils.parse(sourceArn);
+        if (!receipt.accountId().equals(source.accountId()) || !receipt.region().equals(source.region())
+                || !source.resource().startsWith("log-group:")) {
+            throw logExportDestinationError("Invalid export source scope.");
+        }
+        String principal = "logs." + receipt.region() + "." + AwsRegions.dnsSuffixFor(receipt.region());
+        Map<String, List<String>> conditions = Map.of(
+                "aws:PrincipalIsAWSService", List.of("true"),
+                "aws:PrincipalServiceName", List.of(principal),
+                "aws:SourceAccount", List.of(receipt.accountId()),
+                "aws:SourceArn", List.of(sourceArn),
+                "aws:ResourceAccount", List.of(receipt.accountId()),
+                "aws:RequestedRegion", List.of(receipt.region()));
+        Map<String, List<String>> writeConditions = new HashMap<>(conditions);
+        writeConditions.put("s3:x-amz-acl", List.of("bucket-owner-full-control"));
+        List<String> policy = bucket.getPolicy() == null ? List.of() : List.of(bucket.getPolicy());
+        String bucketArn = AwsArnUtils.Arn.global(AwsRegions.partitionFor(receipt.region()),
+                "s3", "", receipt.bucketName()).toString();
+        if (policyEvaluator.evaluateServicePrincipal(policy, principal, "s3:GetBucketAcl", bucketArn, conditions)
+                != IamPolicyEvaluator.Decision.ALLOW
+                || policyEvaluator.evaluateServicePrincipal(policy, principal, "s3:PutObject", receipt.objectArn(key), writeConditions)
+                != IamPolicyEvaluator.Decision.ALLOW) {
+            throw logExportDestinationError("The destination policy must allow the regional Logs service to read its ACL and write export objects.");
+        }
+    }
+
+    private static AwsException logExportDestinationError(String message) {
+        return new AwsException("InvalidParameterException", message, 400);
+    }
+
     public void clear() {
+        logExportEpochs.replaceAll((key, epoch) -> logExportEpochSequence.incrementAndGet());
         memoryDataStore.clear();
         memoryAnnotationStore.clear();
         memoryMultipartStore.clear();
@@ -566,6 +745,10 @@ public class S3Service implements Resettable, ResourceProvider {
         return createBucket(bucketName, region, null, null, null, null, null, null, null, true, true);
     }
 
+    public boolean isServiceOwnedBucket(String bucketName) {
+        return bucketStore.get(bucketName).map(Bucket::isServiceOwned).orElse(false);
+    }
+
     private Bucket createBucket(String bucketName, String region, String requestedOwnership,
                                 String cannedAcl, String grantRead, String grantWrite,
                                 String grantFullControl, String grantReadAcp, String grantWriteAcp,
@@ -619,6 +802,7 @@ public class S3Service implements Resettable, ResourceProvider {
         bucket.setOwnershipControlsConfiguration(ownershipControlsXml(ownership));
         bucket.setAcl(requestedAcl);
         bucketStore.put(bucketName, bucket);
+        logExportEpochs.put(ownerId() + "/" + bucketName, logExportEpochSequence.incrementAndGet());
         LOG.infov("Created bucket: {0} in region: {1}", bucketName, region);
         return bucket;
     }
@@ -653,6 +837,7 @@ public class S3Service implements Resettable, ResourceProvider {
             // Multipart operations take the stripe before the bucket monitor, so a delete cannot
             // sweep their temporary parts or miss an upload created just after its scan.
             synchronized (bucket) {
+                logExportEpochs.put(ownerId() + "/" + bucketName, logExportEpochSequence.incrementAndGet());
                 deleteBucketLocked(bucketName, bucket.getVersioningStatus() != null);
             }
             LOG.infov("Deleted bucket: {0}", bucketName);
@@ -773,6 +958,120 @@ public class S3Service implements Resettable, ResourceProvider {
         return bucket.getLoggingConfiguration();
     }
 
+    record AccessLogTarget(String account, String region, String sourceName, Bucket source,
+                           String sourceDocument, S3AccessLogConfiguration configuration, Bucket destination) { }
+
+    /** Captures both incarnations; a later same-name bucket must not inherit queued requests. */
+    AccessLogTarget accessLogTarget(String bucketName) {
+        AccountAwareStorageBackend.OwnedEntry<Bucket> source = resolveBucketEntry(bucketName).orElse(null);
+        if (source == null) {
+            return null;
+        }
+        String document = source.value().getLoggingConfiguration();
+        S3AccessLogConfiguration configuration = S3AccessLogConfiguration.parse(document);
+        if (configuration == null) {
+            return null;
+        }
+        Bucket destination = accessLogBucket(source.account(), configuration.destination());
+        String region = source.value().getRegion();
+        if (destination == null || region == null || !region.equals(destination.getRegion())) {
+            return null;
+        }
+        return new AccessLogTarget(source.account(), region, bucketName, source.value(),
+                document, configuration, destination);
+    }
+
+    private Bucket accessLogBucket(String account, String bucketName) {
+        AccountAwareStorageBackend<Bucket> aware = accountAwareBucketStore();
+        if (aware != null) {
+            return aware.getForAccount(account, bucketName)
+                    .or(() -> aware.getLegacyForAccount(account, bucketName)).orElse(null);
+        }
+        return account.equals(ownerId()) ? bucketStore.get(bucketName).orElse(null) : null;
+    }
+
+    String accessLogRequester(String accessKeyId) {
+        CallerArns caller = resolveCaller(accessKeyId).orElse(null);
+        if (caller == null) {
+            return null;
+        }
+        if (CallerArns.TYPE_ACCOUNT.equals(caller.principalType())) {
+            return AwsCanonicalUserId.forAccount(caller.userId());
+        }
+        // The role-session ARN is a documented log field. The older IAM-user display form
+        // is not reconstructed from a key or username; leave that field unavailable.
+        return CallerArns.TYPE_ASSUMED_ROLE.equals(caller.principalType()) ? caller.callerArn() : null;
+    }
+
+    /** Runs in the source account/Region, independently of the original HTTP request. */
+    void deliverAccessLog(AccessLogTarget target, String key, byte[] bytes) {
+        if (key.getBytes(StandardCharsets.UTF_8).length > 1024
+                || bytes.length > S3AccessLogRecord.MAX_RECORD_BYTES
+                || accessLogBucket(target.account(), target.sourceName()) != target.source()
+                || !target.sourceDocument().equals(target.source().getLoggingConfiguration())) {
+            return;
+        }
+        Bucket destination = target.destination();
+        S3Object object;
+        synchronized (destination) {
+            if (accessLogBucket(target.account(), target.configuration().destination()) != destination
+                    || !target.region().equals(destination.getRegion())
+                    || destination.isObjectLockEnabled() || destination.getDefaultRetention() != null
+                    || "Requester".equals(destination.getRequestPaymentPayer())
+                    || !S3AccessLogConfiguration.supportsDestinationEncryption(destination.getEncryptionConfiguration())
+                    || !allowsAccessLog(target, key)) {
+                return;
+            }
+            AccountAwareStorageBackend.OwnedEntry<Bucket> current =
+                    resolveBucketEntry(target.configuration().destination()).orElse(null);
+            if (current == null || current.value() != destination || !target.account().equals(current.account())) {
+                return;
+            }
+            object = storeObject(current, target.configuration().destination(), key, new BytesBody(bytes),
+                    "text/plain", Map.of(), null, null,
+                    new PutObjectOptions().withServerSideEncryption("AES256"), null, target.account());
+        }
+        fireNotifications(target.configuration().destination(), key, "ObjectCreated:Put", object);
+    }
+
+    private boolean allowsAccessLog(AccessLogTarget target, String key) {
+        Bucket destination = target.destination();
+        String partition = AwsRegions.partitionFor(target.region());
+        String sourceArn = AwsArnUtils.Arn.global(partition, "s3", "", target.sourceName()).toString();
+        String resourceArn = AwsArnUtils.Arn.global(partition, "s3", "",
+                target.configuration().destination() + "/" + key).toString();
+        String principal = ServicePrincipals.of("logging.s3");
+        Map<String, List<String>> context = IamConditionContextResolver.serviceCallContext(
+                principal, resourceArn, target.account(), sourceArn, target.account(), "s3:PutObject");
+        context.put("aws:RequestedRegion", List.of(target.region()));
+        context.put("s3:x-amz-server-side-encryption", List.of("AES256"));
+        String policy = destination.getPolicy();
+        ResourcePolicyDecision decision = policy == null || policy.isBlank()
+                ? ResourcePolicyDecision.NEUTRAL
+                : policyEvaluator.evaluateResourcePolicyFor(List.of(policy), RequestPrincipal.service(principal),
+                        "s3:PutObject", resourceArn, context);
+        if (decision == ResourcePolicyDecision.EXPLICIT_DENY) {
+            return false;
+        }
+        if (decision == ResourcePolicyDecision.ALLOW) {
+            return true;
+        }
+        if (ownershipIsEnforced(destination) || destination.getAcl() == null) {
+            return false;
+        }
+        try {
+            List<S3AclPolicy.Grant> grants = S3AclPolicy.parse(destination.getAcl()).grants().stream()
+                    .filter(grant -> LOG_DELIVERY_GROUP_URI.equals(grant.grantee().uri())).toList();
+            boolean writes = grants.stream().anyMatch(grant -> grant.permission().allowsWrite());
+            boolean readsAcl = grants.stream().anyMatch(grant ->
+                    grant.permission() == S3AclPolicy.Permission.READ_ACP
+                            || grant.permission() == S3AclPolicy.Permission.FULL_CONTROL);
+            return writes && readsAcl;
+        } catch (S3AclPolicy.AclParseException malformed) {
+            return false;
+        }
+    }
+
     public S3Object putObject(String bucketName, String key, byte[] data,
                               String contentType, Map<String, String> metadata) {
         return putObject(bucketName, key, data, contentType, metadata, new PutObjectOptions());
@@ -874,11 +1173,12 @@ public class S3Service implements Resettable, ResourceProvider {
 
         DigestingInputStream digests = new DigestingInputStream(body,
                 digestAlgorithms(checksums, computed), MAX_PUT_OBJECT_SIZE);
-        Path staged = stageBody(digests);
+        AssembledBody stagedBody = stageEncryptedObject(digests, checkedBucket.value(), bucketName, key, effectiveOptions);
+        Path staged = stagedBody.file();
         try {
             checksums.verify(digests.md5(), digests::checksum);
             verifyChunkedTrailers(body, digests, checksums);
-            S3Object object = storeObject(checkedBucket, bucketName, key, new AssembledBody(staged, digests.size()),
+            S3Object object = storeObject(checkedBucket, bucketName, key, stagedBody,
                     contentType, metadata, computedChecksum(digests, computed), null, effectiveOptions,
                     digests.eTag());
             fireNotifications(bucketName, key, "ObjectCreated:Put", object);
@@ -973,6 +1273,15 @@ public class S3Service implements Resettable, ResourceProvider {
                                  String contentType, Map<String, String> metadata,
                                  S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag,
                                  String aclRequestAccount) {
+        return storeObject(checkedBucket, bucketName, key, body, contentType, metadata, checksum,
+                parts, options, eTag, aclRequestAccount, null);
+    }
+
+    private S3Object storeObject(AccountAwareStorageBackend.OwnedEntry<Bucket> checkedBucket,
+                                 String bucketName, String key, ObjectBody body,
+                                 String contentType, Map<String, String> metadata,
+                                 S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag,
+                                 String aclRequestAccount, S3ObjectEncryption capturedEncryption) {
         AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> noSuchBucket());
         Bucket bucket = ownedBucket.value();
@@ -984,7 +1293,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 throw noSuchBucket();
             }
             return storeObjectInternal(ownedBucket.account(), bucket, bucketName, key, body,
-                    contentType, metadata, checksum, parts, options, eTag, aclRequestAccount);
+                    contentType, metadata, checksum, parts, options, eTag, aclRequestAccount, capturedEncryption);
         }
     }
 
@@ -994,9 +1303,11 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     private sealed interface ObjectBody permits BytesBody, AssembledBody {
         long size();
+        default S3KmsEnvelope envelope() { return null; }
     }
 
-    private record BytesBody(byte[] data) implements ObjectBody {
+    private record BytesBody(byte[] data, S3KmsEnvelope reuseKey) implements ObjectBody {
+        private BytesBody(byte[] data) { this(data, null); }
         @Override
         public long size() {
             return data.length;
@@ -1009,19 +1320,24 @@ public class S3Service implements Resettable, ResourceProvider {
      * out beforehand, since computing either here would mean reading the whole file under the bucket
      * lock.
      */
-    private record AssembledBody(Path file, long size) implements ObjectBody { }
+    private record AssembledBody(Path file, long size, S3KmsEnvelope envelope) implements ObjectBody {
+        private AssembledBody(Path file, long size) { this(file, size, null); }
+    }
 
     private S3Object storeObjectInternal(String bucketOwnerAccount, Bucket bucket,
                                          String bucketName, String key, ObjectBody body,
                                          String contentType, Map<String, String> metadata,
                                          S3Checksum checksum, List<Part> parts, PutObjectOptions options,
-                                         String eTag, String aclRequestAccount) {
+                                         String eTag, String aclRequestAccount, S3ObjectEncryption capturedEncryption) {
         PutObjectOptions effectiveOptions = options != null ? options : new PutObjectOptions();
         String normalizedServerSideEncryption = normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption());
         SseCustomerKey sseCustomerKey = validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(), effectiveOptions.getSseCustomerKey(), effectiveOptions.getSseCustomerKeyMd5());
         rejectConflictingServerSideEncryption(normalizedServerSideEncryption, sseCustomerKey);
         rejectBlockedSseCustomerEncryption(bucket, bucketName, key, sseCustomerKey);
         rejectKmsKeyIdWithoutKmsEncryption(normalizedServerSideEncryption, effectiveOptions.getSseKmsKeyId());
+        S3ObjectEncryption encryption = capturedEncryption != null ? capturedEncryption
+                : S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
+                        normalizedServerSideEncryption, effectiveOptions.getSseKmsKeyId(), sseCustomerKey != null);
         checkWritePreconditions(bucketName, key, effectiveOptions.getIfMatch(), effectiveOptions.getIfNoneMatch());
 
         byte[] data = body instanceof BytesBody bytes ? bytes.data() : null;
@@ -1044,13 +1360,8 @@ public class S3Service implements Resettable, ResourceProvider {
         object.setContentEncoding(effectiveOptions.getContentEncoding());
         object.setContentDisposition(effectiveOptions.getContentDisposition());
         object.setCacheControl(effectiveOptions.getCacheControl());
-        // An object written with neither an encryption header nor an SSE-C key is encrypted with the
-        // bucket's default encryption.
-        ObjectEncryption encryption = normalizedServerSideEncryption == null && sseCustomerKey == null
-                ? defaultEncryption(bucket)
-                : new ObjectEncryption(normalizedServerSideEncryption, effectiveOptions.getSseKmsKeyId());
         object.setServerSideEncryption(encryption.algorithm());
-        object.setSseKmsKeyId(encryption.keptKmsKeyId());
+        object.setSseKmsKeyId(encryption.kmsKeyId());
         if (sseCustomerKey != null) {
             object.setSseCustomerAlgorithm(sseCustomerKey.algorithm());
             object.setSseCustomerKeyMd5(sseCustomerKey.keyMd5());
@@ -1077,6 +1388,29 @@ public class S3Service implements Resettable, ResourceProvider {
         // write order used by in-memory promotion. A failed body write may consume a value, which
         // is harmless because sequencers only need to be monotonic for writes that become visible.
         object.setEventSequencer(nextEventSequencer());
+        if ("aws:kms".equals(encryption.algorithm())) {
+            S3KmsEnvelope envelope = body.envelope();
+            if (envelope == null) {
+                try (S3KmsEncryption.Material material = body instanceof BytesBody bytes && bytes.reuseKey() != null
+                        ? kms().nextBody(bytes.reuseKey())
+                        : kms().generate(bucketName, key, encryption.kmsKeyId(), bucket.getRegion())) {
+                    envelope = material.envelope();
+                    if (body instanceof AssembledBody assembled) {
+                        encryptFile(assembled.file(), material);
+                        body = new AssembledBody(assembled.file(), assembled.size(), envelope);
+                    } else {
+                        try (InputStream encrypted = kms().encrypt(new ByteArrayInputStream(data), material)) {
+                            data = encrypted.readAllBytes();
+                        } catch (IOException error) {
+                            throw new UncheckedIOException("Failed to encrypt the S3 object", error);
+                        }
+                    }
+                }
+            }
+            object.setKmsEnvelope(envelope);
+            object.setSseKmsKeyId(envelope.keyArn());
+        }
+
 
         if (bucket.isVersioningEnabled()) {
             String versionId = UUID.randomUUID().toString();
@@ -1209,6 +1543,61 @@ public class S3Service implements Resettable, ResourceProvider {
             LOG.debugv("Put object: {0}/{1} ({2} bytes)", bucketName, key, body.size());
         }
         return object;
+    }
+
+    private S3KmsEncryption kms() {
+        if (kmsEncryption == null) {
+            throw new IllegalStateException("SSE-KMS requires the native KMS integration");
+        }
+        return kmsEncryption;
+    }
+
+    private AssembledBody stageEncryptedObject(DigestingInputStream plaintext, Bucket bucket,
+                                                String bucketName, String key, PutObjectOptions options) {
+        S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
+                normalizeServerSideEncryption(options.getServerSideEncryption()), options.getSseKmsKeyId(),
+                options.getSseCustomerKey() != null);
+        options.withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId());
+        if (!"aws:kms".equals(encryption.algorithm())) {
+            Path file = stageBody(plaintext);
+            return new AssembledBody(file, plaintext.size());
+        }
+        try (S3KmsEncryption.Material material = kms().generate(bucketName, key, encryption.kmsKeyId(), bucket.getRegion());
+                InputStream encrypted = kms().encrypt(plaintext, material)) {
+            Path file = stageBody(encrypted);
+            options.withSseKmsKeyId(material.envelope().keyArn());
+            return new AssembledBody(file, plaintext.size(), material.envelope());
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to stage encrypted object", error);
+        }
+    }
+
+    private AssembledBody stageEncryptedPart(DigestingInputStream plaintext, MultipartUpload upload) {
+        if (!"aws:kms".equals(upload.effectiveServerSideEncryption())) {
+            Path file = stageBody(plaintext);
+            return new AssembledBody(file, plaintext.size());
+        }
+        try (S3KmsEncryption.Material material = kms().nextBody(upload.getKmsEnvelope());
+                InputStream encrypted = kms().encrypt(plaintext, material)) {
+            Path file = stageBody(encrypted);
+            return new AssembledBody(file, plaintext.size(), material.envelope());
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to stage encrypted multipart part", error);
+        }
+    }
+
+    private void encryptFile(Path file, S3KmsEncryption.Material material) {
+        Path encrypted = null;
+        try (InputStream raw = Files.newInputStream(file); InputStream body = kms().encrypt(raw, material)) {
+            encrypted = stageBody(body);
+            moveIntoPlace(encrypted, file);
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to encrypt staged S3 body", error);
+        } finally {
+            if (encrypted != null) {
+                deleteQuietly(encrypted, "encrypted body that was not stored");
+            }
+        }
     }
 
     private void checkWritePreconditions(String bucketName, String key, String ifMatch, String ifNoneMatch) {
@@ -1706,7 +2095,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 RequestPrincipal.caller(caller),
                 action,
                 resourceArn,
-                bucketPolicyContext(caller, requestConditions));
+                bucketPolicyContext(caller, authorization, requestConditions));
 
         if (decision == ResourcePolicyDecision.EXPLICIT_DENY) {
             throw accessDeniedException(bucketName, key);
@@ -1753,7 +2142,7 @@ public class S3Service implements Resettable, ResourceProvider {
      * the request itself offers, such as an object creation's tags and Object Lock settings.
      * {@code aws:CurrentTime} and {@code aws:EpochTime} are there as on every request.
      */
-    private static Map<String, List<String>> bucketPolicyContext(CallerArns caller,
+    private static Map<String, List<String>> bucketPolicyContext(CallerArns caller, RequestAuthorization authorization,
                                                                  Map<String, List<String>> requestConditions) {
         Map<String, List<String>> context = new HashMap<>();
         if (requestConditions != null) {
@@ -1761,6 +2150,12 @@ public class S3Service implements Resettable, ResourceProvider {
         }
         context.put("aws:PrincipalIsAWSService", List.of("false"));
         IamConditionContextResolver.putRequestTime(context);
+        if (authorization != null && authorization.secureTransport() != null) {
+            context.put("aws:SecureTransport", List.of(authorization.secureTransport().toString()));
+        }
+        if (authorization != null) {
+            context.putAll(authorization.signatureConditions());
+        }
         if (caller != null) {
             caller.putPrincipalKeys(context);
         }
@@ -1785,6 +2180,12 @@ public class S3Service implements Resettable, ResourceProvider {
     private static AwsException accessDeniedException(String bucketName, String key) {
         String resourcePath = key != null ? "/" + bucketName + "/" + key : "/" + bucketName;
         return new AwsException("AccessDenied", "Access Denied", 403, Map.of("Resource", resourcePath));
+    }
+
+    record SignedPrincipalResourcePolicyEvaluation(
+            ResourcePolicyDecision decision,
+            String resourceOwnerAccountId
+    ) {
     }
 
     SignedPrincipalResourcePolicyEvaluation signedPrincipalResourcePolicyDecision(
@@ -1812,7 +2213,7 @@ public class S3Service implements Resettable, ResourceProvider {
                         RequestPrincipal.caller(caller.get()),
                         action,
                         resourceArn,
-                        bucketPolicyContext(caller.get(), null));
+                        bucketPolicyContext(caller.get(), authorization, null));
         return new SignedPrincipalResourcePolicyEvaluation(decision, ownedBucket.account());
     }
 
@@ -1978,6 +2379,20 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public S3Object getObject(String bucketName, String key, String versionId) {
+        S3Object object = readStoredBody(bucketName, key, versionId);
+        if ("aws:kms".equals(object.getServerSideEncryption())) {
+            S3KmsEncryption.requireEnvelope(object.getKmsEnvelope());
+            try (InputStream plaintext = kms().decrypt(new ByteArrayInputStream(object.getData()),
+                    object.getKmsEnvelope(), object.getSize())) {
+                object.setData(plaintext.readAllBytes());
+            } catch (IOException error) {
+                throw new UncheckedIOException("Failed to decrypt the S3 object", error);
+            }
+        }
+        return object;
+    }
+
+    private S3Object readStoredBody(String bucketName, String key, String versionId) {
         if ("null".equals(versionId)) {
             Snapshot<byte[]> snapshot = readNullVersionSnapshot(bucketName, key,
                     location -> location.archived()
@@ -2202,10 +2617,10 @@ public class S3Service implements Resettable, ResourceProvider {
                 resolveVersionedPathForRead(bucketOwnerAccount, bucketName, key, versionId)));
     }
 
-    private static ObjectRead objectRead(S3Object obj, FileChannel channel) {
+    private ObjectRead objectRead(S3Object obj, FileChannel channel) {
         try {
             long fileSize = channel.size();
-            if (fileSize != obj.getSize()) {
+            if (fileSize != S3KmsEncryption.storedSize(obj.getSize(), obj.getKmsEnvelope())) {
                 throw new IllegalStateException("S3 object file for " + obj.getBucketName() + "/"
                         + obj.getKey() + " has " + fileSize + " bytes but metadata declares "
                         + obj.getSize() + "; serving it would corrupt the response framing");
@@ -2217,7 +2632,17 @@ public class S3Service implements Resettable, ResourceProvider {
             closeQuietly(channel);
             throw e;
         }
-        return new ObjectRead(obj, Channels.newInputStream(channel));
+        InputStream raw = Channels.newInputStream(channel);
+        try {
+            if ("aws:kms".equals(obj.getServerSideEncryption())) {
+                S3KmsEncryption.requireEnvelope(obj.getKmsEnvelope());
+            }
+            return new ObjectRead(obj, "aws:kms".equals(obj.getServerSideEncryption())
+                    ? kms().decrypt(raw, obj.getKmsEnvelope(), obj.getSize()) : raw);
+        } catch (RuntimeException error) {
+            closeQuietly(channel);
+            throw error;
+        }
     }
 
     private static FileChannel openForRead(Path path) {
@@ -2269,30 +2694,7 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public InputStream openObjectStream(String bucketName, String key, String versionId) {
-        if ("null".equals(versionId)) {
-            return openObject(bucketName, key, versionId).body();
-        }
-        getObjectMetadata(bucketName, key, versionId);
-        String bucketOwnerAccount = resolveBucketEntry(bucketName)
-                .orElseThrow(() -> noSuchBucket())
-                .account();
-        if (inMemory) {
-            byte[] data = versionId != null
-                    ? memoryDataStore.get(physicalVersionedKey(bucketOwnerAccount, bucketName, key, versionId))
-                    : memoryDataStore.get(physicalKey(bucketOwnerAccount, bucketName, key));
-            if (data == null) {
-                throw new IllegalStateException("S3 object data is missing for " + bucketName + "/" + key);
-            }
-            return new ByteArrayInputStream(data);
-        }
-        try {
-            Path path = versionId != null
-                    ? resolveVersionedPathForRead(bucketOwnerAccount, bucketName, key, versionId)
-                    : resolveObjectPathForRead(bucketOwnerAccount, bucketName, key);
-            return Files.newInputStream(path);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to open S3 object stream", e);
-        }
+        return openObject(bucketName, key, versionId).body();
     }
 
     public S3Object getObjectMetadata(String bucketName, String key, String versionId) {
@@ -2812,13 +3214,13 @@ public class S3Service implements Resettable, ResourceProvider {
             String account = globalBucketNamespace ? bucketOwnerAccount : typed.accountId();
             String rawPrefix = AccountAwareStorageBackend.rawKey(account, fullPrefix);
             String rawNullPrefix = AccountAwareStorageBackend.rawKey(account, nullPrefix);
-            int keyStart = account.length() + 1;
+            String rawHistoryPrefix = AccountAwareStorageBackend.rawKey(account, S3HistoryKeys.prefix(bucketName));
             return typed.scanRaw(raw -> raw.startsWith(rawPrefix)
-                    && raw.indexOf("#v#", keyStart) < 0
+                    && !raw.startsWith(rawHistoryPrefix)
                     && !raw.startsWith(rawNullPrefix));
         }
         return objectStore.scan(key -> key.startsWith(fullPrefix)
-                && !key.contains("#v#")
+                && !key.startsWith(S3HistoryKeys.prefix(bucketName))
                 && !key.startsWith(nullPrefix));
     }
 
@@ -3041,7 +3443,15 @@ public class S3Service implements Resettable, ResourceProvider {
             deleteQuietly(pinned, "pinned copy source whose size could not be read");
             throw new UncheckedIOException("Failed to read the copy source", e);
         }
-        if (fileSize != obj.getSize()) {
+        if ("aws:kms".equals(obj.getServerSideEncryption())) {
+            try {
+                S3KmsEncryption.requireEnvelope(obj.getKmsEnvelope());
+            } catch (RuntimeException error) {
+                deleteQuietly(pinned, "pinned legacy plaintext SSE-KMS source");
+                throw error;
+            }
+        }
+        if (fileSize != S3KmsEncryption.storedSize(obj.getSize(), obj.getKmsEnvelope())) {
             deleteQuietly(pinned, "pinned copy source whose size does not match its metadata");
             throw new IllegalStateException("S3 object file for " + obj.getBucketName() + "/"
                     + obj.getKey() + " has " + fileSize + " bytes but metadata declares " + obj.getSize());
@@ -3075,10 +3485,39 @@ public class S3Service implements Resettable, ResourceProvider {
      * of its bytes and stays, while a multipart one's has to be computed; the source's checksum
      * stays unless a new or composite one has to become a full-object checksum.
      */
-    private CopyBody copyBody(CopySource source, S3Checksum effectiveChecksum, ChecksumAlgorithm copyChecksumAlgorithm) {
+    private CopyBody copyBody(CopySource source, S3Checksum effectiveChecksum, ChecksumAlgorithm copyChecksumAlgorithm,
+                              String destinationBucket, String destinationKey, CopyObjectOptions options) {
         S3Object object = source.object();
         if (source.pinnedFile() == null) {
             return new CopyBody(new BytesBody(object.getData()), null, effectiveChecksum);
+        }
+        Bucket bucket = requireBucket(destinationBucket);
+        S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
+                options.getServerSideEncryption(), options.getSseKmsKeyId(), options.getSseCustomerKey() != null);
+        if ("aws:kms".equals(object.getServerSideEncryption()) || "aws:kms".equals(encryption.algorithm())) {
+            Path staged = null;
+            try (InputStream stored = Files.newInputStream(source.pinnedFile());
+                    InputStream plaintext = "aws:kms".equals(object.getServerSideEncryption())
+                            ? kms().decrypt(stored, object.getKmsEnvelope(), object.getSize()) : stored) {
+                DigestingInputStream digests = new DigestingInputStream(plaintext,
+                        copyChecksumAlgorithm == null ? List.of() : List.of(copyChecksumAlgorithm), MAX_COPY_OBJECT_SOURCE_SIZE);
+                PutObjectOptions destination = new PutObjectOptions()
+                        .withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId())
+                        .withSseCustomerAlgorithm(options.getSseCustomerAlgorithm())
+                        .withSseCustomerKey(options.getSseCustomerKey())
+                        .withSseCustomerKeyMd5(options.getSseCustomerKeyMd5());
+                AssembledBody body = stageEncryptedObject(digests, bucket, destinationBucket, destinationKey, destination);
+                staged = body.file();
+                moveIntoPlace(staged, source.pinnedFile());
+                return new CopyBody(new AssembledBody(source.pinnedFile(), body.size(), body.envelope()), digests.eTag(),
+                        copyChecksumAlgorithm == null ? effectiveChecksum : computedChecksum(digests, copyChecksumAlgorithm));
+            } catch (IOException error) {
+                throw new UncheckedIOException("Failed to prepare encrypted copy", error);
+            } finally {
+                if (staged != null) {
+                    deleteQuietly(staged, "encrypted copy staging file");
+                }
+            }
         }
         boolean needsETag = !SINGLE_PART_ETAG.matcher(stripSurroundingQuotes(object.getETag())).matches();
         S3Checksum.Calculator calculator = effectiveChecksum == null ? S3Checksum.calculator(copyChecksumAlgorithm) : null;
@@ -3161,6 +3600,7 @@ public class S3Service implements Resettable, ResourceProvider {
         snapshot.put("lifecycleConfiguration", bucket.getLifecycleConfiguration());
         snapshot.put("transitionDefaultMinimumObjectSize", bucket.getTransitionDefaultMinimumObjectSize());
         snapshot.put("ownershipControlsConfiguration", bucket.getOwnershipControlsConfiguration());
+        snapshot.put("loggingConfiguration", bucket.getLoggingConfiguration());
         snapshot.set("tags", objectMapper.valueToTree(bucket.getTags()));
         snapshot.set("notificationConfiguration", objectMapper.valueToTree(bucket.getNotificationConfiguration()));
         return snapshot.toString();
@@ -3191,6 +3631,7 @@ public class S3Service implements Resettable, ResourceProvider {
         String lifecycle = snapshotText(snapshot, "lifecycleConfiguration");
         String transitionSize = snapshotText(snapshot, "transitionDefaultMinimumObjectSize");
         String ownership = snapshotText(snapshot, "ownershipControlsConfiguration");
+        String logging = snapshot.has("loggingConfiguration") ? snapshotText(snapshot, "loggingConfiguration") : null;
         if (!snapshot.path("publicAccessBlockDeleted").isBoolean()) {
             throw new IllegalArgumentException("Missing bucket public access block snapshot state");
         }
@@ -3204,6 +3645,9 @@ public class S3Service implements Resettable, ResourceProvider {
         bucket.setLifecycleConfiguration(lifecycle);
         bucket.setTransitionDefaultMinimumObjectSize(transitionSize);
         bucket.setOwnershipControlsConfiguration(ownership);
+        if (snapshot.has("loggingConfiguration")) {
+            bucket.setLoggingConfiguration(logging);
+        }
         bucket.setTags(tags);
         bucket.setNotificationConfiguration(notifications);
         bucketStore.put(bucketName, bucket);
@@ -3246,21 +3690,23 @@ public class S3Service implements Resettable, ResourceProvider {
         String versionPrefix = bucketName + "/";
         String fullPrefix = prefix != null ? versionPrefix + prefix : versionPrefix;
 
-        // Scan for versioned entries (contain #v#)
+        // History uses a reserved namespace; filter its public keys after reading the metadata.
         List<S3Object> versions = new ArrayList<>(objectStore.scan(key ->
-                key.startsWith(fullPrefix)
-                        && key.contains("#v#")
-                        && !key.startsWith(nullVersionPrefix(bucketName))));
+                key.startsWith(S3HistoryKeys.prefix(bucketName))).stream()
+                .filter(object -> prefix == null || object.getKey().startsWith(prefix))
+                .toList());
         objectStore.scan(key -> key.startsWith(nullVersionPrefix(bucketName)))
                 .stream()
                 .filter(object -> prefix == null || object.getKey().startsWith(prefix))
                 .forEach(versions::add);
 
-        // Also include non-versioned objects (no #v# in storage key, versionId == null).
+        // Also include non-versioned current objects (versionId == null).
         // These are objects uploaded when versioning was disabled or before versioning was enabled.
         // Versioned latest-pointer entries (also stored at the plain key) are excluded because
-        // they have a non-null versionId; their #v# entry is already captured above.
-        objectStore.scan(key -> key.startsWith(fullPrefix) && !key.contains("#v#"))
+        // they have a non-null versionId; their history entry is already captured above.
+        objectStore.scan(key -> key.startsWith(fullPrefix)
+                        && !key.startsWith(S3HistoryKeys.prefix(bucketName))
+                        && !key.startsWith(nullVersionPrefix(bucketName)))
                 .stream()
                 .filter(obj -> obj.getVersionId() == null)
                 // A promoted null version is indexed under both the plain latest key and its
@@ -4831,6 +5277,8 @@ public class S3Service implements Resettable, ResourceProvider {
             SseCustomerKey customerKey = validateSseCustomerKey(sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
             rejectConflictingServerSideEncryption(normalizedServerSideEncryption, customerKey);
             rejectBlockedSseCustomerEncryption(destination, bucket, key, customerKey);
+            S3ObjectEncryption encryption = S3ObjectEncryption.resolve(destination.getEncryptionConfiguration(),
+                    normalizedServerSideEncryption, sseKmsKeyId, customerKey != null);
             MultipartUpload upload = new MultipartUpload(bucket, key, contentType);
             upload.setUploadId(orderedMultipartUploadId(upload.getInitiated(), upload.getUploadId()));
             upload.setOwnerAccountId(getBucketOwnerAccountId(bucket));
@@ -4846,9 +5294,18 @@ public class S3Service implements Resettable, ResourceProvider {
             upload.setServerSideEncryption(requested.algorithm());
             upload.setSseKmsKeyId(requested.keptKmsKeyId());
             if (normalizedServerSideEncryption == null && customerKey == null) {
-                ObjectEncryption encryption = defaultEncryption(destination);
                 upload.setDefaultServerSideEncryption(encryption.algorithm());
-                upload.setDefaultSseKmsKeyId(encryption.keptKmsKeyId());
+                upload.setDefaultSseKmsKeyId(encryption.kmsKeyId());
+            }
+            if ("aws:kms".equals(encryption.algorithm())) {
+                try (S3KmsEncryption.Material material = kms().generate(bucket, key, encryption.kmsKeyId(), destination.getRegion())) {
+                    upload.setKmsEnvelope(material.envelope());
+                    if (normalizedServerSideEncryption == null) {
+                        upload.setDefaultSseKmsKeyId(material.envelope().keyArn());
+                    } else {
+                        upload.setSseKmsKeyId(material.envelope().keyArn());
+                    }
+                }
             }
             if (customerKey != null) {
                 upload.setSseCustomerAlgorithm(customerKey.algorithm());
@@ -4913,6 +5370,17 @@ public class S3Service implements Resettable, ResourceProvider {
 
             // Each upload of a part gets its own storage, so a record and the bytes it describes are
             // published together and never change: a re-upload adds new bytes and drops the old ones.
+            byte[] stored = data;
+            S3KmsEnvelope envelope = null;
+            if ("aws:kms".equals(upload.effectiveServerSideEncryption())) {
+                try (S3KmsEncryption.Material material = kms().nextBody(upload.getKmsEnvelope());
+                        InputStream encrypted = kms().encrypt(new ByteArrayInputStream(data), material)) {
+                    stored = encrypted.readAllBytes();
+                    envelope = material.envelope();
+                } catch (IOException error) {
+                    throw new UncheckedIOException("Failed to encrypt multipart part", error);
+                }
+            }
             String storageId = partNumber + "-" + UUID.randomUUID();
             if (inMemory) {
                 // A re-uploaded part number replaces its earlier part, so that part does not count.
@@ -4921,11 +5389,11 @@ public class S3Service implements Resettable, ResourceProvider {
                         .mapToLong(Part::getSize)
                         .sum();
                 requireFitsInMemory("Multipart upload " + uploadId, otherParts + data.length);
-                memoryMultipartStore.get(uploadId).put(storageId, data);
+                memoryMultipartStore.get(uploadId).put(storageId, stored);
             } else {
                 Path partPath = dataRoot.resolve(".multipart").resolve(uploadId).resolve(storageId);
                 try {
-                    Files.write(partPath, data, StandardOpenOption.CREATE_NEW);
+                    Files.write(partPath, stored, StandardOpenOption.CREATE_NEW);
                 } catch (IOException e) {
                     throw new UncheckedIOException("Failed to write multipart part", e);
                 }
@@ -4935,6 +5403,7 @@ public class S3Service implements Resettable, ResourceProvider {
             Part part = new Part(partNumber, eTag, data.length);
             part.setChecksum(S3Checksum.of(upload.getChecksumAlgorithm(), data));
             part.setStorageId(storageId);
+            part.setKmsEnvelope(envelope);
             Part replaced = upload.getParts().put(partNumber, part);
             if (replaced != null) {
                 discardPartBytes(uploadId, replaced);
@@ -4958,23 +5427,25 @@ public class S3Service implements Resettable, ResourceProvider {
                    UploadChecksums checksums,
                    String sseCustomerAlgorithm, String sseCustomerKey, String sseCustomerKeyMd5) {
         checksums.requireWellFormedContentMd5();
-        ChecksumAlgorithm declared = withMultipartOperationLock(bucket, uploadId, () -> {
+        MultipartUpload selectedUpload = withMultipartOperationLock(bucket, uploadId, () -> {
             MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
             if (partNumber < 1 || partNumber > 10000) {
                 throw PartRange.invalidPartNumber(Integer.toString(partNumber));
             }
             validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
-            return upload.getChecksumAlgorithm();
+            return upload;
         });
         if (inMemory) {
             byte[] data = readVerified(body, checksums, "Multipart upload " + uploadId, -1, null).data();
             return storePart(bucket, key, uploadId, partNumber, data,
                     sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
         }
+        ChecksumAlgorithm declared = selectedUpload.getChecksumAlgorithm();
         ChecksumAlgorithm algorithm = declared != null ? declared : ChecksumAlgorithm.CRC64NVME;
         DigestingInputStream digests = new DigestingInputStream(body,
                 digestAlgorithms(checksums, algorithm), MAX_PART_SIZE);
-        Path staged = stageBody(digests);
+        AssembledBody stagedBody = stageEncryptedPart(digests, selectedUpload);
+        Path staged = stagedBody.file();
         try {
             checksums.verify(digests.md5(), digests::checksum);
             verifyChunkedTrailers(body, digests, checksums);
@@ -4992,6 +5463,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 Part part = new Part(partNumber, digests.eTag(), digests.size());
                 part.setChecksum(partChecksum);
                 part.setStorageId(storageId);
+                part.setKmsEnvelope(stagedBody.envelope());
                 Part replaced = upload.getParts().put(partNumber, part);
                 if (replaced != null) {
                     discardPartBytes(uploadId, replaced);
@@ -5365,11 +5837,11 @@ public class S3Service implements Resettable, ResourceProvider {
                 }
 
                 ObjectBody body = inMemory
-                        ? new BytesBody(concatenateParts(uploadId, parts))
+                        ? new BytesBody(concatenateParts(uploadId, parts), upload.getKmsEnvelope())
                         : assembleParts(uploadId, parts);
                 S3Object object;
                 try {
-                    object = storeObject(bucket, key, body, upload.getContentType(), upload.getMetadata(),
+                    object = storeObject(null, bucket, key, body, upload.getContentType(), upload.getMetadata(),
                             checksum, completedParts,
                             new PutObjectOptions()
                                     .withStorageClass(upload.getStorageClass())
@@ -5391,7 +5863,8 @@ public class S3Service implements Resettable, ResourceProvider {
                                     .withIfMatch(ifMatch)
                                     .withIfNoneMatch(ifNoneMatch),
                             compositeETag,
-                            upload.getInitiatorAccountId() != null ? upload.getInitiatorAccountId() : ownerId());
+                            upload.getInitiatorAccountId() != null ? upload.getInitiatorAccountId() : ownerId(),
+                            new S3ObjectEncryption(upload.effectiveServerSideEncryption(), upload.effectiveSseKmsKeyId()));
                 } finally {
                     // A stored body was moved away, so this only removes the file of a failed store and
                     // leaves the parts in place for a retry or an abort.
@@ -5402,7 +5875,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 if (upload.getSseCustomerAlgorithm() != null) {
                     object.setSseCustomerAlgorithm(upload.getSseCustomerAlgorithm());
                     object.setSseCustomerKeyMd5(upload.getSseCustomerKeyMd5());
-                    // Encrypted with the customer's key, not the bucket default the store applied.
+                    // Retain the customer-key metadata captured when the upload began.
                     object.setServerSideEncryption(null);
                     object.setSseKmsKeyId(null);
                 }
@@ -5446,7 +5919,7 @@ public class S3Service implements Resettable, ResourceProvider {
      * Copies the in-memory bytes of {@code parts}, in order, into one array sized to the total
      * upload. The total is measured on the arrays being copied, so it holds whatever the records say.
      */
-    private byte[] concatenateParts(String uploadId, List<Part> parts) {
+    private byte[] concatenateUnencryptedParts(String uploadId, List<Part> parts) {
         Map<String, byte[]> memoryParts = memoryMultipartStore.getOrDefault(uploadId, Map.of());
         byte[][] partData = new byte[parts.size()][];
         long totalSize = 0;
@@ -5473,7 +5946,7 @@ public class S3Service implements Resettable, ResourceProvider {
      * whatever its size, and it happens before the bucket lock is taken. The file name is unique
      * per call, so two Completes racing on one upload never write the same file.
      */
-    private AssembledBody assembleParts(String uploadId, List<Part> parts) throws IOException {
+    private AssembledBody assembleUnencryptedParts(String uploadId, List<Part> parts) throws IOException {
         Path partsDir = dataRoot.resolve(".multipart").resolve(uploadId);
         Path assembled = partsDir.resolve("assembled-" + UUID.randomUUID());
         long totalSize = 0;
@@ -5491,6 +5964,108 @@ public class S3Service implements Resettable, ResourceProvider {
             throw e;
         }
         return new AssembledBody(assembled, totalSize);
+    }
+
+    private byte[] concatenateParts(String uploadId, List<Part> parts) {
+        if (!"aws:kms".equals(multipartUploads.get(uploadId).effectiveServerSideEncryption())) {
+            return concatenateUnencryptedParts(uploadId, parts);
+        }
+        try (InputStream body = multipartBody(uploadId, parts)) {
+            return body.readAllBytes();
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to read encrypted multipart parts", error);
+        }
+    }
+
+    /**
+     * Copies the part files, in order, into one file in the upload's directory for storeObject to
+     * move into place. The copy runs file to file, so the object never passes through the heap
+     * whatever its size, and it happens before the bucket lock is taken. The file name is unique
+     * per call, so two Completes racing on one upload never write the same file.
+     */
+    private AssembledBody assembleParts(String uploadId, List<Part> parts) throws IOException {
+        if (!"aws:kms".equals(multipartUploads.get(uploadId).effectiveServerSideEncryption())) {
+            return assembleUnencryptedParts(uploadId, parts);
+        }
+        MultipartUpload upload = multipartUploads.get(uploadId);
+        if (upload == null) {
+            throw new AwsException("NoSuchUpload", "The specified multipart upload does not exist.", 404);
+        }
+        long size = parts.stream().mapToLong(Part::getSize).sum();
+        try (InputStream plaintext = multipartBody(uploadId, parts)) {
+            if ("aws:kms".equals(upload.effectiveServerSideEncryption())) {
+                try (S3KmsEncryption.Material material = kms().nextBody(upload.getKmsEnvelope());
+                        InputStream encrypted = kms().encrypt(plaintext, material)) {
+                    return new AssembledBody(stageBody(encrypted), size, material.envelope());
+                }
+            }
+            return new AssembledBody(stageBody(plaintext), size);
+        }
+    }
+
+    private InputStream multipartBody(String uploadId, List<Part> parts) {
+        return new InputStream() {
+            private int index;
+            private InputStream current = InputStream.nullInputStream();
+            private boolean closed;
+
+            @Override
+            public int read() throws IOException {
+                byte[] one = new byte[1];
+                return read(one, 0, 1) < 0 ? -1 : Byte.toUnsignedInt(one[0]);
+            }
+
+            @Override
+            public int read(byte[] bytes, int offset, int length) throws IOException {
+                if (closed) {
+                    throw new IOException("Multipart body is closed");
+                }
+                if (length == 0) {
+                    return 0;
+                }
+                while (true) {
+                    int count = current.read(bytes, offset, length);
+                    if (count >= 0) {
+                        return count;
+                    }
+                    if (index == parts.size()) {
+                        return -1;
+                    }
+                    current.close();
+                    current = openStoredPart(uploadId, parts.get(index++));
+                }
+            }
+
+            @Override
+            public void close() throws IOException {
+                closed = true;
+                current.close();
+            }
+        };
+    }
+
+    private InputStream openStoredPart(String uploadId, Part part) throws IOException {
+        InputStream raw;
+        long expected = S3KmsEncryption.storedSize(part.getSize(), part.getKmsEnvelope());
+        if (inMemory) {
+            byte[] bytes = memoryMultipartStore.getOrDefault(uploadId, Map.of()).get(part.getStorageId());
+            if (bytes == null || bytes.length != expected) {
+                throw missingPartData(part);
+            }
+            raw = new ByteArrayInputStream(bytes);
+        } else {
+            Path file = dataRoot.resolve(".multipart").resolve(uploadId).resolve(part.getStorageId());
+            if (Files.size(file) != expected) {
+                throw missingPartData(part);
+            }
+            raw = Files.newInputStream(file);
+        }
+        try {
+            return part.getKmsEnvelope() == null ? raw : kms().decrypt(raw, part.getKmsEnvelope(), part.getSize());
+        } catch (RuntimeException error) {
+            raw.close();
+            throw error;
+        }
     }
 
     /**
@@ -6586,6 +7161,7 @@ public class S3Service implements Resettable, ResourceProvider {
     public void putBucketEncryption(String bucketName, String encryptionXml) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> noSuchBucket());
+        S3ObjectEncryption.fromConfiguration(encryptionXml);
         bucket.setEncryptionConfiguration(encryptionXml);
         bucketStore.put(bucketName, bucket);
     }
@@ -7460,15 +8036,21 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     private void fireNotifications(String bucketName, String key, String eventName, S3Object obj,
                                    String sequencer) {
+        AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName).orElse(null);
+        if (ownedBucket == null) {
+            return;
+        }
+        RequestScopes.runAs(ownedBucket.account(), ownedBucket.value().getRegion(), () ->
+                fireBucketNotifications(ownedBucket.value(), bucketName, key, eventName, obj, sequencer));
+    }
+
+    private void fireBucketNotifications(Bucket bucket, String bucketName, String key, String eventName,
+                                         S3Object obj, String sequencer) {
         if (s3UpdatedEvent != null && eventName.startsWith("ObjectCreated")) {
             s3UpdatedEvent.fire(new S3ObjectUpdatedEvent(bucketName, key));
         }
         if (sqsService == null && snsService == null && lambdaService == null
                 && lambdaServiceProvider == null && lambdaInvoker == null && eventBridgeService == null) {
-            return;
-        }
-        Bucket bucket = bucketStore.get(bucketName).orElse(null);
-        if (bucket == null) {
             return;
         }
         NotificationConfiguration config = bucket.getNotificationConfiguration();
@@ -8077,13 +8659,11 @@ public class S3Service implements Resettable, ResourceProvider {
         return bucketName + "/" + key;
     }
 
-    // S3 object keys can contain "#v#", so the legacy version-key suffix can collide with a
-    // plain object. Null-version history is new and needs no migration; keep it in a namespace
-    // that no path-safe bucket/object key can reach instead of widening that collision surface.
+    // Keep the existing null-version namespace readable alongside numbered version history.
     private static final String NULL_VERSION_STORAGE_PREFIX = "\0null-version/";
 
     private static void requirePublicObjectKey(String key) {
-        if (key.startsWith(NULL_VERSION_STORAGE_PREFIX)) {
+        if (key.startsWith(NULL_VERSION_STORAGE_PREFIX) || key.startsWith(S3HistoryKeys.RESERVED_PREFIX)) {
             throw new AwsException("InvalidArgument", "The specified object key is not valid.", 400);
         }
     }
@@ -8097,7 +8677,7 @@ public class S3Service implements Resettable, ResourceProvider {
         if ("null".equals(versionId)) {
             return nullVersionPrefix(bucketName) + key;
         }
-        return bucketName + "/" + key + "#v#" + versionId;
+        return S3HistoryKeys.key(bucketName, key, versionId);
     }
 
     private static String storedVersionId(S3Object object) {
@@ -8419,7 +8999,7 @@ public class S3Service implements Resettable, ResourceProvider {
 
     private ReentrantLock diskFileLock(Path path) {
         // A stripe collision just serializes unrelated paths — safe, unlike a map entry.
-        return diskFileLocks[Math.floorMod(path.hashCode(), diskFileLocks.length)];
+        return diskFileLocks.lockFor(path);
     }
 
     /**
@@ -8809,8 +9389,6 @@ public class S3Service implements Resettable, ResourceProvider {
         String effectiveCacheControl = replaceMetadata && effectiveOptions.getCacheControl() != null
                 ? effectiveOptions.getCacheControl()
                 : source.getCacheControl();
-        String effectiveSseKmsKeyId = new ObjectEncryption(normalizedServerSideEncryption,
-                effectiveOptions.getSseKmsKeyId()).keptKmsKeyId();
         boolean replaceTags = "REPLACE".equalsIgnoreCase(effectiveOptions.getTaggingDirective());
         Map<String, String> effectiveTags = replaceTags
                 ? effectiveOptions.getReplacementTagging()
@@ -8829,7 +9407,8 @@ public class S3Service implements Resettable, ResourceProvider {
         }
         // Prepared before any bucket monitor is taken, so reading a large source to hash it never
         // holds up other writes to either bucket.
-        CopyBody body = copyBody(copySource, effectiveChecksum, copyChecksumAlgorithm);
+        CopyBody body = copyBody(copySource, effectiveChecksum, copyChecksumAlgorithm,
+                destBucket, destKey, effectiveOptions);
 
         // Annotations travel with the copy by default (x-amz-annotation-directive COPY). They are
         // snapshotted before storeObject: a self-copy (same bucket and key) or a pre-versioning
@@ -8865,8 +9444,8 @@ public class S3Service implements Resettable, ResourceProvider {
                 }
                 result[0] = storeObjectCopy(destBucket, destKey, body, metadata,
                         effectiveContentType, effectiveStorageClass, effectiveContentEncoding,
-                        effectiveContentDisposition, effectiveCacheControl, normalizedServerSideEncryption,
-                        effectiveSseKmsKeyId, effectiveOptions, copyChecksumAlgorithm, effectiveTags);
+                        effectiveContentDisposition, effectiveCacheControl,
+                        effectiveOptions, copyChecksumAlgorithm, effectiveTags);
                 if (copyAnnotations) {
                     restoreAnnotations(sourceAnnotations, destBucket, destKey, result[0]);
                 }
@@ -8889,8 +9468,8 @@ public class S3Service implements Resettable, ResourceProvider {
                 .orElseThrow(() -> noSuchBucket())) {
             result[0] = storeObjectCopy(destBucket, destKey, body, metadata,
                     effectiveContentType, effectiveStorageClass, effectiveContentEncoding,
-                    effectiveContentDisposition, effectiveCacheControl, normalizedServerSideEncryption,
-                    effectiveSseKmsKeyId, effectiveOptions, copyChecksumAlgorithm, effectiveTags);
+                    effectiveContentDisposition, effectiveCacheControl,
+                    effectiveOptions, copyChecksumAlgorithm, effectiveTags);
             if (copyAnnotations) {
                 restoreAnnotations(sourceAnnotations, destBucket, destKey, result[0]);
             }
@@ -8905,8 +9484,7 @@ public class S3Service implements Resettable, ResourceProvider {
                                      Map<String, String> metadata,
                                      String effectiveContentType, String effectiveStorageClass,
                                      String effectiveContentEncoding, String effectiveContentDisposition,
-                                     String effectiveCacheControl, String effectiveServerSideEncryption,
-                                     String effectiveSseKmsKeyId,
+                                      String effectiveCacheControl,
                                      CopyObjectOptions effectiveOptions, ChecksumAlgorithm copyChecksumAlgorithm,
                                      Map<String, String> effectiveTags) {
         return storeObject(destBucket, destKey, body.body(), effectiveContentType,
@@ -8916,8 +9494,8 @@ public class S3Service implements Resettable, ResourceProvider {
                         .withContentEncoding(effectiveContentEncoding)
                         .withContentDisposition(effectiveContentDisposition)
                         .withCacheControl(effectiveCacheControl)
-                        .withServerSideEncryption(effectiveServerSideEncryption)
-                        .withSseKmsKeyId(effectiveSseKmsKeyId)
+                        .withServerSideEncryption(effectiveOptions.getServerSideEncryption())
+                        .withSseKmsKeyId(effectiveOptions.getSseKmsKeyId())
                         .withSseCustomerAlgorithm(effectiveOptions.getSseCustomerAlgorithm())
                         .withSseCustomerKey(effectiveOptions.getSseCustomerKey())
                         .withSseCustomerKeyMd5(effectiveOptions.getSseCustomerKeyMd5())

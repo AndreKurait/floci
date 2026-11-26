@@ -43,7 +43,7 @@ import java.util.stream.Collectors;
  * <p>An update that keeps the group records what it is about to change (the rules it authorizes
  * and revokes, the tag keys it touches, and the ownership records it replaces) in
  * {@link #UPDATE_SNAPSHOT_ATTR}, so a stack update that fails on a later resource puts the group
- * back. A replacement is not rolled back here, so the stack reports it as not rolled back.
+ * back. Replacement cleanup restores a replaced group and retires its replacement.
  */
 @ApplicationScoped
 public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
@@ -76,6 +76,7 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
         Map<String, String> desiredTags = ctx.resolveTags(props, "Tags");
         Ec2Tags.validatedTags(desiredTags);
         CloudFormationTemplateEngine engine = ctx.engine();
@@ -115,17 +116,22 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
         // group does not already carry, and revoke a rule this resource authorized on a prior run
         // that the template no longer declares. Ownership is scoped by the keys recorded in the
         // internal attributes, so a rule owned by a standalone resource is never revoked here.
-        UnaryOperator<String> peerGroupId = peerGroupIdResolver(region, sg.getVpcId());
-        RulePlan ingress = planRules(props, "SecurityGroupIngress", sg.getIpPermissions(), engine, peerGroupId,
-                r.getAttributes().get(INGRESS_RULES_ATTR));
-        RulePlan egress = planRules(props, "SecurityGroupEgress", sg.getIpPermissionsEgress(), engine, peerGroupId,
-                r.getAttributes().get(EGRESS_RULES_ATTR));
         // AWS updates Tags in place and keeps a tag added outside the stack, so a reused group has
         // only the keys the last deployment wrote removed; a new group carries no tags yet.
         boolean reused = reconciled != null;
         Set<String> ownedTags = reused ? Ec2Tags.ownedKeys(r, TAG_KEYS_ATTR, ctx) : Set.of();
         String groupId = sg.getGroupId();
         CfnRollback.guarded(r, ctx, !reused, () -> delete(SECURITY_GROUP, groupId, region), () -> undoInPlace(r), () -> {
+            UnaryOperator<String> peerGroupId = peerGroupIdResolver(region, sg.getVpcId());
+            RulePlan ingress = planRules(props, "SecurityGroupIngress", sg.getIpPermissions(), engine, peerGroupId,
+                    r.getAttributes().get(INGRESS_RULES_ATTR));
+            JsonNode declaredEgress = props == null ? null : props.get("SecurityGroupEgress");
+            List<IpPermission> implicitEgress = reconciled == null && declaredEgress != null
+                    && declaredEgress.isArray() && !declaredEgress.isEmpty()
+                    ? List.copyOf(sg.getIpPermissionsEgress()) : List.of();
+            RulePlan egress = planRules(props, "SecurityGroupEgress",
+                    implicitEgress.isEmpty() ? sg.getIpPermissionsEgress() : List.of(), engine, peerGroupId,
+                    r.getAttributes().get(EGRESS_RULES_ATTR));
             if (reused && ctx.isUpdate()) {
                 snapshotInPlace(r, region, groupId, ingress, egress, ownedTags, desiredTags);
             }
@@ -135,6 +141,9 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
             for (IpPermission perm : ingress.revoke()) {
                 ec2Service.revokeSecurityGroupIngress(region, groupId, List.of(perm));
             }
+            if (!implicitEgress.isEmpty()) {
+                ec2Service.revokeSecurityGroupEgress(region, groupId, implicitEgress);
+            }
             for (IpPermission perm : egress.authorize()) {
                 ec2Service.authorizeSecurityGroupEgress(region, groupId, List.of(perm));
             }
@@ -142,31 +151,43 @@ public class Ec2SecurityGroupCfnProvisioner implements CfnResourceProvisioner {
                 ec2Service.revokeSecurityGroupEgress(region, groupId, List.of(perm));
             }
             Ec2Tags.reconcileOwned(ec2Service, region, groupId, ownedTags, desiredTags);
+            putRuleKeys(r, INGRESS_RULES_ATTR, ingress.declaredKeys());
+            putRuleKeys(r, EGRESS_RULES_ATTR, egress.declaredKeys());
+            Ec2Tags.recordKeys(r, TAG_KEYS_ATTR, desiredTags);
         });
-        putRuleKeys(r, INGRESS_RULES_ATTR, ingress.declaredKeys());
-        putRuleKeys(r, EGRESS_RULES_ATTR, egress.declaredKeys());
-        Ec2Tags.recordKeys(r, TAG_KEYS_ATTR, desiredTags);
+        ReplacementCleanup.record(r, ctx, attributesBefore);
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
     }
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
         resource.getAttributes().remove(UPDATE_SNAPSHOT_ATTR);
-        return UpdateCleanupResult.notApplicable();
+        return ReplacementCleanup.complete(resource, this::delete);
     }
 
     @Override
     public void clearUpdate(StackResource resource) {
         resource.getAttributes().remove(UPDATE_SNAPSHOT_ATTR);
+        ReplacementCleanup.clear(resource);
     }
 
     /**
      * Undoes an update that kept the group, from the snapshot it recorded. Without one the update
-     * replaced the group, which is not rolled back here.
+     * replaced the group, so replacement cleanup restores its prior identity.
      */
     @Override
     public boolean rollbackUpdate(StackResource resource) {
         if (resource.getAttributes().get(UPDATE_SNAPSHOT_ATTR) == null) {
-            return false;
+            return ReplacementCleanup.rollback(resource, this::delete);
         }
         undoInPlace(resource);
         return true;

@@ -8,6 +8,7 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.AwsTestClients;
+import io.floci.aws.testing.MutableClock;
 import io.floci.aws.testing.TestAccounts;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -16,6 +17,7 @@ import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.Timeout;
@@ -39,6 +41,7 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -90,6 +93,7 @@ class SsmSessionManagerDockerNightlyIntegrationTest {
     @Inject ContainerLifecycleManager lifecycle;
     @Inject Ec2Service instances;
     @Inject IamService identities;
+    @Inject MutableClock clock;
     @ConfigProperty(name = "quarkus.http.test-ssl-port") int tlsPort;
     @TestHTTPResource URI httpEndpoint;
 
@@ -98,16 +102,25 @@ class SsmSessionManagerDockerNightlyIntegrationTest {
     @BeforeAll
     @Timeout(720)
     void startGuest() throws Exception {
-        fixture = new SsmSessionFixture(docker, builder, lifecycle, instances, httpEndpoint.getPort(), tlsPort);
+        fixture = new SsmSessionFixture(docker, builder, lifecycle, instances, httpEndpoint.getPort(), tlsPort, clock);
         fixture.start();
     }
 
     @AfterAll
     @Timeout(120)
     void stopGuest() throws Exception {
-        if (fixture != null) {
-            fixture.close();
+        try {
+            if (fixture != null) {
+                fixture.close();
+            }
+        } finally {
+            clock.reset();
         }
+    }
+
+    @BeforeEach
+    void alignClockWithTheRealAgent() {
+        clock.advance(Duration.between(clock.instant(), Instant.now()));
     }
 
     @Test

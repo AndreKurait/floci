@@ -1,8 +1,15 @@
 package io.floci.aws.services.ecs;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.ecs.container.EcsContainerManager;
 import io.floci.aws.services.ecs.container.EcsTaskHandle;
+import io.floci.aws.services.ecs.exec.EcsExecSessionRegistry;
 import io.floci.aws.services.ecs.model.AwsVpcConfiguration;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.EcsServiceModel;
@@ -12,16 +19,26 @@ import io.floci.aws.services.ecs.model.NetworkConfiguration;
 import io.floci.aws.services.ecs.model.NetworkMode;
 import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.services.ecs.model.TaskStatus;
+import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
+import java.lang.reflect.Field;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -34,6 +51,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -44,6 +62,7 @@ import static org.mockito.Mockito.when;
  * services are built without CDI, so no scheduled tick ever runs: every task the tests see was
  * started by a reconcile pass the wait itself asked for.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceAwaitStableTest {
 
     private static final String REGION = "us-east-1";
@@ -54,6 +73,44 @@ class EcsServiceAwaitStableTest {
     @AfterEach
     void stopReconcilers() {
         created.forEach(EcsService::stopManagedContainers);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void reconcilePendingCleanup_visitsCollidingHandlesOncePerPass() throws Exception {
+        EcsContainerManager manager = dockerContainerManager(task -> { });
+        EcsService service = dockerModeService(manager);
+        String firstArn = "arn:aws:ecs:us-east-1:000000000000:task/cleanup/Aa";
+        String secondArn = "arn:aws:ecs:us-east-1:000000000000:task/cleanup/BB";
+        assertEquals(firstArn.hashCode(), secondArn.hashCode());
+        // Seed retained handles without live tasks, reproducing cleanup after task-state removal.
+        Field field = EcsService.class.getDeclaredField("taskHandles");
+        field.setAccessible(true);
+        Map<String, EcsTaskHandle> handles = (Map<String, EcsTaskHandle>) field.get(service);
+        EcsTaskHandle first = new EcsTaskHandle(firstArn, Map.of("app", "first"), Map.of());
+        EcsTaskHandle second = new EcsTaskHandle(secondArn, Map.of("app", "second"), Map.of());
+        handles.put(firstArn, first);
+        handles.put(secondArn, second);
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicBoolean removeContainers = new AtomicBoolean();
+        when(manager.stopTaskAndCollectExitCodes(any())).thenAnswer(invocation -> {
+            assertTrue(attempts.incrementAndGet() <= 2, "a pass must not retry a retained handle");
+            EcsTaskHandle handle = invocation.getArgument(0);
+            if (removeContainers.get()) {
+                handle.recordContainerRemoved("app");
+            }
+            return Map.of();
+        });
+
+        service.reconcile();
+
+        assertEquals(2, attempts.get());
+        assertEquals(Map.of(firstArn, first, secondArn, second), handles);
+        attempts.set(0);
+        removeContainers.set(true);
+        service.reconcile();
+        assertEquals(2, attempts.get());
+        assertTrue(handles.isEmpty(), "the next pass must retry and release both handles");
     }
 
     @Test
@@ -141,6 +198,41 @@ class EcsServiceAwaitStableTest {
 
         assertEquals("NotStabilized", error.getErrorCode());
         assertEquals("Service " + svc.getServiceArn() + " did not stabilize.", error.getMessage());
+    }
+
+    @Test
+    void awaitServiceStable_serviceThatNeverStabilizes_givesUpExactlyFiveMinutesAfterItStarted() {
+        TestTime time = TestTime.create();
+        AtomicInteger polls = new AtomicInteger();
+        // The wait runs on this thread, so each of its sleeps moves the timeline on.
+        EcsService.WaitTimer timer = new EcsService.WaitTimer() {
+            @Override
+            public long nanoTime() {
+                return time.nanoTime();
+            }
+
+            @Override
+            public void sleepMillis(long millis) throws InterruptedException {
+                polls.incrementAndGet();
+                time.sleepAdvancing(Duration.ofMillis(millis));
+            }
+        };
+        EcsContainerManager containerManager = dockerContainerManager(task -> { });
+        when(containerManager.getExitCodeIfStopped(anyString())).thenReturn(1);
+        EcsService service = dockerModeService(containerManager, timer);
+        service.createCluster("slow-cluster", REGION);
+        registerTaskDef(service, "slow-fam", "app:1");
+        EcsServiceModel svc = service.createService("slow-cluster", "slow-svc", "slow-fam", 1,
+                LaunchType.FARGATE, List.of(), null, REGION);
+        Instant started = time.now();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.awaitServiceStable(svc));
+
+        assertEquals("NotStabilized", error.getErrorCode());
+        assertEquals("Service " + svc.getServiceArn() + " did not stabilize.", error.getMessage());
+        // It polls every 50 ms, still waits at 4 min 59.95 s, and fails at the poll that reaches 5 min.
+        assertEquals(Duration.ofMinutes(5), Duration.between(started, time.now()));
+        assertEquals(6000, polls.get());
     }
 
     @Test
@@ -315,7 +407,16 @@ class EcsServiceAwaitStableTest {
     }
 
     private EcsService dockerModeService(EcsContainerManager containerManager) {
-        return track(EcsServiceFixtures.builder().containerManager(containerManager).dockerMode().build());
+        return dockerModeService(containerManager, EcsService.WaitTimer.SYSTEM);
+    }
+
+    private EcsService dockerModeService(EcsContainerManager containerManager, EcsService.WaitTimer timer) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ecs().mock()).thenReturn(false);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        return track(new EcsService(new RegionResolver(REGION, "000000000000"), containerManager,
+                config, mock(EcsLoadBalancerRegistrar.class), new InMemoryStorageFactory(), null,
+                new EcsExecSessionRegistry(), null, null, Clock.systemUTC(), timer));
     }
 
     private EcsService track(EcsService service) {
@@ -340,5 +441,21 @@ class EcsServiceAwaitStableTest {
         return service.describeTasks(null, service.listTasks(null, null, null, null, REGION), REGION).stream()
                 .filter(t -> TaskStatus.RUNNING.name().equals(t.getLastStatus()))
                 .toList();
+    }
+
+    private static final class InMemoryStorageFactory extends StorageFactory {
+        private final Map<String, StorageBackend<String, ?>> stores = new HashMap<>();
+
+        private InMemoryStorageFactory() {
+            super(null, null);
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
+                                                        TypeReference<Map<String, V>> typeReference) {
+            return (AccountAwareStorageBackend<V>) stores.computeIfAbsent(fileName,
+                    ignored -> AccountAwareStorageBackend.inMemory("000000000000"));
+        }
     }
 }

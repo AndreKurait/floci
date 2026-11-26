@@ -23,6 +23,7 @@ import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.core.common.SmithyValidationErrors;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.core.common.StripedLocks;
 import io.floci.aws.core.resource.ExplorerResource;
 import io.floci.aws.core.resource.ResourceProvider;
 import io.floci.aws.core.resource.SupportedResourceType;
@@ -67,7 +68,6 @@ import org.jspecify.annotations.Nullable;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
-
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URLEncoder;
@@ -208,8 +208,8 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
     private final CustomSenderCodeEncryptor customSenderCodeEncryptor;
     private final TlsCertificateManager certificateManager;
     private final boolean enforceTokenValidityLimits;
-    private final Object[] userLocks = newUserLockStripes();
-    private final Object[] poolLocks = newUserLockStripes();
+    private final StripedLocks userLocks = new StripedLocks(USER_LOCK_STRIPES);
+    private final StripedLocks poolLocks = new StripedLocks(USER_LOCK_STRIPES);
     // Reserve names per account through registration callbacks, without blocking their admin requests.
     private final Set<String> userCreatesInFlight = ConcurrentHashMap.newKeySet();
 
@@ -217,18 +217,10 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
     private final CognitoAuthFlowHandler authFlowHandler;
     private final CognitoWebAuthn webAuthn;
 
-    private static Object[] newUserLockStripes() {
-        Object[] stripes = new Object[USER_LOCK_STRIPES];
-        for (int i = 0; i < stripes.length; i++) {
-            stripes[i] = new Object();
-        }
-        return stripes;
-    }
-
     private Object userLock(String poolId, String username) {
         UserPool pool = poolStore.get(poolId).orElse(null);
         String key = userKey(poolId, pool == null ? username : signInKey(pool, username));
-        return userLocks[Math.floorMod(key.hashCode(), USER_LOCK_STRIPES)];
+        return userLocks.lockFor(key);
     }
 
     /**
@@ -237,7 +229,7 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
      * of these writes store a new copy in place of the instance another write is holding.
      */
     private Object poolLock(String poolId) {
-        return poolLocks[Math.floorMod(poolId.hashCode(), USER_LOCK_STRIPES)];
+        return poolLocks.lockFor(poolId);
     }
 
     @Inject

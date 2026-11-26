@@ -1,14 +1,25 @@
 package io.floci.aws.services.s3;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.IamEnforcementFilter;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.model.CopyObjectOptions;
 import io.floci.aws.services.s3.model.MultipartUpload;
 import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
+import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -17,25 +28,32 @@ import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * An object written without encryption headers is encrypted with its bucket's default encryption:
  * the configured {@code ApplyServerSideEncryptionByDefault}, or SSE-S3 ({@code AES256}) for a bucket
  * with none. An explicit header and an SSE-C key keep taking precedence.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class S3DefaultEncryptionServiceTest {
 
     private static final String BUCKET = "default-encryption-bucket";
     private static final String SOURCE = "copy-source-bucket";
-    private static final String KMS_KEY = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555";
-    private static final String OTHER_KMS_KEY = "arn:aws:kms:us-east-1:000000000000:key/99999999-8888-7777-6666-555555555555";
+    private String kmsKeyArn;
+    private String otherKmsKeyArn;
+    private String defaultKmsKeyArn;
     private static final byte[] DATA = "data".getBytes(StandardCharsets.UTF_8);
 
     @TempDir
@@ -47,7 +65,22 @@ class S3DefaultEncryptionServiceTest {
     @BeforeEach
     void setUp() {
         objectStore = new InMemoryStorage<>();
-        s3Service = new S3Service(new InMemoryStorage<>(), objectStore, tempDir.resolve("s3"), false);
+        InMemoryStorageFactory factory = new InMemoryStorageFactory("000000000000")
+                .withStore("s3-objects.json", objectStore);
+        RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
+        KmsService kms = new KmsService(factory, regions);
+        kmsKeyArn = kms.createKey("default bucket key", "us-east-1").getArn();
+        otherKmsKeyArn = kms.createKey("explicit object key", "us-east-1").getArn();
+        defaultKmsKeyArn = kms.describeKey("alias/aws/s3", "us-east-1").getArn();
+        S3KmsEncryption encryption = new S3KmsEncryption(kms, mock(IamEnforcementFilter.class),
+                new RequestContext(), regions, mock(IamService.class));
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage().persistentPath()).thenReturn(tempDir.toString());
+        when(config.storage().mode()).thenReturn("persistent");
+        when(config.storage().services().s3().mode()).thenReturn(Optional.of("persistent"));
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        s3Service = new S3Service(factory, config, null, null, null, null, null,
+                regions, new ObjectMapper(), null, encryption);
         s3Service.createBucket(BUCKET, "us-east-1");
         s3Service.createBucket(SOURCE, "us-east-1");
     }
@@ -121,53 +154,54 @@ class S3DefaultEncryptionServiceTest {
 
     @Test
     void aKmsDefaultIsAppliedWithItsKey() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
 
         S3Object put = put("kms.txt", new PutObjectOptions());
 
         assertEquals("aws:kms", put.getServerSideEncryption());
-        assertEquals(KMS_KEY, put.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, put.getSseKmsKeyId());
         S3Object stored = s3Service.getObject(BUCKET, "kms.txt");
         assertEquals("aws:kms", stored.getServerSideEncryption());
-        assertEquals(KMS_KEY, stored.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, stored.getSseKmsKeyId());
         S3Object posted = s3Service.postObject(BUCKET, "posted.txt", DATA, "text/plain", null);
         assertEquals("aws:kms", posted.getServerSideEncryption());
-        assertEquals(KMS_KEY, posted.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, posted.getSseKmsKeyId());
     }
 
     @Test
-    void aKmsDefaultWithoutAKeyIsAppliedWithoutOne() {
+    void aKmsDefaultWithoutAKeyUsesTheManagedS3Key() {
         s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", null));
 
         S3Object put = put("kms-default-key.txt", new PutObjectOptions());
 
         assertEquals("aws:kms", put.getServerSideEncryption());
-        assertNull(put.getSseKmsKeyId());
+        assertEquals(defaultKmsKeyArn, put.getSseKmsKeyId());
+        assertArrayEquals(DATA, s3Service.getObject(BUCKET, "kms-default-key.txt").getData());
     }
 
     @Test
     void aDualLayerKmsDefaultIsAppliedWithItsKey() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms:dsse", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms:dsse", kmsKeyArn));
 
         S3Object put = put("dsse.txt", new PutObjectOptions());
 
         assertEquals("aws:kms:dsse", put.getServerSideEncryption());
-        assertEquals(KMS_KEY, put.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, put.getSseKmsKeyId());
     }
 
     @Test
     void anExplicitHeaderTakesPrecedenceOverTheDefault() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
 
         S3Object put = put("explicit.txt", new PutObjectOptions().withServerSideEncryption("aws:kms"));
 
         assertEquals("aws:kms", put.getServerSideEncryption());
-        assertNotEquals(KMS_KEY, put.getSseKmsKeyId());
+        assertNotEquals(kmsKeyArn, put.getSseKmsKeyId());
     }
 
     @Test
     void anSseCustomerKeyUploadGetsNoDefault() throws Exception {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY, "NONE"));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn, "NONE"));
 
         S3Object put = put("sse-c.txt", customerKey(new PutObjectOptions()));
 
@@ -277,7 +311,7 @@ class S3DefaultEncryptionServiceTest {
     @Test
     void objectsAlreadyStoredKeepTheirEncryption() {
         put("before.txt", new PutObjectOptions());
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
         put("after.txt", new PutObjectOptions());
 
         assertEquals("AES256", s3Service.getObject(BUCKET, "before.txt").getServerSideEncryption());
@@ -286,7 +320,7 @@ class S3DefaultEncryptionServiceTest {
 
     @Test
     void aMultipartUploadCompletesIntoAnObjectWithTheDefault() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
 
         MultipartUpload upload = s3Service.initiateMultipartUpload(BUCKET, "multipart.bin",
                 "application/octet-stream", Map.of(), null, new PutObjectOptions());
@@ -295,13 +329,14 @@ class S3DefaultEncryptionServiceTest {
                 List.of(1), null, null);
 
         assertEquals("aws:kms", completed.getServerSideEncryption());
-        assertEquals(KMS_KEY, completed.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, completed.getSseKmsKeyId());
         assertEquals("aws:kms", s3Service.getObject(BUCKET, "multipart.bin").getServerSideEncryption());
+        assertArrayEquals(DATA, s3Service.getObject(BUCKET, "multipart.bin").getData());
     }
 
     @Test
     void anSseCustomerKeyMultipartUploadGetsNoDefault() throws Exception {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY, "NONE"));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn, "NONE"));
         PutObjectOptions sseC = customerKey(new PutObjectOptions());
         MultipartUpload upload = s3Service.initiateMultipartUpload(BUCKET, "multipart-sse-c.bin",
                 "application/octet-stream", Map.of(), null, sseC);
@@ -314,19 +349,20 @@ class S3DefaultEncryptionServiceTest {
         assertNull(completed.getSseKmsKeyId());
         assertEquals("AES256", completed.getSseCustomerAlgorithm());
         assertNull(s3Service.getObject(BUCKET, "multipart-sse-c.bin").getServerSideEncryption());
+        assertArrayEquals(DATA, s3Service.getObject(BUCKET, "multipart-sse-c.bin").getData());
     }
 
     @Test
     void aMultipartUploadTakesTheDefaultWhenItIsCreated() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
         MultipartUpload upload = s3Service.initiateMultipartUpload(BUCKET, "created.bin",
                 "application/octet-stream", Map.of(), null, new PutObjectOptions());
 
         assertEquals("aws:kms", upload.effectiveServerSideEncryption());
-        assertEquals(KMS_KEY, upload.effectiveSseKmsKeyId());
+        assertEquals(kmsKeyArn, upload.effectiveSseKmsKeyId());
         assertNull(upload.getServerSideEncryption());
         assertEquals(Map.of("s3:x-amz-server-side-encryption", List.of("aws:kms"),
-                "s3:x-amz-server-side-encryption-aws-kms-key-id", List.of(KMS_KEY)),
+                "s3:x-amz-server-side-encryption-aws-kms-key-id", List.of(kmsKeyArn)),
                 s3Service.multipartEncryptionConditions(BUCKET, "created.bin", upload.getUploadId()));
 
         s3Service.putBucketEncryption(BUCKET, configuration("AES256", null));
@@ -335,12 +371,12 @@ class S3DefaultEncryptionServiceTest {
                 List.of(1), null, null);
 
         assertEquals("aws:kms", completed.getServerSideEncryption());
-        assertEquals(KMS_KEY, completed.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, completed.getSseKmsKeyId());
     }
 
     @Test
     void aDualLayerKmsDefaultReachesAMultipartUploadWithItsKey() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms:dsse", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms:dsse", kmsKeyArn));
         MultipartUpload upload = s3Service.initiateMultipartUpload(BUCKET, "dsse.bin",
                 "application/octet-stream", Map.of(), null, new PutObjectOptions());
         s3Service.uploadPart(BUCKET, "dsse.bin", upload.getUploadId(), 1, DATA);
@@ -348,30 +384,30 @@ class S3DefaultEncryptionServiceTest {
                 List.of(1), null, null);
 
         assertEquals("aws:kms:dsse", upload.effectiveServerSideEncryption());
-        assertEquals(KMS_KEY, upload.effectiveSseKmsKeyId());
+        assertEquals(kmsKeyArn, upload.effectiveSseKmsKeyId());
         assertEquals("aws:kms:dsse", completed.getServerSideEncryption());
-        assertEquals(KMS_KEY, completed.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, completed.getSseKmsKeyId());
     }
 
     @Test
     void anExplicitDualLayerHeaderKeepsItsKeyId() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
         MultipartUpload upload = s3Service.initiateMultipartUpload(BUCKET, "explicit-dsse.bin",
                 "application/octet-stream", Map.of(), null,
-                new PutObjectOptions().withServerSideEncryption("aws:kms:dsse").withSseKmsKeyId(OTHER_KMS_KEY));
+                new PutObjectOptions().withServerSideEncryption("aws:kms:dsse").withSseKmsKeyId(otherKmsKeyArn));
         s3Service.uploadPart(BUCKET, "explicit-dsse.bin", upload.getUploadId(), 1, DATA);
         S3Object completed = s3Service.completeMultipartUpload(BUCKET, "explicit-dsse.bin", upload.getUploadId(),
                 List.of(1), null, null);
 
         assertEquals("aws:kms:dsse", upload.effectiveServerSideEncryption());
-        assertEquals(OTHER_KMS_KEY, upload.effectiveSseKmsKeyId());
+        assertEquals(otherKmsKeyArn, upload.effectiveSseKmsKeyId());
         assertEquals("aws:kms:dsse", completed.getServerSideEncryption());
-        assertEquals(OTHER_KMS_KEY, completed.getSseKmsKeyId());
+        assertEquals(otherKmsKeyArn, completed.getSseKmsKeyId());
     }
 
     @Test
     void anUploadThatSendsItsOwnEncryptionRecordsNoDefault() throws Exception {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY, "NONE"));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn, "NONE"));
 
         MultipartUpload explicit = s3Service.initiateMultipartUpload(BUCKET, "explicit.bin",
                 "application/octet-stream", Map.of(), null, new PutObjectOptions().withServerSideEncryption("AES256"));
@@ -387,18 +423,17 @@ class S3DefaultEncryptionServiceTest {
     }
 
     @Test
-    void aConfigurationWithoutAnAlgorithmFallsBackToSseS3() {
-        s3Service.putBucketEncryption(BUCKET, "<ServerSideEncryptionConfiguration/>");
-        assertEquals("AES256", put("empty-configuration.txt", new PutObjectOptions()).getServerSideEncryption());
-
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:unknown", null));
-        assertEquals("AES256", put("unsupported-algorithm.txt", new PutObjectOptions()).getServerSideEncryption());
-
-        s3Service.putBucketEncryption(BUCKET, "not xml");
-        assertEquals("AES256", put("malformed-configuration.txt", new PutObjectOptions()).getServerSideEncryption());
-
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY) + "<Broken>");
-        assertEquals("AES256", put("truncated-configuration.txt", new PutObjectOptions()).getServerSideEncryption());
+    void malformedConfigurationIsRejectedWithoutReplacingTheStoredDefault() {
+        String valid = configuration("aws:kms", kmsKeyArn, "NONE");
+        s3Service.putBucketEncryption(BUCKET, valid);
+        for (String invalid : List.of("<ServerSideEncryptionConfiguration/>",
+                configuration("aws:unknown", null), "not xml", valid + "<Broken>")) {
+            assertThrows(AwsException.class, () -> s3Service.putBucketEncryption(BUCKET, invalid));
+            assertEquals(valid, s3Service.getBucketEncryption(BUCKET));
+        }
+        S3Object object = put("retained-default.txt", new PutObjectOptions());
+        assertEquals(kmsKeyArn, object.getSseKmsKeyId());
+        assertArrayEquals(DATA, s3Service.getObject(BUCKET, "retained-default.txt").getData());
     }
 
     @Test
@@ -406,13 +441,13 @@ class S3DefaultEncryptionServiceTest {
         s3Service.putBucketEncryption(BUCKET, "<ServerSideEncryptionConfiguration>"
                 + "<Elsewhere><SSEAlgorithm>AES256</SSEAlgorithm><KMSMasterKeyID>other-key</KMSMasterKeyID></Elsewhere>"
                 + "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>"
-                + "<KMSMasterKeyID>" + KMS_KEY + "</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule>"
+                + "<KMSMasterKeyID>" + kmsKeyArn + "</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule>"
                 + "</ServerSideEncryptionConfiguration>");
 
         S3Object put = put("rule.txt", new PutObjectOptions());
 
         assertEquals("aws:kms", put.getServerSideEncryption());
-        assertEquals(KMS_KEY, put.getSseKmsKeyId());
+        assertEquals(kmsKeyArn, put.getSseKmsKeyId());
     }
 
     @Test
@@ -422,7 +457,7 @@ class S3DefaultEncryptionServiceTest {
         PutObjectOptions sseC = customerKey(new PutObjectOptions());
         s3Service.putBucketEncryption(SOURCE, blockedEncryption("NONE"));
         s3Service.putObject(SOURCE, "sse-c.txt", DATA, "text/plain", null, sseC);
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
 
         S3Object fromOld = s3Service.copyObject(SOURCE, "old.txt", BUCKET, "old-copy.txt");
         S3Object fromSseC = s3Service.copyObject(SOURCE, "sse-c.txt", BUCKET, "sse-c-copy.txt", null,
@@ -433,14 +468,14 @@ class S3DefaultEncryptionServiceTest {
 
         for (S3Object copy : List.of(fromOld, fromSseC)) {
             assertEquals("aws:kms", copy.getServerSideEncryption());
-            assertEquals(KMS_KEY, copy.getSseKmsKeyId());
+            assertEquals(kmsKeyArn, copy.getSseKmsKeyId());
             assertNull(copy.getSseCustomerAlgorithm());
         }
     }
 
     @Test
     void aCopyTakesTheDestinationBucketsDefaultNotTheSourcesEncryption() {
-        s3Service.putBucketEncryption(SOURCE, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(SOURCE, configuration("aws:kms", kmsKeyArn));
         s3Service.putObject(SOURCE, "kms.txt", DATA, "text/plain", null, new PutObjectOptions());
         put("sse-s3.txt", new PutObjectOptions());
 
@@ -449,43 +484,46 @@ class S3DefaultEncryptionServiceTest {
         assertEquals("AES256", intoPlainBucket.getServerSideEncryption());
         assertNull(intoPlainBucket.getSseKmsKeyId());
 
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", OTHER_KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", otherKmsKeyArn));
         S3Object fromKmsSource = s3Service.copyObject(SOURCE, "kms.txt", BUCKET, "kms-copy.txt");
         S3Object fromSseS3Source = s3Service.copyObject(BUCKET, "sse-s3.txt", BUCKET, "sse-s3-copy.txt");
 
         for (S3Object copy : List.of(fromKmsSource, fromSseS3Source)) {
             assertEquals("aws:kms", copy.getServerSideEncryption());
-            assertEquals(OTHER_KMS_KEY, copy.getSseKmsKeyId());
+            assertEquals(otherKmsKeyArn, copy.getSseKmsKeyId());
         }
-        assertEquals(OTHER_KMS_KEY, s3Service.getObject(BUCKET, "kms-copy.txt").getSseKmsKeyId());
+        assertEquals(otherKmsKeyArn, s3Service.getObject(BUCKET, "kms-copy.txt").getSseKmsKeyId());
     }
 
     @Test
     void aCopyWithAnExplicitHeaderKeepsIt() {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn));
         put("source.txt", new PutObjectOptions());
 
         S3Object aes = s3Service.copyObject(BUCKET, "source.txt", BUCKET, "aes-copy.txt", null,
                 new CopyObjectOptions().withServerSideEncryption("AES256"));
         S3Object kms = s3Service.copyObject(BUCKET, "source.txt", BUCKET, "kms-copy.txt", null,
-                new CopyObjectOptions().withServerSideEncryption("aws:kms").withSseKmsKeyId(OTHER_KMS_KEY));
+                new CopyObjectOptions().withServerSideEncryption("aws:kms").withSseKmsKeyId(otherKmsKeyArn));
         S3Object kmsWithoutKey = s3Service.copyObject(BUCKET, "source.txt", BUCKET, "kms-no-key-copy.txt", null,
                 new CopyObjectOptions().withServerSideEncryption("aws:kms"));
 
         assertEquals("AES256", aes.getServerSideEncryption());
         assertNull(aes.getSseKmsKeyId());
         assertEquals("aws:kms", kms.getServerSideEncryption());
-        assertEquals(OTHER_KMS_KEY, kms.getSseKmsKeyId());
+        assertEquals(otherKmsKeyArn, kms.getSseKmsKeyId());
         assertEquals("aws:kms", kmsWithoutKey.getServerSideEncryption());
-        assertNotEquals(KMS_KEY, kmsWithoutKey.getSseKmsKeyId());
+        assertNotEquals(kmsKeyArn, kmsWithoutKey.getSseKmsKeyId());
         S3Object dsse = s3Service.copyObject(BUCKET, "source.txt", BUCKET, "dsse-copy.txt", null,
-                new CopyObjectOptions().withServerSideEncryption("aws:kms:dsse").withSseKmsKeyId(OTHER_KMS_KEY));
-        assertEquals(OTHER_KMS_KEY, dsse.getSseKmsKeyId());
+                new CopyObjectOptions().withServerSideEncryption("aws:kms:dsse").withSseKmsKeyId(otherKmsKeyArn));
+        assertEquals(otherKmsKeyArn, dsse.getSseKmsKeyId());
+        for (String key : List.of("aes-copy.txt", "kms-copy.txt", "kms-no-key-copy.txt", "dsse-copy.txt")) {
+            assertArrayEquals(DATA, s3Service.getObject(BUCKET, key).getData(), key);
+        }
     }
 
     @Test
     void aCopyEncryptedWithACustomerKeyGetsNoDefault() throws Exception {
-        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", KMS_KEY, "NONE"));
+        s3Service.putBucketEncryption(BUCKET, configuration("aws:kms", kmsKeyArn, "NONE"));
         put("source.txt", new PutObjectOptions());
         PutObjectOptions sseC = customerKey(new PutObjectOptions());
 
@@ -497,6 +535,7 @@ class S3DefaultEncryptionServiceTest {
 
         assertNull(copy.getServerSideEncryption());
         assertEquals("AES256", copy.getSseCustomerAlgorithm());
+        assertArrayEquals(DATA, s3Service.getObject(BUCKET, "sse-c-copy.txt").getData());
     }
 
     private S3Object put(String key, PutObjectOptions options) {

@@ -11,6 +11,7 @@
 | `CreateStateMachine` | Create a state machine (Standard or Express) |
 | `UpdateStateMachine` | Update definition, role, logging, tracing, or encryption settings and optionally publish a version |
 | `DescribeStateMachine` | Get state machine definition and metadata |
+| `DescribeStateMachineForExecution` | - |
 | `ListStateMachines` | List all state machines |
 | `DeleteStateMachine` | Delete a state machine |
 | `PublishStateMachineVersion` | - |
@@ -22,6 +23,7 @@
 | `UpdateStateMachineAlias` | - |
 | `DeleteStateMachineAlias` | - |
 | `ValidateStateMachineDefinition` | Validate an ASL definition without creating a state machine |
+| `TestState` | - |
 | `StartExecution` | Start a new execution |
 | `StartSyncExecution` | - |
 | `DescribeExecution` | Get execution status and output |
@@ -46,6 +48,44 @@
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
 
+CloudFormation `AWS::StepFunctions::Activity` creates a worker activity with a required
+`Name` and optional `Tags`. `Ref` and `Fn::GetAtt Arn` return its ARN; `Fn::GetAtt Name`
+returns its name. Workers use the existing `GetActivityTask`, `SendTaskSuccess`,
+`SendTaskFailure`, and `SendTaskHeartbeat` APIs. Tag updates preserve the activity,
+including removal of dropped tags. Renaming creates a replacement, deletes the old activity
+after the stack update commits, and honors `UpdateReplacePolicy: Retain`. Rollback restores
+the prior activity or its tags. `EncryptionConfiguration` is currently rejected explicitly;
+customer managed encryption is not implemented for activities.
+
+`DescribeStateMachineForExecution` reads the configuration captured before a Standard
+execution starts, including the resolved version when invoked through an alias.
+Later updates preserve that definition, execution role, configuration date and
+logging/tracing/encryption metadata. The response names the base state-machine ARN.
+Its revision is omitted for an unupdated configuration; after an update, the date
+and revision belong to that update, including when a version is published later.
+`METADATA_ONLY` returns the definition as `"{}"` and preserves the other fields.
+
+Both public execution readers enforce the signing Region, partition and account.
+After the owning state machine is deleted, `DescribeExecution` and
+`DescribeStateMachineForExecution` return `ExecutionDoesNotExist` for its Standard
+executions. Creating another machine with the same name does not make those old
+executions visible. Internal execution rows and callbacks retain their existing
+lifecycle; this does not add cancellation or change execution-history retention.
+
+The snapshot and machine identity use the existing storage backends. Older
+persisted executions without a captured configuration return `UnsupportedOperation`
+while their owner remains visible; the current mutable definition is never
+substituted. Legacy machines and executions without identity fields remain
+compatible, but cannot distinguish recreations that preceded those fields.
+Older published versions without a captured configuration date retain their
+recorded publication date and revision as a compatibility fallback.
+
+Express and Distributed Map child lookups, variable-reference summaries and
+KMS decryption enforcement are not implemented by this action. Existing Express
+`DescribeExecution` behavior is unchanged. Execution-name reuse after machine
+recreation and atomic deletion against concurrent machine mutation are not
+addressed by these reader checks.
+
 `ListExecutions` honors `statusFilter` when listing a state machine's executions.
 Omitting the filter returns all statuses. Invalid filter values or types return
 `ValidationException`. Map Run execution listing and `PENDING_REDRIVE` filtering are not
@@ -59,6 +99,53 @@ concurrency pool for that qualifier can serve the task; resolving an alias to
 its version does not discard its pool identity. Unqualified invocation retains
 the normal on-demand path, and existing authorization checks still precede
 execution.
+
+## Version and alias IAM conditions
+
+`DescribeStateMachine` and `StartExecution` authorize the base state-machine ARN.
+Use `states:StateMachineQualifier` to restrict these calls to a version or alias,
+as in the [AWS authorization examples](https://docs.aws.amazon.com/step-functions/latest/dg/auth-version-alias.html).
+The condition contains the requested version number or alias name; an alias does
+not become its selected version number. An unqualified call has no qualifier key.
+Other qualifier-aware management operations do not yet populate this condition.
+
+## Testing a single pure state
+
+`TestState` evaluates one JSONPath `Pass`, `Choice`, `Succeed`, or `Fail` state.
+Send the state as `definition`, or send a complete state machine with `stateName`
+selecting a top-level state. The complete definition is still validated. The call
+returns `SUCCEEDED` with JSON text in `output` and, when applicable, `nextState`.
+A `Fail` state or runtime evaluation failure returns HTTP 200 with `FAILED`,
+`error`, and `cause`. It does not start an execution, follow a transition, write
+execution history, or call a service integration.
+
+`inspectionLevel` accepts `INFO` and `DEBUG`; `DEBUG` includes the input and
+applicable data-processing stages reached before success or failure. Inspection
+captures the actual evaluation, so a `States.UUID()` value in inspection matches
+the output from that request. Omitted input defaults to `{}`. Output is limited
+to 262144 UTF-8 bytes, including its JSON syntax.
+
+The non-mocked request requires an existing role with its exact ARN, including
+its path, in the caller's account and partition. Its trust policy must allow the
+Step Functions service. These role checks apply even when IAM enforcement is
+disabled. With IAM enforcement enabled, the caller also needs `states:TestState`
+on `*` and `iam:PassRole` on that role, with `iam:PassedToService` set to Step
+Functions when the policy uses that condition. `revealSecrets=true` additionally
+requires `states:RevealSecrets` on `*`. TestState does not create a role session
+or invent a state-machine SourceArn or SourceAccount for trust conditions.
+
+Task, Wait, Map and Parallel states, JSONata, workflow variables, Assign, context
+references, mock, context, variables and stateConfiguration are not supported
+by TestState yet and are explicitly refused. TRACE is rejected for these pure
+states. JSONPath and intrinsic evaluation use the existing execution helpers:
+this is not a complete ASL path grammar validator. Recursive-descent paths are
+rejected; general paths and reference paths are not fully distinguished by the
+pragmatic validator. Existing runtime error names are retained, including
+`States.Runtime` for an unresolved Parameters path.
+
+SDKs can inject a `sync-` prefix into the TestState endpoint. For a local Java
+SDK client, set `SdkAdvancedClientOption.DISABLE_HOST_PREFIX_INJECTION` to `true`
+in its override configuration so the call reaches the configured local endpoint.
 
 ## Task-token IAM resources
 
@@ -304,7 +391,8 @@ workflows converge: the `framework-isComplete-task` throws on every not-yet-comp
 `JitterStrategy` supports `NONE` (the default) and `FULL`. `FULL` draws the delay
 uniformly between zero and the computed delay, as on AWS. One deviation. The delay
 between attempts is capped at `floci.services.stepfunctions.max-wait-seconds`
-(default 30), the same ceiling Floci applies to `Wait` states, so emulated runs stay fast.
+(default 30), unless a positive `max-wait-millis` replaces that ceiling.
+The same ceiling applies to `Wait` states, so emulated runs stay fast.
 
 ## Wait states
 
@@ -315,7 +403,15 @@ unparseable timestamp fails the execution with `States.Runtime`. In a JSONata st
 `Seconds` and `Timestamp` each accept a literal or a JSONata expression that produces the value.
 
 One deviation. Every pause is capped at `floci.services.stepfunctions.max-wait-seconds`
-(default 30) so emulated runs stay fast, where AWS sleeps the full duration.
+(default 30), unless a positive `max-wait-millis` replaces that ceiling.
+This keeps emulated runs fast, where AWS sleeps the full duration.
+
+For subsecond local waits, set `floci.services.stepfunctions.max-wait-millis`, for
+example `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_MILLIS=100`. A positive value overrides
+the seconds ceiling for every Wait form and Retry backoff. Its default, `0`, keeps
+the existing seconds setting. Non-positive values also use the seconds setting.
+This local acceleration does not change the host clock, execution or task deadlines,
+heartbeat timeouts, or the polling interval of an external workflow worker.
 
 ## Timeouts
 
@@ -334,6 +430,10 @@ is `0`. The state that was cut gets no `*StateExited` event. A `Parallel` or `Ma
 on its own thread and is not cut mid-state: the budget is enforced again as soon as the branch
 returns.
 
+The workflow's maximum execution time also bounds this budget: one year (365 days) for
+Standard workflows and five minutes for Express workflows. The Express limit applies to both
+`StartExecution` and `StartSyncExecution`. A shorter state-machine `TimeoutSeconds` takes precedence.
+
 A `Task` that waits for a task token — an activity, or a `.waitForTaskToken` integration — has
 two independent bounds. `TimeoutSeconds` is the whole wait; `HeartbeatSeconds` is the longest gap
 allowed between two `SendTaskHeartbeat` calls, and every heartbeat pushes that gap forward, so a
@@ -343,13 +443,13 @@ clock ends the state the same way: an `ActivityTimedOut` event — `TaskTimedOut
 reads `FAILED` with that same error. A `Catch` on a heartbeat expiry matches under
 `States.HeartbeatTimeout` and under `States.Timeout` alike. Neither timeout carries a cause:
 `DescribeExecution` and the `ExecutionFailed` event both leave the key out, where every other
-failure reports one. A `Task` that declares no `TimeoutSeconds` waits 300 seconds, where AWS
-waits a year.
+failure reports one. A `Task` that declares no `TimeoutSeconds` uses AWS's default of
+99,999,999 seconds, constrained by the workflow's execution budget.
 
 A `Task` that waits for a `.sync` job runs under the same two clocks and no other: the execution's
 budget ends it `TIMED_OUT`, its own `TimeoutSeconds` ends it `FAILED` with a `TaskTimedOut` event
 carrying `States.Timeout` and no cause, and a job that takes longer than either simply runs until
-the earlier clock fires. The default of 300 seconds applies here too when the state declares none.
+the earlier clock fires. The same default applies here when the state declares none.
 When the `Task`'s own clock fires, the job it was waiting on is stopped the way AWS stops it: the
 ECS task reads `stopCode: UserInitiated`, the child execution reads `ABORTED` with no error, and
 both carry the cause `The Task state in AWS Step Functions execution [<arn>] which was managing
@@ -914,6 +1014,15 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 
 | Resource | Result | Notable failure |
 | --- | --- | --- |
+| `arn:aws:states:::aws-sdk:ec2:runInstances` | `{ReservationId, OwnerId, Instances}` | `Ec2.Ec2Exception`; the cause retains the EC2 error code |
+| `arn:aws:states:::aws-sdk:ec2:describeInstances` | `{Reservations, NextToken?}` | `Ec2.Ec2Exception` |
+| `arn:aws:states:::aws-sdk:ec2:terminateInstances` | `{TerminatingInstances}` | `Ec2.Ec2Exception` |
+| `arn:aws:states:::aws-sdk:ssm:describeInstanceInformation` | `{InstanceInformationList, NextToken?}` | `Ssm.InvalidFilterKeyException` |
+| `arn:aws:states:::aws-sdk:ssm:sendCommand` | `{Command}` | `Ssm.InvalidInstanceIdException` |
+| `arn:aws:states:::aws-sdk:ssm:getCommandInvocation` | invocation status and output | `Ssm.InvocationDoesNotExistException` |
+| `arn:aws:states:::aws-sdk:ssm:listCommands` | `{Commands}` | `Ssm.InvalidCommandIdException` |
+| `arn:aws:states:::aws-sdk:ssm:listCommandInvocations` | `{CommandInvocations}` | `Ssm.InvalidCommandIdException` |
+| `arn:aws:states:::aws-sdk:ssm:cancelCommand` | `{}` | `Ssm.InvalidCommandIdException` |
 | `arn:aws:states:::aws-sdk:ecs:updateService` | `{Service}` | `Ecs.ServiceNotFoundException` |
 | `arn:aws:states:::aws-sdk:ecs:listServices` | `{ServiceArns, NextToken?}` | `Ecs.ClusterNotFoundException` |
 | `arn:aws:states:::aws-sdk:ecs:describeServices` | `{Services, Failures}` | Missing services appear in `Failures` |
@@ -959,6 +1068,27 @@ state-machine execution role's per-action IAM policies. Name-based lookups use t
 execution scope; explicit ARNs retain the underlying service's cross-account lookup
 behavior. The underlying services' validation still applies. They implement
 request-response calls, without job-completion polling.
+
+The EC2 and SSM tasks make signed requests through Floci's ordinary AWS listener.
+They use the state-machine region and execution role, or an explicitly selected
+`Credentials.RoleArn`. With IAM enforcement enabled, the role's trust, any task-role
+assumption, and the service's normal IAM/resource checks apply. EC2 Query member
+names, SDK result arrays and scalar types come from pinned botocore models.
+Version and alias starts use the base state-machine ARN for the service trust's
+`aws:SourceArn` and `$$.StateMachine.Id`. The selected version still supplies the
+definition and execution role; version descriptions retain their qualified ARN.
+SSM parameter-map keys retain their spelling; modeled timestamps become ISO strings.
+The existing service implementations remain responsible for validation and effects.
+Failures use the service's modeled SDK exception classes, with `Ec2.Ec2Exception`
+or `Ssm.SsmException` for unmodeled service errors. Their causes retain the wire error
+code and message. EC2's SDK model does not declare operation-specific exceptions.
+
+These are request-response integrations. `runInstances` returns the launch
+response; `sendCommand` returns a command ID before a guest completes the command.
+Use explicit Choice/Wait loops around instance readiness and command status.
+`CancelCommand` and `TerminateInstances` remain separate operations. Stopping
+a workflow does not automatically terminate its instances or cancel its commands.
+There are no `.sync` variants for these compute operations.
 
 For example, force a deployment of an existing disposable service:
 
@@ -1271,7 +1401,9 @@ Literal reserved names, including `Expect`, `Upgrade`, `Authorization` and `Host
 `X-Amz-`, `X-Amzn-` and `X-Forwarded-` prefixes are rejected case-insensitively when a
 definition is created, updated or validated, including JSONata arguments and nested workflows.
 An explicit `Content-Length` must equal the serialized body size; the HTTP client writes that header.
-Private endpoints, resource-policy authentication, query parameters and `AllowNullValues` remain unsupported.
+An API with a resource policy is invoked like any other: the execute-api listener evaluates the
+policy for the signed execution role, as it does for a direct caller.
+Private endpoints, query parameters and `AllowNullValues` remain unsupported.
 
 With IAM enforcement enabled, the execution role must trust Step Functions. The task uses its
 `Credentials.RoleArn` when supplied, including assume-role authorization, identity policies,
@@ -1398,7 +1530,8 @@ unsupported resource.
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_STEPFUNCTIONS_ENABLED` | `true` | Enable or disable the service |
-| `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_SECONDS` | `30` | Ceiling in seconds on a `Wait` state pause and a `Retry` backoff |
+| `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_SECONDS` | `30` | Ceiling in seconds on a `Wait` state pause and a `Retry` backoff when `max-wait-millis` is non-positive |
+| `FLOCI_SERVICES_STEPFUNCTIONS_MAX_WAIT_MILLIS` | `0` | Positive values replace the seconds ceiling for `Wait` states and `Retry` backoff; non-positive values retain it |
 | `SFN_MOCK_CONFIG` | unset | Path to a Step Functions Local compatible mock configuration file (alias: `FLOCI_SERVICES_STEPFUNCTIONS_MOCK_CONFIG_FILE`) |
 
 ## Examples
@@ -1441,3 +1574,7 @@ aws stepfunctions get-execution-history \
   --execution-arn $EXEC_ARN \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+Execution history uses paginated, 24-hour continuation tokens. `maxResults` omitted or zero defaults to 100; the maximum is 1,000. A token remains valid when the page size or `includeExecutionData` changes, but is bound to its execution and `reverseOrder`.
+Floci authenticates history tokens with a process-local key. Edited or unsigned tokens return
+`InvalidToken`; restarting Floci invalidates outstanding tokens.

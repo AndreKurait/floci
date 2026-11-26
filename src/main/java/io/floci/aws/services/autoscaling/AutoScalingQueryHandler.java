@@ -9,6 +9,7 @@ import io.floci.aws.core.common.AwsQueryResponse;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.SmithyValidationErrors;
 import io.floci.aws.core.common.XmlBuilder;
+import io.floci.aws.services.autoscaling.AutoScalingService.AutoScalingInstanceDetails;
 import io.floci.aws.services.autoscaling.model.*;
 import io.floci.aws.services.ec2.model.LaunchTemplateData;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -70,9 +71,9 @@ public class AutoScalingQueryHandler {
                 case "SetInstanceHealth"            -> handleSetInstanceHealth(p, region);
                 case "AttachInstances"              -> handleAttachInstances(p, region);
                 case "DetachInstances"              -> handleDetachInstances(p, region);
-                case "TerminateInstanceInAutoScalingGroup" -> handleTerminateInstance(p, region);
                 case "EnterStandby"                 -> handleEnterStandby(p, region);
                 case "ExitStandby"                  -> handleExitStandby(p, region);
+                case "TerminateInstanceInAutoScalingGroup" -> handleTerminateInstance(p, region);
                 // Load balancer attachment
                 case "AttachLoadBalancerTargetGroups"    -> handleAttachLoadBalancerTargetGroups(p, region);
                 case "DetachLoadBalancerTargetGroups"    -> handleDetachLoadBalancerTargetGroups(p, region);
@@ -88,7 +89,7 @@ public class AutoScalingQueryHandler {
                 case "DeleteLifecycleHook"          -> handleDeleteLifecycleHook(p, region);
                 case "DescribeLifecycleHooks"       -> handleDescribeLifecycleHooks(p, region);
                 case "CompleteLifecycleAction"      -> handleCompleteLifecycleAction(p, region);
-                case "RecordLifecycleActionHeartbeat" -> handleRecordLifecycleActionHeartbeat();
+                case "RecordLifecycleActionHeartbeat" -> handleRecordLifecycleActionHeartbeat(p, region);
                 // Scaling policies
                 case "PutScalingPolicy"             -> handlePutScalingPolicy(p, region);
                 case "DeletePolicy"                 -> handleDeletePolicy(p, region);
@@ -540,6 +541,33 @@ public class AutoScalingQueryHandler {
                 .end("CreateOrUpdateTagsResponse").build());
     }
 
+    private Response handleEnableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.enableMetricsCollection(region, p.getFirst("AutoScalingGroupName"),
+                memberList(p, "Metrics"), p.getFirst("Granularity"));
+        return ok(new XmlBuilder()
+                .start("EnableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("EnableMetricsCollectionResponse").build());
+    }
+
+    private Response handleDisableMetricsCollection(MultivaluedMap<String, String> p, String region) {
+        service.disableMetricsCollection(region, p.getFirst("AutoScalingGroupName"), memberList(p, "Metrics"));
+        return ok(new XmlBuilder()
+                .start("DisableMetricsCollectionResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DisableMetricsCollectionResponse").build());
+    }
+
+    private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
+        for (TagRequest tag : parseTagRequests(p)) {
+            service.deleteTags(region, tag.resourceId(), tag.resourceType(), List.of(tag.key()));
+        }
+        return ok(new XmlBuilder()
+                .start("DeleteTagsResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("DeleteTagsResponse").build());
+    }
+
     private Response handleDescribeTags(MultivaluedMap<String, String> p, String region) {
         List<Map.Entry<String, List<String>>> filters = new ArrayList<>();
         for (int i = 1; ; i++) {
@@ -584,53 +612,24 @@ public class AutoScalingQueryHandler {
         return ok(xml.build());
     }
 
-    private Response handleEnableMetricsCollection(MultivaluedMap<String, String> p, String region) {
-        service.enableMetricsCollection(region, p.getFirst("AutoScalingGroupName"),
-                memberList(p, "Metrics"), p.getFirst("Granularity"));
-        return ok(new XmlBuilder()
-                .start("EnableMetricsCollectionResponse", NS)
-                  .raw(AwsQueryResponse.responseMetadata())
-                .end("EnableMetricsCollectionResponse").build());
-    }
-
-    private Response handleDisableMetricsCollection(MultivaluedMap<String, String> p, String region) {
-        service.disableMetricsCollection(region, p.getFirst("AutoScalingGroupName"), memberList(p, "Metrics"));
-        return ok(new XmlBuilder()
-                .start("DisableMetricsCollectionResponse", NS)
-                  .raw(AwsQueryResponse.responseMetadata())
-                .end("DisableMetricsCollectionResponse").build());
-    }
-
-    private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
-        for (TagRequest tag : parseTagRequests(p)) {
-            service.deleteTags(region, tag.resourceId(), tag.resourceType(), List.of(tag.key()));
-        }
-        return ok(new XmlBuilder()
-                .start("DeleteTagsResponse", NS)
-                  .raw(AwsQueryResponse.responseMetadata())
-                .end("DeleteTagsResponse").build());
-    }
-
     // ── Instances ─────────────────────────────────────────────────────────────
 
     private Response handleDescribeAutoScalingInstances(MultivaluedMap<String, String> p, String region) {
-        List<AutoScalingService.AutoScalingInstanceDetails> instances = service.describeAutoScalingInstances(
+        List<AutoScalingInstanceDetails> instances = service.describeAutoScalingInstances(
                 region, memberList(p, "InstanceIds"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAutoScalingInstancesResponse", NS)
                   .start("DescribeAutoScalingInstancesResult")
                     .start("AutoScalingInstances");
-        for (AutoScalingService.AutoScalingInstanceDetails details : instances) {
+        for (AutoScalingInstanceDetails details : instances) {
             AsgInstance inst = details.instance();
-            // AWS's samples of this API spell health HEALTHY, and UNHEALTHY follows the same rule.
-            // DescribeAutoScalingGroups and SetInstanceHealth use the stored Healthy and Unhealthy.
-            String healthStatus = inst.getHealthStatus() == null ? null : inst.getHealthStatus().toUpperCase(Locale.ROOT);
+            String healthStatus = inst.getHealthStatus();
             xml.start("member")
                .elem("InstanceId", inst.getInstanceId())
                .elem("AutoScalingGroupName", details.autoScalingGroupName())
                .elem("AvailabilityZone", inst.getAvailabilityZone())
                .elem("LifecycleState", inst.getLifecycleState())
-               .elem("HealthStatus", healthStatus)
+               .elem("HealthStatus", healthStatus != null ? healthStatus.toUpperCase(Locale.ROOT) : null)
                .elem("ProtectedFromScaleIn", String.valueOf(inst.isProtectedFromScaleIn()));
             if (inst.getLaunchConfigurationName() != null) {
                 xml.elem("LaunchConfigurationName", inst.getLaunchConfigurationName());
@@ -743,12 +742,13 @@ public class AutoScalingQueryHandler {
         xml.end("CapacityReservationSpecification");
     }
 
+    /**
+     * AWS returns EnabledMetrics on every group, as an empty list when no metrics are enabled, and clients that
+     * read the member directly (botocore leaves an absent list out of the parsed group) depend on it.
+     */
     private static void appendEnabledMetricsXml(XmlBuilder xml, List<String> enabledMetrics) {
-        if (enabledMetrics == null || enabledMetrics.isEmpty()) {
-            return;
-        }
         xml.start("EnabledMetrics");
-        for (String metric : enabledMetrics) {
+        for (String metric : enabledMetrics == null ? List.<String>of() : enabledMetrics) {
             xml.start("member")
                .elem("Metric", metric)
                .elem("Granularity", AutoScalingService.METRICS_GRANULARITY)
@@ -924,14 +924,15 @@ public class AutoScalingQueryHandler {
     }
 
     private Response handleTerminateInstance(MultivaluedMap<String, String> p, String region) {
-        service.terminateInstanceInAutoScalingGroup(region,
+        ScalingActivity activity = service.terminateInstanceInAutoScalingGroup(region,
                 p.getFirst("InstanceId"),
                 "true".equalsIgnoreCase(p.getFirst("ShouldDecrementDesiredCapacity")));
-        return ok(new XmlBuilder()
+        XmlBuilder xml = new XmlBuilder()
                 .start("TerminateInstanceInAutoScalingGroupResponse", NS)
-                  .start("TerminateInstanceInAutoScalingGroupResult")
-                  .end("TerminateInstanceInAutoScalingGroupResult")
-                  .raw(AwsQueryResponse.responseMetadata())
+                  .start("TerminateInstanceInAutoScalingGroupResult");
+        appendActivityXml(xml, activity, "Activity");
+        return ok(xml.end("TerminateInstanceInAutoScalingGroupResult")
+                .raw(AwsQueryResponse.responseMetadata())
                 .end("TerminateInstanceInAutoScalingGroupResponse").build());
     }
 
@@ -1132,7 +1133,10 @@ public class AutoScalingQueryHandler {
                 .end("CompleteLifecycleActionResponse").build());
     }
 
-    private Response handleRecordLifecycleActionHeartbeat() {
+    private Response handleRecordLifecycleActionHeartbeat(MultivaluedMap<String, String> p, String region) {
+        service.recordLifecycleActionHeartbeat(region,
+                p.getFirst("AutoScalingGroupName"), p.getFirst("LifecycleHookName"),
+                p.getFirst("InstanceId"), p.getFirst("LifecycleActionToken"));
         return ok(new XmlBuilder()
                 .start("RecordLifecycleActionHeartbeatResponse", NS)
                   .start("RecordLifecycleActionHeartbeatResult").end("RecordLifecycleActionHeartbeatResult")
@@ -1420,15 +1424,14 @@ public class AutoScalingQueryHandler {
     // ── Activities ────────────────────────────────────────────────────────────
 
     private Response handleDescribeScalingActivities(MultivaluedMap<String, String> p, String region) {
+        Set<String> activityIds = new HashSet<>(indexedMembers(p, "ActivityIds"));
         List<ScalingActivity> activities = service.describeScalingActivities(
                 region, p.getFirst("AutoScalingGroupName"), indexedMembers(p, "ActivityIds"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeScalingActivitiesResponse", NS)
                   .start("DescribeScalingActivitiesResult")
                     .start("Activities");
-        for (ScalingActivity a : activities) {
-            appendActivityXml(xml, a);
-        }
+        appendActivities(xml, activities);
         xml.end("Activities")
            .end("DescribeScalingActivitiesResult")
            .raw(AwsQueryResponse.responseMetadata())
@@ -1436,8 +1439,18 @@ public class AutoScalingQueryHandler {
         return ok(xml.build());
     }
 
+    private static void appendActivities(XmlBuilder xml, List<ScalingActivity> activities) {
+        for (ScalingActivity a : activities) {
+            appendActivityXml(xml, a);
+        }
+    }
+
     private static void appendActivityXml(XmlBuilder xml, ScalingActivity a) {
-        xml.start("member")
+        appendActivityXml(xml, a, "member");
+    }
+
+    private static void appendActivityXml(XmlBuilder xml, ScalingActivity a, String element) {
+        xml.start(element)
            .elem("ActivityId", a.getActivityId())
            .elem("AutoScalingGroupName", a.getAutoScalingGroupName())
            .elem("StatusCode", a.getStatusCode())
@@ -1447,7 +1460,7 @@ public class AutoScalingQueryHandler {
         if (a.getCause() != null) { xml.elem("Cause", a.getCause()); }
         if (a.getEndTime() != null) { xml.elem("EndTime", ISO_FMT.format(a.getEndTime())); }
         if (a.getStatusMessage() != null) { xml.elem("StatusMessage", a.getStatusMessage()); }
-        xml.end("member");
+        xml.end(element);
     }
 
     // ── Metadata responses ────────────────────────────────────────────────────
@@ -1741,6 +1754,7 @@ public class AutoScalingQueryHandler {
         return params.entrySet().stream()
                 .filter(entry -> entry.getKey().startsWith(memberPrefix))
                 .filter(entry -> entry.getKey().substring(memberPrefix.length()).matches("[1-9][0-9]*"))
+                // Positive indexes have no leading zeros: length then text preserves numeric order without overflow.
                 .sorted(Comparator.comparingInt((Map.Entry<String, List<String>> entry) -> entry.getKey().length())
                         .thenComparing(Map.Entry::getKey))
                 .flatMap(entry -> entry.getValue().stream())

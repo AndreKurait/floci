@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vendor API Gateway documentation-part request constraints from botocore's service model.
+"""Vendor API Gateway documentation request constraints from botocore's service model.
 
 Unlike the body-only API Gateway shape file, this includes URI and query members so the
 documentation-part validator can check required members and query enums as modeled.
@@ -13,7 +13,7 @@ import request_shapes
 
 OUTPUT = request_shapes.REPO_ROOT / "src/main/resources/aws/apigateway-documentation-request-shapes.json"
 MODEL = Path("apigateway/2015-07-09")
-OPERATIONS = ("CreateDocumentationPart", "GetDocumentationParts")
+OPERATIONS = ("CreateDocumentationPart", "GetDocumentationParts", "CreateDocumentationVersion")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -769,7 +769,7 @@ public class EksClusterManager
 
     private void launchCluster(Cluster cluster, String image, String containerName, int hostPort) {
         // Remove any stale container
-        ContainerStorageHelper.removeStaleContainer(config, lifecycleManager, containerName);
+        ContainerStorageHelper.removeStaleContainerStrict(config, lifecycleManager, containerName, true);
 
         // k3s v1.34+ removed support for --kube-apiserver-arg=storage-backend and
         // --kube-apiserver-arg=etcd-servers. k3s now manages kine (embedded SQLite)
@@ -3069,8 +3069,8 @@ public class EksClusterManager
                     ContainerCaBundle.endpointTrustPem(config, certificateAuthority.caPem())));
             LOG.infov("Registered the EKS Pod Identity mutating webhook ({0}) for cluster {1}", url, clusterName);
         } catch (Exception e) {
-            LOG.warnv("EKS cluster {0} gets no pod identity injection: could not install {1} into the k3s "
-                    + "container: {2}", clusterName, POD_IDENTITY_MANIFEST_FILE, e.getMessage());
+            LOG.warnv(e, "EKS cluster {0} gets no pod identity injection: could not install {1} into the k3s "
+                    + "container", clusterName, POD_IDENTITY_MANIFEST_FILE);
         }
     }
 
@@ -3304,8 +3304,8 @@ public class EksClusterManager
     /**
      * Builds the {@code MutatingWebhookConfiguration} k3s auto-applies. Scoped to pod {@code CREATE}
      * alone, and {@code failurePolicy: Ignore} so an unreachable or failing Floci never blocks a pod
-     * from being created. The {@code caBundle} is what {@code GET /_floci/ca.pem} serves, which
-     * trusts Floci's HTTPS endpoint, base64 of the PEM as Kubernetes expects.
+     * from being created. The {@code caBundle} trusts Floci's HTTPS endpoint and local CA, base64 of the PEM as Kubernetes
+     * expects.
      *
      * <p>{@code timeoutSeconds} is 3, not the Kubernetes default of 10: Floci is a local process, so
      * a healthy call takes milliseconds, and the timeout only ever runs down when Floci is

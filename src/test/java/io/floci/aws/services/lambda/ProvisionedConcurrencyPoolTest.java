@@ -14,6 +14,8 @@ import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.model.LambdaAlias;
 import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
+import io.floci.aws.testing.TestTime;
+import io.floci.aws.testing.TimelineDeadlineWaits;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,13 +37,13 @@ import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -55,11 +57,31 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 class ProvisionedConcurrencyPoolTest {
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "1", "1234567890", "0001"})
+    void publishedVersionAcceptsAsciiDigits(String value) {
+        assertTrue(ProvisionedConcurrencyPool.isPublishedVersion(value));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "$LATEST", "live", "+1", "-1", "1.0", " 1", "1 ", "1\n", "١", "１"})
+    void publishedVersionRejectsNonDigitQualifiers(String value) {
+        assertFalse(ProvisionedConcurrencyPool.isPublishedVersion(value));
+    }
+
+    @Test
+    void publishedVersionRejectsMissingQualifier() {
+        assertFalse(ProvisionedConcurrencyPool.isPublishedVersion(null));
+    }
+
     @TempDir
     Path storagePath;
 
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
+    private static final Duration ONE_NANOSECOND = Duration.ofNanos(1);
+    private final TestTime time = TestTime.create();
+    private final TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
     private final AccountAwareStorageBackend<LambdaFunction> functionStorage =
             AccountAwareStorageBackend.inMemory(ACCOUNT);
     private final AccountAwareStorageBackend<LambdaAlias> aliasStorage =
@@ -90,6 +112,29 @@ class ProvisionedConcurrencyPoolTest {
         return new ProvisionedConcurrencyPool(launcher, functions, aliases, storage, Clock.systemUTC(), 4, 8, false, 15);
     }
 
+    /**
+     * Replaces the pool with one whose drain deadlines and bounded waits are on {@link #time}, so
+     * only an advance of the timeline can end a drain that is still waiting.
+     */
+    private void useTimelinePool(int drainSeconds) {
+        pool.shutdown();
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, storage, Clock.systemUTC(), 4, 8,
+                false, drainSeconds, new LambdaConcurrencyLimiter(),
+                Executors.newSingleThreadScheduledExecutor(), waits);
+    }
+
+    private static EmulatorConfig drainConfig(int drainSeconds) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.lambda()).thenReturn(lambda);
+        when(lambda.warmPoolMaxPerFunction()).thenReturn(Optional.of(4));
+        when(lambda.warmPoolMaxTotal()).thenReturn(8);
+        when(lambda.containerDrainTimeoutSeconds()).thenReturn(drainSeconds);
+        return config;
+    }
+
     private LambdaFunction function(String account, String region, String number) {
         LambdaFunction fn = LambdaFunctionTestFixtures.function(account, region, "example", number);
         fn.setTimeout(3);
@@ -105,6 +150,120 @@ class ProvisionedConcurrencyPoolTest {
 
     private ProvisionedConcurrencyPool.Status put(int count) {
         return pool.put(REGION, "example", "live", count, ACCOUNT);
+    }
+
+    @Test
+    void accountQuotaRejectsBeforePersistenceOrLaunchAndDeleteReleasesTheCommitment() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(5, 2);
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, storage, Clock.systemUTC(), 100, 0, false, 15, limiter);
+        AwsException greater = assertThrows(AwsException.class, () -> put(6));
+        assertEquals("Specified ConcurrentExecutions for function is greater than account's "
+                + "unreserved concurrency [5].", greater.getMessage());
+        AwsException minimum = assertThrows(AwsException.class, () -> put(4));
+        assertEquals("Specified ConcurrentExecutions for function decreases account's "
+                + "UnreservedConcurrentExecution below its minimum value of [2].", minimum.getMessage());
+        assertEquals("InvalidParameterValueException", minimum.getErrorCode());
+        assertTrue(storage.scanAllAccounts().isEmpty());
+        assertEquals(0, launcher.starts.get());
+        put(1);
+        launched().initialized.complete(null);
+        ready();
+        assertEquals(4, limiter.unreservedCapacity(ACCOUNT, REGION));
+        pool.delete(REGION, "example", "live", ACCOUNT);
+        assertEquals(5, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+    }
+
+    @Test
+    void failedPersistenceAndLocalCapacityRestoreTheAccountBudget() {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        AccountAwareStorageBackend<ProvisionedConcurrencyPool.Configuration> failing = spy(storage);
+        doThrow(new IllegalStateException("controlled persistence failure"))
+                .when(failing).putForAccount(anyString(), anyString(), any());
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, failing, Clock.systemUTC(), 4, 8, false, 15, limiter);
+        assertThrows(IllegalStateException.class, () -> put(1));
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertThrows(AwsException.class, () -> put(5));
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+        assertEquals(0, launcher.starts.get());
+    }
+
+    @Test
+    void resetAfterStoppingReleasesPersistedProvisionedCommitments() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, storage, Clock.systemUTC(), 4, 8, false, 15, limiter);
+        put(1);
+        launched().initialized.complete(null);
+        ready();
+        function("222222222222", REGION, "$LATEST");
+        function("222222222222", REGION, "1");
+        alias("222222222222", REGION, "live", "1", Map.of());
+        pool.put(REGION, "example", "live", 1, "222222222222");
+        launched().initialized.complete(null);
+        pool.stopManagedContainers();
+        assertEquals(999, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertEquals(999, limiter.unreservedCapacity("222222222222", REGION));
+
+        pool.clear();
+
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertEquals(1000, limiter.unreservedCapacity("222222222222", REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+    }
+
+    @Test
+    void resetReleasesAPutThatFinishesBeforeAdmissionCloses() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        pool = spy(new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, storage, Clock.systemUTC(), 4, 8, false, 15, limiter));
+        CountDownLatch stopping = new CountDownLatch(1);
+        CountDownLatch proceed = new CountDownLatch(1);
+        doAnswer(call -> {
+            stopping.countDown();
+            assertTrue(proceed.await(5, TimeUnit.SECONDS));
+            return call.callRealMethod();
+        }).when(pool).stopManagedContainers();
+        CompletableFuture<Void> reset = CompletableFuture.runAsync(pool::clear);
+        try {
+            assertTrue(stopping.await(5, TimeUnit.SECONDS));
+            put(1);
+            launched().initialized.complete(null);
+            ready();
+        } finally {
+            proceed.countDown();
+            reset.get(5, TimeUnit.SECONDS);
+        }
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(storage.scanAllAccounts().isEmpty());
+    }
+
+    @Test
+    void failedResetKeepsPersistedCommitmentsUntilClearSucceeds() throws Exception {
+        pool.shutdown();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter();
+        AccountAwareStorageBackend<ProvisionedConcurrencyPool.Configuration> failing = spy(storage);
+        doThrow(new IllegalStateException("controlled clear failure")).doCallRealMethod().when(failing).clear();
+        pool = new ProvisionedConcurrencyPool(
+                launcher, functions, aliases, failing, Clock.systemUTC(), 4, 8, false, 15, limiter);
+        put(1);
+        launched().initialized.complete(null);
+        ready();
+
+        assertThrows(IllegalStateException.class, pool::clear);
+
+        assertEquals(999, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertEquals(1, failing.scanAllAccounts().size());
+        pool.clear();
+        assertEquals(1000, limiter.unreservedCapacity(ACCOUNT, REGION));
+        assertTrue(failing.scanAllAccounts().isEmpty());
     }
 
     @ParameterizedTest
@@ -297,7 +456,8 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     private void ready() {
-        await().atMost(Duration.ofSeconds(5)).until(() -> "READY".equals(get().status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "READY".equals(get().status()));
     }
 
     @Test
@@ -325,7 +485,8 @@ class ProvisionedConcurrencyPoolTest {
     void listingKeepsFailedInitializationVisible() throws Exception {
         put(1);
         launched().initialized.completeExceptionally(new IllegalStateException("initialization failed"));
-        await().atMost(Duration.ofSeconds(5)).until(() -> "FAILED".equals(get().status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "FAILED".equals(get().status()));
         assertEquals(get(), pool.list(REGION, "example", ACCOUNT, null, null).items().getFirst().status());
     }
 
@@ -478,8 +639,8 @@ class ProvisionedConcurrencyPoolTest {
         pool.reconcile();
         Environment replacement = launched();
         replacement.initialized.complete(null);
-        await().atMost(Duration.ofSeconds(5)).until(() ->
-                "READY".equals(pool.get(REGION, "example", "live", account).status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "READY".equals(pool.get(REGION, "example", "live", account).status()));
         assertEquals(1, first.stops.get());
         assertEquals(2, launcher.starts.get());
     }
@@ -499,15 +660,17 @@ class ProvisionedConcurrencyPoolTest {
         assertNull(launcher.launched.poll(100, TimeUnit.MILLISECONDS));
 
         launcher.launchGate.complete(null);
-        await().atMost(Duration.ofSeconds(5)).until(() -> first.stops.get() == 1);
-        await().atMost(Duration.ofSeconds(5)).until(() -> {
-            pool.reconcile();
-            return launcher.starts.get() == 2;
-        });
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> first.stops.get() == 1);
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    pool.reconcile();
+                    return launcher.starts.get() == 2;
+                });
         Environment replacement = launched();
         replacement.initialized.complete(null);
-        await().atMost(Duration.ofSeconds(5)).until(() ->
-                "READY".equals(pool.get(REGION, "example", "live", account).status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "READY".equals(pool.get(REGION, "example", "live", account).status()));
         assertEquals(2, launcher.starts.get());
     }
 
@@ -583,7 +746,8 @@ class ProvisionedConcurrencyPoolTest {
         put(1);
         Environment first = launched();
         pool.delete(REGION, "example", "live", ACCOUNT);
-        await().atMost(Duration.ofSeconds(5)).until(() -> first.stops.get() == 1);
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> first.stops.get() == 1);
         first.initialized.complete(null);
         AwsException missing = assertThrows(AwsException.class, this::get);
         assertEquals("ProvisionedConcurrencyConfigNotFoundException", missing.getErrorCode());
@@ -599,7 +763,8 @@ class ProvisionedConcurrencyPoolTest {
         Environment first = launched();
         pool.delete(REGION, "example", "live", ACCOUNT);
         launcher.launchGate.complete(null);
-        await().atMost(Duration.ofSeconds(5)).until(() -> first.stops.get() == 1);
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> first.stops.get() == 1);
         assertThrows(AwsException.class, this::get);
     }
 
@@ -685,6 +850,24 @@ class ProvisionedConcurrencyPoolTest {
         ready();
     }
 
+    @Test
+    void releaseAfterAResetStoppedTheLeasedEnvironmentLeavesThePoolUsable() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        // A state reset while the invocation is in flight stops the leased environment and reopens the pool.
+        pool.clear();
+        assertFalse(first.alive);
+
+        assertTrue(pool.release(first.handle, true), "the invocation returns its lease after the reset");
+
+        assertEquals(1, first.stops.get(), "the environment the reset stopped is not stopped again");
+        pool.deleteFunction(version);
+        assertEquals(1, put(1).requested());
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void lateReleaseCleansUpAfterFailedOrExpiredShutdown(boolean expiredDeadline) throws Exception {
@@ -724,12 +907,14 @@ class ProvisionedConcurrencyPoolTest {
         launcher.stopFailures.set(1);
 
         assertTrue(pool.release(first.handle, false));
-        assertTrue(first.alive);
-        assertEquals(1, first.stops.get());
         assertThrows(AwsException.class, this::get);
 
+        // Release queues its own retry, which can complete before this thread observes the failed stop.
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !first.alive);
+        assertEquals(2, first.stops.get());
+
         pool.reconcileSafely();
-        assertFalse(first.alive);
         assertEquals(2, first.stops.get());
     }
 
@@ -738,9 +923,13 @@ class ProvisionedConcurrencyPoolTest {
         put(1);
         Environment first = launched();
         first.initialized.completeExceptionally(new IllegalStateException("controlled init failure"));
-        await().atMost(Duration.ofSeconds(5)).until(() -> "FAILED".equals(get().status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "FAILED".equals(get().status()));
         assertTrue(get().reason().contains("controlled init failure"));
         assertEquals(0, get().allocated());
+        // The launch publishes its failure before it stops the environment it gave up on.
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> first.stops.get() > 0);
         assertEquals(1, first.stops.get());
         put(1);
         Environment second = launched();
@@ -799,16 +988,17 @@ class ProvisionedConcurrencyPoolTest {
                 storage, Clock.systemUTC(), 4, 8, false, 15, scheduler);
         pool.start();
         ArgumentCaptor<Runnable> repair = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).scheduleWithFixedDelay(repair.capture(), eq(0L), eq(1L), eq(TimeUnit.SECONDS));
+        verify(scheduler).scheduleWithFixedDelay(repair.capture(), eq(0L), eq(10L), eq(TimeUnit.SECONDS));
         repair.getValue().run();
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
-                verify(aliasLookup, times(1)).getForAccount(ACCOUNT, REGION, "example", "live"));
+        await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> verify(aliasLookup, times(1)).getForAccount(ACCOUNT, REGION, "example", "live"));
         repair.getValue().run();
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
-                verify(aliasLookup, times(2)).getForAccount(ACCOUNT, REGION, "example", "live"));
+        await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> verify(aliasLookup, times(2)).getForAccount(ACCOUNT, REGION, "example", "live"));
         doCallRealMethod().when(aliasLookup).getForAccount(ACCOUNT, REGION, "example", "live");
         repair.getValue().run();
-        await().atMost(Duration.ofSeconds(3)).until(() -> !launcher.launched.isEmpty());
+        await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !launcher.launched.isEmpty());
         Environment replacement = launched();
         replacement.initialized.complete(null);
         ready();
@@ -816,6 +1006,61 @@ class ProvisionedConcurrencyPoolTest {
         assertEquals(1, first.stops.get());
         pool.shutdown();
         verify(scheduler).shutdownNow();
+    }
+
+    @Test
+    void failedLeaseTriggersReplacementWithoutAReadOrRepairTick() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        assertTrue(pool.release(first.handle, true));
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(2, launcher.starts.get());
+    }
+
+    @Test
+    void retiringBusyAliasReplenishesWhenItsLeaseReleasesCapacity() throws Exception {
+        pool.shutdown();
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, storage,
+                Clock.systemUTC(), 1, 1, false, 15);
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertSame(first.handle, pool.acquire(version, "live"));
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+        pool.reconcile();
+        assertEquals(1, launcher.starts.get());
+
+        assertTrue(pool.release(first.handle, false));
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(2, launcher.starts.get());
+    }
+
+    @Test
+    void aliasChangeSignalInitializesReplacementWithoutAReadOrRepairTick() throws Exception {
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        function(ACCOUNT, REGION, "2");
+        alias(ACCOUNT, REGION, "live", "2", Map.of());
+        pool.requestReconciliation();
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(1, first.stops.get());
+        assertEquals(2, launcher.starts.get());
     }
 
     @Test
@@ -831,6 +1076,24 @@ class ProvisionedConcurrencyPoolTest {
         replacement.initialized.complete(null);
         ready();
         assertEquals(1, first.stops.get());
+    }
+
+    @Test
+    void idleRuntimeFailureTriggersReplacementWithoutRepairTickOrRead() throws Exception {
+        launcher.rejectHealthChecks = true;
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        first.faulted.set(true);
+        first.runtimeFailure.complete(null);
+
+        Environment replacement = launched();
+        replacement.initialized.complete(null);
+        await().atMost(Duration.ofSeconds(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> replacement.handle.getState() == ContainerState.WARM);
+        assertEquals(1, first.stops.get());
+        assertEquals(2, launcher.starts.get());
     }
 
     @Test
@@ -1053,13 +1316,20 @@ class ProvisionedConcurrencyPoolTest {
         original.initialized.complete(null);
         ready();
         LambdaFunction target = function(ACCOUNT, REGION, "2");
+        AtomicBoolean aliasWritesFail = new AtomicBoolean(true);
         if ("hotReload".equals(failureKind)) {
             target.setHotReloadHostPath("/tmp/unsupported-target");
         } else if ("durable".equals(failureKind)) {
             target.setDurableExecutionTimeout(60);
         } else {
-            doThrow(new IllegalStateException("controlled alias write failure"))
-                    .when(backend).putForAccount(eq(ACCOUNT), any(), any());
+            // Stubbed once and switched off below: the background reconciler writes through this spy,
+            // and a call of its landing inside a later re-stubbing would take that stubbing for itself.
+            doAnswer(call -> {
+                if (aliasWritesFail.get()) {
+                    throw new IllegalStateException("controlled alias write failure");
+                }
+                return call.callRealMethod();
+            }).when(backend).putForAccount(eq(ACCOUNT), any(), any());
         }
         functions.saveForAccount(ACCOUNT, REGION, target);
         alias(ACCOUNT, REGION, "live", "2", Map.of());
@@ -1069,22 +1339,20 @@ class ProvisionedConcurrencyPoolTest {
         assertDoesNotThrow(() -> pool.put(REGION, "example", "1", 1, other));
         Environment peer = launched();
         peer.initialized.complete(null);
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                assertEquals("READY", pool.get(REGION, "example", "1", other).status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals("READY", pool.get(REGION, "example", "1", other).status()));
         peer.faulted.set(true);
         assertDoesNotThrow(pool::reconcile);
         assertEquals("IN_PROGRESS", pool.get(REGION, "example", "1", other).status());
         Environment peerReplacement = launched();
         peerReplacement.initialized.complete(null);
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                assertEquals("READY", pool.get(REGION, "example", "1", other).status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals("READY", pool.get(REGION, "example", "1", other).status()));
         assertEquals(1, peer.stops.get());
         assertEquals(0, original.stops.get());
         assertEquals("1", storage.scanAllAccounts().stream()
                 .filter(value -> ACCOUNT.equals(value.account())).findFirst().orElseThrow().version());
-        if ("storage".equals(failureKind)) {
-            doCallRealMethod().when(backend).putForAccount(eq(ACCOUNT), any(), any());
-        }
+        aliasWritesFail.set(false);
         target.setDurableExecutionTimeout(null);
         target.setHotReloadHostPath(null);
         functions.saveForAccount(ACCOUNT, REGION, target);
@@ -1151,14 +1419,18 @@ class ProvisionedConcurrencyPoolTest {
 
     @Test
     void shutdownWaitsForAndRemovesALaunchThatReturnsAfterAdmissionCloses() throws Exception {
+        useTimelinePool(15);
+        Duration budget = Duration.ofSeconds(2);
         launcher.launchGate = new CompletableFuture<>();
         put(1);
         Environment first = launched();
         first.initialized.complete(null);
-        CompletableFuture<Void> shutdown = CompletableFuture.runAsync(() ->
-                pool.stopManagedContainers(System.nanoTime() + TimeUnit.SECONDS.toNanos(2)));
+        long deadline = waits.nanoTime() + budget.toNanos();
+        CompletableFuture<Void> shutdown = CompletableFuture.runAsync(() -> pool.stopManagedContainers(deadline));
         try {
-            assertThrows(TimeoutException.class, () -> shutdown.get(100, TimeUnit.MILLISECONDS));
+            waits.awaitWaiting(1);
+            time.advance(budget.minus(ONE_NANOSECOND));
+            assertFalse(shutdown.isDone(), "Shutdown must wait for the pending launch until its deadline");
             assertEquals(409, assertThrows(AwsException.class, () -> put(1)).getHttpStatus());
             assertEquals(0, first.stops.get());
             launcher.launchGate.complete(null);
@@ -1175,13 +1447,19 @@ class ProvisionedConcurrencyPoolTest {
 
     @Test
     void pendingLaunchPreservesShutdownDeadlineAndCleansUpWhenItReturns() throws Exception {
+        useTimelinePool(15);
+        Duration budget = Duration.ofSeconds(1);
         launcher.launchGate = new CompletableFuture<>();
         put(1);
         Environment first = launched();
         first.initialized.complete(null);
-        CompletableFuture<Void> shutdown = CompletableFuture.runAsync(() ->
-                pool.stopManagedContainers(System.nanoTime() + TimeUnit.SECONDS.toNanos(1)));
+        long deadline = waits.nanoTime() + budget.toNanos();
+        CompletableFuture<Void> shutdown = CompletableFuture.runAsync(() -> pool.stopManagedContainers(deadline));
         try {
+            waits.awaitWaiting(1);
+            time.advance(budget.minus(ONE_NANOSECOND));
+            assertFalse(shutdown.isDone(), "Shutdown must wait for the pending launch until its deadline");
+            time.advance(ONE_NANOSECOND);
             shutdown.get(3, TimeUnit.SECONDS);
             pool.stopManagedContainers();
             assertEquals(0, first.stops.get());
@@ -1189,7 +1467,8 @@ class ProvisionedConcurrencyPoolTest {
         } finally {
             launcher.launchGate.complete(null);
         }
-        await().atMost(Duration.ofSeconds(5)).until(() -> !first.alive);
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !first.alive);
         assertEquals(1, first.stops.get());
         pool.stopManagedContainers();
         assertEquals(1, first.stops.get());
@@ -1200,15 +1479,22 @@ class ProvisionedConcurrencyPoolTest {
 
     @Test
     void suppliedShutdownDeadlineCancelsRemovalAndResetCanRetry() throws Exception {
+        useTimelinePool(15);
+        Duration budget = Duration.ofSeconds(1);
         put(1);
         Environment environment = launched();
         environment.initialized.complete(null);
         ready();
         launcher.stopGate = new CompletableFuture<>();
-        CompletableFuture<Void> drained = CompletableFuture.runAsync(() ->
-                pool.stopManagedContainers(System.nanoTime() + TimeUnit.SECONDS.toNanos(1)));
+        long deadline = waits.nanoTime() + budget.toNanos();
+        CompletableFuture<Void> drained = CompletableFuture.runAsync(() -> pool.stopManagedContainers(deadline));
         try {
             assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
+            waits.awaitWaiting(1);
+            time.advance(budget.minus(ONE_NANOSECOND));
+            assertFalse(drained.isDone(), "The drain must wait for the removal until its deadline");
+            assertEquals(1, environment.stops.get());
+            time.advance(ONE_NANOSECOND);
             drained.get(3, TimeUnit.SECONDS);
             assertTrue(environment.alive, "Canceled Docker removal must remain owned");
             pool.stopManagedContainers();
@@ -1217,10 +1503,11 @@ class ProvisionedConcurrencyPoolTest {
             launcher.stopGate.complete(null);
         }
         pool.clear();
-        await().atMost(Duration.ofSeconds(5)).until(() -> {
-            pool.reconcileSafely();
-            return !environment.alive;
-        });
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    pool.reconcileSafely();
+                    return !environment.alive;
+                });
         int completedAttempts = environment.stops.get();
         pool.stopManagedContainers();
         assertEquals(completedAttempts, environment.stops.get());
@@ -1228,19 +1515,8 @@ class ProvisionedConcurrencyPoolTest {
 
     @Test
     void configuredBudgetBoundsResetAndNormalRemovalAndRetainsRetry() throws Exception {
-        pool.shutdown();
-        EmulatorConfig config = mock(EmulatorConfig.class);
-        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
-        EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
-        StorageFactory factory = mock(StorageFactory.class);
-        when(config.services()).thenReturn(services);
-        when(services.lambda()).thenReturn(lambda);
-        when(lambda.warmPoolMaxPerFunction()).thenReturn(Optional.of(4));
-        when(lambda.warmPoolMaxTotal()).thenReturn(8);
-        when(lambda.containerDrainTimeoutSeconds()).thenReturn(1);
-        when(factory.<ProvisionedConcurrencyPool.Configuration>create(
-                eq("lambda"), eq("lambda-provisioned-concurrency.json"), any())).thenReturn(storage);
-        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, factory, config, Clock.systemUTC());
+        Duration budget = Duration.ofSeconds(1);
+        useTimelinePool(WarmPool.resolveDrainTimeout(drainConfig((int) budget.toSeconds())));
         put(1);
         Environment first = launched();
         first.initialized.complete(null);
@@ -1250,15 +1526,20 @@ class ProvisionedConcurrencyPoolTest {
                 pool.delete(REGION, "example", "live", ACCOUNT));
         try {
             assertSame(first, launcher.stopping.poll(2, TimeUnit.SECONDS));
+            waits.awaitWaiting(1);
+            time.advance(budget.minus(ONE_NANOSECOND));
+            assertFalse(removal.isDone(), "The removal must wait for the stop until the configured budget ends");
+            time.advance(ONE_NANOSECOND);
             removal.get(3, TimeUnit.SECONDS);
             assertTrue(first.alive);
         } finally {
             first.stopGate.complete(null);
         }
-        await().atMost(Duration.ofSeconds(5)).until(() -> {
-            pool.reconcileSafely();
-            return !first.alive;
-        });
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    pool.reconcileSafely();
+                    return !first.alive;
+                });
 
         put(1);
         Environment second = launched();
@@ -1269,16 +1550,86 @@ class ProvisionedConcurrencyPoolTest {
         try {
             assertSame(first, launcher.stopping.poll(2, TimeUnit.SECONDS));
             assertSame(second, launcher.stopping.poll(2, TimeUnit.SECONDS));
+            waits.awaitWaiting(1);
+            time.advance(budget.minus(ONE_NANOSECOND));
+            assertFalse(reset.isDone(), "The reset must wait for the stop until the configured budget ends");
+            time.advance(ONE_NANOSECOND);
             reset.get(3, TimeUnit.SECONDS);
             assertTrue(second.alive);
         } finally {
             second.stopGate.complete(null);
         }
-        await().atMost(Duration.ofSeconds(5)).until(() -> {
-            pool.reconcileSafely();
-            return !second.alive;
-        });
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    pool.reconcileSafely();
+                    return !second.alive;
+                });
         assertTrue(storage.scan(ignored -> true).isEmpty());
+    }
+
+    /**
+     * Real-time wiring: the injected constructor reads the drain budget from the configuration and
+     * waits it out on the system clock, with nothing on a test timeline.
+     */
+    @Test
+    void injectedConstructorWaitsOutTheConfiguredBudgetInRealTime() throws Exception {
+        pool.shutdown();
+        Duration budget = Duration.ofSeconds(1);
+        StorageFactory factory = mock(StorageFactory.class);
+        when(factory.<ProvisionedConcurrencyPool.Configuration>create(
+                eq("lambda"), eq("lambda-provisioned-concurrency.json"), any())).thenReturn(storage);
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, factory,
+                drainConfig((int) budget.toSeconds()), Clock.systemUTC(), new LambdaConcurrencyLimiter());
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        first.stopGate = new CompletableFuture<>();
+        long started = System.nanoTime();
+        CompletableFuture<Void> removal = CompletableFuture.runAsync(() ->
+                pool.delete(REGION, "example", "live", ACCOUNT));
+        try {
+            assertSame(first, launcher.stopping.poll(2, TimeUnit.SECONDS));
+            removal.get(3, TimeUnit.SECONDS);
+            assertTrue(System.nanoTime() - started >= budget.toNanos(),
+                    "The removal must not give up before the configured budget ends");
+            assertTrue(first.alive);
+        } finally {
+            first.stopGate.complete(null);
+        }
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    pool.reconcileSafely();
+                    return !first.alive;
+                });
+    }
+
+    private void awaitAvailable(int expected) {
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> get().available() == expected);
+    }
+
+    @Test
+    void readyStatusCanPrecedeTheLastInitializationWorker() throws Exception {
+        put(2);
+        Environment first = launched();
+        Environment second = launched();
+        first.initializationGate = new CompletableFuture<>();
+        second.initializationGate = new CompletableFuture<>();
+        try {
+            second.initialized.complete(null);
+            first.initialized.complete(null);
+            await().atMost(Duration.ofSeconds(5)).until(() -> get().allocated() == 2);
+            first.initializationGate.complete(null);
+            ready();
+            assertEquals(1, get().available(), "The parked initializer has not admitted its idle environment");
+            second.initializationGate.complete(null);
+            awaitAvailable(2);
+            assertEquals(2, get().available());
+        } finally {
+            first.initializationGate.complete(null);
+            second.initializationGate.complete(null);
+        }
     }
 
     @Test
@@ -1293,7 +1644,7 @@ class ProvisionedConcurrencyPoolTest {
             environments.add(environment);
             environment.initialized.complete(null);
         }
-        ready();
+        awaitAvailable(32);
         launcher.stopGate = new CompletableFuture<>();
         AtomicBoolean interruptionPreserved = new AtomicBoolean();
         Thread drain = Thread.ofPlatform().start(() -> {
@@ -1321,10 +1672,11 @@ class ProvisionedConcurrencyPoolTest {
         assertEquals(attempts, environments.stream().mapToInt(environment -> environment.stops.get()).sum());
         // A deliberate reset reopens normal reconciliation; repeated shutdown never does.
         pool.clear();
-        await().atMost(Duration.ofSeconds(5)).until(() -> {
-            pool.reconcileSafely();
-            return environments.stream().noneMatch(environment -> environment.alive);
-        });
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    pool.reconcileSafely();
+                    return environments.stream().noneMatch(environment -> environment.alive);
+                });
         assertTrue(environments.stream().allMatch(environment -> environment.stops.get() > 0));
     }
 
@@ -1354,14 +1706,15 @@ class ProvisionedConcurrencyPoolTest {
         Environment failed = launched();
         held.initialized.complete(null);
         failed.initialized.complete(null);
-        ready();
+        awaitAvailable(2);
         held.stopGate = new CompletableFuture<>();
         launcher.stopFailures.set(1);
         CompletableFuture<Void> drained = CompletableFuture.runAsync(pool::stopManagedContainers);
         try {
             assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
             assertNotNull(launcher.stopping.poll(2, TimeUnit.SECONDS));
-            await().atMost(Duration.ofSeconds(2)).until(() -> launcher.stopFailures.get() == 0);
+            await().atMost(Duration.ofSeconds(2)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> launcher.stopFailures.get() == 0);
             assertFalse(drained.isDone());
 
             pool.reconcileSafely();
@@ -1375,6 +1728,8 @@ class ProvisionedConcurrencyPoolTest {
 
     @Test
     void shutdownWaitsForAnAdmittedRetryWithoutStoppingTheHandleTwice() throws Exception {
+        Duration budget = Duration.ofSeconds(15);
+        useTimelinePool((int) budget.toSeconds());
         put(1);
         Environment first = launched();
         first.initialized.complete(null);
@@ -1383,8 +1738,8 @@ class ProvisionedConcurrencyPoolTest {
         pool.put(REGION, "example", "2", 1, ACCOUNT);
         Environment second = launched();
         second.initialized.complete(null);
-        await().atMost(Duration.ofSeconds(2)).until(() ->
-                "READY".equals(pool.get(REGION, "example", "2", ACCOUNT).status()));
+        await().atMost(Duration.ofSeconds(2)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "READY".equals(pool.get(REGION, "example", "2", ACCOUNT).status()));
         launcher.stopFailures.set(1);
         pool.delete(REGION, "example", "live", ACCOUNT);
         launcher.stopping.clear();
@@ -1397,8 +1752,10 @@ class ProvisionedConcurrencyPoolTest {
                 shutdown = CompletableFuture.runAsync(pool::stopManagedContainers, tasks);
                 assertSame(second, launcher.stopping.poll(2, TimeUnit.SECONDS),
                         "Shutdown has admitted its own handle while joining the earlier retry");
-                CompletableFuture<Void> drain = shutdown;
-                assertThrows(TimeoutException.class, () -> drain.get(100, TimeUnit.MILLISECONDS));
+                // The retry's caller, the shutdown's caller, and the shutdown's join of the retry's stop.
+                waits.awaitWaiting(3);
+                time.advance(budget.minus(ONE_NANOSECOND));
+                assertFalse(shutdown.isDone(), "Shutdown must join the retry for as long as the drain budget lasts");
                 assertEquals(2, first.stops.get());
             } finally {
                 first.stopGate.complete(null);
@@ -1457,8 +1814,8 @@ class ProvisionedConcurrencyPoolTest {
         pool.deleteFunction(version);
         assertEquals(1, first.stops.get());
         assertEquals(0, second.stops.get());
-        await().atMost(Duration.ofSeconds(5)).until(() ->
-                "READY".equals(pool.get(REGION, "example", "live", "222222222222").status()));
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> "READY".equals(pool.get(REGION, "example", "live", "222222222222").status()));
     }
 
     @ParameterizedTest
@@ -1484,8 +1841,7 @@ class ProvisionedConcurrencyPoolTest {
                     launched().initialized.complete(null);
                     launched().initialized.complete(null);
                     ready();
-                    await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO)
-                            .pollInterval(Duration.ofMillis(10)).until(() -> get().available() == 2);
+                    awaitAvailable(2);
                     assertEquals(get(), pool.list(REGION, "example", ACCOUNT, null, null).items().getFirst().status());
                 } else if (restart == 1) {
                     assertEquals(2, get().requested());
@@ -1536,9 +1892,11 @@ class ProvisionedConcurrencyPoolTest {
     private static final class Environment {
         final RuntimeApiServer runtime = mock(RuntimeApiServer.class);
         final CompletableFuture<Void> initialized = new CompletableFuture<>();
+        final CompletableFuture<Void> runtimeFailure = new CompletableFuture<>();
         final AtomicInteger stops = new AtomicInteger();
         final AtomicBoolean faulted = new AtomicBoolean();
         final ContainerHandle handle;
+        volatile CompletableFuture<Void> initializationGate = CompletableFuture.completedFuture(null);
         volatile CompletableFuture<Void> stopGate = CompletableFuture.completedFuture(null);
         volatile boolean alive = true;
 
@@ -1546,10 +1904,15 @@ class ProvisionedConcurrencyPoolTest {
             handle = new ContainerHandle("environment-" + id, fn.getFunctionName(), runtime, ContainerState.WARM);
             doAnswer(call -> {
                 initialized.get(5, TimeUnit.SECONDS);
+                initializationGate.get(5, TimeUnit.SECONDS);
                 return null;
             }).when(runtime).awaitInitialization(anyLong());
             when(runtime.isInitialized()).thenAnswer(call ->
                     initialized.isDone() && !initialized.isCompletedExceptionally() && alive && !faulted.get());
+            doAnswer(call -> {
+                runtimeFailure.thenRun(call.getArgument(0, Runnable.class));
+                return null;
+            }).when(runtime).onRuntimeFailure(any(Runnable.class));
         }
     }
 

@@ -27,6 +27,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -34,6 +35,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -370,11 +372,9 @@ class EksLaunchTemplateUserDataTest {
             Thread second = new Thread(() -> secondResult.set(
                     eksService.createNodeGroup(CLUSTER_NAME, nodeGroupRequest("ng-2"))));
             second.start();
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (!eksService.listNodeGroups(CLUSTER_NAME).contains("ng-2")
-                    && System.nanoTime() < deadline) {
-                Thread.sleep(10);
-            }
+            await("the second node group is recorded while the first still executes")
+                    .atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> eksService.listNodeGroups(CLUSTER_NAME).contains("ng-2"));
             assertEquals(NodegroupStatus.CREATING,
                     eksService.describeNodeGroup(CLUSTER_NAME, "ng-2").getStatus());
 

@@ -106,6 +106,8 @@ class S3VectorsWriteLockTest {
         assertEquals(Map.of("index", "tag"), service.getIndex("bucket", "index", REGION).getTags());
     }
 
+    
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void bucketTagsDoNotOverwriteConcurrentIndexCreation(boolean copyOnAccess) throws Exception {

@@ -16,6 +16,7 @@ import io.floci.aws.services.acm.model.DomainValidation;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
 import io.floci.aws.services.acm.model.RevocationReason;
 import io.floci.aws.services.acm.model.ValidationMethod;
+import io.floci.aws.testing.ManualClock;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -36,12 +37,14 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -56,6 +59,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -301,7 +305,7 @@ class AcmServiceTest {
                 return assertThrows(AwsException.class, () -> service.deleteCertificate(certificate.getArn(), REGION));
             });
             assertTrue(deleting.await(5, TimeUnit.SECONDS));
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
                 ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(waiter.get());
                 assertEquals(Thread.State.BLOCKED, info.getThreadState());
                 assertEquals(holder.get(), info.getLockOwnerId());
@@ -531,6 +535,78 @@ class AcmServiceTest {
         assertEquals(ca.caPem(), exported.getCertificateChain());
     }
 
+    @ParameterizedTest
+    @EnumSource(value = KeyAlgorithm.class, names = {"RSA_2048", "EC_prime256v1"})
+    void renewPreservesManagedMaterialWhenItsIssuerDisappears(KeyAlgorithm algorithm) throws Exception {
+        FlociCertificateAuthority managed = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("managed"));
+        AcmPrivateCertificateAuthorities authorities = mock();
+        Instance<AcmPrivateCertificateAuthorities> providers = mock();
+        when(providers.isResolvable()).thenReturn(true);
+        when(providers.get()).thenReturn(authorities);
+        when(authorities.find(PCA_ARN, REGION)).thenReturn(Optional.of(
+                new AcmPrivateCertificateAuthorities.PrivateCertificateAuthority(
+                        true, managed.issuer(), managed.caPem())));
+        service.privateAuthorities = providers;
+        Certificate requested = service.requestCertificate("managed.example.test", List.of(), ValidationMethod.DNS,
+                null, algorithm, PCA_ARN, null, Map.of("team", "managed"), REGION);
+        Certificate issued = service.renewCertificate(requested.getArn(), REGION);
+        assertEquals("SUCCESS", issued.getRenewalStatus());
+        Pem.parseCertificate(issued.getCertificateBody()).verify(managed.certificate().getPublicKey());
+        issued.setManagedPrivateAuthority(false); // Older stored certificates have no origin flag.
+        String body = issued.getCertificateBody();
+        String key = issued.getPrivateKey();
+        String chain = issued.getCertificateChain();
+        when(authorities.find(PCA_ARN, REGION)).thenReturn(Optional.empty());
+
+        Certificate unchanged = service.renewCertificate(issued.getArn(), REGION);
+
+        assertEquals(body, unchanged.getCertificateBody());
+        assertEquals(key, unchanged.getPrivateKey());
+        assertEquals(chain, unchanged.getCertificateChain());
+        assertEquals(issued.getSerial(), unchanged.getSerial());
+        assertEquals(issued.getNotAfter(), unchanged.getNotAfter());
+        assertEquals(PCA_ARN, unchanged.getCertAuthorityArn());
+        assertEquals(Map.of("team", "managed"), unchanged.getTags());
+        assertEquals("FAILED", service.describeCertificate(issued.getArn(), REGION).getRenewalStatus());
+        assertEquals(CertificateStatus.ISSUED, unchanged.getStatus());
+        assertTrue(unchanged.getRenewalUpdatedAt() != null);
+        assertEquals(body, service.getCertificate(issued.getArn(), REGION).getCertificateBody());
+        assertEquals(managed.certificate().getSubjectX500Principal(), ca.certificate().getSubjectX500Principal(),
+                "matching issuer names must not authorize fallback to a different key");
+        Pem.parseCertificate(unchanged.getCertificateBody()).verify(managed.certificate().getPublicKey());
+    }
+
+    @Test
+    void managedOriginSurvivesStoredRenewalEvenWhenItsKeyMatchesTheLocalCa() throws Exception {
+        AcmPrivateCertificateAuthorities authorities = mock();
+        Instance<AcmPrivateCertificateAuthorities> providers = mock();
+        when(providers.isResolvable()).thenReturn(true);
+        when(providers.get()).thenReturn(authorities);
+        when(authorities.find(PCA_ARN, REGION)).thenReturn(Optional.of(
+                new AcmPrivateCertificateAuthorities.PrivateCertificateAuthority(true, ca.issuer(), ca.caPem())));
+        service.privateAuthorities = providers;
+        Certificate requested = service.requestCertificate("shared-key.example.test", List.of(), ValidationMethod.DNS,
+                null, KeyAlgorithm.EC_prime256v1, PCA_ARN, null, Map.of(), REGION);
+        Certificate issued = service.renewCertificate(requested.getArn(), REGION);
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        Certificate restored = mapper.readValue(mapper.writeValueAsBytes(issued), Certificate.class);
+        InMemoryStorage<String, Certificate> store = new InMemoryStorage<>();
+        store.put(REGION + "::" + restored.extractCertificateId(), restored);
+        RegionResolver resolver = mock();
+        when(resolver.getAccountId()).thenReturn("000000000000");
+        AcmService reloaded = new AcmService(store, generator, ca, resolver, 0);
+        String body = restored.getCertificateBody();
+        String key = restored.getPrivateKey();
+
+        Certificate unchanged = reloaded.renewCertificate(restored.getArn(), REGION);
+
+        assertEquals(body, unchanged.getCertificateBody());
+        assertEquals(key, unchanged.getPrivateKey());
+        assertEquals("FAILED", unchanged.getRenewalStatus());
+        assertTrue(unchanged.isManagedPrivateAuthority());
+        assertEquals(PCA_ARN, unchanged.getCertAuthorityArn());
+    }
+
     @Test
     void renewRefusesAPublicCertificateWithoutTouchingItsMaterial() {
         Certificate requested = service.requestCertificate("renew-public.example.test", null, ValidationMethod.DNS,
@@ -672,5 +748,66 @@ class AcmServiceTest {
                 null, existing.getArn(), null, REGION);
 
         assertEquals(Map.of("team", "payments"), service.getCertificate(existing.getArn(), REGION).getTags());
+    }
+
+    @Test
+    void aPendingCertificateIsIssuedExactlyWhenTheValidationWaitEnds() {
+        Instant start = Instant.parse("2031-05-06T07:08:09Z");
+        ManualClock clock = new ManualClock(start);
+        AcmService waiting = newService(30, clock);
+        Certificate requested = waiting.requestCertificate("wait.example.test", List.of(), ValidationMethod.DNS,
+                null, KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        assertEquals(start, requested.getCreatedAt());
+
+        clock.advance(Duration.ofSeconds(30).minusNanos(1));
+        Certificate before = waiting.getCertificate(requested.getArn(), REGION);
+        assertEquals(CertificateStatus.PENDING_VALIDATION, before.getStatus());
+        assertNull(before.getIssuedAt());
+
+        clock.advance(Duration.ofNanos(1));
+        Certificate after = waiting.getCertificate(requested.getArn(), REGION);
+        assertEquals(CertificateStatus.ISSUED, after.getStatus());
+        assertEquals(start.plusSeconds(30), after.getIssuedAt());
+    }
+
+    @Test
+    void anIdempotencyTokenIsHonouredUpToOneHourAndNotAfter() {
+        Instant start = Instant.parse("2031-05-06T07:08:09Z");
+        ManualClock clock = new ManualClock(start);
+        AcmService tokens = newService(0, clock);
+        Certificate first = tokens.requestCertificate("token.example.test", List.of(), ValidationMethod.DNS,
+                "token-1", KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+
+        clock.advance(Duration.ofHours(1));
+        Certificate atTheHour = tokens.requestCertificate("token.example.test", List.of(), ValidationMethod.DNS,
+                "token-1", KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        assertEquals(first.getArn(), atTheHour.getArn());
+
+        clock.advance(Duration.ofNanos(1));
+        Certificate pastTheHour = tokens.requestCertificate("token.example.test", List.of(), ValidationMethod.DNS,
+                "token-1", KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        assertNotEquals(first.getArn(), pastTheHour.getArn());
+    }
+
+    @Test
+    void aCertificateIsReportedExpiredOnlyAfterItsNotAfterInstant() {
+        // The leaf's validity is stamped by the certificate generator, so start before it ends.
+        ManualClock clock = new ManualClock(Instant.parse("2020-01-01T00:00:00Z"));
+        AcmService expiring = newService(0, clock);
+        Certificate requested = expiring.requestCertificate("expiry.example.test", List.of(), ValidationMethod.DNS,
+                null, KeyAlgorithm.RSA_2048, null, null, Map.of(), REGION);
+        Instant notAfter = requested.getNotAfter();
+
+        clock.advance(Duration.between(clock.instant(), notAfter));
+        assertEquals(CertificateStatus.ISSUED, expiring.describeCertificate(requested.getArn(), REGION).getStatus());
+
+        clock.advance(Duration.ofNanos(1));
+        assertEquals(CertificateStatus.EXPIRED, expiring.describeCertificate(requested.getArn(), REGION).getStatus());
+    }
+
+    private AcmService newService(int validationWaitSeconds, ManualClock clock) {
+        RegionResolver regionResolver = mock(RegionResolver.class);
+        when(regionResolver.getAccountId()).thenReturn("000000000000");
+        return new AcmService(new InMemoryStorage<>(), generator, ca, regionResolver, validationWaitSeconds, clock);
     }
 }

@@ -28,8 +28,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -45,6 +47,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -61,7 +64,85 @@ class EcsServiceTeardownTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void stoppedTaskKeepsItsHandleUntilEphemeralVolumeCleanupSucceeds(boolean exitsNaturally) {
+    void shutdownStopsTasksInBoundedParallelAndWaitsBeforeReleasingNetworks(boolean interrupted) throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ecs().mock()).thenReturn(false);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        EcsContainerManager manager = mock(EcsContainerManager.class);
+        when(manager.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
+            EcsTask task = invocation.getArgument(0);
+            return new EcsTaskHandle(task.getTaskArn(), Map.of("app", task.getTaskArn()), Map.of());
+        });
+        CountDownLatch firstWave = new CountDownLatch(8);
+        CountDownLatch finishStops = new CountDownLatch(1);
+        AtomicInteger active = new AtomicInteger();
+        AtomicInteger peak = new AtomicInteger();
+        Set<String> stopped = ConcurrentHashMap.newKeySet();
+        doAnswer(invocation -> {
+            EcsTaskHandle handle = invocation.getArgument(0);
+            peak.accumulateAndGet(active.incrementAndGet(), Math::max);
+            firstWave.countDown();
+            try {
+                assertTrue(finishStops.await(10, TimeUnit.SECONDS), "task stops were not released");
+                assertTrue(stopped.add(handle.getTaskArn()), "each task must be stopped once");
+            } finally {
+                active.decrementAndGet();
+            }
+            return null;
+        }).when(manager).stopTask(any());
+        EcsService service = new EcsService(new RegionResolver(REGION, "000000000000"), manager, config,
+                mock(EcsLoadBalancerRegistrar.class), new SingleUseStorageFactory(), null);
+        service.initializeStorage();
+        ContainerDefinition definition = new ContainerDefinition();
+        definition.setName("app");
+        definition.setImage("busybox:stable");
+        service.registerTaskDefinition("parallel-shutdown", List.of(definition), null, null, null,
+                null, null, List.of(), REGION);
+        List<EcsTask> launched = service.runTask(null, "parallel-shutdown", 9, LaunchType.FARGATE, null, null,
+                List.of(), null, REGION);
+        for (EcsTask task : launched) {
+            awaitLastStatus(() -> service.describeTasks(null, List.of(task.getTaskArn()), REGION).getFirst(),
+                    EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
+        }
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicBoolean interruptionPreserved = new AtomicBoolean();
+        Thread shutdown = new Thread(() -> {
+            try {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+                service.stopManagedContainers();
+                interruptionPreserved.set(Thread.currentThread().isInterrupted());
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        });
+        shutdown.start();
+        try {
+            assertTrue(firstWave.await(5, TimeUnit.SECONDS),
+                    "slow ECS tasks must enter shutdown together, within the existing eight-task bound");
+            assertTrue(shutdown.isAlive(), "shutdown must wait for the task stops");
+            assertEquals(8, peak.get());
+            verify(manager, never()).releaseTaskNetwork(any(), anyString());
+            finishStops.countDown();
+            shutdown.join(5000);
+            assertFalse(shutdown.isAlive());
+            assertNull(failure.get());
+            assertEquals(interrupted, interruptionPreserved.get());
+            assertEquals(9, stopped.size());
+            assertEquals(8, peak.get(), "queued tasks must not increase the existing stop concurrency");
+            verify(manager, times(9)).stopTask(any());
+            verify(manager, times(9)).releaseTaskNetwork(any(), anyString());
+        } finally {
+            finishStops.countDown();
+            shutdown.join(5000);
+            assertFalse(shutdown.isAlive(), "the test must release its shutdown thread");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void stoppedTaskKeepsItsHandleUntilEphemeralVolumeCleanupSucceeds(boolean exitsNaturally) throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -100,6 +181,7 @@ class EcsServiceTeardownTest {
             service.reconcile();
         } else {
             service.stopTask(null, taskArn, null, REGION);
+            service.awaitPendingStops();
         }
         assertEquals("STOPPED", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
         assertTrue(handle.hasTaskVolumes());
@@ -309,7 +391,7 @@ class EcsServiceTeardownTest {
     }
 
     @Test
-    void stopTaskRecoversContainerIdsWhenTheRuntimeHandleIsMissing() {
+    void stopTaskRecoversContainerIdsWhenTheRuntimeHandleIsMissing() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -349,6 +431,7 @@ class EcsServiceTeardownTest {
         service.stopManagedContainers();
         service.afterReset();
         service.stopTask(null, taskArn, null, REGION);
+        service.awaitPendingStops();
 
         verify(containerManager).stopTaskAndCollectExitCodes(argThat(
                 handle -> "docker-id".equals(handle.getContainerIds().get("app"))));
@@ -358,7 +441,7 @@ class EcsServiceTeardownTest {
     }
 
     @Test
-    void failedContainerRemovalKeepsTaskStoppingUntilReconciliationRetries() {
+    void failedContainerRemovalKeepsTaskStoppingUntilReconciliationRetries() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -392,17 +475,18 @@ class EcsServiceTeardownTest {
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
         service.stopTask(null, taskArn, null, REGION);
+        service.awaitPendingStops();
         assertEquals("STOPPING", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
 
         // The tick's retry runs off the reconciler thread and lands the task once Docker is done.
         service.reconcile();
-        await().atMost(Duration.ofSeconds(5)).until(() ->
-                "STOPPED".equals(service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus()));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
         verify(containerManager, times(2)).stopTaskAndCollectExitCodes(handle);
     }
 
     @Test
-    void removedContainerWithUnknownExitCodeStopsWithoutInventingSuccess() {
+    void removedContainerWithUnknownExitCodeStopsWithoutInventingSuccess() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -436,7 +520,10 @@ class EcsServiceTeardownTest {
         awaitLastStatus(() -> service.describeTasks(null, List.of(taskArn), REGION).getFirst(),
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
-        EcsTask stopped = service.stopTask(null, taskArn, null, REGION);
+        // StopTask answers STOPPING, as on ECS; the teardown finishes afterwards.
+        assertEquals("STOPPING", service.stopTask(null, taskArn, null, REGION).getLastStatus());
+        service.awaitPendingStops();
+        EcsTask stopped = service.describeTasks(null, List.of(taskArn), REGION).getFirst();
         assertEquals("STOPPED", stopped.getLastStatus());
         assertNull(stopped.getContainers().getFirst().getExitCode());
         service.reconcile();
@@ -477,32 +564,17 @@ class EcsServiceTeardownTest {
         awaitLastStatus(() -> service.describeTasks(null, List.of(taskArn), REGION).getFirst(),
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
-        CompletableFuture<EcsTask> first = CompletableFuture.supplyAsync(() ->
-                service.stopTask(null, taskArn, null, REGION));
+        EcsTask first = service.stopTask(null, taskArn, null, REGION);
         try {
+            assertEquals("STOPPING", first.getLastStatus());
             assertTrue(teardownEntered.await(5, TimeUnit.SECONDS));
-            AtomicReference<Throwable> secondFailure = new AtomicReference<>();
-            Thread second = new Thread(() -> {
-                try {
-                    service.stopTask(null, taskArn, null, REGION);
-                } catch (Throwable failure) {
-                    secondFailure.set(failure);
-                }
-            });
-            second.start();
-
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (second.getState() != Thread.State.BLOCKED) {
-                assertTrue(second.isAlive(), "second stop finished without waiting for the first");
-                assertTrue(System.nanoTime() < deadline, "second stop never queued on the task");
-                Thread.onSpinWait();
-            }
+            // A second StopTask while the first teardown runs answers at once and starts no second one.
+            EcsTask second = CompletableFuture.supplyAsync(() -> service.stopTask(null, taskArn, null, REGION))
+                    .get(5, TimeUnit.SECONDS);
+            assertEquals("STOPPING", second.getLastStatus());
 
             finishTeardown.countDown();
-            first.get(5, TimeUnit.SECONDS);
-            second.join(5000);
-            assertFalse(second.isAlive(), "second stop did not finish");
-            assertNull(secondFailure.get());
+            service.awaitPendingStops();
             verify(containerManager, times(1)).stopTaskAndCollectExitCodes(handle);
             assertEquals("STOPPED", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
         } finally {
@@ -579,7 +651,7 @@ class EcsServiceTeardownTest {
     }
 
     @Test
-    void stoppedTaskRetriesTeardownUntilItsRemainingLogStreamIsReleased() {
+    void stoppedTaskRetriesTeardownUntilItsRemainingLogStreamIsReleased() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false); // docker mode
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -617,6 +689,7 @@ class EcsServiceTeardownTest {
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
         service.stopTask(null, taskArn, null, REGION);
+        service.awaitPendingStops();
         verify(containerManager, times(1)).stopTaskAndCollectExitCodes(handle);
 
         service.reconcile();

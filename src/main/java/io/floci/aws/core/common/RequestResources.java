@@ -183,7 +183,7 @@ public final class RequestResources {
                                   String accountId, StoredResourceArns stored, Map<String, String> labels) {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         RequestResourceMembers.Targets targets = operation == null ? null : table.targets().get(operation);
-        if (targets != null) {
+        if (targets != null && table.operations().getOrDefault(operation, List.of()).isEmpty()) {
             Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
             return targetArns(targets, formats(table, operation), form,
                     form.isEmpty() ? PassedRoles.jsonBody(ctx) : null, partition, region, accountId);
@@ -197,9 +197,13 @@ public final class RequestResources {
         Map<String, String> sent = IamConditionContextResolver.formParameters(ctx);
         JsonNode body = sent.isEmpty() ? located(table, operation, PassedRoles.jsonBody(ctx), ctx, labels) : null;
         Map<String, String> form = ec2Query(table, operation, located(table, operation, sent, ctx, labels));
-        return resources.isEmpty() ? List.of()
+        List<String> arns = new ArrayList<>(resources.isEmpty() ? List.of()
                 : named(operation, resources, formats(table, operation), form, body, partition, region, accountId,
-                        stored, signer(resources, ctx, stored));
+                        stored, signer(resources, ctx, stored)));
+        if (targets != null) {
+            arns.addAll(targetArns(targets, formats(table, operation), sent, body, partition, region, accountId));
+        }
+        return List.copyOf(arns);
     }
 
     /**
@@ -334,7 +338,7 @@ public final class RequestResources {
                                       String accountId, StoredResourceArns stored) {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         RequestResourceMembers.Targets targets = operation == null ? null : table.targets().get(operation);
-        if (targets != null) {
+        if (targets != null && table.operations().getOrDefault(operation, List.of()).isEmpty()) {
             return targetArns(targets, formats(table, operation), Map.of(), body, partition, region, accountId);
         }
         List<RequestResourceMembers.Resource> resources = !readable(table, operation) ? null
@@ -342,7 +346,12 @@ public final class RequestResources {
         if (resources == null || resources.isEmpty()) {
             return List.of();
         }
-        return named(operation, resources, formats(table, operation), Map.of(), body, partition, region, accountId, stored);
+        List<String> arns = new ArrayList<>(named(operation, resources, formats(table, operation), Map.of(), body,
+                partition, region, accountId, stored));
+        if (targets != null) {
+            arns.addAll(targetArns(targets, formats(table, operation), Map.of(), body, partition, region, accountId));
+        }
+        return List.copyOf(arns);
     }
 
     /**
@@ -501,7 +510,8 @@ public final class RequestResources {
                 continue;
             }
             if (resource.arn() != null) {
-                for (String named : values(form, body, resource.arn())) {
+                for (String value : values(form, body, resource.arn())) {
+                    String named = resourceSelector(operation, resource.arn(), value);
                     if (longerFormat(named, resource.types(), formats)) {
                         continue;
                     }
@@ -530,7 +540,7 @@ public final class RequestResources {
                     stored.findDefault(resource.types().getFirst(), region).ifPresent(arns::add);
                 }
             } else {
-                fill(arns, resource, formats, form, body, partition, region, accountId, stored);
+                fill(operation, arns, resource, formats, form, body, partition, region, accountId, stored);
             }
         }
         return List.copyOf(arns);
@@ -615,7 +625,8 @@ public final class RequestResources {
         Set<String> arns = new LinkedHashSet<>();
         for (RequestResourceMembers.Created created : creates) {
             RequestResourceMembers.ArnFormat parentFormat = formats.get(created.parent());
-            for (String named : values(form, body, created.arn())) {
+            for (String value : values(form, body, created.arn())) {
+                String named = resourceSelector(operation, created.arn(), value);
                 if (!parentFormat.pattern().matcher(named).matches()) {
                     continue;
                 }
@@ -627,6 +638,19 @@ public final class RequestResources {
             }
         }
         return List.copyOf(arns);
+    }
+
+    /**
+     * Execution starts accept Step Functions Local's test-case suffix. The handler runs the state machine before
+     * that suffix, so authorization and the execution ARN use that same identity. Other operations retain it.
+     */
+    private static String resourceSelector(String operation, RequestResourceMembers.Member member, String value) {
+        if (("states:StartExecution".equals(operation) || "states:StartSyncExecution".equals(operation))
+                && "stateMachineArn".equals(member.name())) {
+            int separator = value.indexOf('#');
+            return separator < 0 ? value : value.substring(0, separator);
+        }
+        return value;
     }
 
     /**
@@ -890,7 +914,7 @@ public final class RequestResources {
      * ({@code defaults}) fills its variable from the ARN of that default, which {@code stored} gives in the caller's
      * account: an ECS service a request names with no cluster is on the default cluster.
      */
-    private static void fill(Set<String> arns, RequestResourceMembers.Resource resource,
+    private static void fill(String operation, Set<String> arns, RequestResourceMembers.Resource resource,
                              Map<String, RequestResourceMembers.ArnFormat> formats, Map<String, String> form,
                              JsonNode body, String partition, String region, String accountId,
                              StoredResourceArns stored) {
@@ -973,12 +997,12 @@ public final class RequestResources {
         for (Filling filling : fillings) {
             AwsArnUtils.Arn from = filling.from();
             if (from == null) {
-                arns.add(withId(format.checked(render(format.format(), filling.variables(), partition, region,
+                arns.add(withId(operation, format.named(render(format.format(), filling.variables(), partition, region,
                         account)), format,
                         resource.types().getFirst(), filling.variables(), account.equals(accountId) ? stored : null,
                         region));
             } else {
-                addNamed(arns, withId(format.checked(render(format.format(), filling.variables(), from.partition(),
+                addNamed(arns, withId(operation, format.named(render(format.format(), filling.variables(), from.partition(),
                         from.region().isEmpty() ? region : from.region(),
                         from.accountId().isEmpty() ? accountId : from.accountId())), format,
                         resource.types().getFirst(), filling.variables(), null, region), format.awsOwned(), partition,
@@ -1241,10 +1265,17 @@ public final class RequestResources {
      * stores none, one whose service follows it with characters it mints those characters open (a secret's
      * {@code -??????}, as a create names the secret it makes), and any other type's is as rendered.
      */
-    private static String withId(String arn, RequestResourceMembers.ArnFormat format, String type,
+    private static String withId(String operation, String arn, RequestResourceMembers.ArnFormat format, String type,
                                  Map<String, String> filling, StoredResourceArns stored, String region) {
-        if (stored != null && filling.size() == 1) {
-            Optional<String> found = stored.find(type, List.of(filling.values().iterator().next()), region);
+        if (stored != null) {
+            if (filling.size() == 1) {
+                String name = filling.values().iterator().next();
+                Optional<String> resolved = stored.resolveNamedForOperation(operation, type, name, region);
+                if (resolved.isPresent()) {
+                    return resolved.get();
+                }
+            }
+            Optional<String> found = stored.findByVariables(type, filling, region);
             if (found.isPresent()) {
                 return found.get();
             }

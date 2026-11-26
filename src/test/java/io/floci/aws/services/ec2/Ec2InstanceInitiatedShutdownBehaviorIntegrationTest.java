@@ -91,6 +91,28 @@ class Ec2InstanceInitiatedShutdownBehaviorIntegrationTest {
         }
     }
 
+    @Test
+    void clientTokenReplayRetainsShutdownBehaviorAndRejectsAChange() {
+        try (Ec2Client ec2 = AwsTestClients.create(Ec2Client.builder(), "test", Region.US_EAST_1)) {
+            String token = "shutdown-" + UUID.randomUUID();
+            String first = ec2.runInstances(r -> r.imageId("ami-alpine").instanceType("t3.micro")
+                    .minCount(1).maxCount(1).clientToken(token)
+                    .instanceInitiatedShutdownBehavior(ShutdownBehavior.TERMINATE))
+                    .instances().getFirst().instanceId();
+            String replay = ec2.runInstances(r -> r.imageId("ami-alpine").instanceType("t3.micro")
+                    .minCount(1).maxCount(1).clientToken(token)
+                    .instanceInitiatedShutdownBehavior(ShutdownBehavior.TERMINATE))
+                    .instances().getFirst().instanceId();
+
+            assertEquals(first, replay);
+            assertEquals("terminate", shutdownBehavior(ec2, first));
+            Ec2Exception mismatch = assertThrows(Ec2Exception.class, () -> ec2.runInstances(r -> r
+                    .imageId("ami-alpine").instanceType("t3.micro").minCount(1).maxCount(1).clientToken(token)
+                    .instanceInitiatedShutdownBehavior(ShutdownBehavior.STOP)));
+            assertEquals("IdempotentParameterMismatch", mismatch.awsErrorDetails().errorCode());
+        }
+    }
+
     private static String shutdownBehavior(Ec2Client ec2, String instanceId) {
         return ec2.describeInstanceAttribute(r -> r.instanceId(instanceId)
                 .attribute(InstanceAttributeName.INSTANCE_INITIATED_SHUTDOWN_BEHAVIOR))

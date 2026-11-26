@@ -5,6 +5,7 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.Ports;
+import io.floci.aws.config.EmulatorConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -33,14 +34,21 @@ public class CurrentContainerNetworkResolver {
 
     private final DockerClient dockerClient;
     private final ContainerDetector containerDetector;
+    private final String configuredNetwork;
     private final Map<Integer, OptionalInt> cachedPublishedPorts = new ConcurrentHashMap<>();
 
     private volatile Optional<CurrentContainerNetwork> cachedNetwork;
 
-    @Inject
     public CurrentContainerNetworkResolver(DockerClient dockerClient, ContainerDetector containerDetector) {
+        this(dockerClient, containerDetector, null);
+    }
+
+    @Inject
+    public CurrentContainerNetworkResolver(DockerClient dockerClient, ContainerDetector containerDetector,
+                                           EmulatorConfig config) {
         this.dockerClient = dockerClient;
         this.containerDetector = containerDetector;
+        this.configuredNetwork = config == null ? null : config.services().dockerNetwork().orElse(null);
     }
 
     public Optional<String> resolveNetworkName() {
@@ -144,7 +152,10 @@ public class CurrentContainerNetworkResolver {
                 return Optional.empty();
             }
 
-            Optional<CurrentContainerNetwork> selected = selectNetwork(networks);
+            String creationNetwork = inspect.getHostConfig() == null
+                    ? null : inspect.getHostConfig().getNetworkMode();
+            Optional<CurrentContainerNetwork> selected = selectNetwork(
+                    networks, "default".equals(creationNetwork) ? "bridge" : creationNetwork);
             selected.ifPresent(network -> LOG.infov(
                     "Detected current Docker network for spawned containers: {0} ({1})",
                     network.name(), network.ipAddress()));
@@ -153,6 +164,14 @@ public class CurrentContainerNetworkResolver {
             LOG.debugv("Could not inspect current Docker container {0}: {1}", containerId, e.getMessage());
             return Optional.empty();
         }
+    }
+
+    private Optional<CurrentContainerNetwork> selectNetwork(Map<String, ContainerNetwork> networks,
+                                                            String creationNetwork) {
+        if (configuredNetwork != null) {
+            return namedNetwork(networks, configuredNetwork);
+        }
+        return namedNetwork(networks, creationNetwork).or(() -> selectNetwork(networks));
     }
 
     // Docker lists a container's networks by name. One Floci made and joined, an EC2 VPC's or an EMR cluster's, is not
@@ -176,6 +195,17 @@ public class CurrentContainerNetworkResolver {
                         .filter(entry -> eligible.test(entry.getKey()))
                         .findFirst())
                 .map(entry -> new CurrentContainerNetwork(entry.getKey(), entry.getValue().getIpAddress()));
+    }
+
+    private Optional<CurrentContainerNetwork> namedNetwork(Map<String, ContainerNetwork> networks, String selection) {
+        if (selection == null) {
+            return Optional.empty();
+        }
+        return networks.entrySet().stream()
+                .filter(entry -> isUsable(entry.getValue()))
+                .filter(entry -> selection.equals(entry.getKey()) || selection.equals(entry.getValue().getNetworkID()))
+                .map(entry -> new CurrentContainerNetwork(entry.getKey(), entry.getValue().getIpAddress()))
+                .findFirst();
     }
 
     private boolean isUsable(ContainerNetwork network) {

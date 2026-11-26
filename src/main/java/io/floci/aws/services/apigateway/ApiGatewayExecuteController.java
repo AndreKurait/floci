@@ -23,11 +23,14 @@ import io.floci.aws.core.common.AwsErrorResponse;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsPartition;
 import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.core.common.AwsRegions;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.CookieHeaders;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.core.common.auth.SigV4AuthorizationHeader;
 import io.floci.aws.services.apigateway.model.ApiGatewayResource;
 import io.floci.aws.services.apigateway.model.ApiKey;
@@ -38,6 +41,7 @@ import io.floci.aws.services.apigateway.model.IntegrationResponse;
 import io.floci.aws.services.apigateway.model.MethodConfig;
 import io.floci.aws.services.apigateway.model.MethodSetting;
 import io.floci.aws.services.apigateway.model.Stage;
+import io.floci.aws.services.apigateway.model.TestInvokeMethodResult;
 import io.floci.aws.services.apigateway.model.UsagePlan;
 import io.floci.aws.services.apigateway.model.UsagePlanKey;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
@@ -58,6 +62,7 @@ import io.floci.aws.services.elbv2.ElbV2Service;
 import io.floci.aws.services.elbv2.model.Listener;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
 import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
+import io.floci.aws.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
@@ -75,6 +80,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -136,6 +142,9 @@ public class ApiGatewayExecuteController {
     private final CognitoUserPoolAuthorizer cognitoAuthorizer;
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final LambdaService lambdaService;
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
+    private final CallerCallAuthorizer callerCallAuthorizer;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final Configuration jsonPathConfiguration;
@@ -151,16 +160,19 @@ public class ApiGatewayExecuteController {
     private final RestLambdaAuthorizer restLambdaAuthorizer;
     private final AuthorizerPolicyEvaluator authorizerPolicyEvaluator;
     private final CloudMapInstanceResolver cloudMapInstanceResolver;
+    private final Clock clock;
     private final AwsServiceIntegrationMapper awsServiceIntegrationMapper;
     private final HttpProxyInvoker httpProxyInvoker;
-    private final ServiceCallAuthorizer serviceCallAuthorizer;
     private final ResponseParameterMapper responseParameterMapper =
             new ResponseParameterMapper(new ContextValueResolver());
 
-    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, CognitoUserPoolAuthorizer cognitoAuthorizer,
+    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService,
+                                       CognitoUserPoolAuthorizer cognitoAuthorizer,
                                        ApiGatewayV2Service apiGatewayV2Service,
-                                       LambdaService lambdaService, RegionResolver regionResolver,
-                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
+                                       LambdaService lambdaService,
+                                       RegionResolver regionResolver,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
                                        AwsServiceRouter serviceRouter,
                                        WebSocketConnectionManager webSocketConnectionManager,
                                        ElbV2Service elbV2Service,
@@ -168,21 +180,25 @@ public class ApiGatewayExecuteController {
                                        ApiGatewayExecuteRouteContext routeContext,
                                        JwtSignatureVerifier jwtSignatureVerifier,
                                        RequestContext requestContext,
-                                       ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
+                                       ExecuteApiSigV4Authorizer sigV4Authorizer,
+                                       RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
                                        CloudMapInstanceResolver cloudMapInstanceResolver,
                                        HttpProxyInvoker httpProxyInvoker) {
-        this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver, objectMapper,
-                vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service, sqsQueryHandler, routeContext,
-                jwtSignatureVerifier, requestContext, sigV4Authorizer, restLambdaAuthorizer,
-                authorizerPolicyEvaluator, cloudMapInstanceResolver, httpProxyInvoker, null);
+        this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver,
+                objectMapper, vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service,
+                sqsQueryHandler, routeContext, jwtSignatureVerifier, requestContext, sigV4Authorizer,
+                restLambdaAuthorizer, authorizerPolicyEvaluator, null, null, null, cloudMapInstanceResolver,
+                httpProxyInvoker, Clock.systemUTC());
     }
 
-    @Inject
-    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, CognitoUserPoolAuthorizer cognitoAuthorizer,
+    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService,
+                                       CognitoUserPoolAuthorizer cognitoAuthorizer,
                                        ApiGatewayV2Service apiGatewayV2Service,
-                                       LambdaService lambdaService, RegionResolver regionResolver,
-                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
+                                       LambdaService lambdaService,
+                                       RegionResolver regionResolver,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
                                        AwsServiceRouter serviceRouter,
                                        WebSocketConnectionManager webSocketConnectionManager,
                                        ElbV2Service elbV2Service,
@@ -190,15 +206,109 @@ public class ApiGatewayExecuteController {
                                        ApiGatewayExecuteRouteContext routeContext,
                                        JwtSignatureVerifier jwtSignatureVerifier,
                                        RequestContext requestContext,
-                                       ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
+                                       ExecuteApiSigV4Authorizer sigV4Authorizer,
+                                       RestLambdaAuthorizer restLambdaAuthorizer,
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
                                        CloudMapInstanceResolver cloudMapInstanceResolver,
                                        HttpProxyInvoker httpProxyInvoker,
                                        ServiceCallAuthorizer serviceCallAuthorizer) {
+        this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver,
+                objectMapper, vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service,
+                sqsQueryHandler, routeContext, jwtSignatureVerifier, requestContext, sigV4Authorizer,
+                restLambdaAuthorizer, authorizerPolicyEvaluator, serviceCallAuthorizer, null, null,
+                cloudMapInstanceResolver, httpProxyInvoker, Clock.systemUTC());
+    }
+
+    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService,
+                                       CognitoUserPoolAuthorizer cognitoAuthorizer,
+                                       ApiGatewayV2Service apiGatewayV2Service,
+                                       LambdaService lambdaService,
+                                       RegionResolver regionResolver,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       AwsServiceRouter serviceRouter,
+                                       WebSocketConnectionManager webSocketConnectionManager,
+                                       ElbV2Service elbV2Service,
+                                       SqsQueryHandler sqsQueryHandler,
+                                       ApiGatewayExecuteRouteContext routeContext,
+                                       JwtSignatureVerifier jwtSignatureVerifier,
+                                       RequestContext requestContext,
+                                       ExecuteApiSigV4Authorizer sigV4Authorizer,
+                                       RestLambdaAuthorizer restLambdaAuthorizer,
+                                       AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer,
+                                       CloudMapInstanceResolver cloudMapInstanceResolver,
+                                       Clock clock) {
+        this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver,
+                objectMapper, vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service,
+                sqsQueryHandler, routeContext, jwtSignatureVerifier, requestContext, sigV4Authorizer,
+                restLambdaAuthorizer, authorizerPolicyEvaluator, serviceCallAuthorizer,
+                serviceRoleCallAuthorizer, callerCallAuthorizer, cloudMapInstanceResolver,
+                new HttpProxyInvoker(), clock);
+    }
+
+    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService,
+                                       CognitoUserPoolAuthorizer cognitoAuthorizer,
+                                       ApiGatewayV2Service apiGatewayV2Service,
+                                       LambdaService lambdaService,
+                                       RegionResolver regionResolver,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       AwsServiceRouter serviceRouter,
+                                       WebSocketConnectionManager webSocketConnectionManager,
+                                       ElbV2Service elbV2Service,
+                                       SqsQueryHandler sqsQueryHandler,
+                                       ApiGatewayExecuteRouteContext routeContext,
+                                       JwtSignatureVerifier jwtSignatureVerifier,
+                                       RequestContext requestContext,
+                                       ExecuteApiSigV4Authorizer sigV4Authorizer,
+                                       RestLambdaAuthorizer restLambdaAuthorizer,
+                                       AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer,
+                                       CloudMapInstanceResolver cloudMapInstanceResolver) {
+        this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver,
+                objectMapper, vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service,
+                sqsQueryHandler, routeContext, jwtSignatureVerifier, requestContext, sigV4Authorizer,
+                restLambdaAuthorizer, authorizerPolicyEvaluator, serviceCallAuthorizer,
+                serviceRoleCallAuthorizer, callerCallAuthorizer, cloudMapInstanceResolver,
+                new HttpProxyInvoker(), Clock.systemUTC());
+    }
+
+    @Inject
+    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService,
+                                       CognitoUserPoolAuthorizer cognitoAuthorizer,
+                                       ApiGatewayV2Service apiGatewayV2Service,
+                                       LambdaService lambdaService,
+                                       RegionResolver regionResolver,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       AwsServiceRouter serviceRouter,
+                                       WebSocketConnectionManager webSocketConnectionManager,
+                                       ElbV2Service elbV2Service,
+                                       SqsQueryHandler sqsQueryHandler,
+                                       ApiGatewayExecuteRouteContext routeContext,
+                                       JwtSignatureVerifier jwtSignatureVerifier,
+                                       RequestContext requestContext,
+                                       ExecuteApiSigV4Authorizer sigV4Authorizer,
+                                       RestLambdaAuthorizer restLambdaAuthorizer,
+                                       AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer,
+                                       CloudMapInstanceResolver cloudMapInstanceResolver,
+                                       HttpProxyInvoker httpProxyInvoker,
+                                       Clock clock) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
+        this.callerCallAuthorizer = callerCallAuthorizer;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.jsonPathConfiguration = Configuration.builder()
@@ -218,8 +328,8 @@ public class ApiGatewayExecuteController {
         this.restLambdaAuthorizer = restLambdaAuthorizer;
         this.authorizerPolicyEvaluator = authorizerPolicyEvaluator;
         this.cloudMapInstanceResolver = cloudMapInstanceResolver;
+        this.clock = clock;
         this.httpProxyInvoker = httpProxyInvoker;
-        this.serviceCallAuthorizer = serviceCallAuthorizer;
     }
 
     /** Matches an ELBv2 listener ARN (ALB {@code app/} or NLB {@code net/}); group 1 = region. */
@@ -242,16 +352,39 @@ public class ApiGatewayExecuteController {
     private record GatewayResponseScope(String region, String apiId, String stageName, Stage stage,
                                         String httpMethod, String path, ApiGatewayResource resource,
                                         HttpHeaders headers, UriInfo uriInfo, byte[] body, ResolvedApiKey apiKey,
-                                        ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity) {
+                                        ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity,
+                                        TestExecutionFacts testFacts) {
+        GatewayResponseScope(String region, String apiId, String stageName, Stage stage,
+                             String httpMethod, String path, ApiGatewayResource resource,
+                             HttpHeaders headers, UriInfo uriInfo, byte[] body, ResolvedApiKey apiKey,
+                             ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity) {
+            this(region, apiId, stageName, stage, httpMethod, path, resource, headers, uriInfo, body,
+                    apiKey, iamIdentity, null);
+        }
+
         GatewayResponseScope withResource(ApiGatewayResource matched) {
             return new GatewayResponseScope(region, apiId, stageName, stage, httpMethod, path, matched,
-                    headers, uriInfo, body, apiKey, iamIdentity);
+                    headers, uriInfo, body, apiKey, iamIdentity, testFacts);
         }
 
         GatewayResponseScope withIdentity(ResolvedApiKey key, ExecuteApiSigV4Authorizer.CallerIdentity identity) {
             return new GatewayResponseScope(region, apiId, stageName, stage, httpMethod, path, resource,
-                    headers, uriInfo, body, key, identity);
+                    headers, uriInfo, body, key, identity, testFacts);
         }
+    }
+
+    private record TestExecutionFacts(String requestId, String extendedRequestId, Instant time,
+                                      String sourceIp, String accountId,
+                                      MultivaluedMap<String, String> query) {
+    }
+
+    private String executionRequestId(GatewayResponseScope scope) {
+        return scope.testFacts() != null ? scope.testFacts().requestId() : routeContext.requestId(scope.headers());
+    }
+
+    private MultivaluedMap<String, String> executionQuery(GatewayResponseScope scope) {
+        return scope.testFacts() != null ? scope.testFacts().query()
+                : ResteasyRequests.queryParameters(scope.uriInfo());
     }
 
     // ──────────────────────────── @connections API ────────────────────────────
@@ -269,16 +402,62 @@ public class ApiGatewayExecuteController {
         return URLDecoder.decode(rawConnectionId, StandardCharsets.UTF_8);
     }
 
+    private Response handleConnectionRequest(String method, String apiId, String stageName,
+                                             String connectionId, HttpHeaders headers, UriInfo uriInfo, byte[] body) {
+        Optional<ApiGatewayV2Service.ApiOwner> owner = apiGatewayV2Service.findApiOwner(apiId);
+        if (owner.isEmpty()) {
+            return forbiddenConnectionRequest();
+        }
+        ApiGatewayV2Service.ApiOwner apiOwner = owner.get();
+        applyApiOwnerContext(apiOwner);
+        if (callerCallAuthorizer.enforcementEnabled()) {
+            ExecuteApiSigV4Authorizer.Result signature = sigV4Authorizer.authorize(
+                    method, headers, uriInfo, body, routeContext.signedRequestPath());
+            if (!signature.authorized()) {
+                LOG.debugv("execute-api rejected a connection management request: {0} ({1})",
+                        signature.failure(), signature.detail());
+                return forbiddenConnectionRequest();
+            }
+            ExecuteApiSigV4Authorizer.CallerIdentity caller = signature.identity();
+            String resource = AwsArnUtils.Arn.of("execute-api", apiOwner.region(), apiOwner.accountId(),
+                    apiId + "/" + stageName + "/" + method + "/@connections").toString();
+            if (callerCallAuthorizer.authorizeRequest(caller == null ? null : caller.accessKey(),
+                    caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                    "execute-api:ManageConnections", resource, AwsRegions.partitionFor(apiOwner.region()),
+                    routeContext.sourceIp(), isSecureTransport(uriInfo)) != Decision.ALLOW) {
+                return forbiddenConnectionRequest();
+            }
+        }
+        if ("POST".equals(method) && body != null && body.length > MAX_CONNECTIONS_PAYLOAD_BYTES) {
+            return Response.status(413)
+                    .entity(new AwsErrorResponse("PayloadTooLargeException", "Payload too large"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+        ConnectionInfo info = webSocketConnectionManager.getConnectionInfo(connectionId);
+        if (info == null || !apiId.equals(info.getApiId()) || !stageName.equals(info.getStageName())
+                || !apiOwner.region().equals(info.getRegion())) {
+            return Response.status(410)
+                    .entity(new AwsErrorResponse("GoneException", "GoneException"))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+        return switch (method) {
+            case "GET" -> handleGetConnectionInfo(connectionId);
+            case "POST" -> handlePostToConnection(connectionId, body);
+            case "DELETE" -> handleDeleteConnection(connectionId);
+            default -> throw new IllegalArgumentException("Unsupported connection method: " + method);
+        };
+    }
+
+    private Response forbiddenConnectionRequest() {
+        return Response.status(403).header("x-amzn-ErrorType", "ForbiddenException")
+                .entity(new AwsErrorResponse("ForbiddenException", "Forbidden"))
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
     /** Maximum payload size for @connections POST (128 KB, matching AWS limit). */
     private static final int MAX_CONNECTIONS_PAYLOAD_BYTES = 128 * 1024;
 
     private Response handlePostToConnection(String connectionId, byte[] body) {
-        if (body != null && body.length > MAX_CONNECTIONS_PAYLOAD_BYTES) {
-            return Response.status(413)
-                    .entity(new AwsErrorResponse("PayloadTooLargeException", "Payload too large"))
-                    .type(MediaType.APPLICATION_JSON)
-                    .build();
-        }
         try {
             webSocketConnectionManager.sendMessage(connectionId, new String(body, StandardCharsets.UTF_8));
             return Response.ok().build();
@@ -329,7 +508,7 @@ public class ApiGatewayExecuteController {
                               @PathParam("proxy") String proxy) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
-            return handleGetConnectionInfo(connectionId);
+            return handleConnectionRequest("GET", apiId, stageName, connectionId, headers, uriInfo, null);
         }
         return dispatch("GET", apiId, stageName, proxy, headers, uriInfo, null);
     }
@@ -344,7 +523,7 @@ public class ApiGatewayExecuteController {
                                byte[] body) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
-            return handlePostToConnection(connectionId, body);
+            return handleConnectionRequest("POST", apiId, stageName, connectionId, headers, uriInfo, body);
         }
         return dispatch("POST", apiId, stageName, proxy, headers, uriInfo, body);
     }
@@ -370,7 +549,7 @@ public class ApiGatewayExecuteController {
                                  byte[] body) {
         if (isWebSocketConnectionRequest(apiId, proxy)) {
             String connectionId = decodeConnectionId(proxy.substring(CONNECTIONS_PREFIX.length()));
-            return handleDeleteConnection(connectionId);
+            return handleConnectionRequest("DELETE", apiId, stageName, connectionId, headers, uriInfo, null);
         }
         return dispatch("DELETE", apiId, stageName, proxy, headers, uriInfo, body);
     }
@@ -534,6 +713,25 @@ public class ApiGatewayExecuteController {
                 return restIamRejection(scope, iamResult);
             }
             iamIdentity = iamResult.identity();
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath()));
+            if (callerCallAuthorizer.authorizeRequest(iamIdentity == null ? null : iamIdentity.accessKey(),
+                    iamIdentity == null ? null : iamIdentity.accountId(),
+                    iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
+                    AwsArnUtils.parse(invokeArn).partition(), routeContext.sourceIp(),
+                    isSecureTransport(uriInfo)) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
+        }
+
+        if ("CUSTOM".equals(method.getAuthorizationType())
+                && callerCallAuthorizer.evaluateAnonymousResourcePolicy("execute-api:Invoke",
+                        buildMethodArn(region, apiId, stageName, httpMethod,
+                                preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath())), routeContext.sourceIp(),
+                        isSecureTransport(uriInfo)) == ResourcePolicyDecision.EXPLICIT_DENY) {
+            return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                    "User is not authorized to access this resource");
         }
 
         scope = scope.withIdentity(resolvedApiKey, iamIdentity);
@@ -542,6 +740,18 @@ public class ApiGatewayExecuteController {
         if (keyFromAuthorizer) {
             resolvedApiKey = resolveApiKey(region, apiId, stageName, authorizerResult.usageIdentifierKey());
             scope = scope.withIdentity(resolvedApiKey, iamIdentity);
+        }
+
+        String authorizationType = method.getAuthorizationType();
+        if (authorizationType == null || "NONE".equalsIgnoreCase(authorizationType)
+                || "COGNITO_USER_POOLS".equalsIgnoreCase(authorizationType)) {
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath()));
+            if (callerCallAuthorizer.authorizeAnonymousResource("execute-api:Invoke", invokeArn,
+                    routeContext.sourceIp(), isSecureTransport(uriInfo)) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
         }
 
         // API Gateway checks the API key requirement after authorization but before request
@@ -584,17 +794,44 @@ public class ApiGatewayExecuteController {
         Response vpcLinkError = validateVpcLink(scope, region, integration);
         if (vpcLinkError != null) return vpcLinkError;
 
-        String cacheKey = cacheKeyFor(stage, matched, httpMethod, path, integration, headers, uriInfo);
+        String cacheKey = cacheKeyFor(region, apiId, stageName, stage, matched, httpMethod, path, integration,
+                headers, uriInfo);
         if (cacheKey != null) {
             CachedResponse cached = responseCache.get(cacheKey);
-            if (cached != null && cached.expiresAt() > System.currentTimeMillis()) {
+            if (cached != null && cached.expiresAt() > clock.millis()) {
                 LOG.debugv("execute-api: cache hit for {0} {1}/{2}{3}", httpMethod, apiId, stageName, path);
                 return fromCache(cached);
             }
             responseCache.remove(cacheKey);
         }
 
-        Response response = switch (integrationType.toUpperCase(Locale.ROOT)) {
+        Response response = executeIntegration(scope, proxy, integration, authorizerResult);
+
+        // Only successful responses are cached — AWS does not serve an error from the cache.
+        if (cacheKey != null && response.getStatus() < 400) {
+            responseCache.put(cacheKey,
+                    snapshotForCache(response, cacheTtlSeconds(methodSettingFor(stage, matched.getPath(), httpMethod)),
+                            clock.millis()));
+        }
+        return response;
+    }
+
+    private Response executeIntegration(GatewayResponseScope scope, String proxy, Integration integration,
+                                        AuthorizerResult authorizerResult) {
+        String region = scope.region();
+        String apiId = scope.apiId();
+        String httpMethod = scope.httpMethod();
+        String path = scope.path();
+        String stageName = scope.stageName();
+        Stage stage = scope.stage();
+        ApiGatewayResource matched = scope.resource();
+        HttpHeaders headers = scope.headers();
+        UriInfo uriInfo = scope.uriInfo();
+        byte[] body = scope.body();
+        ResolvedApiKey resolvedApiKey = scope.apiKey();
+        ExecuteApiSigV4Authorizer.CallerIdentity iamIdentity = scope.iamIdentity();
+        String integrationType = integration.getType();
+        return switch (integrationType.toUpperCase(Locale.ROOT)) {
             case "AWS_PROXY" -> invokeProxy(scope, region, apiId, httpMethod, path, proxy, stageName,
                     matched, stage, integration, headers, uriInfo, body, authorizerResult, resolvedApiKey,
                     iamIdentity);
@@ -609,13 +846,76 @@ public class ApiGatewayExecuteController {
             default -> gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
                     "Unsupported integration type: " + integration.getType());
         };
+    }
 
-        // Only successful responses are cached — AWS does not serve an error from the cache.
-        if (cacheKey != null && response.getStatus() < 400) {
-            responseCache.put(cacheKey,
-                    snapshotForCache(response, cacheTtlSeconds(methodSettingFor(stage, matched.getPath(), httpMethod))));
+    TestInvokeMethodResult testInvokeMethod(String region, String apiId, String resourceId,
+                                           String httpMethod, JsonNode request) {
+        apiGatewayService.getRestApi(region, apiId);
+        ApiGatewayResource resource = apiGatewayService.getResource(region, apiId, resourceId);
+        MethodConfig method = apiGatewayService.getMethod(region, apiId, resourceId, httpMethod);
+        Integration integration = method.getMethodIntegration();
+        if (integration == null) {
+            throw new AwsException("BadRequestException", "No integration configured for method", 400);
         }
-        return response;
+        if (!"MOCK".equalsIgnoreCase(integration.getType())) {
+            throw new AwsException("BadRequestException",
+                    "Test invocation currently supports MOCK integrations only", 400);
+        }
+        if (method.getAuthorizationType() != null && !"NONE".equals(method.getAuthorizationType())
+                && !"AWS_IAM".equals(method.getAuthorizationType())) {
+            throw new AwsException("BadRequestException",
+                    "Test invocation currently supports NONE and AWS_IAM method authorization only", 400);
+        }
+        TestInvokeMethodInput input = TestInvokeMethodInput.read(request, resource.getPath());
+        Stage stage = new Stage();
+        stage.setStageName("test-invoke-stage");
+        stage.setVariables(input.stageVariables());
+        TestExecutionFacts facts = new TestExecutionFacts(UUID.randomUUID().toString(),
+                UUID.randomUUID().toString(), Instant.now(), routeContext.sourceIp(), regionResolver.getAccountId(),
+                input.query());
+        byte[] body = input.body() != null ? input.body().getBytes(StandardCharsets.UTF_8) : null;
+        GatewayResponseScope scope = new GatewayResponseScope(region, apiId, stage.getStageName(), stage,
+                httpMethod.toUpperCase(Locale.ROOT), input.path(), resource, input.headers(), null, body,
+                null, null, facts);
+        long started = System.nanoTime();
+        Response response;
+        String phase;
+        Response validationResponse = validateRequest(scope, region, apiId, method, input.headers(), null, body);
+        if (validationResponse != null) {
+            response = validationResponse;
+            phase = "Request validation failed";
+        } else if (integration.getIntegrationResponses() == null || integration.getIntegrationResponses().isEmpty()) {
+            response = gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
+                    "No integration response configured");
+            phase = "MOCK configuration failed";
+        } else {
+            try {
+                response = executeIntegration(scope, null, integration, new AuthorizerResult(null, null, Map.of()));
+                phase = "MOCK mapping execution completed";
+            } catch (RuntimeException executionFailure) {
+                LOG.warnv("MOCK test invocation for API {0} resource {1} failed with {2}",
+                        apiId, resourceId, executionFailure.getClass().getSimpleName());
+                response = gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
+                        "Internal server error");
+                phase = "MOCK mapping execution failed";
+            }
+        }
+        int latency = (int) Math.min(Integer.MAX_VALUE, Math.max(0L, (System.nanoTime() - started) / 1_000_000L));
+        String responseBody = response.getEntity() == null ? ""
+                : response.getEntity() instanceof byte[] bytes ? new String(bytes, StandardCharsets.UTF_8)
+                : String.valueOf(response.getEntity());
+        Map<String, String> headers = new LinkedHashMap<>();
+        Map<String, List<String>> multiValueHeaders = new LinkedHashMap<>();
+        response.getStringHeaders().forEach((name, values) -> {
+            headers.put(name, String.join(",", values));
+            multiValueHeaders.put(name, List.copyOf(values));
+        });
+        String log = "Execution started: " + facts.requestId() + "\n"
+                + "Method: " + scope.httpMethod() + "; resource: " + resourceId + "\n"
+                + phase + "\n"
+                + "Execution status: " + response.getStatus() + "; latency: " + latency + " ms\n";
+        return new TestInvokeMethodResult(response.getStatus(), responseBody, Map.copyOf(headers),
+                Map.copyOf(multiValueHeaders), log, latency);
     }
 
     private void applyApiOwnerContext(ApiGatewayV2Service.ApiOwner owner) {
@@ -647,6 +947,13 @@ public class ApiGatewayExecuteController {
                 resource.getId(), stageName, stage, headers, uriInfo, body, requestId,
                 authorizerResult.principalId(), authorizerResult.context(), resolvedApiKey, iamIdentity);
 
+        functionName = resolvedLambdaIntegrationTarget(scope, functionName);
+        Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path,
+                headers, uriInfo, body);
+        if (permissionError != null) {
+            return permissionError;
+        }
+
         try {
             InvokeResult result = lambdaService.invokeTarget(region, functionName, eventJson.getBytes(),
                     InvocationType.RequestResponse);
@@ -665,6 +972,60 @@ public class ApiGatewayExecuteController {
             }
             throw e;
         }
+    }
+
+    private String resolvedLambdaIntegrationTarget(GatewayResponseScope scope, String reference) {
+        return LambdaArnUtils.functionArn(reference, regionResolver.getPartition(),
+                scope.region(), regionResolver.getAccountId());
+    }
+
+    private Response lambdaIntegrationPermission(GatewayResponseScope scope, Integration integration,
+                                                  String functionArn, String httpMethod, String path,
+                                                  HttpHeaders headers, UriInfo uriInfo, byte[] body) {
+        String credentials = integration.getCredentials();
+        Decision decision;
+        if (credentials != null && !credentials.isBlank()) {
+            if ("*".equals(credentials)) {
+                // Retained local compatibility spelling, not the documented AWS caller sentinel.
+                return null;
+            }
+            if (callerCredentialsPassthrough(credentials)) {
+                ExecuteApiSigV4Authorizer.CallerIdentity caller = scope.iamIdentity();
+                if (caller == null) {
+                    ExecuteApiSigV4Authorizer.Result verified = sigV4Authorizer.authorize(
+                            httpMethod, headers, uriInfo, body, routeContext.signedRequestPath());
+                    if (verified.authorized()) {
+                        caller = verified.identity();
+                    }
+                }
+                decision = callerCallAuthorizer.authorize(caller == null ? null : caller.accessKey(),
+                        caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                        "lambda:InvokeFunction", functionArn, regionResolver.getPartition());
+            } else {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, regionResolver.getAccountId(), regionResolver.getPartition());
+            }
+        } else {
+            // Lambda's API Gateway guide uses the function's region in a cross-region source ARN.
+            String sourceArn = buildMethodArn(AwsArnUtils.parse(functionArn).region(), scope.apiId(),
+                    scope.stageName(), httpMethod, path);
+            decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                    sourceArn, regionResolver.getAccountId());
+        }
+        if (decision == Decision.DENY) {
+            return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
+                    "Internal server error");
+        }
+        return null;
+    }
+
+    private boolean callerCredentialsPassthrough(String credentials) {
+        if (!AwsArnUtils.isArnFor(credentials, "iam")) {
+            return false;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(credentials);
+        return arn.partition().equals(regionResolver.getPartition()) && arn.region().isEmpty()
+                && "*".equals(arn.accountId()) && "user/*".equals(arn.resource());
     }
 
     // ──────────────────────────── HTTP_PROXY ────────────────────────────
@@ -770,7 +1131,7 @@ public class ApiGatewayExecuteController {
     /** AWS's default integration cache TTL when a method enables caching without naming one. */
     private static final int DEFAULT_CACHE_TTL_SECONDS = 300;
 
-    private record CachedResponse(int status, Object entity, Map<String, String> headers, long expiresAt) {}
+    private record CachedResponse(int status, Object entity, Map<String, List<String>> headers, long expiresAt) {}
 
     private final Map<String, CachedResponse> responseCache = new ConcurrentHashMap<>();
 
@@ -786,14 +1147,19 @@ public class ApiGatewayExecuteController {
      * can return the same cached data; mixing the method and request path back in would mean two
      * resources could never share an entry, which is the setting's whole purpose. The namespace
      * defaults to the resource id, so resources that did not opt into sharing stay separate.
+     *
+     * <p>A cache belongs to one stage of one API: the key starts with the region, API id and stage
+     * name, so a namespace is shared between the resources of a stage and never beyond it.
      */
-    private String cacheKeyFor(Stage stage, ApiGatewayResource resource, String httpMethod,
+    private String cacheKeyFor(String region, String apiId, String stageName, Stage stage,
+                               ApiGatewayResource resource, String httpMethod,
                                String path, Integration integration, HttpHeaders headers, UriInfo uriInfo) {
         if (stage == null || !stage.isCacheClusterEnabled()) return null;
         MethodSetting setting = methodSettingFor(stage, resource.getPath(), httpMethod);
         if (setting == null || !setting.isCachingEnabled()) return null;
 
         StringBuilder key = new StringBuilder();
+        key.append(region).append('|').append(apiId).append('|').append(stageName).append('|');
         key.append(integration.getCacheNamespace() != null
                 ? integration.getCacheNamespace() : resource.getId());
         for (String param : integration.getCacheKeyParameters()) {
@@ -849,18 +1215,18 @@ public class ApiGatewayExecuteController {
         return ttl > 0 ? ttl : DEFAULT_CACHE_TTL_SECONDS;
     }
 
-    private static CachedResponse snapshotForCache(Response response, int ttlSeconds) {
-        Map<String, String> headers = new LinkedHashMap<>();
+    private static CachedResponse snapshotForCache(Response response, int ttlSeconds, long nowMillis) {
+        Map<String, List<String>> headers = new LinkedHashMap<>();
         response.getStringHeaders().forEach((name, values) -> {
-            if (!values.isEmpty()) headers.put(name, values.get(0));
+            if (!values.isEmpty()) headers.put(name, List.copyOf(values));
         });
         return new CachedResponse(response.getStatus(), response.getEntity(), headers,
-                System.currentTimeMillis() + ttlSeconds * 1000L);
+                nowMillis + ttlSeconds * 1000L);
     }
 
     private static Response fromCache(CachedResponse cached) {
         Response.ResponseBuilder rb = Response.status(cached.status()).entity(cached.entity());
-        cached.headers().forEach(rb::header);
+        cached.headers().forEach((name, values) -> values.forEach(value -> rb.header(name, value)));
         return rb.build();
     }
 
@@ -1191,8 +1557,24 @@ public class ApiGatewayExecuteController {
                     auth.getIdentitySource(), ttl, identities != null ? identities : List.of());
             RestLambdaAuthorizer.Result verified = restLambdaAuthorizer.get(key);
             if (verified == null) {
+                String functionArn = LambdaArnUtils.functionArn(function, regionResolver.getPartition(),
+                        region, regionResolver.getAccountId());
+                String credentials = auth.getAuthorizerCredentials();
+                Decision decision;
+                if (credentials == null || credentials.isBlank()) {
+                    String sourceArn = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                            apiId + "/authorizers/" + auth.getId()).toString();
+                    decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                            sourceArn, regionResolver.getAccountId());
+                } else {
+                    decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                            "lambda:InvokeFunction", functionArn, regionResolver.getAccountId(), regionResolver.getPartition());
+                }
+                if (decision == Decision.DENY) {
+                    return authorizerError(scope, GatewayResponseType.AUTHORIZER_CONFIGURATION_ERROR, 500);
+                }
                 try (RestLambdaAuthorizer.Invocation pending = restLambdaAuthorizer.beginInvocation(key)) {
-                    InvokeResult invocation = lambdaService.invokeTarget(region, function,
+                    InvokeResult invocation = lambdaService.invokeTarget(region, functionArn,
                             event.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
                     if (invocation.getFunctionError() != null) {
                         return lambdaAuthorizerFailure(scope, invocation);
@@ -1201,16 +1583,20 @@ public class ApiGatewayExecuteController {
                     pending.cache(verified);
                 }
             }
-            String methodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
+            String methodArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(requestPath, uriInfo.getRequestUri().getRawPath()));
             Map<String, List<String>> conditions = AuthorizerPolicyEvaluator.requestConditions(
                     routeContext.sourceIp(), isSecureTransport(uriInfo));
-            if (!restLambdaAuthorizer.permits(verified, methodArn, conditions)) {
+            ResourcePolicyDecision resourceDecision = callerCallAuthorizer.evaluateAnonymousResourcePolicy(
+                    "execute-api:Invoke", methodArn, routeContext.sourceIp(), isSecureTransport(uriInfo));
+            String authorizerMethodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
+            if (!restLambdaAuthorizer.permits(verified, authorizerMethodArn, conditions, resourceDecision)) {
                 return authorizerError(scope, GatewayResponseType.ACCESS_DENIED, 403);
             }
             return new AuthorizerResult(null, verified.principalId(), verified.context(),
                     verified.usageIdentifierKey());
         } catch (Exception exception) {
-            LOG.warnv("Authorizer failure: {0}", exception.getMessage());
+            LOG.warnv(exception, "Authorizer failure: {0}", exception.getMessage());
             return authorizerError(scope, GatewayResponseType.AUTHORIZER_FAILURE, 500);
         }
     }
@@ -1288,7 +1674,7 @@ public class ApiGatewayExecuteController {
         if (validator.isValidateRequestParameters()) {
             Map<String, Boolean> requiredParams = method.getRequestParameters();
             if (requiredParams != null) {
-                MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
+                MultivaluedMap<String, String> queryParams = executionQuery(scope);
                 for (Map.Entry<String, Boolean> entry : requiredParams.entrySet()) {
                     if (!Boolean.TRUE.equals(entry.getValue())) continue;
                     String paramKey = entry.getKey();
@@ -2025,6 +2411,7 @@ public class ApiGatewayExecuteController {
         String backendStatusMatchString = null;
         String errorType = null;
         String errorMessage = null;
+        String functionErrorMessage = null;
         try {
             if ("lambda".equals(target.service())) {
                 String functionName = functionNameFromUri(integration.getUri());
@@ -2032,10 +2419,11 @@ public class ApiGatewayExecuteController {
                     throw new AwsException("InvalidParameterValueException",
                             "Cannot resolve Lambda function name from URI: " + integration.getUri(), 400);
                 }
-                if (!apiGatewayMayInvoke(integration, functionName, region, scope.apiId(), stageName, httpMethod,
-                        path)) {
-                    return gatewayResponse(scope, GatewayResponseType.API_CONFIGURATION_ERROR, 500,
-                            "Internal server error");
+                functionName = resolvedLambdaIntegrationTarget(scope, functionName);
+                Response permissionError = lambdaIntegrationPermission(scope, integration, functionName, httpMethod, path,
+                        headers, uriInfo, body);
+                if (permissionError != null) {
+                    return permissionError;
                 }
                 byte[] payload = transformedBody != null ? transformedBody.getBytes(StandardCharsets.UTF_8) : new byte[0];
                 InvokeResult invokeResult = lambdaService.invokeTarget(region, functionName, payload, InvocationType.RequestResponse);
@@ -2045,6 +2433,7 @@ public class ApiGatewayExecuteController {
                 if (invokeResult.getFunctionError() != null) {
                     errorType = invokeResult.getFunctionError();
                     errorMessage = lambdaResponseBody;
+                    functionErrorMessage = functionErrorMessage(lambdaResponseBody);
                 }
                 serviceResponse = Response.status(lambdaStatus)
                         .entity(lambdaResponseBody)
@@ -2121,8 +2510,11 @@ public class ApiGatewayExecuteController {
         String errorMatchString = errorType != null
                 ? errorType + (errorMessage != null ? ": " + errorMessage : "")
                 : errorMessage;
+        // A function error is selected by its errorMessage alone, as API Gateway does; a payload
+        // without one falls back to the error type and the whole payload.
         String selectionMatchString = "lambda".equals(target.service())
-                ? errorMatchString : backendStatusMatchString;
+                ? (functionErrorMessage != null ? functionErrorMessage : errorMatchString)
+                : backendStatusMatchString;
 
         // Case-insensitive: an integration.response.header.X-Foo mapping must resolve regardless of
         // the casing the backend or client library used for the header name.
@@ -2214,6 +2606,17 @@ public class ApiGatewayExecuteController {
                                             String defaultContentType) {
         return mapIntegrationResponse(integration, selectionMatchString, responseBodyStr, null,
                 fallbackStatus, integrationResponseHeaders, responseMappingCtx, defaultContentType);
+    }
+
+    /** The {@code errorMessage} of a Lambda error payload, or null when the payload does not carry one. */
+    private String functionErrorMessage(String payload) {
+        try {
+            JsonNode message = objectMapper.readTree(payload).path("errorMessage");
+            return message.isTextual() ? message.asText() : null;
+        } catch (IOException e) {
+            LOG.debugv("execute-api: function error payload is not JSON: {0}", e.getMessage());
+            return null;
+        }
     }
 
     private Response mapIntegrationResponse(Integration integration, String selectionMatchString,
@@ -2366,7 +2769,7 @@ public class ApiGatewayExecuteController {
 
     private Map<String, Object> restRequestContext(GatewayResponseScope scope, String requestId) {
         String region = scope.region() != null ? scope.region() : regionResolver.getDefaultRegion();
-        GatewayContextValues values = gatewayContextValues(scope.apiId(), region, scope.headers());
+        GatewayContextValues values = gatewayContextValues(scope);
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("accountId", values.accountId());
         context.put("apiId", scope.apiId());
@@ -2395,6 +2798,17 @@ public class ApiGatewayExecuteController {
     private record GatewayContextValues(String accountId, String domainName, String domainPrefix,
                                         String extendedRequestId, String requestTime, long requestTimeEpoch) {}
 
+    private GatewayContextValues gatewayContextValues(GatewayResponseScope scope) {
+        TestExecutionFacts facts = scope.testFacts();
+        if (facts == null) {
+            return gatewayContextValues(scope.apiId(), scope.region(), scope.headers());
+        }
+        String domain = restDomainName(scope.apiId(), scope.region(), scope.headers());
+        return new GatewayContextValues(facts.accountId(), domain, domain.split("\\.")[0],
+                facts.extendedRequestId(), GATEWAY_REQUEST_TIME.format(facts.time().atZone(ZoneOffset.UTC)),
+                facts.time().toEpochMilli());
+    }
+
     private GatewayContextValues gatewayContextValues(String apiId, String region, HttpHeaders headers) {
         Instant requestTime = routeContext.requestTime();
         String domain = restDomainName(apiId, region, headers);
@@ -2421,7 +2835,7 @@ public class ApiGatewayExecuteController {
     private Map<String, Object> restRequestIdentity(GatewayResponseScope scope) {
         ExecuteApiSigV4Authorizer.CallerIdentity caller = scope.iamIdentity();
         Map<String, Object> identity = new LinkedHashMap<>();
-        identity.put("sourceIp", routeContext.sourceIp());
+        identity.put("sourceIp", scope.testFacts() != null ? scope.testFacts().sourceIp() : routeContext.sourceIp());
         identity.put("userAgent", scope.headers() != null ? scope.headers().getHeaderString("User-Agent") : null);
         identity.put("apiKey", scope.apiKey() != null ? scope.apiKey().value() : null);
         identity.put("apiKeyId", scope.apiKey() != null ? scope.apiKey().id() : null);
@@ -2567,7 +2981,7 @@ public class ApiGatewayExecuteController {
                                 String stageName, ApiGatewayResource resource, Integration integration,
                                 HttpHeaders headers, UriInfo uriInfo, byte[] body,
                                 AuthorizerResult authorizerResult) {
-        String requestId = routeContext.requestId(headers);
+        String requestId = executionRequestId(scope);
         String bodyStr = body != null && body.length > 0 ? new String(body) : null;
 
         Map<String, String> headerMap = new HashMap<>();
@@ -2577,7 +2991,7 @@ public class ApiGatewayExecuteController {
             }
         }
         Map<String, String> queryMap = new HashMap<>();
-        for (Map.Entry<String, List<String>> e : ResteasyRequests.queryParameters(uriInfo).entrySet()) {
+        for (Map.Entry<String, List<String>> e : executionQuery(scope).entrySet()) {
             if (!e.getValue().isEmpty()) {
                 queryMap.put(e.getKey(), e.getValue().get(0));
             }
@@ -2587,7 +3001,9 @@ public class ApiGatewayExecuteController {
 
         VtlTemplateEngine.VtlContext vtlCtx = new VtlTemplateEngine.VtlContext(
                 bodyStr, headerMap, queryMap, pathMap, stageName, httpMethod,
-                resource.getPath(), requestId, regionResolver.getAccountId(), scope.stage().getVariables(),
+                resource.getPath(), requestId,
+                scope.testFacts() != null ? scope.testFacts().accountId() : regionResolver.getAccountId(),
+                scope.stage().getVariables(),
                 vtlAuthorizerContext(authorizerResult.principalId(), authorizerResult.context()),
                 httpRequestMappingContext(scope, requestId, authorizerResult));
 
@@ -2971,6 +3387,17 @@ public class ApiGatewayExecuteController {
                 return httpApiIamRejection(iamResult);
             }
             iamIdentity = iamResult.identity();
+            String routeResource = "$default".equals(route.getRouteKey()) ? "$default" : httpMethod + path;
+            String invokeArn = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                    apiId + "/" + stageName + "/" + routeResource).toString();
+            if (callerCallAuthorizer.authorizeRequest(iamIdentity == null ? null : iamIdentity.accessKey(),
+                    iamIdentity == null ? null : iamIdentity.accountId(),
+                    iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
+                    regionResolver.getPartition(), routeContext.sourceIp(), isSecureTransport(uriInfo))
+                    != Decision.ALLOW) {
+                return Response.status(403).entity(jsonMessage("Forbidden"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
         }
 
         Map<String, String> jwtClaims = null;
@@ -3039,8 +3466,41 @@ public class ApiGatewayExecuteController {
         LOG.debugv("execute-api v2: {0} {1}/{2}{3} → Lambda {4}", httpMethod, apiId, stageName, path, functionName);
 
         try {
+            String credentials = integration.getCredentialsArn();
+            if (("AWS_PROXY".equalsIgnoreCase(integrationType) || "AWS".equalsIgnoreCase(integrationType))
+                    && !"*".equals(credentials)) {
+                String accountId = regionResolver.getAccountId();
+                functionName = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                        region, accountId);
+                Decision decision;
+                if (credentials == null || credentials.isBlank()) {
+                    String functionRegion = AwsArnUtils.parse(functionName).region();
+                    String sourceArn = AwsArnUtils.Arn.of("execute-api", functionRegion, accountId,
+                            apiId + "/" + stageName + "/" + httpMethod + path).toString();
+                    decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionName,
+                            sourceArn, accountId);
+                } else if (callerCredentialsPassthrough(credentials)) {
+                    ExecuteApiSigV4Authorizer.CallerIdentity caller = iamIdentity;
+                    if (caller == null) {
+                        ExecuteApiSigV4Authorizer.Result verified = sigV4Authorizer.authorize(
+                                httpMethod, headers, uriInfo, body, routeContext.signedRequestPath());
+                        if (verified.authorized()) {
+                            caller = verified.identity();
+                        }
+                    }
+                    decision = callerCallAuthorizer.authorize(caller == null ? null : caller.accessKey(),
+                            caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                            "lambda:InvokeFunction", functionName, regionResolver.getPartition());
+                } else {
+                    decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                            "lambda:InvokeFunction", functionName, accountId, regionResolver.getPartition());
+                }
+                if (decision == Decision.DENY) {
+                    return httpApiError(500, "Internal Server Error");
+                }
+            }
             InvokeResult result = lambdaService.invokeTarget(region, functionName,
-                    eventJson.getBytes(), InvocationType.RequestResponse);
+                    eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
             return buildProxyResponse(result, true, !payloadV1);
         } catch (AwsException e) {
             // Measured: API Gateway answers an invocation Lambda refuses itself, with the CORS
@@ -3628,10 +4088,29 @@ public class ApiGatewayExecuteController {
         // Invoke the authorizer Lambda
         InvokeResult invokeResult;
         try {
-            invokeResult = lambdaService.invokeTarget(region, functionName,
+            String accountId = regionResolver.getAccountId();
+            String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                    region, accountId);
+            String credentials = authorizer.getAuthorizerCredentialsArn();
+            Decision decision;
+            if (credentials == null || credentials.isBlank()) {
+                String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
+                        apiId + "/authorizers/" + route.getAuthorizerId()).toString();
+                decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId);
+            } else {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, accountId, regionResolver.getPartition());
+            }
+            if (decision == Decision.DENY) {
+                return new RequestAuthorizerResult(Response.status(500)
+                        .entity(jsonMessage("Internal Server Error"))
+                        .type(MediaType.APPLICATION_JSON).build(), null);
+            }
+            invokeResult = lambdaService.invokeTarget(region, functionArn,
                     eventJson.getBytes(StandardCharsets.UTF_8), InvocationType.RequestResponse);
         } catch (Exception e) {
-            LOG.warnv("Lambda REQUEST authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Lambda REQUEST authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
             return new RequestAuthorizerResult(Response.status(500)
                     .entity(jsonMessage("Internal Server Error"))
                     .type(MediaType.APPLICATION_JSON).build(), null);
@@ -3696,7 +4175,7 @@ public class ApiGatewayExecuteController {
 
             return new RequestAuthorizerResult(null, requestAuthorizerContext(response));
         } catch (Exception e) {
-            LOG.warnv("Failed to parse authorizer response for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Failed to parse authorizer response for API {0}: {1}", apiId, e.getMessage());
             return new RequestAuthorizerResult(Response.status(500)
                     .entity(jsonMessage("Internal Server Error"))
                     .type(MediaType.APPLICATION_JSON).build(), null);
@@ -3766,7 +4245,7 @@ public class ApiGatewayExecuteController {
         ctx.put("stage", stageName);
         ctx.put("requestId", UUID.randomUUID().toString());
         ctx.put("protocol", "HTTP/1.1");
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         ctx.put("requestTime", GATEWAY_REQUEST_TIME.format(now.atZone(ZoneOffset.UTC)));
         ctx.put("requestTimeEpoch", now.toEpochMilli());
         String arnRegion = region != null ? region : regionResolver.getDefaultRegion();
@@ -3816,8 +4295,9 @@ public class ApiGatewayExecuteController {
         ctx.put("requestId", UUID.randomUUID().toString());
         ctx.put("routeKey", routeKey != null ? routeKey : "$default");
         ctx.put("stage", stageName);
-        ctx.put("time", GATEWAY_REQUEST_TIME.format(Instant.now().atZone(ZoneOffset.UTC)));
-        ctx.put("timeEpoch", System.currentTimeMillis());
+        Instant now = clock.instant();
+        ctx.put("time", GATEWAY_REQUEST_TIME.format(now.atZone(ZoneOffset.UTC)));
+        ctx.put("timeEpoch", now.toEpochMilli());
 
         ObjectNode http = ctx.putObject("http");
         http.put("method", httpMethod);
@@ -4185,8 +4665,9 @@ public class ApiGatewayExecuteController {
         ctx.put("requestId", requestId);
         ctx.put("routeKey", routeKey != null ? routeKey : "$default");
         ctx.put("stage", stageName);
-        ctx.put("time", GATEWAY_REQUEST_TIME.format(Instant.now().atZone(ZoneOffset.UTC)));
-        ctx.put("timeEpoch", System.currentTimeMillis());
+        Instant now = clock.instant();
+        ctx.put("time", GATEWAY_REQUEST_TIME.format(now.atZone(ZoneOffset.UTC)));
+        ctx.put("timeEpoch", now.toEpochMilli());
 
         ObjectNode http = ctx.putObject("http");
         http.put("method", httpMethod);
@@ -4402,7 +4883,7 @@ public class ApiGatewayExecuteController {
         }
 
         Map<String, String> headerMap = gatewayRequestHeaders(scope.headers());
-        Map<String, String> queryMap = gatewayRequestQuery(scope.uriInfo());
+        Map<String, String> queryMap = gatewayRequestQuery(scope);
         Map<String, String> pathMap = gatewayRequestPathParams(scope);
         Map<String, Object> context = gatewayResponseContext(scope, type, finalStatus, message, validationError);
 
@@ -4490,7 +4971,7 @@ public class ApiGatewayExecuteController {
             return queryMap.get(source.substring("method.request.querystring.".length()));
         }
         if (source.startsWith("method.request.multivaluequerystring.")) {
-            return joinedValues(scope.uriInfo() != null ? ResteasyRequests.queryParameters(scope.uriInfo()) : null,
+            return joinedValues(scope.testFacts() != null || scope.uriInfo() != null ? executionQuery(scope) : null,
                     source.substring("method.request.multivaluequerystring.".length()));
         }
         if (source.startsWith("method.request.path.")) {
@@ -4540,7 +5021,7 @@ public class ApiGatewayExecuteController {
      */
     private Map<String, Object> gatewayResponseContext(GatewayResponseScope scope, GatewayResponseType type,
                                                        int status, String message, String validationError) {
-        Map<String, Object> context = restRequestContext(scope, routeContext.requestId(scope.headers()));
+        Map<String, Object> context = restRequestContext(scope, executionRequestId(scope));
         context.put("status", status);
 
         String messageString;
@@ -4571,12 +5052,16 @@ public class ApiGatewayExecuteController {
         return headerMap;
     }
 
-    private static Map<String, String> gatewayRequestQuery(UriInfo uriInfo) {
+    private Map<String, String> gatewayRequestQuery(GatewayResponseScope scope) {
         Map<String, String> queryMap = new HashMap<>();
-        if (uriInfo == null || ResteasyRequests.queryParameters(uriInfo) == null) {
+        if (scope.testFacts() == null && scope.uriInfo() == null) {
             return queryMap;
         }
-        for (Map.Entry<String, List<String>> entry : ResteasyRequests.queryParameters(uriInfo).entrySet()) {
+        MultivaluedMap<String, String> query = executionQuery(scope);
+        if (query == null) {
+            return queryMap;
+        }
+        for (Map.Entry<String, List<String>> entry : query.entrySet()) {
             if (entry.getValue() != null && !entry.getValue().isEmpty()) {
                 queryMap.put(entry.getKey(), entry.getValue().get(0));
             }

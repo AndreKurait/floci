@@ -1,5 +1,6 @@
 package io.floci.aws.services.cloudwatch.metrics;
 
+import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
@@ -11,17 +12,19 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Evaluates every CloudWatch alarm that carries metric-math configuration
- * (namespace/metricName/period/evaluationPeriods/comparisonOperator), transitions its
+ * Evaluates single-metric and supported metric-math CloudWatch alarms, transitions their
  * {@code StateValue} the way real CloudWatch would, and while it is in {@code ALARM}
  * dispatches {@code AlarmActions} through {@link AlarmActionHandler} on every tick — not
  * just the first transition into that state, so an action deferred by a handler (e.g. a
@@ -45,21 +48,31 @@ import java.util.concurrent.TimeUnit;
 public class AlarmEvaluator {
 
     private static final Logger LOG = Logger.getLogger(AlarmEvaluator.class);
+    static final long INITIAL_DELAY_SECONDS = 5;
+    static final long TICK_SECONDS = 10;
 
     private final CloudWatchMetricsService metricsService;
     private final Instance<AlarmActionHandler> handlers;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
-            r -> new Thread(r, "alarm-evaluator"));
+    private final Clock clock;
+    private final ScheduledExecutorService scheduler;
 
     @Inject
     AlarmEvaluator(CloudWatchMetricsService metricsService, @Any Instance<AlarmActionHandler> handlers) {
+        this(metricsService, handlers, Clock.systemUTC(), Executors.newSingleThreadScheduledExecutor(
+                r -> new Thread(r, "alarm-evaluator")));
+    }
+
+    AlarmEvaluator(CloudWatchMetricsService metricsService, Instance<AlarmActionHandler> handlers,
+                   Clock clock, ScheduledExecutorService scheduler) {
         this.metricsService = metricsService;
         this.handlers = handlers;
+        this.clock = clock;
+        this.scheduler = scheduler;
     }
 
     @PostConstruct
     void start() {
-        scheduler.scheduleAtFixedRate(this::evaluateAll, 5, 10, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::evaluateAll, INITIAL_DELAY_SECONDS, TICK_SECONDS, TimeUnit.SECONDS);
     }
 
     @PreDestroy
@@ -79,14 +92,15 @@ public class AlarmEvaluator {
      */
     void evaluateAll() {
         try {
-            for (MetricAlarm alarm : metricsService.allAlarms()) {
+            for (CloudWatchMetricsService.OwnedAlarm owned : metricsService.allOwnedAlarms()) {
+                MetricAlarm alarm = owned.alarm();
                 try {
-                    evaluate(alarm);
+                    RequestScopes.runAs(owned.accountId(), alarm.getRegion(), () -> evaluate(alarm));
                 } catch (Exception e) {
                     LOG.warnv("Alarm evaluation failed for {0}: {1}", alarm.getAlarmName(), e.getMessage());
                 }
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             LOG.warnv(e, "Alarm evaluation tick failed: {0}", e.getMessage());
         }
     }
@@ -112,33 +126,61 @@ public class AlarmEvaluator {
             return;
         }
         String region = alarm.getRegion();
-        int period = alarm.getPeriod();
+        MetricMath math = alarm.getMetrics().isEmpty() ? null : metricsService.alarmMath(alarm);
+        int period = math == null ? alarm.getPeriod() : math.alarmPeriod();
         int evaluationPeriods = alarm.getEvaluationPeriods();
         int range = evaluationRange(evaluationPeriods);
-        long nowBucket = (Instant.now().getEpochSecond() / period) * period;
+        long nowBucket = (clock.instant().getEpochSecond() / period) * period;
         long lastCompleteBucket = nowBucket - period;
         long oldestBucket = lastCompleteBucket - (long) period * (range - 1);
         Instant start = Instant.ofEpochSecond(oldestBucket);
         Instant end = Instant.ofEpochSecond(lastCompleteBucket + period);
-
-        List<CloudWatchMetricsService.Datapoint> retrieved = metricsService.getMetricStatistics(
-                alarm.getNamespace(), alarm.getMetricName(), alarm.getDimensions(),
-                start, end, period, List.of(alarm.getStatistic()), alarm.getUnit(), region);
-
+        Map<Instant, Double> samples = new HashMap<>();
+        Map<Instant, Double> sampleCounts = new HashMap<>();
+        if (math == null) {
+            String statistic = alarm.getExtendedStatistic() != null
+                    ? alarm.getExtendedStatistic() : alarm.getStatistic();
+            for (CloudWatchMetricsService.Datapoint point : metricsService.getMetricStatistics(
+                    alarm.getNamespace(), alarm.getMetricName(), alarm.getDimensions(),
+                    start, end, period, List.of(statistic), alarm.getUnit(), region)) {
+                samples.put(point.timestamp(), CloudWatchMetricsService.resolveStatValue(point, statistic));
+                sampleCounts.put(point.timestamp(), point.sampleCount());
+            }
+        } else {
+            CloudWatchMetricsService.MetricDataResult result =
+                    metricsService.metricMathData(math, start, end, region).getFirst();
+            for (int i = 0; i < result.timestamps().size(); i++) {
+                samples.put(result.timestamps().get(i), result.values().get(i));
+            }
+        }
         Double[] buckets = new Double[range];
-        for (CloudWatchMetricsService.Datapoint dp : retrieved) {
-            long bucket = (dp.timestamp().getEpochSecond() / period) * period;
+        Double[] bucketSampleCounts = new Double[range];
+        for (Map.Entry<Instant, Double> sample : samples.entrySet()) {
+            long bucket = (sample.getKey().getEpochSecond() / period) * period;
             int index = (int) ((bucket - oldestBucket) / period);
             if (index >= 0 && index < range) {
-                buckets[index] = CloudWatchMetricsService.resolveStatValue(dp, alarm.getStatistic());
+                buckets[index] = sample.getValue();
+                bucketSampleCounts[index] = sampleCounts.get(sample.getKey());
             }
         }
 
         List<Double> real = new ArrayList<>();
-        for (Double value : buckets) {
-            if (value != null) {
-                real.add(value);
+        List<Double> realSampleCounts = new ArrayList<>();
+        for (int index = 0; index < range; index++) {
+            if (buckets[index] != null) {
+                real.add(buckets[index]);
+                realSampleCounts.add(bucketSampleCounts[index]);
             }
+        }
+
+        if (lowSampleCountHolds(alarm, realSampleCounts, evaluationPeriods)) {
+            // Held like TreatMissingData=ignore: an ALARM keeps dispatching, with the latest breach
+            // among the datapoints that would have decided the state (NaN when none of them breaches).
+            if ("ALARM".equals(alarm.getStateValue()) && alarm.isActionsEnabled()) {
+                List<Double> deciding = real.subList(Math.max(0, real.size() - evaluationPeriods), real.size());
+                dispatch(alarm, latestBreachingValue(deciding, alarm), region);
+            }
+            return;
         }
 
         String newState;
@@ -191,6 +233,32 @@ public class AlarmEvaluator {
                 dispatch(current.get(), latestValue, region);
             }
         }
+    }
+
+    /**
+     * {@code EvaluateLowSampleCountPercentile=ignore} on a single-metric percentile alarm: AWS keeps
+     * the alarm state "during periods with too few data points to be statistically significant".
+     * AWS does not say how that combines with M of N, so this is Floci's reading: the datapoints that
+     * would decide the state are checked (the most recent {@code evaluationPeriods} real ones, or all
+     * of them when there are fewer), and if any of them holds fewer samples than {@link
+     * MetricPercentiles#minimumSamples} the state is left as it is. A period with no samples at all
+     * is missing data, which {@code TreatMissingData} still governs. Metric math alarms are not held.
+     */
+    private static boolean lowSampleCountHolds(MetricAlarm alarm, List<Double> realSampleCounts,
+                                               int evaluationPeriods) {
+        if (!MetricPercentiles.IGNORE.equals(alarm.getEvaluateLowSampleCountPercentile())
+                || alarm.getExtendedStatistic() == null || !alarm.getMetrics().isEmpty()) {
+            return false;
+        }
+        double floor = MetricPercentiles.minimumSamples(alarm.getExtendedStatistic());
+        int from = Math.max(0, realSampleCounts.size() - evaluationPeriods);
+        for (Double count : realSampleCounts.subList(from, realSampleCounts.size())) {
+            // Null cannot occur on the single-metric path; guarded so a future caller cannot unbox it.
+            if (count != null && count < floor) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -279,13 +347,13 @@ public class AlarmEvaluator {
 
     private static boolean isEvaluable(MetricAlarm alarm) {
         return alarm.getRegion() != null
-                && alarm.getMetrics().isEmpty()
-                && alarm.getNamespace() != null && !alarm.getNamespace().isBlank()
-                && alarm.getMetricName() != null && !alarm.getMetricName().isBlank()
-                && alarm.getStatistic() != null && !alarm.getStatistic().isBlank()
-                && alarm.getPeriod() != null && alarm.getPeriod() > 0
                 && alarm.getEvaluationPeriods() > 0
-                && alarm.getComparisonOperator() != null;
+                && alarm.getComparisonOperator() != null
+                && (!alarm.getMetrics().isEmpty()
+                    || (alarm.getNamespace() != null && !alarm.getNamespace().isBlank()
+                        && alarm.getMetricName() != null && !alarm.getMetricName().isBlank()
+                        && alarm.getPeriod() != null && alarm.getPeriod() > 0
+                        && (alarm.getStatistic() != null || alarm.getExtendedStatistic() != null)));
     }
 
     private static boolean breaches(double value, String comparisonOperator, double threshold) {

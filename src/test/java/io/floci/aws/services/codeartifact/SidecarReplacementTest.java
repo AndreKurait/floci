@@ -58,7 +58,7 @@ class SidecarReplacementTest {
 
     @ParameterizedTest
     @EnumSource(Format.class)
-    void actualStarterKeepsAnAdmittedPredecessorUntilItsUseEnds(Format format) throws Exception {
+    void actualStarterReplacesAnUnhealthyContainerAfterItsAdmittedUseEnds(Format format) throws Exception {
         AtomicBoolean healthy = new AtomicBoolean(true);
         HttpServer first = healthServer(healthy);
         HttpServer replacement = healthServer(new AtomicBoolean(true));
@@ -164,15 +164,15 @@ class SidecarReplacementTest {
             assertTrue(liveNames.containsValue("foreign-namespace"));
             assertEquals(original, manager.ready().apply("repository", "http://localhost:4566"));
             assertEquals(1, created.get(), "Healthy reuse must not create a new container");
+            manager.end().accept("repository");
+            admitted = false;
             healthy.set(false);
             String next = manager.ready().apply("repository", "http://localhost:4566");
 
             assertNotEquals(original, next);
-            assertTrue(liveNames.containsValue("container-1"),
-                    "The actual replacement starter must not remove the admitted predecessor by name");
+            assertFalse(liveNames.containsValue("container-1"),
+                    "An unhealthy predecessor can retire once its admitted use has ended");
             assertNotEquals(createdNames.get("container-1"), createdNames.get("container-2"));
-            manager.end().accept("repository");
-            admitted = false;
             assertFalse(liveNames.containsValue("container-1"));
             assertTrue(liveNames.containsValue("container-2"));
         } finally {

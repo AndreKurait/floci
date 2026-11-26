@@ -81,7 +81,7 @@ SERVICE_SUFFIX = ".amazonaws.com"
 # The IAM namespaces whose operations this file reads: those Floci serves over the JSON and Query
 # protocols and Smithy RPC v2 CBOR, and the REST ones whose routes Floci authorizes by operation.
 NAMESPACES = (
-    "application-autoscaling", "aps", "athena", "autoscaling", "budgets", "cloudformation", "cloudtrail",
+    "appconfig", "application-autoscaling", "aps", "athena", "autoscaling", "budgets", "cloudformation", "cloudtrail",
     "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito-identity", "cognito-idp",
     "comprehend", "config", "datasync", "dms", "dsql", "ec2", "ecr", "ecs", "eks",
     "elasticfilesystem", "elasticloadbalancing", "elasticmapreduce",
@@ -98,7 +98,6 @@ NOT_COVERED = {
     "apigateway": "authorized by HTTP method, so no request is checked as one of these operations",
     "access-analyzer": "REST routes no rule maps yet",
     "airflow": "REST routes no rule maps yet",
-    "appconfig": "REST routes no rule maps yet",
     "appsync": "REST routes no rule maps yet",
     "aws-marketplace": "REST routes no rule maps yet",
     "backup": "REST routes no rule maps yet",
@@ -227,6 +226,7 @@ BY_HAND = {
     "scheduler:CreateSchedule": "the target's role",
     "scheduler:UpdateSchedule": "the target's role",
     "states:CreateStateMachine": "the state machine's role",
+    "states:TestState": "the tested state's role",
     "states:UpdateStateMachine": "the state machine's role",
 }
 
@@ -260,6 +260,10 @@ XML_BODY = "the request body is XML, which PassedRoles does not read"
 
 # Operations whose request names no role this file can read.
 NOT_READ = {
+    "appconfig:CreateExtension": "extension actions hold roles in a map of lists, Actions{}[].RoleArn, which "
+                                 "PassedRoles cannot read yet; Floci does not implement extension operations",
+    "appconfig:UpdateExtension": "extension actions hold roles in a map of lists, Actions{}[].RoleArn, which "
+                                 "PassedRoles cannot read yet; Floci does not implement extension operations",
     "config:PutConformancePack": NO_ROLE_MEMBER,
     "config:PutOrganizationConformancePack": NO_ROLE_MEMBER,
     "config:PutRemediationConfigurations": RUNBOOK_PARAMETER,

@@ -8,7 +8,7 @@ import io.floci.aws.core.common.EpochSeconds;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.SmithyValidationErrors;
-import io.floci.aws.services.ssm.session.SsmSession;
+import io.floci.aws.services.ssm.model.SsmSession;
 import io.floci.aws.services.ssm.session.SsmSessionService;
 import io.floci.aws.services.ssm.session.SsmSessionService.SessionConnection;
 import io.floci.aws.services.ssm.session.SsmSessionService.SessionFilter;
@@ -100,6 +100,9 @@ class SsmSessionJsonHandler {
             }
             if (session.reason() != null) {
                 entry.put("Reason", session.reason());
+            }
+            if (session.getMaxSessionDuration() != null) {
+                entry.put("MaxSessionDuration", session.getMaxSessionDuration());
             }
         }
         if (page.nextToken() != null) {

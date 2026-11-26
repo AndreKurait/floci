@@ -190,7 +190,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
     private static final String FLOCI_ALIAS = "floci";
     // How long a cluster's HDFS and metastore may take to start, the NameNode formatted the first time, before a step
     // gives up.
-    private static final Duration HDFS_START_TIMEOUT = Duration.ofSeconds(120);
+    static final Duration HDFS_START_TIMEOUT = Duration.ofSeconds(120);
     private static final Duration HDFS_POLL_INTERVAL = Duration.ofMillis(500);
     // How long Trino's coordinator has to answer once its container starts: it took 18 s on a laptop, its image's
     // catalogs loaded.
@@ -585,6 +585,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
     private final Map<String, Function<String, Instance>> identities = new ConcurrentHashMap<>();
     // The link-local address each node's container this process started was given, by container name.
     private final Map<String, String> nodeAddresses = new ConcurrentHashMap<>();
+    private final Pause pause;
     // How many teardowns, by a reset or a shutdown, have run: a step waiting for its cluster's HDFS through one stops.
     private final AtomicLong teardowns = new AtomicLong();
 
@@ -621,6 +622,16 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                       CurrentContainerNetworkResolver currentContainer, EmulatorConfig config, S3Service s3Service,
                       Duration hdfsStartTimeout, LongSupplier nanoTime, Executor decommissions,
                       Duration decommissionPoll, EmrMetadataRelays relays) {
+        this(lifecycleManager, containerBuilder, awsEnv, roleCredentials, currentContainer, config, s3Service,
+                hdfsStartTimeout, nanoTime, decommissions, decommissionPoll, relays,
+                interval -> Thread.sleep(interval.toMillis()));
+    }
+
+    EmrClusterStorage(ContainerLifecycleManager lifecycleManager, ContainerBuilder containerBuilder,
+                      LaunchedContainerAwsEnv awsEnv, LambdaExecutionRoleCredentials roleCredentials,
+                      CurrentContainerNetworkResolver currentContainer, EmulatorConfig config, S3Service s3Service,
+                      Duration hdfsStartTimeout, LongSupplier nanoTime, Executor decommissions,
+                      Duration decommissionPoll, EmrMetadataRelays relays, Pause pause) {
         this.relays = relays;
         this.decommissions = decommissions;
         this.decommissionPoll = decommissionPoll;
@@ -633,6 +644,13 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
         this.s3Service = s3Service;
         this.hdfsStartTimeout = hdfsStartTimeout;
         this.nanoTime = nanoTime;
+        this.pause = pause;
+    }
+
+    /** The wait between two looks at a starting HDFS: {@link Thread#sleep} outside tests. */
+    @FunctionalInterface
+    interface Pause {
+        void between(Duration interval) throws InterruptedException;
     }
 
     @Override
@@ -2067,7 +2085,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                         + hdfsStartTimeout.toSeconds() + " seconds");
             }
             try {
-                Thread.sleep(HDFS_POLL_INTERVAL.toMillis());
+                pause.between(HDFS_POLL_INTERVAL);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Stopped waiting for the HDFS of EMR cluster " + clusterId, e);
@@ -2264,7 +2282,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                     .exec()) {
                 Map<String, String> labels = container.getLabels() != null ? container.getLabels() : Map.of();
                 String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
-                if (!kept.contains(clusterId)) {
+                if (clusterId == null || !kept.contains(clusterId)) {
                     // Known first, so one Docker refuses to remove stays for the next reset or shutdown to remove.
                     String name = clusterId != null ? hdfsName(clusterId) : container.getId();
                     running.add(name);
@@ -2301,7 +2319,9 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                             ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config)))
                     .exec()) {
                 Map<String, String> labels = network.getLabels() != null ? network.getLabels() : Map.of();
-                if (!kept.contains(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))) {
+                // An immutable set refuses a null lookup, which would end the sweep at an object without the label.
+                String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+                if (clusterId == null || !kept.contains(clusterId)) {
                     detachFloci(network.getName());
                     lifecycleManager.removeNetwork(network.getName());
                 }
@@ -2318,7 +2338,8 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                     ? response.getVolumes() : List.of();
             for (InspectVolumeResponse volume : volumes) {
                 Map<String, String> labels = volume.getLabels() != null ? volume.getLabels() : Map.of();
-                if (!kept.contains(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))) {
+                String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+                if (clusterId == null || !kept.contains(clusterId)) {
                     lifecycleManager.removeVolume(volume.getName());
                 }
             }

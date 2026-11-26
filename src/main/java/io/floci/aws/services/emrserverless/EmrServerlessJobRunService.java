@@ -81,6 +81,13 @@ import java.util.regex.Pattern;
  *
  * <p>In either mode a run beyond its application's {@code maxConcurrentRuns} waits QUEUED until one of the
  * application's runs ends, or until its queue timeout ({@link EmrServerlessScheduler}).
+ * <p>In the {@code refuse} runner mode no run executes and none pretends to: StartJobRun admits the run as
+ * in the other modes (validation, client token, auto-start) and the run ends FAILED at once, never
+ * started, its {@code stateDetails} saying that job execution is not available here. It is not tried
+ * again.
+ *
+ * <p>Each state a run enters goes to EventBridge, through {@link EmrServerlessEventPublisher}: SUBMITTED as
+ * it is admitted, then each state GetJobRun reports it in.
  *
  * <p>Every public method is synchronized: admitting a run (look up its client token, then write
  * it), settling one and cancelling one each read and then write a run, and must not interleave. A
@@ -91,6 +98,7 @@ public class EmrServerlessJobRunService implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(EmrServerlessJobRunService.class);
 
+    static final String STATE_SUBMITTED = "SUBMITTED";
     static final String STATE_SCHEDULED = "SCHEDULED";
     static final String STATE_RUNNING = "RUNNING";
     static final String STATE_SUCCESS = "SUCCESS";
@@ -112,6 +120,7 @@ public class EmrServerlessJobRunService implements Resettable {
     private static final int MIN_GRACE_SECONDS = 15;
     private static final int MAX_GRACE_SECONDS = 1800;
     private static final String RUNNER_DOCKER = "docker";
+    private static final String RUNNER_REFUSE = "refuse";
     // The service a container run's driver belongs to, which names it and labels it.
     static final String SERVICE = "emr-serverless";
     private static final String SPARK_DEFAULTS = "spark-defaults";
@@ -149,6 +158,8 @@ public class EmrServerlessJobRunService implements Resettable {
     static final String DRIVER_NOT_THE_APPLICATIONS = "Floci runs a Spark application's sparkSubmit job runs and a"
             + " Hive application's hive job runs, and this job run's driver is not its application's type.";
     static final String INTERRUPTED = "Floci stopped while the job run was in progress.";
+    static final String EXECUTION_REFUSED = "Job execution is not available on this emulator:"
+            + " floci.services.emrserverless.runner-mode is refuse, so no job run executes.";
 
     private static final Set<String> TERMINAL_STATES = Set.of(STATE_SUCCESS, STATE_FAILED, STATE_CANCELLED);
     private static final List<String> STATES = List.of("SUBMITTED", "PENDING", "SCHEDULED", STATE_RUNNING,
@@ -203,6 +214,10 @@ public class EmrServerlessJobRunService implements Resettable {
     private final int executorContainers;
     // Whether a container run runs for its application's architecture: honour-architectures, off by default.
     private final boolean honourArchitectures;
+    // The refuse runner mode: every run ends FAILED as it is admitted.
+    private final boolean refuseExecution;
+    // Where the runs' state changes go; null in a service built without it, which sends none.
+    private final EmrServerlessEventPublisher events;
     // Container runs a thread is running; one not here that has not ended was left by a restart.
     private final Set<String> executing = new HashSet<>();
     // Raised by each reset, so a run's thread from before it writes nothing back after the wipe.
@@ -217,7 +232,8 @@ public class EmrServerlessJobRunService implements Resettable {
     public EmrServerlessJobRunService(StorageFactory storageFactory, EmrServerlessService applications,
                                       IamService iamService, RegionResolver regionResolver,
                                       RequestContext requestContext, ObjectMapper objectMapper,
-                                      EmulatorConfig config, Clock clock, EmrServerlessSparkRunner sparkRunner) {
+                                      EmulatorConfig config, Clock clock, EmrServerlessSparkRunner sparkRunner,
+                                      EmrServerlessEventPublisher events) {
         this(storageFactory.create("emrserverless", "emr-serverless-job-runs.json", new TypeReference<>() {}),
                 applications, iamService, regionResolver, requestContext, objectMapper,
                 config.services().emrserverless().jobRunDurationSeconds(), clock,
@@ -227,7 +243,8 @@ public class EmrServerlessJobRunService implements Resettable {
                 config.services().emrserverless().hiveImageTemplate().orElse(null),
                 config.services().emrserverless().dockerNetwork().orElse(null),
                 config.services().emrserverless().executorContainers(),
-                config.services().emrserverless().honourArchitectures());
+                config.services().emrserverless().honourArchitectures(),
+                RUNNER_REFUSE.equalsIgnoreCase(config.services().emrserverless().runnerMode()), events);
         // Before any run of this process starts: a driver an earlier one left belongs to a run read as FAILED.
         if (this.sparkRunner != null && config.services().emrserverless().reconcileContainersOnStartup()) {
             sparkRunner.removeLeftoverDrivers(SERVICE);
@@ -273,7 +290,8 @@ public class EmrServerlessJobRunService implements Resettable {
                                ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
                                SparkJobRunner sparkRunner, Executor runExecutor,
                                String imageTemplate, String hiveImageTemplate, String dockerNetwork,
-                               int executorContainers, boolean honourArchitectures) {
+                               int executorContainers, boolean honourArchitectures,
+                               boolean refuseExecution, EmrServerlessEventPublisher events) {
         if (runDurationSeconds < 0) {
             throw new IllegalArgumentException(
                     "floci.services.emrserverless.job-run-duration-seconds must not be negative: " + runDurationSeconds);
@@ -293,6 +311,41 @@ public class EmrServerlessJobRunService implements Resettable {
         this.dockerNetwork = dockerNetwork;
         this.executorContainers = executorContainers;
         this.honourArchitectures = honourArchitectures;
+        this.refuseExecution = refuseExecution;
+        this.events = events;
+    }
+
+    EmrServerlessJobRunService(AccountAwareStorageBackend<JobRunRecord> store, EmrServerlessService applications,
+                               IamService iamService, RegionResolver regionResolver, RequestContext requestContext,
+                               ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
+                               SparkJobRunner sparkRunner, Executor runExecutor,
+                               String imageTemplate, String hiveImageTemplate, String dockerNetwork,
+                               int executorContainers, boolean honourArchitectures) {
+        this(store, applications, iamService, regionResolver, requestContext, objectMapper, runDurationSeconds, clock,
+                sparkRunner, runExecutor, imageTemplate, hiveImageTemplate, dockerNetwork, executorContainers,
+                honourArchitectures, false, null);
+    }
+
+    EmrServerlessJobRunService(AccountAwareStorageBackend<JobRunRecord> store, EmrServerlessService applications,
+                               IamService iamService, RegionResolver regionResolver, RequestContext requestContext,
+                               ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
+                               SparkJobRunner sparkRunner, Executor runExecutor,
+                               String imageTemplate, String hiveImageTemplate, String dockerNetwork,
+                               boolean refuseExecution) {
+        this(store, applications, iamService, regionResolver, requestContext, objectMapper, runDurationSeconds, clock,
+                sparkRunner, runExecutor, imageTemplate, hiveImageTemplate, dockerNetwork, 0, false,
+                refuseExecution, null);
+    }
+
+    EmrServerlessJobRunService(AccountAwareStorageBackend<JobRunRecord> store, EmrServerlessService applications,
+                               IamService iamService, RegionResolver regionResolver, RequestContext requestContext,
+                               ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
+                               SparkJobRunner sparkRunner, Executor runExecutor,
+                               String imageTemplate, String hiveImageTemplate, String dockerNetwork,
+                               boolean refuseExecution, EmrServerlessEventPublisher events) {
+        this(store, applications, iamService, regionResolver, requestContext, objectMapper, runDurationSeconds, clock,
+                sparkRunner, runExecutor, imageTemplate, hiveImageTemplate, dockerNetwork, 0, false,
+                refuseExecution, events);
     }
 
     @PreDestroy
@@ -328,9 +381,15 @@ public class EmrServerlessJobRunService implements Resettable {
         JobRunRecord record = applications.admit(applicationId, "a job run is submitted",
                 app -> checkBatchTimeout(app, body), app -> {
             EmrServerlessScheduler.Limits limits = EmrServerlessScheduler.limits(app);
-            boolean queued = limits != null && active(runs).size() >= limits.maxConcurrentRuns();
+            boolean queued = !refuseExecution && limits != null && active(runs).size() >= limits.maxConcurrentRuns();
             JobRunRecord admitted = newRun(app, body, original, queued);
-            if (sparkRunner != null && !queued) {
+            if (refuseExecution) {
+                admitted.getJobRun().setStateDetails(EXECUTION_REFUSED);
+                finish(admitted, STATE_FAILED, admitted.getJobRun().getCreatedAt());
+                LOG.infov("Refused EMR Serverless job run {0}: the refuse runner mode executes no job",
+                        admitted.getJobRun().getJobRunId());
+            } else if (sparkRunner != null && !queued) {
+
                 launch(admitted, app);
             }
             return admitted;
@@ -721,7 +780,7 @@ public class EmrServerlessJobRunService implements Resettable {
         run.setCreatedAt(now);
         run.setUpdatedAt(now);
         requested(run, request);
-        run.setState(queued ? STATE_QUEUED : sparkRunner != null ? STATE_SCHEDULED : STATE_RUNNING);
+        run.setState(STATE_SUBMITTED);
         run.setStateDetails("");
         run.setReleaseLabel(app.getReleaseLabel());
         run.setNetworkConfiguration(app.getNetworkConfiguration());
@@ -729,7 +788,7 @@ public class EmrServerlessJobRunService implements Resettable {
         run.setAttemptCreatedAt(now);
         run.setAttemptUpdatedAt(now);
         applyImages(run, app);
-        if (sparkRunner == null && !queued) {
+        if (sparkRunner == null && !queued && !refuseExecution) {
             run.setStartedAt(now);
         }
 
@@ -742,6 +801,12 @@ public class EmrServerlessJobRunService implements Resettable {
         record.setWorkers(workers(app, run));
         record.setContainerRun(sparkRunner != null);
         keepDriverLogs(record, app);
+        stateChanged(run, null);
+        // A refused run fails from SUBMITTED.
+        if (!refuseExecution) {
+            run.setState(queued ? STATE_QUEUED : sparkRunner != null ? STATE_SCHEDULED : STATE_RUNNING);
+            stateChanged(run, STATE_SUBMITTED);
+        }
         store.put(jobRunId, record);
         indexRun(run);
         return record;
@@ -840,7 +905,7 @@ public class EmrServerlessJobRunService implements Resettable {
                 ? onPlatform.asInterruptible() : onPlatform;
         executing.add(run.getJobRunId());
         long launchedIn = generation;
-        runExecutor.execute(() -> execute(launched, launchedIn));
+        runExecutor.execute(() -> execute(launched.withImagePullSourceArn(app.getArn()), launchedIn));
     }
 
     /** The runner of the docker runner mode, or null in the immediate one. */
@@ -1283,6 +1348,7 @@ public class EmrServerlessJobRunService implements Resettable {
                     run.setUpdatedAt(now);
                     run.setAttemptUpdatedAt(now);
                     store.put(jobRunId, record);
+                    stateChanged(run, STATE_SCHEDULED);
                     LOG.infov("EMR Serverless job run {0} is running", jobRunId);
                 });
     }
@@ -1335,11 +1401,13 @@ public class EmrServerlessJobRunService implements Resettable {
 
     private void markCancelling(JobRunRecord record) {
         JobRun run = record.getJobRun();
+        String previousState = run.getState();
         Instant now = clock.instant().truncatedTo(ChronoUnit.MILLIS);
         run.setState(STATE_CANCELLING);
         run.setUpdatedAt(now);
         run.setAttemptUpdatedAt(now);
         store.put(run.getJobRunId(), record);
+        stateChanged(run, previousState);
     }
 
     /**
@@ -1417,6 +1485,7 @@ public class EmrServerlessJobRunService implements Resettable {
      */
     private void retry(JobRunRecord record, Application app, String details, Instant now) {
         JobRun run = record.getJobRun();
+        String previousState = run.getState();
         JobRun failed = objectMapper.convertValue(run, JobRun.class);
         failed.setStateDetails(details);
         end(record, failed, STATE_FAILED, now);
@@ -1436,6 +1505,7 @@ public class EmrServerlessJobRunService implements Resettable {
         applyImages(run, app);
         keepDriverLogs(record, app);
         store.put(run.getJobRunId(), record);
+        stateChanged(run, previousState);
         LOG.infov("EMR Serverless job run {0} failed its attempt {1}; attempt {2} starts", run.getJobRunId(),
                 failed.getAttempt(), run.getAttempt());
         launch(record, app);
@@ -1630,7 +1700,9 @@ public class EmrServerlessJobRunService implements Resettable {
                 queued.add(record);
             } else if (record.isContainerRun() && !executing.contains(run.getJobRunId())) {
                 run.setStateDetails(INTERRUPTED);
+                String previousState = run.getState();
                 end(record, run, STATE_FAILED, now);
+                replay.recordChange(run, previousState);
                 replay.changed.add(record);
             } else {
                 replay.running(record);
@@ -1643,6 +1715,7 @@ public class EmrServerlessJobRunService implements Resettable {
             Map<String, JobRunRecord> writes = new LinkedHashMap<>();
             replay.changed.forEach(record -> writes.put(record.getJobRun().getJobRunId(), record));
             store.putAll(writes);
+            replay.stateChanges.forEach(change -> stateChanged(change.run(), change.previousState()));
         }
         // Once the changes are stored, and each counted as going first: a thread that runs at once would read them, and
         // read a container run that has no thread as one Floci's shutdown stopped.
@@ -1695,6 +1768,13 @@ public class EmrServerlessJobRunService implements Resettable {
         // By identity: whatever the records' own equality.
         private final Set<JobRunRecord> changed = Collections.newSetFromMap(new IdentityHashMap<>());
         private final List<JobRunRecord> launched = new ArrayList<>();
+        private final List<StateChange> stateChanges = new ArrayList<>();
+
+        private void recordChange(JobRun run, String previousState) {
+            if (events != null && !run.getState().equals(previousState)) {
+                stateChanges.add(new StateChange(objectMapper.convertValue(run, JobRun.class), previousState));
+            }
+        }
 
         Replay(Application app, EmrServerlessScheduler.Limits limits) {
             this.app = app;
@@ -1729,11 +1809,16 @@ public class EmrServerlessJobRunService implements Resettable {
                     // No source gives AWS's stateDetails for it; the wording is Floci's.
                     run.setStateDetails("Job run timed out after " + limits.queueTimeout().toMinutes()
                             + " minutes in the queue.");
+                    String previousState = run.getState();
                     end(head, run, STATE_CANCELLED, timesOutAt);
+                    recordChange(run, previousState);
                     changed.add(head);
                 } else if (endsAt != null) {
                     timed.poll();
-                    end(first.record(), first.record().getJobRun(), first.ending().state(), endsAt);
+                    JobRun run = first.record().getJobRun();
+                    String previousState = run.getState();
+                    end(first.record(), run, first.ending().state(), endsAt);
+                    recordChange(run, previousState);
                     changed.add(first.record());
                     startQueued(endsAt);
                 } else if (!startQueued(now)) {
@@ -1754,6 +1839,7 @@ public class EmrServerlessJobRunService implements Resettable {
                     && (limits == null || timed.size() + untimed < limits.maxConcurrentRuns())) {
                 JobRunRecord record = queue.pollFirst();
                 JobRun run = record.getJobRun();
+                String previousState = run.getState();
                 leaveQueue(run, at);
                 run.setUpdatedAt(at);
                 run.setAttemptUpdatedAt(at);
@@ -1772,10 +1858,13 @@ public class EmrServerlessJobRunService implements Resettable {
                     launched.add(record);
                     untimed++;
                 }
+                recordChange(run, previousState);
             }
             return took;
         }
     }
+
+    private record StateChange(JobRun run, String previousState) {}
 
     // A run that ends on its own, and how.
     private record Timed(JobRunRecord record, Ending ending) {
@@ -1824,8 +1913,17 @@ public class EmrServerlessJobRunService implements Resettable {
     }
 
     private void finish(JobRunRecord record, String state, Instant endedAt) {
+        String previousState = record.getJobRun().getState();
         end(record, record.getJobRun(), state, endedAt);
         store.put(record.getJobRun().getJobRunId(), record);
+        stateChanged(record.getJobRun(), previousState);
+    }
+
+    // Sends the run's change from previousState, null for a run just submitted, unless its state is unchanged.
+    private void stateChanged(JobRun run, String previousState) {
+        if (events != null && !run.getState().equals(previousState)) {
+            events.jobRunStateChange(run, previousState);
+        }
     }
 
     // Ends an attempt of a run, as of endedAt, with what its workers used.

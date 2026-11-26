@@ -3,7 +3,9 @@ package io.floci.aws.services.ssm.session;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsEndpoints;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
@@ -14,6 +16,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.ssm.model.SsmSession;
 import io.floci.aws.services.ssm.session.SessionDocumentResolver.ResolvedDocument;
 import io.floci.aws.services.ssmmessages.DataChannelRouter;
 import io.floci.aws.services.ssmmessages.SsmMessageGateway;
@@ -41,6 +44,7 @@ import java.util.regex.Pattern;
 public class SsmSessionService implements Resettable {
     private static final int MAX_RESULTS = 200;
     private static final Duration HISTORY_RETENTION = Duration.ofDays(30);
+    private static final Pattern MANAGED_TARGET = Pattern.compile("(?:i-(?:[0-9a-f]{8}|[0-9a-f]{17})|mi-[0-9a-f]{17})");
     private static final Pattern EC2_TARGET = Pattern.compile("i-(?:[0-9a-f]{8}|[0-9a-f]{17})");
 
     private final AccountAwareStorageBackend<SsmSession> sessions;
@@ -88,7 +92,7 @@ public class SsmSessionService implements Resettable {
     public synchronized SessionConnection start(String region, String target, String documentName, String reason,
                                                 Map<String, List<String>> parameters, URI requestBaseUri) {
         Node node = node(region, target);
-        if (!isEc2Target(target) || resetting || !gateway.isConnected(node)) {
+        if (!isManagedTarget(target) || resetting || !gateway.isConnected(node)) {
             throw new AwsException("TargetNotConnected", target + " is not connected.", 400);
         }
         String owner = ownerArn(node.accountId());
@@ -96,12 +100,17 @@ public class SsmSessionService implements Resettable {
         deleteExpiredHistory();
         String sessionId = sessionId(owner);
         String arn = AwsArnUtils.Arn.of("ssm", region, node.accountId(), "session/" + sessionId).toString();
-        String url = streamUrl(sessionId, requestBaseUri);
+        String url = streamUrl(region, sessionId, requestBaseUri);
         String key = sessionKey(region, sessionId);
         SessionRequest request = new SessionRequest(sessionId, arn, owner, node, document.name(), document.content(),
                 document.parameters());
-        sessions.put(key, new SsmSession(sessionId, target, owner, document.name(), reason,
-                SessionState.CONNECTED, clock.instant(), null));
+        SsmSession session = new SsmSession(sessionId, target, owner, document.name(), reason,
+                SessionState.CONNECTED, clock.instant(), null);
+        session.setAccountId(node.accountId());
+        session.setRegion(region);
+        String maxDuration = document.content().path("inputs").path("maxSessionDuration").asText("");
+        session.setMaxSessionDuration(maxDuration.isEmpty() ? null : maxDuration);
+        sessions.put(key, session);
         String token;
         try {
             token = gateway.startSession(request, state -> RequestScopes.runAs(node.accountId(), region,
@@ -117,7 +126,7 @@ public class SsmSessionService implements Resettable {
         SsmSession session = requireActive(region, sessionId);
         String token = gateway.resumeSession(node(region, session.target()), sessionId)
                 .orElseThrow(SsmSessionService::invalidSessionState);
-        return new SessionConnection(sessionId, streamUrl(sessionId, requestBaseUri), token);
+        return new SessionConnection(sessionId, streamUrl(region, sessionId, requestBaseUri), token);
     }
 
     public synchronized void terminate(String region, String sessionId) {
@@ -127,7 +136,11 @@ public class SsmSessionService implements Resettable {
     }
 
     public synchronized boolean isConnected(String region, String target) {
-        return isEc2Target(target) && !resetting && gateway.isConnected(node(region, target));
+        return isManagedTarget(target) && !resetting && gateway.isConnected(node(region, target));
+    }
+
+    public static boolean isManagedTarget(String target) {
+        return MANAGED_TARGET.matcher(target).matches();
     }
 
     public static boolean isEc2Target(String target) {
@@ -147,7 +160,8 @@ public class SsmSessionService implements Resettable {
         List<Predicate<SsmSession>> predicates = filters.stream().map(SsmSessionService::filter).toList();
         Instant cutoff = clock.instant().minus(HISTORY_RETENTION);
         String prefix = sessionKey(region, "");
-        List<SsmSession> matching = sessions.scan(key -> key.startsWith(prefix)).stream()
+        String upstreamPrefix = region + "|";
+        List<SsmSession> matching = sessions.scan(key -> key.startsWith(prefix) || key.startsWith(upstreamPrefix)).stream()
                 .filter(session -> active == session.active())
                 .filter(session -> active || !session.endDate().isBefore(cutoff))
                 .filter(session -> predicates.stream().allMatch(predicate -> predicate.test(session)))
@@ -226,8 +240,12 @@ public class SsmSessionService implements Resettable {
         return prefix + "-" + UUID.randomUUID().toString().replace("-", "").substring(0, 26);
     }
 
-    private String streamUrl(String sessionId, URI requestBaseUri) {
+    private String streamUrl(String region, String sessionId, URI requestBaseUri) {
         URI endpoint = requestBaseUri != null ? requestBaseUri : baseUri;
+        String host = endpoint.getHost();
+        if (host != null && host.toLowerCase(Locale.ROOT).endsWith("." + AwsRegions.dnsSuffixFor(region))) {
+            endpoint = URI.create("https://" + AwsEndpoints.host("ssmmessages", region));
+        }
         return UriBuilder.fromUri(endpoint)
                 .scheme("https".equalsIgnoreCase(endpoint.getScheme()) ? "wss" : "ws")
                 .path(DataChannelRouter.CHANNEL_PATH_PREFIX)
@@ -237,7 +255,7 @@ public class SsmSessionService implements Resettable {
     }
 
     private static String sessionKey(String region, String sessionId) {
-        return region + "|" + sessionId;
+        return region + "::" + sessionId;
     }
 
     private static String cursor(SsmSession session) {

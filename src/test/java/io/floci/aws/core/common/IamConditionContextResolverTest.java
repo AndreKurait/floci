@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
+import io.floci.aws.services.cloudwatch.logs.LogGroupTagTarget;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
@@ -24,6 +26,8 @@ import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
+import io.floci.aws.services.kms.KmsService;
+import io.floci.aws.services.kms.model.KmsAlias;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
 import io.floci.aws.services.s3.S3Service;
@@ -44,6 +48,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -69,6 +74,7 @@ import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -91,6 +97,46 @@ class IamConditionContextResolverTest {
     private EmulatorConfig config;
     private IamConditionContextResolver resolver;
     private ResolvedServiceCatalog serviceCatalog;
+
+    @Test
+    void privateCaDefaultTemplateUsesDeploymentPartitionForUnknownRegion() {
+        assertPrivateCaTemplate("polygondwanaland-west-1", "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaDefaultTemplateUsesKnownRegionPartition() {
+        assertPrivateCaTemplate("us-east-1", "{}", "aws");
+        assertPrivateCaTemplate("cn-north-1", "{\"TemplateArn\":null}", "aws-cn");
+        assertPrivateCaTemplate("us-gov-west-1", "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaDefaultTemplateUsesConfiguredRegionWhenRequestRegionIsAbsent() {
+        when(config.defaultRegion()).thenReturn("polygondwanaland-west-1");
+        assertPrivateCaTemplate(null, "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaExplicitTemplateIsNotRewritten() {
+        String template = "arn:aws-cn:acm-pca:::template/RootCACertificate/V1";
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(json("{\"TemplateArn\":\"" + template + "\"}"));
+        assertEquals(Map.of("acm-pca:TemplateArn", List.of(template)),
+                resolver.resolve("acm-pca", "acm-pca:IssueCertificate", request));
+    }
+
+    private void assertPrivateCaTemplate(String region, String body, String partition) {
+        requestContext.setRegion(region);
+        EmulatorConfig.PartitionsConfig partitions = mock(EmulatorConfig.PartitionsConfig.class);
+        when(config.partitions()).thenReturn(partitions);
+        when(partitions.id()).thenReturn(Optional.of("aws-us-gov"));
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(body));
+        assertEquals(Map.of("acm-pca:TemplateArn", List.of("arn:" + partition
+                        + ":acm-pca:::template/EndEntityCertificate/V1")),
+                resolver.resolve("acm-pca", "acm-pca:IssueCertificate", request));
+    }
 
     @Test
     void eksRequestConditionsUseModeledPathsAndLeaveOmissionsAbsent() {
@@ -129,6 +175,13 @@ class IamConditionContextResolverTest {
         Instance<S3Service> s3ServiceInstance = mock(Instance.class);
         when(s3ServiceInstance.isResolvable()).thenReturn(true);
         when(s3ServiceInstance.get()).thenReturn(s3Service);
+        logsService = mock(CloudWatchLogsService.class);
+        Instance<CloudWatchLogsService> logsServiceInstance = mock(Instance.class);
+        when(logsServiceInstance.isResolvable()).thenReturn(true);
+        when(logsServiceInstance.get()).thenReturn(logsService);
+        when(logsService.resolveTagTarget(anyString(), anyString())).thenAnswer(call ->
+                LogGroupTagTarget.resolve(
+                        call.getArgument(0), call.getArgument(1), "123456789012", "aws"));
         iamService = mock(IamService.class);
         Instance<IamService> iamServiceInstance = mock(Instance.class);
         when(iamServiceInstance.isResolvable()).thenReturn(true);
@@ -154,6 +207,95 @@ class IamConditionContextResolverTest {
                 lambdaWebServiceInstance, spellings(new ShapeNamingSpelling()), mock(Instance.class),
                 requestContext, new RegionResolver("us-east-1", "123456789012"), config,
                 null, serviceCatalog);
+        try {
+            Field field = IamConditionContextResolver.class.getDeclaredField("logsService");
+            field.setAccessible(true);
+            field.set(resolver, logsServiceInstance);
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError(failure);
+        }
+    }
+
+    @Test
+    void mqCreateReadsUncachedWireTagsAndRestoresTheBody() throws Exception {
+        byte[] wire = "{\"name\":\"owned\",\"tags\":{\"owner\":\"one\"}}".getBytes(StandardCharsets.UTF_8);
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(wire));
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_JSON_TYPE);
+        assertNull(ctx.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY));
+
+        Map<String, List<String>> actual = resolver.resolve("mq", "mq:CreateConfiguration", ctx);
+        assertEquals(Map.of("aws:RequestTag/owner", List.of("one"), "aws:TagKeys", List.of("owner")), actual);
+        ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+        verify(ctx).setEntityStream(restored.capture());
+        assertArrayEquals(wire, restored.getValue().readAllBytes());
+        ArgumentCaptor<JsonNode> cached = ArgumentCaptor.forClass(JsonNode.class);
+        verify(ctx).setProperty(eq(IamConditionContextResolver.BUFFERED_JSON_BODY), cached.capture());
+        assertEquals(mapper.readTree(wire), cached.getValue());
+
+        when(ctx.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY)).thenReturn(cached.getValue());
+        doThrow(new AssertionError("A cached body must not be consumed again")).when(ctx).getEntityStream();
+        assertEquals(actual, resolver.resolve("mq", "mq:CreateConfiguration", ctx));
+    }
+
+    @Test
+    void mqCreateRejectsNonStringTagsFromAnUncachedBodyBeforeAuthorization() throws Exception {
+        byte[] wire = "{\"name\":\"owned\",\"tags\":{\"owner\":1}}".getBytes(StandardCharsets.UTF_8);
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(wire));
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_JSON_TYPE);
+        AwsException refused = assertThrows(AwsException.class,
+                () -> resolver.resolve("mq", "mq:CreateConfiguration", ctx));
+        assertEquals("BadRequestException", refused.getErrorCode());
+        assertEquals(400, refused.getHttpStatus());
+        ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+        verify(ctx).setEntityStream(restored.capture());
+        assertArrayEquals(wire, restored.getValue().readAllBytes());
+    }
+
+    @Test
+    void accountTargetRegionReadsAndRestoresAnUncachedRequestBody() throws Exception {
+        for (String action : List.of("EnableRegion", "DisableRegion", "GetRegionOptStatus")) {
+            byte[] bytes = "{\"RegionName\":\"ap-east-2\"}".getBytes(StandardCharsets.UTF_8);
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getEntityStream()).thenReturn(new ByteArrayInputStream(bytes));
+            Map<String, Object> properties = new HashMap<>();
+            when(request.getProperty(anyString())).thenAnswer(call -> properties.get(call.<String>getArgument(0)));
+            doAnswer(call -> properties.put(call.getArgument(0), call.getArgument(1)))
+                    .when(request).setProperty(anyString(), any());
+            assertNull(request.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY));
+            assertEquals(Map.of("account:TargetRegion", List.of("ap-east-2")),
+                    resolver.resolve("account", "account:" + action, request));
+            ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+            verify(request).setEntityStream(restored.capture());
+            assertArrayEquals(bytes, restored.getValue().readAllBytes());
+            verify(request).setProperty(eq(IamConditionContextResolver.BUFFERED_JSON_BODY), any(JsonNode.class));
+        }
+    }
+
+    @Test
+    void accountListAndNonTextualTargetsDoNotInventTargetRegionConditions() throws Exception {
+        for (String action : List.of("ListRegions", "GetAlternateContact", "PutAlternateContact", "DeleteAlternateContact")) {
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getEntityStream()).thenThrow(new AssertionError("Unrelated action must not read the body"));
+            assertNull(resolver.resolve("account", "account:" + action, request));
+        }
+        for (String body : List.of("{}", "{\"RegionName\":4}", "{\"RegionName\":null}")) {
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getEntityStream()).thenReturn(new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+            assertNull(resolver.resolve("account", "account:GetRegionOptStatus", request));
+        }
+    }
+
+    @Test
+    void anonymousGlobalContextOmitsSignedPrincipalFlag() {
+        Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
+                Map.of("aws:PrincipalIsAWSService", List.of("false")),
+                "arn:aws:execute-api:us-east-1:111122223333:api/prod/GET/items",
+                "us-east-1", "anonymous", "111122223333");
+        assertFalse(context.containsKey("aws:PrincipalIsAWSService"));
+        assertEquals(List.of("anonymous"), context.get("aws:PrincipalAccount"));
+        assertEquals(List.of("111122223333"), context.get("aws:ResourceAccount"));
     }
 
     @Test
@@ -853,7 +995,7 @@ class IamConditionContextResolverTest {
     }
 
     /** A resolver whose only finder of stored resources is {@code stored}. */
-    private IamConditionContextResolver resolverReading(StoredResourceArns stored) {
+    private IamConditionContextResolver resolverReading(StoredResourceArns... stored) {
         @SuppressWarnings("unchecked")
         Instance<StoredResourceArns> instance = mock(Instance.class);
         when(instance.iterator()).thenAnswer(invocation -> List.of(stored).iterator());
@@ -861,6 +1003,54 @@ class IamConditionContextResolverTest {
                 mock(Instance.class), mock(Instance.class),
                 spellings(), instance, requestContext, new RegionResolver("us-east-1", "123456789012"), config,
                 null, serviceCatalog, Clock.systemUTC());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"aws", "aws-cn", "aws-us-gov"})
+    void callingServiceTagKeysUseEachTargetOwnersStoredTags(String partition) {
+        String first = "arn:" + partition + ":ec2:unknown-region-1:123456789012:instance/i-first";
+        String second = "arn:" + partition + ":ec2:unknown-region-1:210987654321:instance/i-second";
+        String document = "arn:" + partition + ":ssm:unknown-region-1:123456789012:document/RunTask";
+        StoredResourceArns ec2 = mock(StoredResourceArns.class);
+        StoredResourceArns ssm = mock(StoredResourceArns.class);
+        when(ec2.namespace()).thenReturn("ec2");
+        when(ssm.namespace()).thenReturn("ssm");
+        when(ec2.storedTags(first)).thenReturn(Map.of("Team", "first"));
+        when(ec2.storedTags(second)).thenReturn(Map.of("Team", "second"));
+        when(ssm.storedTags(document)).thenReturn(Map.of("Team", "document"));
+        IamConditionContextResolver reading = resolverReading(ec2, ssm);
+
+        Map<String, List<String>> firstTags = reading.resourceTags("ssm:SendCommand", first);
+        assertEquals(List.of("first"), firstTags.get("ssm:resourceTag/Team"));
+        assertEquals(List.of("first"), firstTags.get("aws:ResourceTag/Team"));
+        assertEquals(List.of("first"), firstTags.get("ec2:ResourceTag/Team"));
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"ssm:SendCommand","Resource":"*",
+                   "Condition":{"StringEquals":{"ssm:resourceTag/Team":"first"}}}
+                ]}""";
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(policy),
+                "ssm:SendCommand", first, firstTags));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy),
+                "ssm:SendCommand", second, reading.resourceTags("ssm:SendCommand", second)));
+        assertEquals(List.of("second"), reading.resourceTags("ssm:SendCommand", second)
+                .get("ssm:resourceTag/Team"));
+        assertEquals(List.of("document"), reading.resourceTags("ssm:SendCommand", document)
+                .get("aws:ResourceTag/Team"));
+        assertFalse(reading.resourceTags("ec2:StartInstances", first).containsKey("ssm:resourceTag/Team"));
+        assertFalse(reading.resourceTags("dynamodb:Query", first).containsKey("ssm:resourceTag/Team"));
+        assertEquals(reading.resourceTags(first), reading.resourceTags(null, first));
+        assertNull(reading.resourceTags("ssm:SendCommand", first.replace("i-first", "i-absent")));
+        assertNull(reading.resourceTags("ssm:SendCommand", "*"));
+        verify(ssm, never()).storedTags(first);
+        verify(ec2, never()).storedTags(document);
+
+        when(ec2.storedTags(first)).thenReturn(Map.of("Team", "revoked"));
+        assertEquals(List.of("revoked"), reading.resourceTags("ssm:SendCommand", first)
+                .get("ssm:resourceTag/Team"));
+        assertEquals(List.of("first"), firstTags.get("ssm:resourceTag/Team"));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy),
+                "ssm:SendCommand", first, reading.resourceTags("ssm:SendCommand", first)));
     }
 
     @Test
@@ -943,10 +1133,18 @@ class IamConditionContextResolverTest {
 
     @SuppressWarnings("unchecked")
     private IamConditionContextResolver resolverWithStoredEc2Tags(AccountAwareStorageBackend<List<Tag>> tags) {
+        return resolverWithStoredEc2Tags(tags, AccountAwareStorageBackend.inMemory("123456789012"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private IamConditionContextResolver resolverWithStoredEc2Tags(AccountAwareStorageBackend<List<Tag>> tags,
+            AccountAwareStorageBackend<io.floci.aws.services.ec2.model.Instance> instances) {
         StorageFactory storage = mock(StorageFactory.class);
-        when(storage.create(anyString(), anyString(), any())).thenAnswer(call ->
-                call.getArgument(1).equals("ec2-tags.json") ? tags
-                        : AccountAwareStorageBackend.inMemory("123456789012"));
+        when(storage.create(anyString(), anyString(), any())).thenAnswer(call -> switch ((String) call.getArgument(1)) {
+            case "ec2-tags.json" -> tags;
+            case "ec2-instances.json" -> instances;
+            default -> AccountAwareStorageBackend.inMemory("123456789012");
+        });
         when(config.defaultAccountId()).thenReturn("123456789012");
         EmulatorConfig.ServicesConfig serviceConfig = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2Config = mock(EmulatorConfig.Ec2ServiceConfig.class);
@@ -999,14 +1197,19 @@ class IamConditionContextResolverTest {
         Map<String, List<String>> record = reading.withEc2ResourceContext(scope, action, resource, region, account, context);
         IamConditionContextResolver tags = reading == resolver
                 ? resolverReading(new Ec2StoredResourceArns(ec2Service, new RegionResolver(region, account))) : reading;
-        return IamConditionContextResolver.withResourceTags(record, tags.resourceTags(resource));
+        return IamConditionContextResolver.withResourceTags(record, tags.resourceTags(action, resource));
     }
 
     @Test
     void otherServiceReadsEc2TagsThroughGeneratedSharedPath() {
         AccountAwareStorageBackend<List<Tag>> tags = AccountAwareStorageBackend.inMemory("123456789012");
         tags.putForAccount("111111111111", "eu-west-1::i-0123456789", List.of(new Tag("Team", "foreign")));
-        IamConditionContextResolver reading = resolverWithStoredEc2Tags(tags);
+        AccountAwareStorageBackend<io.floci.aws.services.ec2.model.Instance> instances =
+                AccountAwareStorageBackend.inMemory("123456789012");
+        io.floci.aws.services.ec2.model.Instance instance = new io.floci.aws.services.ec2.model.Instance();
+        instance.setInstanceId("i-0123456789");
+        instances.putForAccount("111111111111", "eu-west-1::i-0123456789", instance);
+        IamConditionContextResolver reading = resolverWithStoredEc2Tags(tags, instances);
         String arn = "arn:aws:ec2:eu-west-1:111111111111:instance/i-0123456789";
         Map<String, List<String>> context = ec2ResourceContext(reading, "ec2-instance-connect", "ec2-instance-connect:SendSSHPublicKey",
                 arn, "us-east-1", "123456789012", Map.of("aws:RequestTag/Team", List.of("requested")));
@@ -1539,6 +1742,47 @@ class IamConditionContextResolverTest {
                         "Action=CreateTags&ResourceId.1=i-1&Tag.1.Key=CostCenter&Tag.1.Value=9999"))));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"ec2:DeleteSecurityGroup", "ec2:AuthorizeSecurityGroupIngress",
+            "ec2:AuthorizeSecurityGroupEgress", "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress"})
+    void securityGroupActionsEvaluateTheNamedGroupsCurrentTags(String action) {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"%s","Resource":"*",
+                   "Condition":{"StringEquals":{"aws:ResourceTag/Team":"payments"}}}
+                ]}""".formatted(action);
+        String body = "Action=" + action.substring("ec2:".length()) + "&GroupId=sg-target";
+
+        for (String value : List.of("payments", "engineering")) {
+            when(ec2Service.resourceTags("us-east-1", "sg-target")).thenReturn(List.of(new Tag("Team", value)));
+            assertEquals("payments".equals(value) ? Decision.ALLOW : Decision.DENY,
+                    evaluator.simulateCustomPolicy(List.of(policy), action, "*",
+                            resolver.resolve("ec2", action, formRequest(body))));
+        }
+        when(ec2Service.resourceTags("us-east-1", "sg-target")).thenReturn(List.of());
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), action, "*",
+                resolver.resolve("ec2", action, formRequest(body))));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress"})
+    void securityGroupRevocationDoesNotInferTagsFromRuleIdsWithoutAGroup(String action) {
+        assertNull(resolver.resolve("ec2", action,
+                formRequest("Action=" + action.substring("ec2:".length()) + "&SecurityGroupRuleId.1=sgr-target")));
+    }
+
+    @Test
+    void securityGroupTagsUseTheRequestRegionAndGroupWhenRuleIdsArePresent() {
+        requestContext.setRegion("eu-west-1");
+        when(ec2Service.resourceTags("eu-west-1", "sg-target")).thenReturn(List.of(new Tag("Team", "payments")));
+        when(ec2Service.resourceTags("us-east-1", "sg-target")).thenReturn(List.of(new Tag("Team", "other")));
+        when(ec2Service.resourceTags("eu-west-1", "sgr-target")).thenReturn(List.of(new Tag("Team", "other")));
+
+        assertEquals(Map.of("aws:ResourceTag/Team", List.of("payments")),
+                resolver.resolve("ec2", "ec2:RevokeSecurityGroupIngress",
+                        formRequest("Action=RevokeSecurityGroupIngress&GroupId=sg-target&SecurityGroupRuleId.1=sgr-target")));
+    }
+
     @Test
     void resourceTagConditionOnABucketFollowsItsOwnerTag() {
         String policy = """
@@ -1777,5 +2021,208 @@ class IamConditionContextResolverTest {
             }
         }
         return Decision.ALLOW;
+    }
+
+    /** A role's KMS policy scoped to one key by its alias, which also limits the grants it may create. */
+    private static final String ALIAS_SCOPED_KMS_POLICY = """
+            {"Version":"2012-10-17","Statement":[
+              {"Effect":"Allow","Action":["kms:CreateGrant","kms:Decrypt","kms:Describe*","kms:Encrypt"],
+               "Resource":"arn:aws:kms:us-east-1:123456789012:key/*",
+               "Condition":{"ForAnyValue:StringLike":{"kms:ResourceAliases":"alias/example-app-key"}}},
+              {"Effect":"Deny","Action":"kms:CreateGrant","Resource":"arn:aws:kms:us-east-1:123456789012:key/*",
+               "Condition":{"ForAnyValue:StringLike":{"kms:ResourceAliases":"alias/example-app-key"},
+                            "ForAnyValue:StringNotEquals":{"kms:GrantOperations":"Decrypt"}}}]}""";
+    private static final String ALIASED_KEY = "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+
+    @SuppressWarnings("unchecked")
+    private KmsService kmsWithAliasedKey() {
+        KmsService kms = mock(KmsService.class);
+        Instance<KmsService> kmsInstance = mock(Instance.class);
+        when(kmsInstance.isResolvable()).thenReturn(true);
+        when(kmsInstance.get()).thenReturn(kms);
+        // Injected as CDI does (a field), through reflection so the case compiles, and fails, without it.
+        try {
+            Field field = IamConditionContextResolver.class.getDeclaredField("kmsService");
+            field.setAccessible(true);
+            field.set(resolver, kmsInstance);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("the resolver has no KMS service to read a key's aliases from", e);
+        }
+        KmsAlias alias = new KmsAlias("alias/example-app-key",
+                "arn:aws:kms:us-east-1:123456789012:alias/example-app-key", "1234abcd-12ab-34cd-56ef-1234567890ab");
+        for (String keyId : List.of("alias/example-app-key", "1234abcd-12ab-34cd-56ef-1234567890ab")) {
+            when(kms.listAliases(keyId, "us-east-1")).thenReturn(List.of(alias));
+        }
+        return kms;
+    }
+
+    private ContainerRequestContext kmsRequest(String body) {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(body));
+        return request;
+    }
+
+    @Test
+    void aKmsPolicyScopedByAliasAllowsTheRequestsOnThatKey() {
+        // Red before KMS had a condition context: kms:ResourceAliases was never set, so a policy
+        // scoped to a key by its alias refused DescribeKey, Encrypt and CreateGrant.
+        kmsWithAliasedKey();
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:DescribeKey",
+                ALIASED_KEY, resolver.resolve("kms", "kms:DescribeKey",
+                        kmsRequest("{\"KeyId\":\"alias/example-app-key\"}"))));
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:Encrypt",
+                ALIASED_KEY, resolver.resolve("kms", "kms:Encrypt",
+                        kmsRequest("{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\",\"Plaintext\":\"eA==\"}"))));
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:CreateGrant",
+                ALIASED_KEY, resolver.resolve("kms", "kms:CreateGrant", kmsRequest(
+                        "{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\",\"Operations\":[\"Decrypt\"]}"))));
+    }
+
+    @Test
+    void aKmsGrantForAnotherOperationIsDeniedByTheGrantOperationsCondition() {
+        kmsWithAliasedKey();
+        Map<String, List<String>> context = resolver.resolve("kms", "kms:CreateGrant", kmsRequest(
+                "{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\",\"Operations\":[\"Decrypt\",\"Encrypt\"]}"));
+        assertEquals(List.of("alias/example-app-key"), context.get("kms:ResourceAliases"));
+        assertEquals(List.of("Decrypt", "Encrypt"), context.get("kms:GrantOperations"));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:CreateGrant",
+                ALIASED_KEY, context));
+    }
+
+    @Test
+    void aKmsRequestNamingItsKeyByAliasCarriesThatAliasAsTheRequestAlias() {
+        kmsWithAliasedKey();
+        Map<String, List<String>> byName = resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"alias/example-app-key\"}"));
+        assertEquals(List.of("alias/example-app-key"), byName.get("kms:RequestAlias"));
+        assertEquals(List.of("alias/example-app-key"), resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"arn:aws:kms:us-east-1:123456789012:alias/example-app-key\"}"))
+                .get("kms:RequestAlias"));
+        Map<String, List<String>> byId = resolver.resolve("kms", "kms:Encrypt",
+                kmsRequest("{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\"}"));
+        assertFalse(byId.containsKey("kms:RequestAlias"));
+        Map<String, List<String>> byKeyArn = resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"" + ALIASED_KEY + "\"}"));
+        assertFalse(byKeyArn != null && byKeyArn.containsKey("kms:RequestAlias"));
+        String policy = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"kms:DescribeKey","Resource":"*",
+                  "Condition":{"StringEquals":{"kms:RequestAlias":"alias/example-app-key"}}}]}""";
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(policy), "kms:DescribeKey", ALIASED_KEY, byName));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), "kms:DescribeKey", ALIASED_KEY,
+                resolver.resolve("kms", "kms:DescribeKey",
+                        kmsRequest("{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\"}"))));
+    }
+
+    @Test
+    void aKmsKeyIdNamingNoKeyAddsNoAlias() {
+        KmsService kms = kmsWithAliasedKey();
+        when(kms.listAliases("alias/none", "us-east-1"))
+                .thenThrow(new AwsException("NotFoundException", "Alias alias/none is not found.", 400));
+        Map<String, List<String>> context = resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"alias/none\"}"));
+        // The request still names its alias; only the key's own aliases are unknown.
+        assertEquals(Map.of("kms:RequestAlias", List.of("alias/none")), context);
+    }
+
+    private CloudWatchLogsService logsService;
+
+    @Test
+    void logStreamTagsUseRawParentNameAndRequestRegion() throws Exception {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(mapper.readTree("{\"logGroupName\":\" group \",\"logStreamName\":42}"));
+        when(logsService.listTagsLogGroup(" group ", "eu-west-1")).thenReturn(Map.of("team", "blue"));
+        requestContext.setRegion("eu-west-1");
+        assertEquals(Map.of("aws:ResourceTag/team", List.of("blue")),
+                resolver.resolve("logs", "logs:PutLogEvents", request));
+        requestContext.setRegion(null);
+        when(logsService.listTagsLogGroup(" group ", "us-east-1")).thenReturn(Map.of("team", "red"));
+        assertEquals(Map.of("aws:ResourceTag/team", List.of("red")),
+                resolver.resolve("logs", "logs:PutLogEvents", request));
+    }
+
+    @Test
+    void missingLogGroupTagsDoNotReplaceTheHandlersMissingResourceError() throws Exception {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(mapper.readTree("{\"logGroupName\":42}"));
+        when(logsService.listTagsLogGroup("42", "us-east-1"))
+                .thenThrow(new AwsException("ResourceNotFoundException", "missing", 400));
+        assertNull(resolver.resolve("logs", "logs:PutLogEvents", request));
+    }
+
+    @Test
+    void unexpectedLogGroupLookupFailuresCannotEraseTagDenies() throws Exception {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(mapper.readTree("{\"logGroupName\":\"group\"}"));
+        AwsException failure = new AwsException("InternalFailure", "storage unavailable", 500);
+        when(logsService.listTagsLogGroup("group", "us-east-1")).thenThrow(failure);
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> resolver.resolve("logs", "logs:PutLogEvents", request)));
+        IllegalStateException unexpected = new IllegalStateException("unavailable");
+        doThrow(unexpected).when(logsService).listTagsLogGroup("group", "us-east-1");
+        assertSame(unexpected, assertThrows(IllegalStateException.class,
+                () -> resolver.resolve("logs", "logs:PutLogEvents", request)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"logs:CreateLogStream", "logs:DeleteLogStream"})
+    void streamCreationAndDeletionDoNotInheritParentGroupTags(String action) throws Exception {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(mapper.readTree("{\"logGroupName\":\"group\",\"logStreamName\":\"stream\"}"));
+        when(logsService.listTagsLogGroup("group", "us-east-1")).thenReturn(Map.of("team", "blue"));
+        assertNull(resolver.resolve("logs", action, request));
+        verify(logsService, never()).listTagsLogGroup(anyString(), anyString());
+    }
+
+    private ContainerRequestContext webRequest(String path, String body) throws Exception {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(containerRequest.getUriInfo()).thenReturn(uriInfo);
+        when(uriInfo.getPath()).thenReturn(path);
+        when(containerRequest.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(body.isEmpty() ? null : mapper.readTree(body));
+        return containerRequest;
+    }
+
+    @Test
+    void anEc2ResourceIsCheckedWithItsOwnStoredTagsFromTheAccountItsArnNames() {
+        when(ec2Service.resourceTags("111111111111", "eu-west-1", "vpce-0123456789"))
+                .thenReturn(List.of(new Tag("OpenSearchManaged", "true")));
+
+        assertEquals(Map.of("aws:ResourceTag/OpenSearchManaged", List.of("true")),
+                resolver.ec2ResourceTags("arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789")
+                        .orElseThrow());
+    }
+
+    @Test
+    void anUntaggedEc2ResourceLeavesEveryResourceTagKeyAbsent() {
+        when(ec2Service.resourceTags("111111111111", "eu-west-1", "vpce-0123456789")).thenReturn(List.of());
+
+        assertEquals(Map.of(), resolver.ec2ResourceTags(
+                "arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789").orElseThrow());
+    }
+
+    @Test
+    void anArnWithoutAnAccountIsReadInTheCallersAccountAndAWildcardIsNotRead() {
+        when(ec2Service.resourceTags("123456789012", "us-east-1", "ami-0123456789"))
+                .thenReturn(List.of(new Tag("Team", "payments")));
+
+        assertEquals(List.of("payments"), resolver.ec2ResourceTags("arn:aws:ec2:us-east-1::image/ami-0123456789")
+                .orElseThrow().get("aws:ResourceTag/Team"));
+        for (String notOne : List.of("*", "arn:aws:ec2:us-east-1:123456789012:vpc-endpoint/*",
+                "arn:aws:s3:::bucket", "arn:aws:ec2:us-east-1:123456789012:instance/i-*",
+                "arn:aws:ec2:us-east-1:123456789012:placement-group/web")) {
+            assertTrue(resolver.ec2ResourceTags(notOne).isEmpty(), notOne);
+        }
+    }
+
+    @Test
+    void staleInstanceTagsCannotSupplyAnotherServicesResourceTagCondition() {
+        AccountAwareStorageBackend<List<Tag>> tags = AccountAwareStorageBackend.inMemory("123456789012");
+        tags.putForAccount("111111111111", "eu-west-1::i-0123456789", List.of(new Tag("Team", "foreign")));
+        IamConditionContextResolver reading = resolverWithStoredEc2Tags(tags);
+        assertNull(reading.resourceTags("ec2-instance-connect:SendSSHPublicKey",
+                "arn:aws:ec2:eu-west-1:111111111111:instance/i-0123456789"));
     }
 }

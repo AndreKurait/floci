@@ -10,6 +10,8 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { get as httpGet } from 'node:http';
+import { get as httpsGet } from 'node:https';
 import {
   APIGatewayClient,
   CreateRestApiCommand,
@@ -326,14 +328,37 @@ describe('API Gateway v1 — execute-api data plane', () => {
 
   describe('REQUEST authorizer — full event shape', () => {
     let receivedEvent: Record<string, unknown>;
+    let clientAddress: string;
 
     beforeAll(async () => {
-      const res = await executeApi(apiId, 'prod', '/items/42', {
-        headers: { Authorization: 'Bearer test-token', 'X-Custom-Header': 'hello' },
-        query: 'foo=bar&baz=qux',
+      const url = new URL(`${ENDPOINT}/execute-api/${apiId}/prod/items/42?foo=bar&baz=qux`);
+      const get = url.protocol === 'https:' ? httpsGet : httpGet;
+      // Capture the peer on this request, so a Docker client does not assume loopback.
+      const result = await new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
+        const request = get(url, {
+          agent: false,
+          timeout: 30_000,
+          headers: {
+            Authorization: 'Bearer test-token',
+            'X-Custom-Header': 'hello',
+            'X-Forwarded-For': '203.0.113.11',
+          },
+        }, (response) => {
+          clientAddress = response.socket.localAddress ?? '';
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('error', reject);
+          response.on('end', () => resolve({
+            status: response.statusCode,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }));
+        });
+        request.on('error', reject);
+        request.on('timeout', () => request.destroy(new Error('Authorizer request timed out')));
       });
-      expect(res.status).toBe(200);
-      const body = await res.json() as { authorizer: { receivedEvent: string } };
+      expect(result.status).toBe(200);
+      expect(clientAddress).not.toBe('');
+      const body = JSON.parse(result.body) as { authorizer: { receivedEvent: string } };
       receivedEvent = JSON.parse(body.authorizer.receivedEvent) as Record<string, unknown>;
     });
 
@@ -401,10 +426,10 @@ describe('API Gateway v1 — execute-api data plane', () => {
       expect((ctx.requestId as string).length).toBeGreaterThan(0);
     });
 
-    it('should include requestContext.identity.sourceIp', () => {
+    it('should include the actual TCP peer in requestContext.identity.sourceIp', () => {
       const ctx = receivedEvent.requestContext as Record<string, unknown>;
       const identity = ctx.identity as Record<string, string>;
-      expect(identity.sourceIp).toBe('127.0.0.1');
+      expect(identity.sourceIp.replace(/^::ffff:/, '')).toBe(clientAddress.replace(/^::ffff:/, ''));
     });
 
     it('should include requestContext.resourcePath', () => {

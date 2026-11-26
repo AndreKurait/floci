@@ -11,6 +11,8 @@ import io.floci.aws.core.common.auth.SigV4Canonicalization;
 import io.floci.aws.core.common.auth.SigV4RequestValidator;
 import io.floci.aws.core.common.auth.SigV4SignedRequest;
 import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.ssm.ExternalAgentAuthentication;
+import io.floci.aws.services.ssmmessages.SsmMessageGateway.Node;
 import io.netty.handler.codec.http.QueryStringDecoder;
 import io.vertx.core.MultiMap;
 import io.vertx.core.http.HttpServerRequest;
@@ -47,15 +49,28 @@ public class ChannelAuthentication {
     private final AccountResolver accountResolver;
     private final IamEnforcementFilter iamEnforcement;
     private final Clock clock;
+    private final ExternalAgentAuthentication externalAgents;
+
+    public ChannelAuthentication(IamService iamService, AccountResolver accountResolver,
+                                 IamEnforcementFilter iamEnforcement) {
+        this(iamService, accountResolver, iamEnforcement, Clock.systemUTC(), null);
+    }
 
     @Inject
     public ChannelAuthentication(IamService iamService, AccountResolver accountResolver,
-                                 IamEnforcementFilter iamEnforcement) {
-        this(iamService, accountResolver, iamEnforcement, Clock.systemUTC());
+                                 IamEnforcementFilter iamEnforcement, ExternalAgentAuthentication externalAgents) {
+        this(iamService, accountResolver, iamEnforcement, Clock.systemUTC(), externalAgents);
     }
 
     ChannelAuthentication(IamService iamService, AccountResolver accountResolver,
                           IamEnforcementFilter iamEnforcement, Clock clock) {
+        this(iamService, accountResolver, iamEnforcement, clock, null);
+    }
+
+    ChannelAuthentication(IamService iamService, AccountResolver accountResolver,
+                          IamEnforcementFilter iamEnforcement, Clock clock,
+                          ExternalAgentAuthentication externalAgents) {
+        this.externalAgents = externalAgents;
         this.iamService = iamService;
         this.accountResolver = accountResolver;
         this.iamEnforcement = iamEnforcement;
@@ -71,6 +86,71 @@ public class ChannelAuthentication {
         Claim claim = readClaim(request);
         IamService.Ec2InstanceIdentity instance = signingInstance(claim).orElseThrow(ChannelAuthentication::denied);
         return authenticateAgent(request, body, action, "*", claim, instance);
+    }
+
+    public void verifyAgentRequest(HttpServerRequest request, byte[] body, String action) {
+        Claim claim = readClaim(request);
+        if (claim == null || claim.signature().presigned()) {
+            throw denied();
+        }
+        String key = claim.scope().accessKeyId();
+        boolean legacy = LEGACY_ACCESS_KEY_ID.equals(key);
+        String account = legacy ? accountResolver.resolve(null) : iamService.resolveAccountId(key).orElseThrow(
+                ChannelAuthentication::denied);
+        RequestScopes.runAs(account, claim.scope().region(), () -> {
+            String secret = legacy ? LEGACY_SECRET_KEY : iamService.findSecretKey(key, claim.sessionToken())
+                    .orElseThrow(ChannelAuthentication::denied);
+            verify(request, body, claim, secret);
+            iamEnforcement.authorizeRequestParameters(request.getHeader(AUTHORIZATION), action, "*", request::getParam);
+        });
+    }
+
+    public AgentIdentity authenticateAgent(HttpServerRequest request, byte[] body, String action, Node expected) {
+        Claim claim = readClaim(request);
+        Optional<IamService.Ec2InstanceIdentity> instance = signingInstance(claim);
+        if (instance.isPresent()) {
+            AgentIdentity identity = authenticateAgent(request, body, action, "*", claim, instance.get());
+            if (!identity.accountId().equals(expected.accountId()) || !identity.region().equals(expected.region())
+                    || !identity.instanceId().equals(expected.instanceId())) {
+                throw denied();
+            }
+            return identity;
+        }
+        return authenticateExternal(request, body, action, "*", expected, claim);
+    }
+
+    private AgentIdentity authenticateExternal(HttpServerRequest request, byte[] body, String action,
+                                               String resource, Node expected, Claim claim) {
+        if (claim == null || claim.signature().presigned() || externalAgents == null || expected == null
+                || !externalAgents.supports(expected)) {
+            throw denied();
+        }
+        String key = claim.scope().accessKeyId();
+        boolean legacy = LEGACY_ACCESS_KEY_ID.equals(key);
+        String account = legacy ? accountResolver.resolve(null) : iamService.resolveAccountId(key).orElse(null);
+        if (!expected.accountId().equals(account) || !expected.region().equals(claim.scope().region())) {
+            throw denied();
+        }
+        return RequestScopes.callAs(account, expected.region(), () -> {
+            String secret = legacy ? LEGACY_SECRET_KEY : iamService.findSecretKey(key, claim.sessionToken())
+                    .orElseThrow(ChannelAuthentication::denied);
+            verify(request, body, claim, secret);
+            externalAgents.authorize(request, body, action, resource, expected);
+            return new AgentIdentity(account, expected.region(), expected.instanceId());
+        });
+    }
+
+    public Optional<AgentIdentity> authenticateAgentUpgradeIfClaimed(HttpServerRequest request, String action,
+                                                                    String sessionArn, Node expected) {
+        Claim claim = readClaim(request);
+        Optional<IamService.Ec2InstanceIdentity> instance = signingInstance(claim);
+        if (instance.isPresent()) {
+            return Optional.of(authenticateAgent(request, EMPTY_BODY, action, sessionArn, claim, instance.get()));
+        }
+        if (claim == null || externalAgents == null || !externalAgents.supports(expected)) {
+            return Optional.empty();
+        }
+        return Optional.of(authenticateExternal(request, EMPTY_BODY, action, sessionArn, expected, claim));
     }
 
     /**

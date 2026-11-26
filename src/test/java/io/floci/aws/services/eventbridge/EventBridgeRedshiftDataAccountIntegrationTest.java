@@ -49,6 +49,10 @@ class EventBridgeRedshiftDataAccountIntegrationTest {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void scheduledSqlUsesRuleAccountWithoutAnHttpRequest(boolean batch) {
+        Vertx vertx = mock(Vertx.class);
+        ArgumentCaptor<Handler<Long>> fire = ArgumentCaptor.captor();
+        when(vertx.setPeriodic(eq(60_000L), fire.capture())).thenReturn(1L);
+        RuleScheduler scheduler = new RuleScheduler(vertx, config, objectMapper, dispatcher);
         String previousAccount = regionResolver.getAccountId();
         AtomicReference<String> executionAccount = new AtomicReference<>();
         if (batch) {
@@ -79,10 +83,6 @@ class EventBridgeRedshiftDataAccountIntegrationTest {
         }
         target.setRedshiftDataParameters(parameters);
 
-        Vertx vertx = mock(Vertx.class);
-        ArgumentCaptor<Handler<Long>> fire = ArgumentCaptor.captor();
-        when(vertx.setPeriodic(eq(60_000L), fire.capture())).thenReturn(1L);
-        RuleScheduler scheduler = new RuleScheduler(vertx, config, objectMapper, dispatcher);
         try {
             scheduler.startScheduler(rule.getArn(), "rate(1 minute)",
                     () -> new RuleScheduler.ScheduleData(rule, List.of(target)));

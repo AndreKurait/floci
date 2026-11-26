@@ -1,5 +1,6 @@
 package io.floci.aws.services.lambda.launcher.kubernetes;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import io.fabric8.kubernetes.api.model.ConfigMap;
 import io.fabric8.kubernetes.api.model.EnvVar;
 import io.fabric8.kubernetes.api.model.Pod;
@@ -27,6 +28,7 @@ import io.floci.aws.services.lambda.runtime.RuntimeApiServerFactory;
 import io.floci.aws.services.s3.PreSignedUrlGenerator;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,6 +53,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -78,6 +81,10 @@ import static org.mockito.Mockito.when;
  * to seed pods and play the kubelet (setting phases) exactly as a real cluster would. Reading
  * pods back through it after {@link #apiClient} creates them works because both talk to the same
  * backing store; only the mock's transport is fabric8, never Floci's own code.
+ *
+ * <p>{@link #apiClient} pauses between two pod polls on {@link #time}: each pause moves the timeline
+ * by the client's own poll interval and then lets {@link #duringPollPause} act, which is where the
+ * kubelet sets a pod's phase. Launches therefore never wait on the real clock.
  */
 @EnableKubernetesMockClient(crud = true)
 @ResourceLock(ParallelLocks.TLS_CONFIG)
@@ -103,6 +110,24 @@ class KubernetesPodLauncherTest {
     private S3Service s3Service;
     private PreSignedUrlGenerator presignGenerator;
     private KubernetesPodLauncher launcher;
+    private final TestTime time = TestTime.create();
+    private final List<Long> pollPauses = new CopyOnWriteArrayList<>();
+    private volatile Runnable duringPollPause = () -> { };
+
+    /** The pause between two pod polls: the timeline moves by it, then the pause's hook runs. */
+    private final KubernetesApiClient.PollTimer pollTimer = new KubernetesApiClient.PollTimer() {
+        @Override
+        public long nanoTime() {
+            return time.nanoTime();
+        }
+
+        @Override
+        public void sleepMillis(long millis) {
+            pollPauses.add(millis);
+            time.sleepAdvancing(Duration.ofMillis(millis));
+            duringPollPause.run();
+        }
+    };
 
     @BeforeEach
     void setUp() {
@@ -153,10 +178,10 @@ class KubernetesPodLauncherTest {
                         + invocation.getArgument(2) + "?X-Amz-Algorithm=AWS4-HMAC-SHA256");
 
         apiClient = new KubernetesApiClient(
-                URI.create(client.getConfiguration().getMasterUrl()), trustAllHttpClient(), null);
+                URI.create(client.getConfiguration().getMasterUrl()), trustAllHttpClient(), null, pollTimer);
         launcher = new KubernetesPodLauncher(apiClient, config, regionResolver, runtimeApiServerFactory, imageResolver,
                 addressResolver, awsEnv, layerService, new LambdaPodSpecFactory(config),
-                logStreamer, s3Service, presignGenerator, System::nanoTime);
+                logStreamer, s3Service, presignGenerator, time::nanoTime);
     }
 
     @ParameterizedTest
@@ -172,12 +197,12 @@ class KubernetesPodLauncherTest {
         KubernetesPodLauncher backgroundLauncher = new KubernetesPodLauncher(
                 apiClient, config, regionResolver, runtimeApiServerFactory, imageResolver, addressResolver, awsEnv,
                 layers, new LambdaPodSpecFactory(config), logStreamer, s3Service, presignGenerator,
-                System::nanoTime);
+                time::nanoTime);
         LambdaFunction fn = function();
         fn.setAccountId(account);
         fn.setFunctionArn("arn:aws:lambda:" + region + ":" + account + ":function:my-fn");
         fn.setLayers(List.of((defaultAccount.equals(account) ? defaultLayer : ownerLayer).getLayerVersionArn()));
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
 
         ContainerHandle handle = CompletableFuture.supplyAsync(() -> backgroundLauncher.launch(fn))
                 .get(10, TimeUnit.SECONDS);
@@ -228,27 +253,145 @@ class KubernetesPodLauncherTest {
         return fn;
     }
 
-    /**
-     * Plays the kubelet for the launcher's pod: waits for it, writes {@code status}, and
-     * completes once the mock server has accepted the write.
-     */
+    /** Sets status during the next pause, completing once the mock API has accepted it. */
     private CompletableFuture<Void> markPodInBackground(PodStatus status) {
-        return CompletableFuture.runAsync(() -> {
-            awaitFlociLambdaPod();
-            Pod pod = flociLambdaPod();
-            pod.setStatus(status);
-            client.pods().inNamespace("default").resource(pod).updateStatus();
-        });
+        CompletableFuture<Void> marked = new CompletableFuture<>();
+        duringPollPause = () -> {
+            if (!marked.isDone()) {
+                Pod pod = flociLambdaPod();
+                pod.setStatus(status);
+                client.pods().inNamespace("default").resource(pod).updateStatus();
+                marked.complete(null);
+            }
+        };
+        return marked;
     }
 
-    private void markPodPhaseInBackground(String phase) {
-        markPodInBackground(new PodStatusBuilder().withPhase(phase).build());
+    /**
+     * Plays the kubelet: during the first pause between two polls of a pod with the given name
+     * prefix, sets that pod's phase. The launcher's first poll therefore sees the pod it just
+     * created without a phase, and its second poll, one poll interval later, sees the phase.
+     */
+    private void markPodPhaseBetweenPolls(String namePrefix, String phase) {
+        AtomicBoolean marked = new AtomicBoolean();
+        duringPollPause = () -> {
+            Optional<Pod> created = client.pods().inNamespace("default").list().getItems().stream()
+                    .filter(p -> p.getMetadata().getName().startsWith(namePrefix))
+                    .findFirst();
+            if (created.isPresent() && marked.compareAndSet(false, true)) {
+                setPodPhase(created.get(), phase);
+            }
+        };
     }
+
+    private void setPodPhase(Pod pod, String phase) {
+        pod.setStatus(new PodStatusBuilder().withPhase(phase).build());
+        client.pods().inNamespace("default").resource(pod).updateStatus();
+    }
+
+    private Pod createPendingPod(String name) {
+        Pod pod = new PodBuilder().withNewMetadata().withName(name).endMetadata().build();
+        return client.pods().inNamespace("default").resource(pod).create();
+    }
+
+    @Test
+    void waitForPodPollsEveryHalfSecondAndReturnsThePodFoundByThePollAtItsDeadline() {
+        Pod waited = createPendingPod("waited-pod");
+        Instant start = time.now();
+        duringPollPause = () -> {
+            if (time.now().equals(start.plusSeconds(15))) {
+                setPodPhase(waited, "Running");
+            }
+        };
+
+        JsonNode pod = apiClient.waitForPod("default", "waited-pod",
+                p -> "Running".equals(p.path("status").path("phase").asText(null)), 15);
+
+        assertThat(pod.path("status").path("phase").asText()).isEqualTo("Running");
+        assertThat(time.now()).isEqualTo(start.plusSeconds(15));
+        assertThat(pollPauses).hasSize(30).containsOnly(500L);
+    }
+
+    @Test
+    void waitForPodTimesOutOnThePollAtItsDeadlineThatStillFindsTheConditionUnmet() {
+        createPendingPod("waited-pod");
+        Instant start = time.now();
+
+        assertThatThrownBy(() -> apiClient.waitForPod("default", "waited-pod", p -> false, 15))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("timed out after 15s waiting for pod waited-pod");
+
+        assertThat(time.now()).isEqualTo(start.plusSeconds(15));
+        assertThat(pollPauses).hasSize(30).containsOnly(500L);
+    }
+
+    @Test
+    void launchSeesThePodRunningOnePollIntervalAfterCreatingIt() {
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
+        Instant start = time.now();
+
+        ContainerHandle handle = launcher.launch(function());
+
+        assertThat(handle.getContainerId()).startsWith("floci-lambda-my-fn-");
+        assertThat(time.now()).isEqualTo(start.plusMillis(500));
+        assertThat(pollPauses).containsExactly(500L);
+    }
+
+    @Test
+    void launchSucceedsWhenThePodTurnsRunningOnThePollAtTheStartupTimeout() {
+        Instant start = time.now();
+        duringPollPause = () -> {
+            if (time.now().equals(start.plusSeconds(300))) {
+                setPodPhase(client.pods().inNamespace("default").list().getItems().getFirst(), "Running");
+            }
+        };
+
+        ContainerHandle handle = launcher.launch(function());
+
+        assertThat(handle.getContainerId()).startsWith("floci-lambda-my-fn-");
+        assertThat(time.now()).isEqualTo(start.plusSeconds(300));
+        assertThat(pollPauses).hasSize(600).containsOnly(500L);
+    }
+
+    @Test
+    void launchFailsOnThePollAtTheStartupTimeoutThatStillFindsThePodPending() {
+        Instant start = time.now();
+
+        assertThatThrownBy(() -> launcher.launch(function()))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("did not reach Running within 300s");
+
+        assertThat(time.now()).isEqualTo(start.plusSeconds(300));
+        assertThat(pollPauses).hasSize(600).containsOnly(500L);
+        assertThat(client.pods().inNamespace("default").list().getItems())
+                .as("the pod that never started is deleted")
+                .isEmpty();
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    @Test
+    void stopKeepsThePortReservedWhenThePodIsStillThereAtTheDeleteTimeout() {
+        Pod pod = new PodBuilder()
+                .withNewMetadata().withName("floci-lambda-my-fn-abc12345")
+                .withFinalizers("floci.io/held-by-test").endMetadata()
+                .build();
+        client.pods().inNamespace("default").resource(pod).create();
+        ContainerHandle handle = new ContainerHandle("floci-lambda-my-fn-abc12345", "my-fn",
+                runtimeApiServer, ContainerState.WARM);
+        Instant start = time.now();
+
+        launcher.stop(handle);
+
+        assertThat(time.now()).isEqualTo(start.plusSeconds(15));
+        assertThat(pollPauses).hasSize(30).containsOnly(500L);
+        verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
+    }
+
 
     @ParameterizedTest
     @CsvSource({"$LATEST, $$LATEST", "1, 1", "7, 7"})
     void launchExposesTheExecutingVersionInThePodAndRuntimeApi(String version, String podValue) {
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
         LambdaFunction fn = function();
         fn.setVersion(version);
         fn.setEnvironment(Map.of("AWS_LAMBDA_FUNCTION_VERSION", "user-override"));
@@ -266,7 +409,7 @@ class KubernetesPodLauncherTest {
 
     @Test
     void launchPassesTheLoggingConfigToTheRuntime() {
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
         LambdaFunction fn = function();
         fn.setLogFormat("JSON");
         fn.setApplicationLogLevel("DEBUG");
@@ -286,7 +429,7 @@ class KubernetesPodLauncherTest {
         // A pod-launched Lambda is subject to the same placeholder-credential bug as a
         // Docker-launched one: without the owning account it resolves to the emulator's
         // default account and reads the wrong partition.
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
         LambdaFunction fn = function();
         fn.setAccountId("222222222222");
         fn.setFunctionArn("arn:aws:lambda:us-east-1:222222222222:function:my-fn");
@@ -303,7 +446,7 @@ class KubernetesPodLauncherTest {
         // owner-account/placeholder baseline. If the function's own Environment config defines
         // only AWS_ACCESS_KEY_ID (no matching secret or session token), that partial value must
         // not override just the baseline's access key and leave its secret/token in place.
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
         lenient().when(awsEnv.sdkBaselineEnv(anyString(), any(), anyString(), any(), anyString()))
                 .thenReturn(List.of(
                         "AWS_ACCESS_KEY_ID=000000000000",
@@ -323,7 +466,7 @@ class KubernetesPodLauncherTest {
 
     @Test
     void launchCreatesPodAndReturnsHandle() {
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
 
         ContainerHandle handle = launcher.launch(function());
 
@@ -352,7 +495,7 @@ class KubernetesPodLauncherTest {
         LambdaFunction fn = function();
         fn.setAccountId("111122223333");
         fn.setFunctionArn("arn:aws:lambda:us-east-1:111122223333:function:my-fn");
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
 
         ContainerHandle handle = launcher.launch(fn);
 
@@ -368,7 +511,7 @@ class KubernetesPodLauncherTest {
 
     @Test
     void launchFailureReleasesPortAndDeletesPod() {
-        markPodPhaseInBackground("Failed");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Failed");
 
         assertThatThrownBy(() -> launcher.launch(function()))
                 .isInstanceOf(RuntimeException.class)
@@ -376,7 +519,8 @@ class KubernetesPodLauncherTest {
 
         verify(runtimeApiServer).stop();
         verify(runtimeApiServerFactory).release(runtimeApiServer);
-        Awaitility.await().atMost(Duration.ofSeconds(5)).until(
+        Awaitility.await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).until(
                 () -> client.pods().inNamespace("default").list().getItems().isEmpty());
     }
 
@@ -390,8 +534,8 @@ class KubernetesPodLauncherTest {
         doThrow(new RuntimeException("kube api down")).when(failingApiClient).deletePod(anyString(), anyString());
         KubernetesPodLauncher failingLauncher = new KubernetesPodLauncher(failingApiClient, config, regionResolver,
                 runtimeApiServerFactory, imageResolver, addressResolver, awsEnv, layerService,
-                new LambdaPodSpecFactory(config), logStreamer, s3Service, presignGenerator, System::nanoTime);
-        markPodPhaseInBackground("Failed");
+                new LambdaPodSpecFactory(config), logStreamer, s3Service, presignGenerator, time::nanoTime);
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Failed");
 
         assertThatThrownBy(() -> failingLauncher.launch(function()))
                 .isInstanceOf(RuntimeException.class);
@@ -407,7 +551,7 @@ class KubernetesPodLauncherTest {
     void podThatExitsCleanlyIsTerminalNotATimeout() {
         // A runtime that exits before serving parks the pod in Succeeded; the launch
         // must fail fast instead of blocking for the full startup timeout.
-        markPodPhaseInBackground("Succeeded");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Succeeded");
 
         assertThatThrownBy(() -> launcher.launch(function()))
                 .isInstanceOf(RuntimeException.class)
@@ -446,15 +590,18 @@ class KubernetesPodLauncherTest {
                 new LambdaPodSpecFactory(config), logStreamer, s3Service, presignGenerator, clock::get);
         lenient().when(kubernetes.unschedulableGraceSeconds()).thenReturn(5);
 
-        // Once the launcher has read the Unschedulable status twice (anchoring the grace, then
-        // handling that read), advancing its clock past the configured seconds fails the cold
-        // start without waiting it out.
-        CompletableFuture.runAsync(() -> {
-            markUnschedulableInBackground(Instant.now()).join();
-            awaitLauncherPodRead();
-            awaitLauncherPodRead();
-            clock.addAndGet(Duration.ofSeconds(60).toNanos());
-        });
+        // The first pause publishes Unschedulable; the following poll anchors the grace.
+        // The next pause advances the injected monotonic clock beyond that grace.
+        AtomicBoolean marked = new AtomicBoolean();
+        duringPollPause = () -> {
+            if (marked.compareAndSet(false, true)) {
+                Pod pod = flociLambdaPod();
+                pod.setStatus(unschedulableStatus(Instant.now()));
+                client.pods().inNamespace("default").resource(pod).updateStatus();
+            } else {
+                clock.addAndGet(Duration.ofSeconds(60).toNanos());
+            }
+        };
 
         assertThatThrownBy(() -> launcher.launch(function()))
                 .isInstanceOf(RuntimeException.class)
@@ -494,24 +641,15 @@ class KubernetesPodLauncherTest {
         return markPodInBackground(unschedulableStatus(since));
     }
 
-    /**
-     * Reports the pod Unschedulable since {@code since}, then Running once the launcher has
-     * read that status: the mock server's request count rising past the write proves the
-     * launcher's poll observed Unschedulable, so the grace is anchored before the node joins,
-     * without a fixed sleep.
-     */
+    /** Reports Unschedulable at one polling boundary and Running at the next. */
     private void markUnschedulableThenRunningInBackground(Instant since) {
-        CompletableFuture.runAsync(() -> {
-            markUnschedulableInBackground(since).join();
-            awaitLauncherPodRead();
-            markPodInBackground(new PodStatusBuilder().withPhase("Running").build());
-        });
-    }
-
-    private void awaitLauncherPodRead() {
-        int readsAfterWrite = mockServer.getRequestCount();
-        Awaitility.await().atMost(Duration.ofSeconds(10)).until(
-                () -> mockServer.getRequestCount() > readsAfterWrite);
+        AtomicBoolean marked = new AtomicBoolean();
+        duringPollPause = () -> {
+            Pod pod = flociLambdaPod();
+            pod.setStatus(marked.compareAndSet(false, true)
+                    ? unschedulableStatus(since) : new PodStatusBuilder().withPhase("Running").build());
+            client.pods().inNamespace("default").resource(pod).updateStatus();
+        };
     }
 
     /** The pod this launcher created for {@code my-fn}, by its managed name prefix. */
@@ -521,11 +659,6 @@ class KubernetesPodLauncherTest {
                 .findFirst().orElseThrow();
     }
 
-    private void awaitFlociLambdaPod() {
-        Awaitility.await().atMost(Duration.ofSeconds(5)).until(
-                () -> client.pods().inNamespace("default").list().getItems().stream()
-                        .anyMatch(p -> p.getMetadata().getName().startsWith("floci-lambda-my-fn-")));
-    }
 
     @Test
     void hotReloadIsRejectedBeforeAllocatingAnything() {
@@ -605,7 +738,8 @@ class KubernetesPodLauncherTest {
         assertThatThrownBy(() -> launcher.launch(function()))
                 .isInstanceOf(RuntimeException.class);
 
-        Awaitility.await().atMost(Duration.ofSeconds(5)).until(
+        Awaitility.await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).until(
                 () -> client.pods().inNamespace("default").withName("floci-lambda-old-fn-dead1234").get() == null);
         assertThat(client.pods().inNamespace("default").withName("some-other-pod").get()).isNotNull();
     }
@@ -652,9 +786,9 @@ class KubernetesPodLauncherTest {
         }).when(flakyApiClient).listPods(anyString(), anyMap());
         KubernetesPodLauncher retryingLauncher = new KubernetesPodLauncher(flakyApiClient, config, regionResolver,
                 runtimeApiServerFactory, imageResolver, addressResolver, awsEnv, layerService,
-                new LambdaPodSpecFactory(config), logStreamer, s3Service, presignGenerator, System::nanoTime);
+                new LambdaPodSpecFactory(config), logStreamer, s3Service, presignGenerator, time::nanoTime);
 
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
         ContainerHandle handle = retryingLauncher.launch(function());
         assertThat(client.pods().inNamespace("default").withName("floci-lambda-old-fn-dead1234").get())
                 .as("orphan survives the failed sweep")
@@ -666,7 +800,8 @@ class KubernetesPodLauncherTest {
         assertThatThrownBy(() -> retryingLauncher.launch(function()))
                 .isInstanceOf(RuntimeException.class);
 
-        Awaitility.await().atMost(Duration.ofSeconds(5)).until(
+        Awaitility.await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).until(
                 () -> client.pods().inNamespace("default").withName("floci-lambda-old-fn-dead1234").get() == null);
         assertThat(client.pods().inNamespace("default").withName(handle.getContainerId()).get())
                 .as("the retried sweep must not delete this process's own pod")
@@ -680,7 +815,7 @@ class KubernetesPodLauncherTest {
     @Test
     void tlsOnPublishesTheCaBundleAsAConfigMapAndTheFunctionEnvWins() throws Exception {
         String bundlePem = enableTlsWithBundle();
-        markPodPhaseInBackground("Running");
+        markPodPhaseBetweenPolls("floci-lambda-my-fn-", "Running");
         LambdaFunction fn = function();
         fn.setEnvironment(Map.of("SSL_CERT_FILE", "/my/own.pem"));
 

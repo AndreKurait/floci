@@ -21,9 +21,16 @@ JSON_ONLY_PREFIXES = {"DynamoDB_20111205", "CloudWatchVersion20130116"}
 MODEL_ALIASES = {"AmazonApiGatewayV2": "apigatewayv2", "CloudTrail_20131101": "cloudtrail",
                  "SNS_20100331": "sns"}
 AGENT_PREFIXES = ("AmazonSSMMessageDeliveryService", "EC2WindowsMessageDeliveryService")
+CODEDEPLOY_AGENT_PREFIXES = ("CodeDeployCommandService", "CodeDeployCommandService_v20141006")
 # The agent facade has no pinned botocore model. MDS Message fields, including CreatedDate and Payload, are strings.
 # aws/amazon-ssm-agent agent/runcommand/mds/mdsservice.go, immutable blob:
 # https://api.github.com/repos/aws/amazon-ssm-agent/git/blobs/f3e4d67147e5027ca2568d597077e56310921610
+# The CodeDeploy agent is a separate service from botocore's public CodeDeploy API.
+# Its PascalCase wire types contain strings, structures and an integer Nonce, not blobs or
+# timestamp values: Payload and EstimatedCompletionTime are strings. PutHostCommandComplete
+# has no output. Source: aws/aws-codedeploy-agent v2.1.2, crates/codedeploy-commands/src/
+# types.rs blob 11c19b70191a0bbb6e47868adcef9ba040259523 and
+# client.rs blob c568e6e59897565b8e37ddf1864c963090c7a6d4 (both target prefixes and unit output).
 
 
 def project_model(model: dict, json_facade: bool = False) -> dict:
@@ -106,11 +113,16 @@ def build(data: Path, catalog: Path, provenance: str) -> dict:
     aliases["AWS Marketplace Entitlement Service"] = "marketplace-entitlement"
     services["ec2messages"] = {"timestampFormat": "unixTimestamp", "shapes": {}, "operations": {}}
     aliases.update({prefix: "ec2messages" for prefix in AGENT_PREFIXES})
+    services["codedeploy-commands"] = {
+        "timestampFormat": "unixTimestamp", "shapes": {},
+        "operations": {"PutHostCommandComplete": {"input": None, "output": None, "hasOutput": False}}}
+    aliases.update({prefix: "codedeploy-commands" for prefix in CODEDEPLOY_AGENT_PREFIXES})
     missing = prefixes - aliases.keys()
     if missing:
         raise ValueError(f"No RPC v2 wire model for catalog prefixes: {sorted(missing)}")
     return {"_source": {"generator": "tools/aws/regen_rpcv2_cbor_shapes.py", "botocore": provenance,
-                         "ec2messages": "aws/amazon-ssm-agent agent/runcommand/mds/mdsservice.go blob f3e4d67147e5027ca2568d597077e56310921610"},
+                         "ec2messages": "aws/amazon-ssm-agent agent/runcommand/mds/mdsservice.go blob f3e4d67147e5027ca2568d597077e56310921610",
+                         "codedeploy-commands": "aws/aws-codedeploy-agent crates/codedeploy-commands/src/ types.rs blob 11c19b70191a0bbb6e47868adcef9ba040259523; client.rs blob c568e6e59897565b8e37ddf1864c963090c7a6d4"},
             "aliases": dict(sorted(aliases.items())), "services": dict(sorted(services.items()))}
 
 

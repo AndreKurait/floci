@@ -62,6 +62,7 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
     private static final String EVENT_BUS_RESOURCE_PREFIX = "event-bus/";
     /** Joins a custom bus to the rule name in a rule's physical id; neither name can contain it. */
     private static final char RULE_ID_SEPARATOR = '|';
+    private static final List<String> RULE_IDENTITY_ATTRIBUTES = List.of("EventBusName", "Arn", "RuleName");
 
     /** The shape AWS::Events::Rule's resource schema declares for its targets. */
     private static final String TARGETS = CfnPropertyTypes.propertyShape("AWS::Events::Rule", "Targets");
@@ -146,11 +147,48 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
+        return ReplacementCleanup.complete(resource, this::delete);
+    }
+
+    @Override
+    public UpdateCleanupResult completeDeleteCleanup(StackResource resource) {
+        return ReplacementCleanup.complete(resource, this::delete);
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        ReplacementCleanup.clear(resource);
+    }
+
     private void provisionRule(StackResource r, JsonNode props, ProvisionContext ctx) {
         // A snapshot describes the update in flight. The one an earlier update left behind goes
         // before this run touches a target, so a rollback never puts back a target the rule stopped
         // carrying two updates ago.
         r.getAttributes().remove(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
+        Map<String, String> attributesBefore = new LinkedHashMap<>(r.getAttributes());
+        if (ctx.isUpdate()) {
+            ReplacementCleanup.endRollbackRetry(r);
+        }
+        ObjectNode priorIdentity = null;
+        if (ctx.isUpdate()) {
+            priorIdentity = MAPPER.createObjectNode().put("physicalId", ctx.priorPhysicalId());
+            for (String attribute : RULE_IDENTITY_ATTRIBUTES) {
+                priorIdentity.put(attribute, r.getAttributes().get(attribute));
+            }
+        }
         // Name is createOnly, so an unnamed rule keeps its name across an UpdateStack: without that it
         // was given a fresh random name on every update, creating a second rule and leaving the first
         // behind with its targets. The prior name comes out of the prior physical id, which for a rule
@@ -178,21 +216,37 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         // touches the rule.
         List<Target> targets = declaredTargets(props, ctx);
 
+        String physicalId = rulePhysicalId(ruleName, busName, ctx.accountId());
+        String priorPhysicalId = ctx.priorPhysicalId();
+        if (ctx.isUpdate()) {
+            String priorBus = busNameOf(priorPhysicalId);
+            priorPhysicalId = rulePhysicalId(ruleNameOf(priorPhysicalId),
+                    priorBus != null ? priorBus : attributesBefore.get("EventBusName"), ctx.accountId());
+        }
+        boolean replaced = ctx.isUpdate() && !physicalId.equals(priorPhysicalId);
+        boolean replacementPreexisting = replaced && ruleExists(ruleName, busName, ctx.region());
         Rule rule = eventBridgeService.putRule(ruleName, busName, eventPattern, scheduleExpression,
                 state, description, roleArn, Map.of(), ctx.region());
-        r.setPhysicalId(rulePhysicalId(ruleName, busName, ctx.accountId()));
+        r.setPhysicalId(physicalId);
         r.getAttributes().put("Arn", rule.getArn());
         r.getAttributes().put("RuleName", ruleName);
         // The bus as the template gave it, name or ARN. The physical id carries it too; this copy is
         // what a delete reads for a rule saved before the physical id did.
         if (busName != null && !busName.isBlank()) {
             r.getAttributes().put("EventBusName", busName);
+        } else {
+            r.getAttributes().remove("EventBusName");
         }
 
         if (ctx.isUpdate()) {
-            snapshotTargetsBeforeUpdate(r, ruleName, busName, ctx.region());
+            ReplacementCleanup.record(r, new ProvisionContext(ctx.engine(), ctx.region(), ctx.accountId(), ctx.stackName(),
+                    priorPhysicalId, ctx.progress(), ctx.priorProperties(), ctx.updatePolicy(), ctx.priorUpdatePolicy()), attributesBefore,
+                    replaced, !replacementPreexisting);
         }
         try {
+            if (ctx.isUpdate()) {
+                snapshotTargetsBeforeUpdate(r, ruleName, busName, ctx.region(), priorIdentity);
+            }
             if (!targets.isEmpty()) {
                 eventBridgeService.putTargets(ruleName, busName, targets, ctx.region());
             }
@@ -293,11 +347,13 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
      * <p>The rule name, its bus and the region travel with the targets because the rollback hook is
      * handed the stack resource alone, and those three are how targets are addressed.
      */
-    private void snapshotTargetsBeforeUpdate(StackResource r, String ruleName, String busName, String region) {
+    private void snapshotTargetsBeforeUpdate(StackResource r, String ruleName, String busName, String region,
+                                             ObjectNode priorIdentity) {
         ObjectNode snapshot = MAPPER.createObjectNode();
         snapshot.put("ruleName", ruleName);
         snapshot.put("busName", busName);
         snapshot.put("region", region);
+        snapshot.set("identity", priorIdentity);
         snapshot.set("targets", MAPPER.valueToTree(
                 eventBridgeService.listTargetsByRule(ruleName, busName, region)));
         r.getAttributes().put(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR, snapshot.toString());
@@ -319,11 +375,12 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
      */
     private void restoreTargetsAfterFailedUpdate(StackResource r, RuntimeException updateFailure) {
         String rawSnapshot = r.getAttributes().get(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
-        if (rawSnapshot == null) {
-            return;
-        }
         try {
-            restoreSnapshottedTargets(r, MAPPER.readTree(rawSnapshot));
+            if (rawSnapshot != null) {
+                restoreSnapshottedTargets(r, MAPPER.readTree(rawSnapshot));
+            } else {
+                ReplacementCleanup.rollback(r, this::delete);
+            }
         } catch (RuntimeException | JsonProcessingException restoreFailure) {
             if (restoreFailure != updateFailure) {
                 updateFailure.addSuppressed(restoreFailure);
@@ -337,6 +394,30 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
+    private boolean ruleExists(String name, String bus, String region) {
+        try {
+            return eventBridgeService.describeRule(name, bus, region) != null;
+        } catch (AwsException failure) {
+            if (!"ResourceNotFoundException".equals(failure.getErrorCode())) {
+                throw failure;
+            }
+            return false;
+        }
+    }
+
+    @Override
+    public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        if (!"AWS::Events::Rule".equals(attempted.getResourceType())) {
+            return;
+        }
+        ReplacementCleanup.mergeDisplaced(previous, attempted);
+        String snapshot = attempted.getAttributes().get(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
+        previous.getAttributes().remove(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
+        if (snapshot != null && attempted.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR)) {
+            previous.getAttributes().put(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR, snapshot);
+        }
+    }
+
     /**
      * An event bus update that failed after its tag snapshot may already have changed tags, so the
      * engine keeps that attempt for {@link #rollbackUpdate} instead of putting the previous resource
@@ -344,8 +425,10 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
      */
     @Override
     public boolean retainsFailedUpdateState(StackResource resource) {
-        return "AWS::Events::EventBus".equals(resource.getResourceType())
-                && resource.getAttributes().containsKey(CfnRollback.EVENT_BUS_UPDATE_SNAPSHOT_ATTR);
+        return ("AWS::Events::EventBus".equals(resource.getResourceType())
+                && resource.getAttributes().containsKey(CfnRollback.EVENT_BUS_UPDATE_SNAPSHOT_ATTR))
+                || ("AWS::Events::Rule".equals(resource.getResourceType())
+                && resource.getAttributes().containsKey(CfnRollback.REPLACEMENT_CLEANUP_ATTR));
     }
 
     /**
@@ -373,7 +456,8 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         }
         String rawSnapshot = resource.getAttributes().get(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
         if (rawSnapshot == null) {
-            return false;
+            return "AWS::Events::Rule".equals(resource.getResourceType())
+                    && ReplacementCleanup.rollback(resource, this::delete);
         }
         try {
             restoreSnapshottedTargets(resource, MAPPER.readTree(rawSnapshot));
@@ -400,6 +484,19 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         }
         if (!restored.isEmpty()) {
             eventBridgeService.restoreAcceptedTargets(ruleName, busName, restored, region);
+        }
+        ReplacementCleanup.rollback(resource, this::delete);
+        JsonNode identity = snapshot.path("identity");
+        if (identity.isObject()) {
+            resource.setPhysicalId(snapshotText(identity, "physicalId"));
+            for (String attribute : RULE_IDENTITY_ATTRIBUTES) {
+                String value = snapshotText(identity, attribute);
+                if (value == null) {
+                    resource.getAttributes().remove(attribute);
+                } else {
+                    resource.getAttributes().put(attribute, value);
+                }
+            }
         }
         resource.getAttributes().remove(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
     }

@@ -19,6 +19,8 @@ import io.floci.aws.core.common.docker.DockerHostResolver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -49,9 +51,10 @@ class EcsCredentialsProxyTest {
     private DockerHostResolver dockerHostResolver;
     private EmulatorConfig config;
     private EcsCredentialsProxy proxy;
+    private String helperRecipe;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws IOException {
         dockerClient = mock(DockerClient.class);
         InfoCmd info = mock(InfoCmd.class);
         when(dockerClient.infoCmd()).thenReturn(info);

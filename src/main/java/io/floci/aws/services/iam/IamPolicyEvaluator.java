@@ -79,7 +79,8 @@ public class IamPolicyEvaluator {
         ALLOW_DIRECT_IAM_USER,
         /**
          * An Allow that names the caller only through its account: an account ID, the account's
-         * root ARN or, in an S3 bucket policy, its canonical user ID. That "delegates authority to
+         * root ARN, a configured service-principal membership or, in S3, its canonical user ID.
+         * That "delegates authority to
          * the account" (IAM User Guide, "AWS account principals"), so across accounts it is the
          * owner's half of the grant, while within the account it grants nothing on its own and the
          * caller's identity-based policies have to allow the request.
@@ -183,11 +184,21 @@ public class IamPolicyEvaluator {
     private static final Pattern POLICY_VARIABLE = Pattern.compile("\\$\\{\\s*([^,}]+?)\\s*[,}]");
 
     private final ObjectMapper objectMapper;
+    private final ServicePrincipalMemberships servicePrincipalMemberships;
     private final ConcurrentHashMap<String, CachedDocument> cachedDocuments = new ConcurrentHashMap<>();
 
-    @Inject
     public IamPolicyEvaluator(ObjectMapper objectMapper) {
+        this(objectMapper, new ServicePrincipalMemberships());
+    }
+
+    @Inject
+    public IamPolicyEvaluator(ObjectMapper objectMapper, ServicePrincipalMemberships servicePrincipalMemberships) {
         this.objectMapper = objectMapper;
+        this.servicePrincipalMemberships = servicePrincipalMemberships;
+    }
+
+    boolean matchesServicePrincipalMembership(String callerArn, String servicePrincipal) {
+        return servicePrincipalMemberships.contains(callerArn, servicePrincipal);
     }
 
     /**
@@ -205,6 +216,7 @@ public class IamPolicyEvaluator {
                              String action,
                              String resource,
                              Map<String, List<String>> conditionCtx) {
+        conditionCtx = verifiedContext(caller, conditionCtx);
         String principalArn = caller != null ? caller.principalArn() : null;
         ResourcePolicyDecision resourceDecision = evaluateResourcePolicy(
                 resourcePolicies, principalArn, action, resource, conditionCtx);
@@ -263,11 +275,11 @@ public class IamPolicyEvaluator {
             String action,
             String resource,
             Map<String, List<String>> conditionCtx) {
-        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        Map<String, List<String>> ctx = normalizeConditionContext(verifiedContext(caller, conditionCtx));
         String loweredAction = lowercase(action);
         List<CachedDocument> identityDocs = parseEach(caller.identityPolicies());
-        List<CachedDocument> sessionDocs = caller.sessionPolicyDocument() == null
-                ? null : parseEach(List.of(caller.sessionPolicyDocument()));
+        List<CachedDocument> sessionDocs = caller.sessionPolicyDocuments().isEmpty()
+                ? null : parseEach(caller.sessionPolicyDocuments());
         List<CachedDocument> boundaryDocs = caller.boundaryPolicyDocument() == null
                 ? null : parseEach(List.of(caller.boundaryPolicyDocument()));
         ResourcePolicyDecision resolvedDecision = resourcePolicyDecision == null
@@ -359,6 +371,27 @@ public class IamPolicyEvaluator {
     }
 
     /**
+     * True when a service control policy withholds {@code action} from the caller, or any of the
+     * caller's identity, session or boundary policies explicitly denies it. A grant authorizes on
+     * its own, but never past an explicit deny.
+     */
+    public boolean deniesExplicitly(CallerContext caller, String action, String resource,
+                                    Map<String, List<String>> conditionCtx) {
+        Map<String, List<String>> ctx = normalizeConditionContext(verifiedContext(caller, conditionCtx));
+        String loweredAction = lowercase(action);
+        if (!scpWalk(caller.scpLevels(), loweredAction, resource, ctx).allows()) {
+            return true;
+        }
+        List<PolicyStatement> sessionStmts = caller.sessionPolicyDocuments().isEmpty()
+                ? null : parseAll(caller.sessionPolicyDocuments());
+        List<PolicyStatement> boundaryStmts = caller.boundaryPolicyDocument() == null
+                ? null : parseAll(List.of(caller.boundaryPolicyDocument()));
+        return anyExplicitDeny(parseAll(caller.identityPolicies()), loweredAction, resource, ctx)
+                || (sessionStmts != null && anyExplicitDeny(sessionStmts, loweredAction, resource, ctx))
+                || (boundaryStmts != null && anyExplicitDeny(boundaryStmts, loweredAction, resource, ctx));
+    }
+
+    /**
      * Evaluates a resource-based policy standalone for an IAM caller identified by its ARN. With no
      * ARN, the request's {@code aws:PrincipalArn} stands in for it, which is IAM-only too: the key
      * names IAM users, roles, federated users and the account root, never a service.
@@ -385,7 +418,8 @@ public class IamPolicyEvaluator {
     /**
      * Evaluates a resource-based policy standalone for a typed caller. Each principal type in the
      * policy matches only the callers it can name: {@code AWS} an IAM identity, {@code Service} a
-     * service by its exact name, {@code "*"} anyone. Named apart from the String form so a call
+     * service by its exact name or a configured member account, {@code "*"} anyone.
+     * Named apart from the String form so a call
      * passing a literal null caller to that one stays unambiguous.
      */
     public ResourcePolicyDecision evaluateResourcePolicyFor(
@@ -396,6 +430,9 @@ public class IamPolicyEvaluator {
             Map<String, List<String>> conditionCtx) {
         if (resourcePolicies == null || resourcePolicies.isEmpty()) {
             return ResourcePolicyDecision.NEUTRAL;
+        }
+        if (principal != null && principal.verifiedIdentityContext() != null) {
+            conditionCtx = principal.verifiedIdentityContext().mergeInto(conditionCtx);
         }
         Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
         String loweredAction = lowercase(action);
@@ -452,7 +489,7 @@ public class IamPolicyEvaluator {
                                                       String action,
                                                       String resource,
                                                       Map<String, List<String>> conditionCtx) {
-        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        Map<String, List<String>> ctx = normalizeConditionContext(verifiedContext(caller, conditionCtx));
         String loweredAction = lowercase(action);
         return simulationDecision(simulatedPolicies(caller, loweredAction, resource, ctx),
                 loweredAction, resource, ctx);
@@ -471,7 +508,7 @@ public class IamPolicyEvaluator {
                                      String action,
                                      String resource,
                                      Map<String, List<String>> conditionCtx) {
-        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        Map<String, List<String>> ctx = normalizeConditionContext(verifiedContext(caller, conditionCtx));
         String loweredAction = lowercase(action);
         SimulatedPolicies policies = simulatedPolicies(caller, loweredAction, resource, ctx);
         SimulationDecision decision = simulationDecision(policies, loweredAction, resource, ctx);
@@ -501,8 +538,8 @@ public class IamPolicyEvaluator {
         // differently from the request it models.
         return new SimulatedPolicies(
                 parseEach(caller.identityPolicies()),
-                caller.sessionPolicyDocument() == null
-                        ? null : parseEach(List.of(caller.sessionPolicyDocument())),
+                caller.sessionPolicyDocuments().isEmpty()
+                        ? null : parseEach(caller.sessionPolicyDocuments()),
                 caller.boundaryPolicyDocument() == null
                         ? null : parseEach(List.of(caller.boundaryPolicyDocument())),
                 scpWalk(caller.scpLevels(), action, resource, ctx));
@@ -1266,7 +1303,8 @@ public class IamPolicyEvaluator {
             }
             if ("AWS".equalsIgnoreCase(type) || "*".equals(type)) {
                 for (String pattern : patterns) {
-                    if (pattern.equals(principalArn)) {
+                    if (pattern.equals(principalArn)
+                            || TrustPolicyPrincipalIds.isIdentityId(pattern) && pattern.equals(principal.identityId())) {
                         directMatch = true;
                         break;
                     }
@@ -1385,7 +1423,8 @@ public class IamPolicyEvaluator {
      * which policies AWS writes itself rely on (an FIS Deny pausing DynamoDB replication names the
      * replication service that way). Any other {@code AWS} entry names IAM identities only, and a
      * role session matches the role it assumed through that role's own ARN, path included.
-     * {@code Service} names one service exactly; {@code {"Service": "*"}} is not a form AWS accepts
+     * {@code Service} names one service exactly, including its configured local member accounts.
+     * {@code {"Service": "*"}} is not a form AWS accepts
      * and matches nothing. {@code CanonicalUser}, which S3 bucket policies accept, names an account
      * by its S3 canonical user ID, the 64-hex value S3 reports as owner and ACL grantee, and matches
      * the IAM identities of that account as an account principal does. The account ID itself still
@@ -1433,6 +1472,12 @@ public class IamPolicyEvaluator {
                             return PrincipalMatch.CALLER;
                         }
                     }
+                } else if (principal.type() == RequestPrincipal.Type.IAM) {
+                    for (String pattern : patterns) {
+                        if (matchesServicePrincipalMembership(principal.arn(), pattern)) {
+                            strongest = PrincipalMatch.ACCOUNT;
+                        }
+                    }
                 }
             } else if ("CanonicalUser".equalsIgnoreCase(type)) {
                 if (principal.type() == RequestPrincipal.Type.IAM && principal.arn() != null) {
@@ -1455,7 +1500,11 @@ public class IamPolicyEvaluator {
                 : extractRoleArnFromAssumedRole(principalArn);
         PrincipalMatch strongest = PrincipalMatch.NONE;
         for (String pattern : patterns) {
-            if (pattern.matches("\\d{12}")) {
+            if (TrustPolicyPrincipalIds.isIdentityId(pattern)) {
+                if (pattern.equals(principal.identityId())) {
+                    return PrincipalMatch.CALLER;
+                }
+            } else if (pattern.matches("\\d{12}")) {
                 if (pattern.equals(accountId)) {
                     strongest = PrincipalMatch.ACCOUNT;
                 }
@@ -1546,7 +1595,7 @@ public class IamPolicyEvaluator {
     private static String logGroupResourceAlias(String action, String resource) {
         if (action == null || !switch (action) {
             case "logs:createloggroup", "logs:deleteloggroup", "logs:putretentionpolicy",
-                    "logs:deleteretentionpolicy", "logs:tagloggroup" -> true;
+                    "logs:deleteretentionpolicy", "logs:tagloggroup", "logs:createexporttask" -> true;
             default -> false;
         } || !AwsArnUtils.isArnFor(resource, "logs")) {
             return null;
@@ -2315,5 +2364,11 @@ public class IamPolicyEvaluator {
             }
         }
         return list;
+    }
+
+    private static Map<String, List<String>> verifiedContext(CallerContext caller,
+                                                             Map<String, List<String>> supplied) {
+        return caller == null || caller.verifiedIdentityContext() == null ? supplied
+                : caller.verifiedIdentityContext().mergeInto(supplied);
     }
 }

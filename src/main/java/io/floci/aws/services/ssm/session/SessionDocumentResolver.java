@@ -102,7 +102,8 @@ public class SessionDocumentResolver {
                 throw invalidDocument("Document " + name + " does not contain a valid Session document.");
             }
             String sessionType = content.path("sessionType").asText();
-            if (!"Standard_Stream".equals(sessionType) && !"Port".equals(sessionType)) {
+            if (!"Standard_Stream".equals(sessionType) && !"Port".equals(sessionType)
+                    && !"InteractiveCommands".equals(sessionType) && !"NonInteractiveCommands".equals(sessionType)) {
                 throw invalidDocument("Session type '" + sessionType + "' is not supported.");
             }
             return content;

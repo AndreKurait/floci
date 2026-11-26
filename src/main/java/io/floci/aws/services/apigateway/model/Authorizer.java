@@ -12,6 +12,7 @@ public class Authorizer {
     private String name;
     private String type; // TOKEN, REQUEST, COGNITO_USER_POOLS
     private String authorizerUri;
+    private String authorizerCredentials;
     private String identitySource;
     private String authorizerResultTtlInSeconds;
     private List<String> providerARNs; // COGNITO_USER_POOLS
@@ -29,6 +30,9 @@ public class Authorizer {
 
     public String getAuthorizerUri() { return authorizerUri; }
     public void setAuthorizerUri(String authorizerUri) { this.authorizerUri = authorizerUri; }
+
+    public String getAuthorizerCredentials() { return authorizerCredentials; }
+    public void setAuthorizerCredentials(String credentials) { this.authorizerCredentials = credentials; }
 
     public String getIdentitySource() { return identitySource; }
     public void setIdentitySource(String identitySource) { this.identitySource = identitySource; }

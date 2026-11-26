@@ -1,8 +1,11 @@
 package io.floci.aws.services.cloudformation;
 
+import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -100,10 +103,7 @@ class CloudFormationVpcGatewayAttachmentIntegrationTest {
 
     /** Polls DescribeStacks until the stack reports {@code status}; provisioning is asynchronous. */
     private static void awaitStackStatus(String stackName, String status) {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks")
@@ -112,36 +112,16 @@ class CloudFormationVpcGatewayAttachmentIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
-                .extract().asString();
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return;
-            }
-            sleepBriefly();
-        }
-        throw new AssertionError("stack " + stackName + " never reached " + status + ": " + xml);
+                .extract().asString(),
+                xml -> xml.contains("<StackStatus>" + status + "</StackStatus>"),
+                xml -> "stack " + stackName + " never reached " + status + ": " + xml);
     }
 
     /** Polls the gateway until it no longer reports the attachment, returning the last response. */
     private static String awaitIgwDetached(String igwId, String vpcId) {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = describeIgw(igwId).then().statusCode(200).extract().asString();
-            if (!xml.contains(vpcId)) {
-                return xml;
-            }
-            sleepBriefly();
-        }
-        return xml;
-    }
-
-    private static void sleepBriefly() {
-        try {
-            Thread.sleep(50);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted while awaiting an asynchronous stack operation", e);
-        }
+        return CfnStackWaits.lastStateWithin(Duration.ofSeconds(10),
+                () -> describeIgw(igwId).then().statusCode(200).extract().asString(),
+                xml -> !xml.contains(vpcId));
     }
 
     private static Response describeIgw(String igwId) {

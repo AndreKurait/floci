@@ -43,7 +43,8 @@ import java.util.function.Consumer;
 public class SsmMessageGateway implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(SsmMessageGateway.class);
-    private static final Duration GRANT_TTL = Duration.ofMinutes(5);
+    private static final Duration GRANT_TTL = Duration.ofMinutes(1);
+    private static final Duration SESSION_WAIT_TTL = Duration.ofMinutes(5);
     private static final Duration HANDSHAKE_TTL = Duration.ofSeconds(30);
     private static final int MAX_QUEUED_BYTES = 4 * 1024 * 1024;
     private static final int MAX_QUEUED_MESSAGES = 4096;
@@ -70,6 +71,7 @@ public class SsmMessageGateway implements Resettable {
     // Opening and closing sockets, grants and queues all use the same monitor. No socket I/O waits on it.
     private final Set<Connection> connections = new HashSet<>();
     private final Map<Node, Connection> controls = new HashMap<>();
+    private final Map<Node, AttachedControl> attachedControls = new HashMap<>();
     private final Map<Node, Grant> controlGrants = new HashMap<>();
     private final Map<String, Session> sessions = new HashMap<>();
     private long generation;
@@ -92,7 +94,9 @@ public class SsmMessageGateway implements Resettable {
 
     public synchronized boolean isConnected(Node node) {
         Connection connection = controls.get(node);
-        return !resetting && connection != null && !connection.socket.isClosed();
+        AttachedControl attached = attachedControls.get(node);
+        return !resetting && !stopping && ((connection != null && !connection.socket.isClosed())
+                || (attached != null && attached.transport().isOpen()));
     }
 
     /**
@@ -146,8 +150,67 @@ public class SsmMessageGateway implements Resettable {
         return Optional.ofNullable(activeSession(sessionId)).map(session -> session.target);
     }
 
-    synchronized long generation() {
+    public synchronized long generation() {
         return generation;
+    }
+
+    /** A control socket whose authentication and command delivery belong to another gateway consumer. */
+    public interface ControlTransport {
+        boolean isOpen();
+        Future<Void> send(Buffer frame);
+        void close();
+    }
+
+    /** Registers only an already authenticated transport from this reset generation. */
+    public synchronized boolean attachControl(Node node, UUID connectionId, ControlTransport transport,
+                                               long expectedGeneration) {
+        if (resetting || stopping || generation != expectedGeneration || !transport.isOpen()) {
+            closeTransport(transport);
+            return false;
+        }
+        Connection internal = controls.remove(node);
+        if (internal != null) {
+            internal.socket.close();
+        }
+        AttachedControl previous = attachedControls.put(node, new AttachedControl(connectionId, transport));
+        if (previous != null && previous.transport() != transport) {
+            closeTransport(previous.transport());
+        }
+        return true;
+    }
+
+    public synchronized void detachControl(Node node, UUID connectionId) {
+        AttachedControl attached = attachedControls.get(node);
+        if (attached != null && attached.id().equals(connectionId)) {
+            attachedControls.remove(node);
+        }
+    }
+
+    /** Handles Session Manager completion frames; the socket owner retains all other message types. */
+    public synchronized boolean receiveControl(Node node, UUID connectionId, Buffer frame) {
+        AttachedControl attached = attachedControls.get(node);
+        if (resetting || stopping || attached == null || !attached.id().equals(connectionId)
+                || !attached.transport().isOpen()) {
+            return false;
+        }
+        if (!TASK_COMPLETE_MESSAGE.equals(AgentMessage.gatewayMessageType(frame))) {
+            return false;
+        }
+        AgentMessage message = AgentMessage.decode(frame.getBytes());
+        JsonNode payload = readJson(message);
+        String sessionId = payload.path("TaskId").asText("");
+        if (sessionId.isBlank() || payload.path("Topic").asText("").isBlank()) {
+            throw new IllegalArgumentException("Invalid task completion");
+        }
+        if (!sessions.containsKey(sessionId)) {
+            return false;
+        }
+        completeTask(node, message);
+        return true;
+    }
+
+    private void closeTransport(ControlTransport transport) {
+        eventContext.runOnContext(ignored -> transport.close());
     }
 
     synchronized String createControlGrant(Node node) {
@@ -176,6 +239,10 @@ public class SsmMessageGateway implements Resettable {
                 return false;
             }
             controlGrants.remove(node);
+            AttachedControl attached = attachedControls.remove(node);
+            if (attached != null) {
+                closeTransport(attached.transport());
+            }
             Connection previous = controls.put(node, connection);
             if (previous != null) {
                 previous.socket.close();
@@ -303,6 +370,7 @@ public class SsmMessageGateway implements Resettable {
         if (previous != null) {
             previous.socket.close();
         }
+        updatePublication(session);
         flush(session, side, session.otherPeer(side));
         updateConnectivity(session);
         return true;
@@ -330,6 +398,7 @@ public class SsmMessageGateway implements Resettable {
             finish(session, session.completion);
             return;
         }
+        updatePublication(session);
         updateConnectivity(session);
         updateBackpressure(other, side);
     }
@@ -408,6 +477,19 @@ public class SsmMessageGateway implements Resettable {
         }
     }
 
+    private void updatePublication(Session session) {
+        Connection agent = session.agent.connection;
+        if (agent == null || agent.socket.isClosed() || session.finished || session.terminating) {
+            return;
+        }
+        boolean paused = session.client.connection == null || session.client.connection.socket.isClosed();
+        if (agent.publicationPaused == null || agent.publicationPaused != paused) {
+            agent.publicationPaused = paused;
+            queue(session.agent, frame(paused ? "pause_publication" : "start_publication", Map.of()));
+            flush(session, session.agent, session.client);
+        }
+    }
+
     private void updateConnectivity(Session session) {
         if (session.terminating || session.finished) {
             return;
@@ -416,7 +498,7 @@ public class SsmMessageGateway implements Resettable {
             session.deadline = null;
             publishState(session, SessionState.CONNECTED);
         } else if (session.state == SessionState.CONNECTED) {
-            session.deadline = clock.instant().plus(GRANT_TTL);
+            session.deadline = clock.instant().plus(SESSION_WAIT_TTL);
             publishState(session, SessionState.DISCONNECTED);
         }
     }
@@ -464,6 +546,7 @@ public class SsmMessageGateway implements Resettable {
         sendControl(node, frame("agent_task_acknowledge", Map.of("SchemaVersion", 1, "TaskId", id,
                 "Topic", topic, "MessageId", message.messageId().toString())));
         if (session != null && session.completion == null) {
+            session.completionOutput = payload.path("Output").asText("");
             session.completion = "Success".equals(payload.path("FinalTaskStatus").asText())
                     ? SessionState.TERMINATED : SessionState.FAILED;
             if (session.agent.connection == null) {
@@ -495,14 +578,15 @@ public class SsmMessageGateway implements Resettable {
         }
         session.finished = true;
         publishState(session, state);
-        if (session.agent.connection != null) {
-            session.agent.connection.socket.close();
-        }
-        if (session.client.connection != null) {
-            queue(session.client, frame(AgentMessage.CHANNEL_CLOSED, Map.of("SessionId", session.id, "Output", "")));
-            flush(session, session.client, session.agent);
-            Connection connection = session.client.connection;
-            connection.timer = vertx.setTimer(HANDSHAKE_TTL.toMillis(), ignored -> connection.socket.close());
+        Buffer closed = frame(AgentMessage.CHANNEL_CLOSED,
+                Map.of("SessionId", session.id, "Output", session.completionOutput));
+        for (Peer peer : List.of(session.agent, session.client)) {
+            if (peer.connection != null) {
+                queue(peer, closed);
+                flush(session, peer, session.otherPeer(peer));
+                Connection connection = peer.connection;
+                connection.timer = vertx.setTimer(HANDSHAKE_TTL.toMillis(), ignored -> connection.socket.close());
+            }
         }
     }
 
@@ -536,10 +620,17 @@ public class SsmMessageGateway implements Resettable {
 
     private Future<Void> sendControl(Node node, Buffer frame) {
         Connection connection = controls.get(node);
-        if (resetting || connection == null || connection.socket.isClosed() || connection.socket.writeQueueFull()) {
+        if (resetting || stopping) {
             return Future.failedFuture(targetNotConnected());
         }
-        return connection.socket.writeBinaryMessage(frame);
+        if (connection != null && !connection.socket.isClosed() && !connection.socket.writeQueueFull()) {
+            return connection.socket.writeBinaryMessage(frame);
+        }
+        AttachedControl attached = attachedControls.get(node);
+        if (attached == null || !attached.transport().isOpen()) {
+            return Future.failedFuture(targetNotConnected());
+        }
+        return attached.transport().send(frame);
     }
 
     private JsonNode readJson(AgentMessage message) {
@@ -623,6 +714,9 @@ public class SsmMessageGateway implements Resettable {
         List<Connection> disconnect = List.copyOf(connections);
         connections.clear();
         controls.clear();
+        List<AttachedControl> attached = List.copyOf(attachedControls.values());
+        attachedControls.clear();
+        attached.forEach(control -> closeTransport(control.transport()));
         controlGrants.clear();
         sessions.clear();
         for (Connection connection : disconnect) {
@@ -638,6 +732,8 @@ public class SsmMessageGateway implements Resettable {
         clear();
     }
 
+    private record AttachedControl(UUID id, ControlTransport transport) { }
+
     private record Grant(String value, Instant expires, String binding) { }
 
     private static final class Connection {
@@ -648,6 +744,7 @@ public class SsmMessageGateway implements Resettable {
         private boolean authenticated;
         private boolean rejected;
         private boolean paused;
+        private Boolean publicationPaused;
 
         private Connection(ServerWebSocket socket) {
             this.socket = socket;
@@ -669,9 +766,10 @@ public class SsmMessageGateway implements Resettable {
         private final Consumer<SessionState> onStateChange;
         private final Peer agent = new Peer();
         private final Peer client = new Peer();
-        private Instant deadline = clock.instant().plus(GRANT_TTL);
+        private Instant deadline = clock.instant().plus(SESSION_WAIT_TTL);
         private SessionState state;
         private SessionState completion;
+        private String completionOutput = "";
         private boolean agentReady;
         private boolean terminating;
         private boolean finished;

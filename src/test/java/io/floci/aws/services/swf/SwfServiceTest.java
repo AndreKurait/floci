@@ -1,6 +1,7 @@
 package io.floci.aws.services.swf;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
@@ -18,8 +19,11 @@ import io.floci.aws.services.swf.model.SwfDomain;
 import io.floci.aws.services.swf.model.SwfHistoryEvent;
 import io.floci.aws.services.swf.model.SwfWorkflowExecution;
 import io.floci.aws.services.swf.model.SwfWorkflowType;
+import io.floci.aws.testing.LockWaits;
 import io.floci.aws.testing.MutableClock;
+import io.floci.aws.testing.TestTime;
 import io.floci.aws.testutil.LogCapture;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +33,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -45,6 +50,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -86,12 +93,28 @@ class SwfServiceTest {
         lambdaResponse = new LambdaInvocationResult("{\"ok\":true}", null);
         lambdaFailure = null;
         lambdaGate = null;
-        service = new SwfService(new InMemoryStorageFactory(),
-                new RegionResolver("us-east-1", "000000000000"), clock, recordingLambdaInvoker());
+        service = registeredService(clock);
+    }
 
-        service.registerDomain(DOMAIN, "unit test domain", "7", Map.of(), REGION);
-        service.registerWorkflowType(REGION, DOMAIN, workflowType("W", "1"));
-        service.registerActivityType(REGION, DOMAIN, activityType("A", "1"));
+    private SwfService registeredService(Clock serviceClock) {
+        SwfService registered = new SwfService(new InMemoryStorageFactory(),
+                new RegionResolver("us-east-1", "000000000000"), serviceClock, recordingLambdaInvoker());
+
+        registered.registerDomain(DOMAIN, "unit test domain", "7", Map.of(), REGION);
+        registered.registerWorkflowType(REGION, DOMAIN, workflowType("W", "1"));
+        registered.registerActivityType(REGION, DOMAIN, activityType("A", "1"));
+        return registered;
+    }
+
+    /**
+     * Puts the service on a timeline that moves only when the test advances it. {@link #clock}
+     * also moves a millisecond with every reading, which keeps task ordering distinct but leaves
+     * no exact instant to assert a timeout at.
+     */
+    private TestTime exactTimeline() {
+        TestTime time = TestTime.create();
+        service = registeredService(time.clock());
+        return time;
     }
 
     /**
@@ -118,6 +141,275 @@ class SwfServiceTest {
             }
             return lambdaResponse;
         };
+    }
+
+    @Test
+    void timedPollExpiresWithoutAnAvailableTask() {
+        long started = System.nanoTime();
+        assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "d",
+                Duration.ofMillis(100)).isEmpty());
+        assertTrue(System.nanoTime() - started >= Duration.ofMillis(50).toNanos());
+        assertTrue(service.pollForActivityTask(REGION, DOMAIN, "act-tl", "w",
+                Duration.ofMillis(20)).isEmpty());
+    }
+
+    @Test
+    void timedPollValidatesBeforeWaiting() {
+        assertThrows(AwsException.class, () -> service.pollForDecisionTask(
+                REGION, "missing-domain", "tl", "d", Duration.ofSeconds(60)));
+        assertThrows(AwsException.class, () -> service.pollForActivityTask(
+                REGION, DOMAIN, "", "w", Duration.ofSeconds(60)));
+    }
+
+    @Test
+    void activityPollWakesWhenADecisionSchedulesItsTask() throws Exception {
+        start("later-activity");
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Optional<SwfActivityTask>> poll = executor.submit(() -> service.pollForActivityTask(
+                    REGION, DOMAIN, "act-tl", "w", Duration.ofSeconds(10)));
+            assertHeldOpen(poll);
+            scheduleActivity("later-activity", "act");
+            assertEquals("act", poll.get(5, TimeUnit.SECONDS).orElseThrow().getActivityId());
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void timedPollDoesNotLosePublicationBetweenEmptyScanAndWait() throws Exception {
+        CountDownLatch emptyScan = new CountDownLatch(1);
+        CountDownLatch returnScan = new CountDownLatch(1);
+        AtomicBoolean pause = new AtomicBoolean(true);
+        StorageFactory factory = new StorageFactory(null, null) {
+            @Override
+            public synchronized <V> AccountAwareStorageBackend<V> create(String serviceName,
+                    String fileName, TypeReference<Map<String, V>> typeReference) {
+                return new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "000000000000") {
+                    @Override
+                    public List<V> scan(Predicate<String> predicate) {
+                        List<V> result = super.scan(predicate);
+                        if (fileName.equals("swf-executions.json") && result.isEmpty()
+                                && pause.compareAndSet(true, false)) {
+                            emptyScan.countDown();
+                            try {
+                                assertTrue(returnScan.await(10, TimeUnit.SECONDS));
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError("empty scan fixture interrupted", interrupted);
+                            }
+                        }
+                        return result;
+                    }
+                };
+            }
+        };
+        service = new SwfService(factory, new RegionResolver(REGION, "000000000000"),
+                clock, recordingLambdaInvoker());
+        service.registerDomain(DOMAIN, "race", "1", Map.of(), REGION);
+        service.registerWorkflowType(REGION, DOMAIN, workflowType("W", "1"));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Optional<SwfDecisionTask>> poll = executor.submit(() -> service.pollForDecisionTask(
+                    REGION, DOMAIN, "tl", "d", Duration.ofSeconds(10)));
+            assertTrue(emptyScan.await(5, TimeUnit.SECONDS));
+            start("published-during-scan");
+            returnScan.countDown();
+            assertEquals("published-during-scan",
+                    poll.get(5, TimeUnit.SECONDS).orElseThrow().getWorkflowId());
+        } finally {
+            returnScan.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void activityHeartbeatsDoNotRescanAnIdleDecisionPoll() throws Exception {
+        start("heartbeats");
+        scheduleActivity("heartbeats", "activity");
+        SwfActivityTask task = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        service = Mockito.spy(service);
+        CountDownLatch firstScan = new CountDownLatch(1);
+        CountDownLatch extraScan = new CountDownLatch(1);
+        AtomicInteger scans = new AtomicInteger();
+        Mockito.doAnswer(invocation -> {
+            Object result = invocation.callRealMethod();
+            if (scans.incrementAndGet() == 1) {
+                firstScan.countDown();
+            } else {
+                extraScan.countDown();
+            }
+            return result;
+        }).when(service).pollForDecisionTask(REGION, DOMAIN, "tl", "idle");
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Optional<SwfDecisionTask>> poll = executor.submit(() ->
+                    service.pollForDecisionTask(REGION, DOMAIN, "tl", "idle", Duration.ofSeconds(10)));
+            assertTrue(firstScan.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < 20; i++) {
+                service.recordActivityTaskHeartbeat(task.getTaskToken(), "working");
+            }
+            assertFalse(extraScan.await(200, TimeUnit.MILLISECONDS),
+                    "heartbeats publish no decision work and must not wake decision pollers");
+            service.respondActivityTaskCompleted(task.getTaskToken(), "done");
+            assertEquals("heartbeats", poll.get(5, TimeUnit.SECONDS).orElseThrow().getWorkflowId());
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void multipleTimedPollersClaimEachTaskExactlyOnce() throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(4);
+        CountDownLatch started = new CountDownLatch(4);
+        List<Future<Optional<SwfDecisionTask>>> polls = new ArrayList<>();
+        try {
+            for (int i = 0; i < 4; i++) {
+                polls.add(executor.submit(() -> {
+                    started.countDown();
+                    return service.pollForDecisionTask(REGION, DOMAIN, "tl", "d", Duration.ofSeconds(10));
+                }));
+            }
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            assertHeldOpen(polls);
+            for (int i = 0; i < 4; i++) {
+                start("parallel-" + i);
+                clock.advance(Duration.ofSeconds(1));
+            }
+            Set<String> workflows = new LinkedHashSet<>();
+            Set<String> tokens = new LinkedHashSet<>();
+            for (Future<Optional<SwfDecisionTask>> poll : polls) {
+                SwfDecisionTask task = poll.get(5, TimeUnit.SECONDS).orElseThrow();
+                assertTrue(workflows.add(task.getWorkflowId()));
+                assertTrue(tokens.add(task.getTaskToken()));
+            }
+            assertEquals(Set.of("parallel-0", "parallel-1", "parallel-2", "parallel-3"), workflows);
+            assertEquals(0, service.countPendingDecisionTasks(REGION, DOMAIN, "tl"));
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void timedPollRetainsTaskListIsolationAndOldestFirstClaiming() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Optional<SwfDecisionTask>> poll = executor.submit(() -> service.pollForDecisionTask(
+                    REGION, DOMAIN, "other", "d", Duration.ofSeconds(10)));
+            start("first");
+            clock.advance(Duration.ofSeconds(1));
+            start("second");
+            assertHeldOpen(poll);
+            service.startWorkflowExecution(new StartWorkflowExecutionRequest(
+                    REGION, DOMAIN, "other-list", "W", "1", "other",
+                    null, null, null, null, null, null, null));
+            assertEquals("other-list", poll.get(5, TimeUnit.SECONDS).orElseThrow().getWorkflowId());
+            assertEquals("first", service.pollForDecisionTask(REGION, DOMAIN, "tl", "d",
+                    Duration.ofSeconds(10)).orElseThrow().getWorkflowId());
+            assertEquals("second", service.pollForDecisionTask(REGION, DOMAIN, "tl", "d",
+                    Duration.ofSeconds(10)).orElseThrow().getWorkflowId());
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"interrupt", "reset", "shutdown"})
+    void pendingPollIsReleasedByCancellationOrLifecycle(String action) throws Exception {
+        AtomicReference<Thread> thread = new AtomicReference<>();
+        CountDownLatch started = new CountDownLatch(1);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Boolean> poll = executor.submit(() -> {
+                thread.set(Thread.currentThread());
+                started.countDown();
+                assertTrue(service.pollForDecisionTask(REGION, DOMAIN, "tl", "d",
+                        Duration.ofSeconds(60)).isEmpty());
+                return Thread.currentThread().isInterrupted();
+            });
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            assertHeldOpen(poll);
+            switch (action) {
+                case "interrupt" -> thread.get().interrupt();
+                case "reset" -> service.clear();
+                case "shutdown" -> service.stopPolling();
+                default -> throw new AssertionError(action);
+            }
+            assertEquals(action.equals("interrupt"), poll.get(5, TimeUnit.SECONDS));
+            if (action.equals("reset")) {
+                start("after-reset");
+                assertEquals("after-reset", service.pollForDecisionTask(REGION, DOMAIN, "tl", "d",
+                        Duration.ofSeconds(10)).orElseThrow().getWorkflowId());
+            }
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void backgroundTimerWakesOnlyTheOwningAccountAndRegion() throws Exception {
+        ThreadLocal<RequestContext> contexts = ThreadLocal.withInitial(RequestContext::new);
+        Instance<RequestContext> request = Mockito.mock(Instance.class);
+        RequestContext proxy = Mockito.mock(RequestContext.class);
+        Mockito.when(proxy.getAccountId()).thenAnswer(call -> contexts.get().getAccountId());
+        Mockito.when(request.get()).thenReturn(proxy);
+        StorageFactory factory = new StorageFactory(null, null) {
+            @Override
+            public synchronized <V> AccountAwareStorageBackend<V> create(String serviceName,
+                    String fileName, TypeReference<Map<String, V>> typeReference) {
+                return new AccountAwareStorageBackend<>(new InMemoryStorage<>(), request, "000000000000");
+            }
+        };
+        service = new SwfService(factory, new RegionResolver(REGION, "000000000000"),
+                clock, recordingLambdaInvoker());
+        for (String account : List.of("111111111111", "222222222222")) {
+            contexts.get().setAccountId(account);
+            for (String region : List.of(REGION, "eu-west-1")) {
+                service.registerDomain(DOMAIN, "scope", "1", Map.of(), region);
+                service.registerWorkflowType(region, DOMAIN, workflowType("W", "1"));
+            }
+        }
+        contexts.get().setAccountId("111111111111");
+        start("timer-owner");
+        SwfDecisionTask initial = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d").orElseThrow();
+        service.respondDecisionTaskCompleted(initial.getTaskToken(),
+                List.of(new Decision("StartTimer", Map.of("timerId", "wake", "startToFireTimeout", "1"))), null);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Optional<SwfDecisionTask>> poll = executor.submit(() -> {
+                contexts.get().setAccountId("111111111111");
+                return service.pollForDecisionTask(REGION, DOMAIN, "tl", "d", Duration.ofSeconds(10));
+            });
+            assertHeldOpen(poll);
+            contexts.get().setAccountId("222222222222");
+            start("other-account");
+            contexts.get().setAccountId("111111111111");
+            service.startWorkflowExecution(new StartWorkflowExecutionRequest(
+                    "eu-west-1", DOMAIN, "other-region", "W", "1", null,
+                    null, null, null, null, null, null, null));
+            assertHeldOpen(poll);
+            contexts.get().setAccountId(null);
+            clock.advance(Duration.ofSeconds(2));
+            service.sweep();
+            assertEquals("timer-owner", poll.get(5, TimeUnit.SECONDS).orElseThrow().getWorkflowId());
+            contexts.get().setAccountId("111111111111");
+            assertEquals("other-region", service.pollForDecisionTask("eu-west-1", DOMAIN, "tl", "d")
+                    .orElseThrow().getWorkflowId());
+            contexts.get().setAccountId("222222222222");
+            assertEquals("other-account", service.pollForDecisionTask(REGION, DOMAIN, "tl", "d")
+                    .orElseThrow().getWorkflowId());
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+            contexts.remove();
+        }
     }
 
     @Test
@@ -306,27 +598,131 @@ class SwfServiceTest {
         assertEquals("COMPLETED", execution.getCloseStatus());
     }
 
-    @Test
-    void closingDecisionWithAnOpenActivity_recordsUnhandledDecisionAndKeepsTheExecutionOpen() {
-        String runId = start("wf-unhandled");
-        scheduleActivity("wf-unhandled", "act-1");
+    @ParameterizedTest
+    @CsvSource({"CompleteWorkflowExecution,COMPLETED,false", "FailWorkflowExecution,FAILED,false",
+            "CancelWorkflowExecution,CANCELED,false", "ContinueAsNewWorkflowExecution,CONTINUED_AS_NEW,false",
+            "CompleteWorkflowExecution,COMPLETED,true", "FailWorkflowExecution,FAILED,true",
+            "CancelWorkflowExecution,CANCELED,true", "ContinueAsNewWorkflowExecution,CONTINUED_AS_NEW,true"})
+    void closingDecisionClosesKnownActivitiesAndTimers(String closing, String status, boolean startAfterDecision) {
+        String runId = start("wf-known-work");
+        SwfDecisionTask first = pollFor("wf-known-work");
+        service.respondDecisionTaskCompleted(first.getTaskToken(), List.of(
+                new Decision("ScheduleActivityTask", Map.of("activityId", "known",
+                        "activityType", Map.of("name", "A", "version", "1"))),
+                new Decision("StartTimer", Map.of("timerId", "known", "startToFireTimeout", "300"))), null);
+        SwfActivityTask activity = startAfterDecision ? null
+                : service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        SwfDecisionTask task = pokeForDecision("wf-known-work");
+        if (startAfterDecision) {
+            activity = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow();
+        }
+        String activityToken = activity.getTaskToken();
+        service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(
+                new Decision("RecordMarker", Map.of("markerName", "before-close")),
+                new Decision(closing, Map.of())), null);
 
-        SwfDecisionTask task = pokeForDecision("wf-unhandled");
-        service.respondDecisionTaskCompleted(task.getTaskToken(),
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-known-work", runId);
+        assertEquals("CLOSED", execution.getExecutionStatus());
+        assertEquals(status, execution.getCloseStatus());
+        assertEquals("before-close", lastAttribute(execution, "MarkerRecorded", "markerName"));
+        assertEquals(0, service.openActivityCount(execution));
+        assertEquals(0, service.openTimerCount(execution));
+        assertEquals("UnknownResourceFault", assertThrows(AwsException.class,
+                () -> service.respondActivityTaskCompleted(activityToken, "late")).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"CompleteWorkflowExecution,signal", "FailWorkflowExecution,signal",
+            "CancelWorkflowExecution,signal", "ContinueAsNewWorkflowExecution,signal",
+            "CompleteWorkflowExecution,activity", "FailWorkflowExecution,activity",
+            "CancelWorkflowExecution,activity", "ContinueAsNewWorkflowExecution,activity",
+            "CompleteWorkflowExecution,timer", "FailWorkflowExecution,timer",
+            "CancelWorkflowExecution,timer", "ContinueAsNewWorkflowExecution,timer"})
+    void closingDecisionDefersEventsThatArrivedAfterTheTaskStarted(String closing, String event) {
+        String runId = start("wf-new-event");
+        SwfDecisionTask first = pollFor("wf-new-event");
+        List<Decision> setup = switch (event) {
+            case "activity" -> List.of(new Decision("ScheduleActivityTask", Map.of("activityId", "act",
+                    "activityType", Map.of("name", "A", "version", "1"))));
+            case "timer" -> List.of(new Decision("StartTimer",
+                    Map.of("timerId", "timer", "startToFireTimeout", "1")));
+            default -> List.of();
+        };
+        service.respondDecisionTaskCompleted(first.getTaskToken(), setup, null);
+        SwfActivityTask activity = "activity".equals(event)
+                ? service.pollForActivityTask(REGION, DOMAIN, "act-tl", "worker").orElseThrow() : null;
+        SwfDecisionTask task = pokeForDecision("wf-new-event");
+        switch (event) {
+            case "activity" -> service.respondActivityTaskCompleted(activity.getTaskToken(), "done");
+            case "timer" -> {
+                clock.advance(Duration.ofSeconds(2));
+                service.sweep();
+            }
+            default -> service.signalWorkflowExecution(REGION, DOMAIN, "wf-new-event", runId, "new", null);
+        }
+        service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(new Decision(closing, Map.of())), null);
+
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-new-event", runId);
+        assertEquals("OPEN", execution.getExecutionStatus());
+        assertEquals("UNHANDLED_DECISION", lastAttribute(execution, closing + "Failed", "cause"));
+        SwfDecisionTask next = pollFor("wf-new-event");
+        assertEquals(task.getStartedEventId(), next.getPreviousStartedEventId());
+        service.respondDecisionTaskCompleted(next.getTaskToken(), List.of(new Decision(closing, Map.of())), null);
+        assertFalse(service.describeWorkflowExecution(REGION, DOMAIN, "wf-new-event", runId).isOpen());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"CompleteWorkflowExecution", "FailWorkflowExecution",
+            "CancelWorkflowExecution", "ContinueAsNewWorkflowExecution"})
+    void closingDecisionDefersFailureFromEarlierDecisionInBatch(String closing) {
+        String runId = start("wf-batch-failure");
+        SwfDecisionTask task = pollFor("wf-batch-failure");
+        service.respondDecisionTaskCompleted(task.getTaskToken(), List.of(
+                new Decision("CancelTimer", Map.of("timerId", "missing")),
+                new Decision(closing, Map.of())), null);
+
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-batch-failure", runId);
+        assertEquals("OPEN", execution.getExecutionStatus());
+        assertEquals("TIMER_ID_UNKNOWN", lastAttribute(execution, "CancelTimerFailed", "cause"));
+        assertEquals("UNHANDLED_DECISION", lastAttribute(execution, closing + "Failed", "cause"));
+        SwfDecisionTask next = pollFor("wf-batch-failure");
+        service.respondDecisionTaskCompleted(next.getTaskToken(), List.of(new Decision(closing, Map.of())), null);
+        assertFalse(service.describeWorkflowExecution(REGION, DOMAIN, "wf-batch-failure", runId).isOpen());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"TERMINATE,TERMINATED", "REQUEST_CANCEL,", "ABANDON,"})
+    void completingParentAppliesChildPolicyToKnownOpenChildren(String policy, String childStatus) {
+        String runId = service.startWorkflowExecution(new StartWorkflowExecutionRequest(
+                REGION, DOMAIN, "wf-parent-close", "W", "1", null, null, null, null, null, policy, null, null));
+        SwfDecisionTask first = pollFor("wf-parent-close");
+        service.respondDecisionTaskCompleted(first.getTaskToken(), List.of(
+                new Decision("StartChildWorkflowExecution", Map.of("workflowId", "wf-child-close",
+                        "workflowType", Map.of("name", "W", "version", "1")))), null);
+        SwfWorkflowExecution child = service.describeWorkflowExecution(REGION, DOMAIN, "wf-child-close", null);
+        SwfDecisionTask closing = pokeForDecision("wf-parent-close");
+        service.respondDecisionTaskCompleted(closing.getTaskToken(),
                 List.of(new Decision("CompleteWorkflowExecution", Map.of())), null);
 
-        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-unhandled", runId);
-        assertEquals("OPEN", execution.getExecutionStatus());
-        assertEquals("UNHANDLED_DECISION",
-                lastAttribute(execution, "CompleteWorkflowExecutionFailed", "cause"));
+        assertEquals("COMPLETED",
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-parent-close", runId).getCloseStatus());
+        child = service.describeWorkflowExecution(REGION, DOMAIN, "wf-child-close", child.getRunId());
+        assertEquals(childStatus, child.getCloseStatus());
+        assertEquals("REQUEST_CANCEL".equals(policy), child.isCancelRequested());
     }
 
     @Test
     void activityScheduleToStartTimeout_expiresTheTaskAndSchedulesANewDecision() {
+        TestTime time = exactTimeline();
         String runId = start("wf-s2s");
         scheduleActivity("wf-s2s", "act-s2s");
 
-        clock.advance(Duration.ofSeconds(31));
+        time.advance(Duration.ofSeconds(30).minusMillis(1));
+        service.sweep();
+        assertNull(lastAttribute(service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2s", runId),
+                "ActivityTaskTimedOut", "timeoutType"), "the task has one millisecond left to be started");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2s", runId);
@@ -340,12 +736,18 @@ class SwfServiceTest {
 
     @Test
     void activityStartToCloseTimeout_expiresAStartedTask() {
+        TestTime time = exactTimeline();
         start("wf-s2c");
         scheduleActivity("wf-s2c", "act-s2c");
         SwfActivityTask task = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "w").orElseThrow();
         assertEquals("act-s2c", task.getActivityId());
 
-        clock.advance(Duration.ofSeconds(61));
+        time.advance(Duration.ofSeconds(60).minusMillis(1));
+        service.sweep();
+        assertNull(lastAttribute(service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2c", null),
+                "ActivityTaskTimedOut", "timeoutType"), "the worker has one millisecond left to finish");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-s2c", null);
@@ -357,6 +759,7 @@ class SwfServiceTest {
 
     @Test
     void activityHeartbeatTimeout_expiresATaskThatStopsHeartbeating() {
+        TestTime time = exactTimeline();
         SwfActivityType heartbeating = activityType("HB", "1");
         heartbeating.setDefaultTaskHeartbeatTimeout("10");
         heartbeating.setDefaultTaskStartToCloseTimeout("600");
@@ -371,15 +774,21 @@ class SwfServiceTest {
         SwfActivityTask task = service.pollForActivityTask(REGION, DOMAIN, "act-tl", "w").orElseThrow();
 
         // A heartbeat resets the window, so the task survives the first advance.
-        clock.advance(Duration.ofSeconds(8));
+        time.advance(Duration.ofSeconds(8));
         assertFalse(service.recordActivityTaskHeartbeat(task.getTaskToken(), "alive"));
-        clock.advance(Duration.ofSeconds(8));
+        time.advance(Duration.ofSeconds(8));
         service.sweep();
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-hb", null);
         assertNull(lastAttribute(execution, "ActivityTaskTimedOut", "timeoutType"),
                 "a heartbeat within the window must keep the task alive");
 
-        clock.advance(Duration.ofSeconds(11));
+        time.advance(Duration.ofSeconds(2).minusMillis(1));
+        service.sweep();
+        execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-hb", null);
+        assertNull(lastAttribute(execution, "ActivityTaskTimedOut", "timeoutType"),
+                "the window runs for ten seconds from the last heartbeat");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
         execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-hb", null);
         assertEquals("HEARTBEAT", lastAttribute(execution, "ActivityTaskTimedOut", "timeoutType"));
@@ -387,10 +796,16 @@ class SwfServiceTest {
 
     @Test
     void decisionTaskStartToCloseTimeout_reschedulesTheTaskForAnotherDecider() {
+        TestTime time = exactTimeline();
         String runId = start("wf-dt-timeout");
         SwfDecisionTask abandoned = service.pollForDecisionTask(REGION, DOMAIN, "tl", "dead").orElseThrow();
 
-        clock.advance(Duration.ofSeconds(11));
+        time.advance(Duration.ofSeconds(10).minusMillis(1));
+        service.sweep();
+        assertNull(lastAttribute(service.describeWorkflowExecution(REGION, DOMAIN, "wf-dt-timeout", runId),
+                "DecisionTaskTimedOut", "timeoutType"), "the decider has one millisecond left to respond");
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-dt-timeout", runId);
@@ -404,9 +819,15 @@ class SwfServiceTest {
 
     @Test
     void workflowExecutionStartToCloseTimeout_closesTheExecutionAsTimedOut() {
+        TestTime time = exactTimeline();
         String runId = start("wf-exec-timeout");
 
-        clock.advance(Duration.ofSeconds(301));
+        time.advance(Duration.ofSeconds(300).minusMillis(1));
+        service.sweep();
+        assertEquals("OPEN",
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-exec-timeout", runId).getExecutionStatus());
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-exec-timeout", runId);
@@ -417,6 +838,7 @@ class SwfServiceTest {
 
     @Test
     void timerFires_onceItsStartToFireTimeoutElapses() {
+        TestTime time = exactTimeline();
         String runId = start("wf-timer");
         SwfDecisionTask decision = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d").orElseThrow();
         service.respondDecisionTaskCompleted(decision.getTaskToken(), List.of(
@@ -426,11 +848,43 @@ class SwfServiceTest {
         assertEquals(1, service.openTimerCount(
                 service.describeWorkflowExecution(REGION, DOMAIN, "wf-timer", runId)));
 
-        clock.advance(Duration.ofSeconds(31));
+        time.advance(Duration.ofSeconds(30).minusMillis(1));
+        service.sweep();
+        assertEquals(1, service.openTimerCount(
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-timer", runId)));
+
+        time.advance(Duration.ofMillis(1));
         service.sweep();
 
         SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-timer", runId);
         assertEquals("t-1", lastAttribute(execution, "TimerFired", "timerId"));
+        assertEquals(0, service.openTimerCount(execution));
+    }
+
+    @Test
+    void aTimerDueBetweenTwoSweepsFiresOnTheLaterOne() {
+        TestTime time = exactTimeline();
+        EmulatorConfig config = Mockito.mock(EmulatorConfig.class, Mockito.RETURNS_DEEP_STUBS);
+        Mockito.when(config.services().swf().enabled()).thenReturn(true);
+        Mockito.when(config.services().swf().timeoutSweepEnabled()).thenReturn(true);
+        Mockito.when(config.services().swf().timeoutSweepIntervalMillis()).thenReturn(0L);
+        Mockito.when(config.services().swf().timeoutSweepIntervalSeconds()).thenReturn(1L);
+        new SwfTimeoutSweeper(service, config, time.scheduler()).onStart(new StartupEvent());
+        String runId = start("wf-swept-timer");
+        SwfDecisionTask decision = service.pollForDecisionTask(REGION, DOMAIN, "tl", "d").orElseThrow();
+        time.advance(Duration.ofMillis(400));
+        service.respondDecisionTaskCompleted(decision.getTaskToken(), List.of(
+                new Decision("StartTimer", Map.of("timerId", "t-swept", "startToFireTimeout", "30"))), null);
+
+        // Due 30.4 s in, between the sweeps at 30 s and 31 s.
+        time.advance(Duration.ofSeconds(31).minusMillis(401));
+        assertEquals(1, service.openTimerCount(
+                service.describeWorkflowExecution(REGION, DOMAIN, "wf-swept-timer", runId)));
+
+        time.advance(Duration.ofMillis(1));
+
+        SwfWorkflowExecution execution = service.describeWorkflowExecution(REGION, DOMAIN, "wf-swept-timer", runId);
+        assertEquals("t-swept", lastAttribute(execution, "TimerFired", "timerId"));
         assertEquals(0, service.openTimerCount(execution));
     }
 
@@ -1586,6 +2040,18 @@ class SwfServiceTest {
             }
         }
         throw new AssertionError("no decision task for " + workflowId);
+    }
+
+    /** The poll is idle at the long poll's wait, where only a published task or its deadline ends it. */
+    private static void assertHeldOpen(Future<?> poll) {
+        assertHeldOpen(List.of(poll));
+    }
+
+    private static void assertHeldOpen(List<? extends Future<?>> polls) {
+        LockWaits.awaitTimedWaitIn(SwfService.class, "awaitTask", polls.size());
+        for (Future<?> poll : polls) {
+            assertFalse(poll.isDone(), "an empty task list must hold the poll open");
+        }
     }
 
     private Object lastAttribute(SwfWorkflowExecution execution, String eventType, String attribute) {

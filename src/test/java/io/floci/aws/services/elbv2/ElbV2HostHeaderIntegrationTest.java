@@ -54,9 +54,9 @@ class ElbV2HostHeaderIntegrationTest {
 
     @BeforeEach
     void createSdkListenerAndRealBackend() throws Exception {
-        Ec2Client ec2 = AwsTestClients.create(Ec2Client.builder(), "test", Region.EU_WEST_1, endpoint);
+        Ec2Client ec2 = AwsTestClients.create(Ec2Client.builder(), "321321321324", Region.EU_WEST_1, endpoint);
         cleanup.add(ec2::close);
-        elb = AwsTestClients.create(ElasticLoadBalancingV2Client.builder(), "test", Region.EU_WEST_1, endpoint);
+        elb = AwsTestClients.create(ElasticLoadBalancingV2Client.builder(), "321321321324", Region.EU_WEST_1, endpoint);
         cleanup.add(elb::close);
         String vpc = ec2.createVpc(r -> r.cidrBlock("10.84.0.0/16")).vpc().vpcId();
         cleanup.add(() -> ec2.deleteVpc(r -> r.vpcId(vpc)));
@@ -93,11 +93,13 @@ class ElbV2HostHeaderIntegrationTest {
         cleanup.add(() -> elb.deleteListener(r -> r.listenerArn(listener)));
         elb.registerTargets(r -> r.targetGroupArn(group)
                 .targets(TargetDescription.builder().id("127.0.0.1").port(backend.actualPort()).build()));
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            try (Socket socket = new Socket("127.0.0.1", listenerPort)) {
-                assertTrue(socket.isConnected());
-            }
-        });
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = new Socket("127.0.0.1", listenerPort)) {
+                        assertTrue(socket.isConnected());
+                    }
+                });
     }
 
     @AfterEach

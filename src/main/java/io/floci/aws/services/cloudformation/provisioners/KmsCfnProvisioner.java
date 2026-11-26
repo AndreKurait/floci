@@ -116,7 +116,7 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
                 });
     }
 
-    /** The template's KeyPolicy as JSON, or null when it has none, which keeps the key's current policy. */
+    /** The template's KeyPolicy as JSON, or null when it has none. */
     private static String keyPolicy(JsonNode props, ProvisionContext ctx) {
         String policy = props == null ? null : ctx.engine().resolveJsonAttributeStrict(props.path("KeyPolicy"));
         return policy == null || policy.isBlank() ? null : policy;
@@ -168,14 +168,22 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
         if (rotation == null && dropped.contains("EnableKeyRotation")) {
             rotation = Boolean.FALSE;
         }
-        Map<String, String> desiredTags = ReservedTags.stripReservedTags(
-                parseCfnTags(props != null ? props.get("Tags") : null, ctx));
+        Map<String, String> requestedTags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
+        String overrideId = ReservedTags.extractOverrideKeyId(requestedTags);
+        if (overrideId != null && !overrideId.equals(keyId)) {
+            throw new AwsException("ValidationError", "The key ID override cannot be changed.", 400);
+        }
+        Map<String, String> desiredTags = ReservedTags.stripReservedTags(requestedTags);
         // Only the keys the previous template or this one sets are the stack's to change or drop.
         Set<String> priorTagKeys = Ec2Tags.ownedKeys(r, TAG_KEYS_ATTR, ctx);
         Set<String> managedTagKeys = new TreeSet<>(priorTagKeys);
         managedTagKeys.addAll(desiredTags.keySet());
         // Resolved before the snapshot: a template that cannot be read changes nothing.
-        String policy = keyPolicy(props, ctx);
+        String declaredPolicy = keyPolicy(props, ctx);
+        // AWS's KMS resource provider defaults both models before comparing their policies.
+        // Removing a managed policy restores the account default; omission in both models leaves live drift alone.
+        String policy = declaredPolicy == null && dropped.contains("KeyPolicy")
+                ? kmsService.buildDefaultKeyPolicy() : declaredPolicy;
         ObjectNode snapshot = MAPPER.createObjectNode();
         snapshot.put("keyId", keyId);
         snapshot.put("region", region);
@@ -191,7 +199,6 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
         String finalDescription = description;
         Boolean finalEnabled = enabled;
         Boolean finalRotation = rotation;
-        // A dropped KeyPolicy keeps the current policy: no AWS documentation says it resets to the default.
         CfnRollback.guarded(r, ctx, false, () -> { }, () -> restore(snapshot), () ->
                 converge(key, finalDescription, policy, finalEnabled, finalRotation, desiredTags,
                         managedTagKeys, region));
@@ -314,6 +321,8 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
         String targetKeyId = ctx.resolveOptional(props, "TargetKeyId");
         if (aliasName != null && targetKeyId != null) {
             if (ctx.isUpdate() && aliasName.equals(ctx.priorPhysicalId())) {
+                // The alias keeps its name, so the stack already owns it: a changed TargetKeyId
+                // repoints it in place. CreateAlias refuses a name that exists.
                 kmsService.updateAlias(aliasName, targetKeyId, ctx.region());
             } else {
                 kmsService.createAlias(aliasName, targetKeyId, ctx.region());

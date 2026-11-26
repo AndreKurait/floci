@@ -1,6 +1,7 @@
 package io.floci.aws.services.autoscaling;
 
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.services.autoscaling.model.AsgInstance;
 import io.floci.aws.services.autoscaling.model.AsgOptionalFields;
 import io.floci.aws.services.autoscaling.model.AutoScalingGroup;
@@ -30,6 +31,24 @@ import static org.mockito.Mockito.*;
 class AutoScalingQueryHandlerTest {
 
     private static final String REGION = "us-east-1";
+    private static final String XML_NAMESPACE = "http://autoscaling.amazonaws.com/doc/2011-01-01/";
+
+    @Test
+    void describeAutoScalingInstancesEmptyUsesModeledNamespace() throws Exception {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
+
+        Response response = handler.handle("DescribeAutoScalingInstances", new MultivaluedHashMap<>(), REGION);
+
+        assertEquals(200, response.getStatus());
+        String xml = (String) response.getEntity();
+        Element root = assertModeledNamespace(xml);
+        NodeList collections = root.getElementsByTagNameNS(XML_NAMESPACE, "AutoScalingInstances");
+        assertEquals(1, collections.getLength());
+        Element instances = (Element) collections.item(0);
+        assertEquals(0, instances.getElementsByTagName("*").getLength());
+    }
 
     @ParameterizedTest
     @MethodSource("malformedTagPropagationValues")
@@ -259,23 +278,6 @@ class AutoScalingQueryHandlerTest {
                 group.getCapacityReservationSpecification().getCapacityReservationIds());
         assertEquals("CapacityReservationResourceGroupArns".equals(field) ? List.of(target) : List.of(),
                 group.getCapacityReservationSpecification().getCapacityReservationResourceGroupArns());
-    }
-
-    @Test
-    void describeAutoScalingInstancesEmptyUsesModeledNamespace() throws Exception {
-        AutoScalingService service = new AutoScalingService();
-        service.regionResolver = new RegionResolver(REGION, "000000000000");
-        AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
-
-        Response response = handler.handle("DescribeAutoScalingInstances", new MultivaluedHashMap<>(), REGION);
-
-        assertEquals(200, response.getStatus());
-        String xml = (String) response.getEntity();
-        Element root = assertModeledNamespace(xml);
-        NodeList collections = root.getElementsByTagNameNS(XML_NAMESPACE, "AutoScalingInstances");
-        assertEquals(1, collections.getLength());
-        Element instances = (Element) collections.item(0);
-        assertEquals(0, instances.getElementsByTagName("*").getLength());
     }
 
     @Test
@@ -750,5 +752,16 @@ class AutoScalingQueryHandlerTest {
         assertFalse(xml.contains("<CapacityRebalance>"));
         assertFalse(xml.contains("<MaxInstanceLifetime>"));
         assertFalse(xml.contains("<DefaultInstanceWarmup>"));
+    }
+
+    private static Element assertModeledNamespace(String xml) throws Exception {
+        Element root = XmlParser.parseDocument(xml).getDocumentElement();
+        assertEquals(XML_NAMESPACE, root.getNamespaceURI());
+        NodeList descendants = root.getElementsByTagName("*");
+        for (int i = 0; i < descendants.getLength(); i++) {
+            assertEquals(XML_NAMESPACE, descendants.item(i).getNamespaceURI(),
+                    descendants.item(i).getNodeName());
+        }
+        return root;
     }
 }

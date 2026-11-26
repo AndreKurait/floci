@@ -32,6 +32,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -663,6 +664,18 @@ class LeafCfnProvisionerTest {
             assertTrue(r.getPhysicalId().startsWith("cdk-metadata-"), r.getPhysicalId());
             // The stub arm would have added a fake Arn here; the real type has no attributes.
             assertTrue(r.getAttributes().isEmpty(), "CDK::Metadata exposes no Fn::GetAtt attributes");
+        }
+
+        @Test
+        void anAnalyticsUpdatePreservesThePriorPhysicalId() {
+            StackResource r = resource("CDKMetadata", "AWS::CDK::Metadata");
+            ProvisionContext update = new ProvisionContext(engine, REGION, "000000000000",
+                    "my-stack", "cdk-metadata-existing");
+
+            provisioner.provision(r, props("{\"Analytics\":\"updated\"}"), update);
+
+            assertEquals("cdk-metadata-existing", r.getPhysicalId());
+            assertTrue(r.getAttributes().isEmpty());
         }
     }
 }

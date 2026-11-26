@@ -30,10 +30,12 @@ import io.floci.aws.services.ecr.model.ImageDetail;
 import io.floci.aws.services.ecr.model.ImageFailure;
 import io.floci.aws.services.ecr.model.ImageIdentifier;
 import io.floci.aws.services.ecr.model.ImageMetadata;
+import io.floci.aws.services.ecr.model.LifecyclePolicyPreview;
 import io.floci.aws.services.ecr.model.PullThroughCacheRule;
 import io.floci.aws.services.ecr.model.RegistrySettings;
 import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.model.RepositoryCreationTemplate;
+import io.floci.aws.services.ecr.registry.EcrRegistryAuthorization;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecr.registry.RegistryHttpClient;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -44,17 +46,19 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
@@ -99,12 +103,18 @@ public class EcrService implements ResourceProvider, Resettable {
     private static final Map<String, String> ACCOUNT_SETTING_DEFAULTS = Map.of(
             "BASIC_SCAN_TYPE_VERSION", "AWS_NATIVE", "REGISTRY_POLICY_SCOPE", "V2", "BLOB_MOUNTING", "DISABLED");
 
+    @Inject
+    EcrRegistryAuthorization registryAuthorization;
+
     private final StorageBackend<String, Repository> repoStore;
     private final StorageBackend<String, ImageMetadata> imageMetaStore;
     // Keep the first timestamp across write failures. Access is guarded by imageMetaStore.
     private final Map<String, ImageMetadata> pendingImagePushes = new HashMap<>();
     private final StorageBackend<String, PullThroughCacheRule> pullThroughCacheRuleStore;
     private final StorageBackend<String, RegistrySettings> registrySettingsStore;
+    private final Map<String, Object> repositoryMonitors = new ConcurrentHashMap<>();
+    private final Object creationPruneGate = new Object();
+    private final EcrLifecyclePreviews previews = new EcrLifecyclePreviews(this);
     private final Map<String, Object> registryLocks = new ConcurrentHashMap<>();
     private final StorageBackend<String, RepositoryCreationTemplate> templateStore;
     private final EcrRegistryManager registryManager;
@@ -328,52 +338,45 @@ public class EcrService implements ResourceProvider, Resettable {
         if (catalog == null || catalog.isEmpty()) {
             return;
         }
-        String defaultAccount = regionResolver.getDefaultAccountId();
-        String defaultRegion = regionResolver.getDefaultRegion();
-        int recreated = 0;
-        for (String registryRepositoryName : catalog) {
-            String legacyKey = key(defaultRegion, defaultAccount, registryRepositoryName);
-            Optional<Repository> legacyRepository = repositoryInAccount(defaultAccount, legacyKey);
-            if (legacyRepository.isPresent()) {
-                Repository repo = legacyRepository.get();
-                repo.setRepositoryUri(registryManager.getRepositoryUri(
-                        defaultAccount, defaultRegion, repo.getRepositoryName()));
-                repo.setRegistryRepositoryName(registryRepositoryName);
-                AccountAwareStorageBackend.putInAccount(repoStore, defaultAccount, legacyKey, repo);
-                continue;
-            }
-            String[] parts = registryRepositoryName.split("/", 3);
-            boolean namespaced = parts.length == 3 && parts[0].matches("[0-9]{12}")
+        for (String physical : catalog) {
+            String defaultAccount = regionResolver.getDefaultAccountId();
+            String defaultRegion = regionResolver.getDefaultRegion();
+            String legacyKey = key(defaultRegion, defaultAccount, physical);
+            boolean legacy = catalogRepository(defaultAccount, legacyKey, defaultRegion, physical).isPresent();
+            String[] parts = physical.split("/", 3);
+            boolean namespaced = !legacy && parts.length == 3 && parts[0].matches("[0-9]{12}")
                     && parts[1].matches("[a-z0-9-]+");
             String account = namespaced ? parts[0] : defaultAccount;
             String region = namespaced ? parts[1] : defaultRegion;
-            String repoName = namespaced ? parts[2] : registryRepositoryName;
-            String key = key(region, account, repoName);
-            Optional<Repository> existing = repositoryInAccount(account, key);
-            if (existing.isPresent()) {
-                Repository repo = existing.get();
-                repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repoName));
+            String name = namespaced ? parts[2] : physical;
+            String logical = key(region, account, name);
+            String uri = registryManager.getRepositoryUri(account, region, name);
+            synchronized (repositoryMonitor(account, logical)) {
+                Repository next = catalogRepository(account, logical, region, name).map(Repository::new).orElseGet(() -> {
+                    Repository fresh = new Repository();
+                    fresh.setRepositoryGeneration(UUID.randomUUID().toString());
+                    fresh.setRepositoryName(name);
+                    fresh.setRegistryId(account);
+                    fresh.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account, "repository/" + name).toString());
+                    fresh.setCreatedAt(Instant.now());
+                    return fresh;
+                });
+                next.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account, "repository/" + name).toString());
+                next.setRepositoryUri(uri);
                 if (!namespaced) {
-                    repo.setRegistryRepositoryName(registryRepositoryName);
+                    next.setRegistryRepositoryName(physical);
                 }
-                AccountAwareStorageBackend.putInAccount(repoStore, account, key, repo);
-                continue;
+                saveRepository(next, region);
             }
-            Repository repo = new Repository();
-            repo.setRepositoryName(repoName);
-            repo.setRegistryId(account);
-            repo.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account, "repository/" + repoName).toString());
-            repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repoName));
-            if (!namespaced) {
-                repo.setRegistryRepositoryName(registryRepositoryName);
-            }
-            repo.setCreatedAt(Instant.now());
-            AccountAwareStorageBackend.putInAccount(repoStore, account, key, repo);
-            recreated++;
         }
-        if (recreated > 0) {
-            LOG.infov("Reconciled {0} ECR repository metadata entries from registry catalog", recreated);
-        }
+    }
+
+    /** Catalog recovery also preserves older owned rows that predate persisted repository ARNs. */
+    private Optional<Repository> catalogRepository(String account, String logical, String region, String name) {
+        String expected = AwsArnUtils.Arn.of("ecr", region, account, "repository/" + name).toString();
+        return repositoryInAccount(account, logical).filter(repo -> account.equals(repo.getRegistryId())
+                && name.equals(repo.getRepositoryName())
+                && (repo.getRepositoryArn() == null || expected.equals(repo.getRepositoryArn())));
     }
 
     /**
@@ -576,43 +579,48 @@ public class EcrService implements ResourceProvider, Resettable {
                                        Map<String, String> tags,
                                        String region) {
         validateRepoName(repositoryName);
-        // Repository records are pure metadata: the ARN and the URI are derived from the
-        // configured account, region and registry port, none of which need Docker. Start
-        // the backing registry opportunistically so the URI reflects an already-adopted
-        // container's published port, but never fail CreateRepository when no Docker
-        // daemon is reachable, the registry is retried on the next image operation.
-        registryManager.tryEnsureStarted();
-        String account = effectiveAccount(registryId);
-        String key = key(region, account, repositoryName);
-        if (repoStore.get(key).isPresent()) {
-            throw new AwsException("RepositoryAlreadyExistsException",
-                    "The repository with name '" + repositoryName + "' already exists in the registry with id '"
-                            + account + "'", 400);
-        }
+        synchronized (creationPruneGate) {
+            // Repository records are pure metadata: the ARN and the URI are derived from the
+            // configured account, region and registry port, none of which need Docker. Start
+            // the backing registry opportunistically so the URI reflects an already-adopted
+            // container's published port, but never fail CreateRepository when no Docker
+            // daemon is reachable, the registry is retried on the next image operation.
+            registryManager.tryEnsureStarted();
+            String account = effectiveAccount(registryId);
+            String key = key(region, account, repositoryName);
+            synchronized (repositoryMonitor(account, key)) {
+                if (registryRepository(repositoryName, account, region).isPresent()) {
+                    throw new AwsException("RepositoryAlreadyExistsException",
+                            "The repository with name '" + repositoryName + "' already exists in the registry with id '"
+                                    + account + "'", 400);
+                }
 
-        Repository repo = new Repository();
-        repo.setRepositoryName(repositoryName);
-        repo.setRegistryId(account);
-        repo.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account, "repository/" + repositoryName).toString());
-        repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repositoryName));
-        repo.setCreatedAt(Instant.now());
-        if (imageTagMutability != null && !imageTagMutability.isBlank()) {
-            repo.setImageTagMutability(imageTagMutability);
-        }
-        if (scanOnPush != null) {
-            repo.setScanOnPush(scanOnPush);
-        }
-        if (encryptionType != null && !encryptionType.isBlank()) {
-            repo.setEncryptionType(encryptionType);
-        }
-        repo.setKmsKey(kmsKey);
-        if (tags != null) {
-            repo.getTags().putAll(tags);
-        }
+                Repository repo = new Repository();
+                repo.setRepositoryGeneration(UUID.randomUUID().toString());
+                repo.setRepositoryName(repositoryName);
+                repo.setRegistryId(account);
+                repo.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account, "repository/" + repositoryName).toString());
+                repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repositoryName));
+                repo.setCreatedAt(Instant.now());
+                if (imageTagMutability != null && !imageTagMutability.isBlank()) {
+                    repo.setImageTagMutability(imageTagMutability);
+                }
+                if (scanOnPush != null) {
+                    repo.setScanOnPush(scanOnPush);
+                }
+                if (encryptionType != null && !encryptionType.isBlank()) {
+                    repo.setEncryptionType(encryptionType);
+                }
+                repo.setKmsKey(kmsKey);
+                if (tags != null) {
+                    repo.getTags().putAll(tags);
+                }
 
-        repoStore.put(key, repo);
-        LOG.infov("Created ECR repository {0}/{1}/{2}", region, account, repositoryName);
-        return repo;
+                saveRepository(repo, region);
+                LOG.infov("Created ECR repository {0}/{1}/{2}", region, account, repositoryName);
+                return new Repository(repo);
+            }
+        }
     }
 
     // ============================================================
@@ -626,15 +634,17 @@ public class EcrService implements ResourceProvider, Resettable {
         String prefix = region + "::" + account + "::";
 
         if (repositoryNames == null || repositoryNames.isEmpty()) {
-            return repoStore.scan(k -> k.startsWith(prefix)).stream()
+            List<Repository> repositories = repoStore instanceof AccountAwareStorageBackend<Repository> aware
+                    ? aware.scanForAccount(account, k -> k.startsWith(prefix))
+                    : repoStore.scan(k -> k.startsWith(prefix));
+            return repositories.stream()
                     .map(repo -> refreshRepositoryUri(repo, region))
                     .toList();
         }
 
         List<Repository> out = new ArrayList<>();
         for (String name : repositoryNames) {
-            String key = key(region, account, name);
-            Repository repo = repoStore.get(key).orElseThrow(() -> notFound(name, account));
+            Repository repo = registryRepository(name, account, region).orElseThrow(() -> notFound(name, account));
             out.add(refreshRepositoryUri(repo, region));
         }
         return out;
@@ -703,84 +713,125 @@ public class EcrService implements ResourceProvider, Resettable {
     private Repository deleteRepositoryUnderLifecycleLock(String repositoryName, String registryId, boolean force,
                                                           String region) {
         String account = effectiveAccount(registryId);
-        String key = key(region, account, repositoryName);
-        Repository repo = repoStore.get(key).orElseThrow(() -> notFound(repositoryName, account));
-
-        // Check whether the registry has any images for this repo, tagged or not.
-        // A test double with no HTTP client means no backing registry exists,
-        // so there is nothing to clean up. Any failure against a real client
-        // aborts the delete: an unreachable registry cannot prove the repo
-        // empty (non-force must not bypass RepositoryNotEmptyException) and
-        // force must not orphan pullable images behind deleted metadata.
-        List<String> tags;
-        boolean untaggedImages = false;
-        boolean registryAvailable = true;
-        if (registryManager.httpClient() == null) {
-            // Test double without an HTTP layer (Mockito default): no backing
-            // registry exists, so there is nothing to clean up.
-            tags = List.of();
-            registryAvailable = false;
-        } else try {
-            String internal = resolveRegistryRepoNameStrict(account, region, repositoryName);
-            tags = registryManager.httpClient().listTagsStrict(internal);
-            if (tags.isEmpty() && !force) {
-                untaggedImages = holdsImage(account, region, repositoryName, internal);
-            }
+        String logical = key(region, account, repositoryName);
+        Repository repo = registryRepository(repositoryName, account, region).map(Repository::new)
+                .orElseThrow(() -> notFound(repositoryName, account));
+        RegistryHttpClient http = registryManager.httpClient();
+        String physical;
+        try {
+            physical = http == null ? registryRepositoryName(repo, region)
+                    : resolveRegistryRepoNameStrict(account, region, repositoryName);
         } catch (Exception e) {
-            if (isRegistryUnreachable(e)) {
-                throw new AwsException("ServerException",
-                        "Backing registry unreachable for repository '" + repositoryName
-                                + "': retry after the registry recovers (" + e.getMessage() + ")",
-                        500);
+            throw registryFailure(repositoryName, e);
+        }
+        lockRepositoryWrites(physical);
+        try {
+            synchronized (repositoryMonitor(repo, region)) {
+                currentRepository(repo, region, true);
             }
-            throw new AwsException("ServerException",
-                    "Failed to clean up the backing registry for repository '" + repositoryName + "': "
-                            + e.getMessage(),
-                    500);
-        }
-        if ((!tags.isEmpty() || untaggedImages) && !force) {
-            throw new AwsException("RepositoryNotEmptyException",
-                    "The repository with name '" + repositoryName
-                            + "' in registry with id '" + account + "' cannot be deleted because it still contains images",
-                    400);
-        }
-        if (force && registryAvailable) {
-            // Single cleanup mechanism (#2982): remove the repository storage
-            // directories inside the registry container. Routed through
-            // resolveRegistryRepoName so content pushed under the bare name
-            // via hostname-style URIs is removed too (issue #2444).
-            deleteRepositoryStorageResolved(account, region, repositoryName);
-        }
-
-        repoStore.delete(key);
-        lifecycleEvaluations.remove(key);
-        // Drop cached image metadata for this repo.
-        String metaPrefix = key + "::";
-        synchronized (imageMetaStore) {
-            pendingImagePushes.keySet().removeIf(k -> k.startsWith(metaPrefix));
-            for (ImageMetadata meta : storedImageRecords(account, metaPrefix)) {
-                removeImagePush(account, region, repositoryName, meta.getDigest());
+            List<String> tags;
+            try {
+                if (http != null && !physical.equals(resolveRegistryRepoNameStrict(account, region, repositoryName))) {
+                    throw new AwsException("ServerException", "Registry namespace changed during deletion", 500);
+                }
+                tags = http == null ? List.of() : http.listTagsStrict(physical);
+            } catch (Exception e) {
+                throw registryFailure(repositoryName, e);
             }
+            boolean untaggedImages = false;
+            if (tags.isEmpty() && !force && http != null) {
+                try {
+                    untaggedImages = holdsImage(account, region, repositoryName, physical);
+                } catch (Exception e) {
+                    throw registryFailure(repositoryName, e);
+                }
+            }
+            if ((!tags.isEmpty() || untaggedImages) && !force) {
+                throw new AwsException("RepositoryNotEmptyException",
+                        "The repository with name '" + repositoryName + "' in registry with id '" + account
+                                + "' cannot be deleted because it still contains images", 400);
+            }
+            if (force && http != null) {
+                try {
+                    registryManager.deleteRepositoryStorageByInternalName(physical);
+                } catch (Exception e) {
+                    throw registryFailure(repositoryName, e);
+                }
+            }
+            synchronized (repositoryMonitor(repo, region)) {
+                currentRepository(repo, region, true);
+                deleteOldImageMetadata(repo, region);
+                // The metadata and parent stores are separate commits. A refused parent deletion
+                // can retain the old preview after metadata cleanup; recreation is still refused.
+                if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+                    aware.getForAccountMigratingLegacy(account, logical, value -> sameLifetime(repo, value));
+                    aware.deleteAllAtomicallyForAccounts(Map.of(account, Set.of(logical)));
+                } else {
+                    repoStore.deleteAllAtomically(Set.of(logical));
+                }
+            }
+        } finally {
+            unlockRepositoryWrites(physical);
         }
-        if (!hasRepositories()) {
-            registryManager.pruneStorage();
+        lifecycleEvaluations.remove(logical);
+        synchronized (creationPruneGate) {
+            synchronized (registryManager) {
+                if (!hasRepositories()) {
+                    registryManager.pruneStorage();
+                }
+            }
         }
         LOG.infov("Deleted ECR repository {0}/{1}/{2}", region, account, repositoryName);
         repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repositoryName));
         return repo;
     }
 
+    private void deleteOldImageMetadata(Repository repo, String region) {
+        String account = repo.getRegistryId();
+        String prefix = key(region, account, repo.getRepositoryName()) + "::";
+        synchronized (imageMetaStore) {
+            Set<String> keys = imageMetaStore instanceof AccountAwareStorageBackend<ImageMetadata> aware
+                    ? aware.keysIncludingLegacyForAccount(account, logical -> logical.startsWith(prefix))
+                    : imageMetaStore.keys();
+            Set<String> deletions = new LinkedHashSet<>();
+            for (String logical : keys) {
+                if (logical.startsWith(prefix)) {
+                    AccountAwareStorageBackend.readInAccount(imageMetaStore, account, logical)
+                            .filter(value -> belongsToGeneration(value, repo)).ifPresent(value -> deletions.add(logical));
+                }
+            }
+            deleteImageMetadataKeys(account, deletions);
+            pendingImagePushes.entrySet().removeIf(entry -> entry.getKey().startsWith(prefix)
+                    && belongsToGeneration(entry.getValue(), repo));
+        }
+    }
+
     // ============================================================
     // GetAuthorizationToken
     // ============================================================
+
+    public List<AuthorizationData> getAuthorizationToken(List<String> registryIds) {
+        if (registryIds == null) {
+            return List.of(getAuthorizationToken());
+        }
+        if (registryIds.isEmpty() || registryIds.size() > 10
+                || registryIds.stream().anyMatch(id -> id == null || !id.matches("[0-9]{12}"))) {
+            throw new AwsException("InvalidParameterException", "registryIds must contain 1 to 10 twelve-digit account IDs", 400);
+        }
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
+        String token = issued.authorizationToken();
+        Instant expires = issued.expiresAt();
+        return registryIds.stream().map(account -> new AuthorizationData(token, expires,
+                registryManager.getProxyEndpoint(account, regionResolver.getRegion()))).toList();
+    }
 
     public AuthorizationData getAuthorizationToken() {
         // Deliberately not gated on the backing registry: AWS answers this call from the
         // control plane, and both values here are computed without Docker. Gating it made
         // every SDK client retry a 500 before its first repository call.
-        String token = Base64.getEncoder()
-                .encodeToString("AWS:floci".getBytes(StandardCharsets.UTF_8));
-        Instant expires = Instant.now().plusSeconds(12 * 60 * 60);
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
+        String token = issued.authorizationToken();
+        Instant expires = issued.expiresAt();
         String proxy = registryManager.getProxyEndpoint();
         return new AuthorizationData(token, expires, proxy);
     }
@@ -920,7 +971,22 @@ public class EcrService implements ResourceProvider, Resettable {
                 d.setImageManifestMediaType(m.mediaType());
                 d.setArtifactMediaType(RegistryHttpClient.artifactMediaTypeFromManifest(m.body()));
 
-                ImageMetadata meta = describeImagePush(repo.getRegistryId(), region, repositoryName, m.digest());
+                ImageMetadata meta;
+                lockRepositoryWrites(internal);
+                try {
+                    if (!internal.equals(resolveRegistryRepoNameStrict(repo.getRegistryId(), region, repositoryName))) {
+                        throw new AwsException("ServerException", "Registry namespace changed during metadata lookup", 500);
+                    }
+                    if (http.headManifestDigestStrict(internal, m.digest(), null) == null) {
+                        throw new AwsException("ImageNotFoundException", "Image changed during metadata lookup", 400);
+                    }
+                    synchronized (repositoryMonitor(repo, region)) {
+                        currentRepository(repo, region, true);
+                        meta = recordImageMetadata(repo, region, m.digest(), Instant.now(), false, true);
+                    }
+                } finally {
+                    unlockRepositoryWrites(internal);
+                }
                 d.setImagePushedAt(meta.getPushedAt());
                 details.add(d);
             } catch (Exception e) {
@@ -999,6 +1065,12 @@ public class EcrService implements ResourceProvider, Resettable {
             try {
                 lockRepositoryWrites(internal);
                 try {
+                    if (!internal.equals(resolveRegistryRepoNameStrict(repo.getRegistryId(), region, repositoryName))) {
+                        throw new AwsException("ServerException", "Registry namespace changed during image deletion", 500);
+                    }
+                    synchronized (repositoryMonitor(repo, region)) {
+                        currentRepository(repo, region, true);
+                    }
                     if (id.getImageDigest() == null && id.getImageTag() != null) {
                         deleteImageTag(repo, repositoryName, internal, http, id, region, deleted, failures);
                     } else {
@@ -1051,7 +1123,7 @@ public class EcrService implements ResourceProvider, Resettable {
                 return;
             }
             deleted.add(new ImageIdentifier(id.getImageTag(), digest));
-            removeImagePush(repo.getRegistryId(), region, repositoryName, digest);
+            removeImageMetadata(repo, region, digest);
             return;
         }
         RegistryHttpClient.ManifestResult manifest = http.getManifest(internal, digest, null);
@@ -1104,7 +1176,7 @@ public class EcrService implements ResourceProvider, Resettable {
                 deleted.add(new ImageIdentifier(removedTag, digest));
             }
         }
-        removeImagePush(repo.getRegistryId(), region, repositoryName, digest);
+        removeImageMetadata(repo, region, digest);
     }
 
     /**
@@ -1188,7 +1260,8 @@ public class EcrService implements ResourceProvider, Resettable {
         try {
             lockRepositoryWrites(storage);
             try {
-                return callRegistry(() -> writeManifest(repo, repositoryName, storage, http, imageManifest, mediaType,
+                Repository current = nativeRepository(repo, region);
+                return callRegistry(() -> writeManifest(current, repositoryName, storage, http, imageManifest, mediaType,
                         imageTag, digest, guarded, region), EcrService::putImageError);
             } finally {
                 unlockRepositoryWrites(storage);
@@ -1213,10 +1286,14 @@ public class EcrService implements ResourceProvider, Resettable {
         if (existing != null && guarded != null) {
             throw imageTagAlreadyExists(imageTag, repositoryName);
         }
+        boolean digestExisted = http.headManifestDigestStrict(storage, digest, null) != null;
         String stored = http.putManifest(storage, imageTag != null ? imageTag : digest, mediaType, imageManifest);
         String finalDigest = stored != null ? stored : digest;
-        // A retag keeps the image's first push time, as DescribeImages records it.
-        recordImagePush(repo.getRegistryId(), region, repositoryName, finalDigest, Instant.now());
+        synchronized (repositoryMonitor(repo, region)) {
+            currentRepository(repo, region, true);
+            recordImageMetadata(repo, region, finalDigest, Instant.now(),
+                    !digestExisted && digest.equals(finalDigest), false);
+        }
 
         Image image = new Image();
         image.setRegistryId(repo.getRegistryId());
@@ -1769,9 +1846,7 @@ public class EcrService implements ResourceProvider, Resettable {
     public Repository putImageScanningConfiguration(String repositoryName, String registryId,
                                                     boolean scanOnPush, String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
-        repo.setScanOnPush(scanOnPush);
-        repoStore.put(key(region, repo.getRegistryId(), repositoryName), repo);
-        return repo;
+        return modifyRepository(repo, region, next -> next.setScanOnPush(scanOnPush));
     }
 
     public Repository putImageTagMutability(String repositoryName, String registryId,
@@ -1782,9 +1857,7 @@ public class EcrService implements ResourceProvider, Resettable {
                     "imageTagMutability must be MUTABLE or IMMUTABLE", 400);
         }
         Repository repo = requireRepo(repositoryName, registryId, region);
-        repo.setImageTagMutability(mutability);
-        repoStore.put(key(region, repo.getRegistryId(), repositoryName), repo);
-        return repo;
+        return modifyRepository(repo, region, next -> next.setImageTagMutability(mutability));
     }
 
     /**
@@ -1826,29 +1899,21 @@ public class EcrService implements ResourceProvider, Resettable {
     }
 
     public void tagResource(String repoName, String registryId, Map<String, String> tags, String region) {
-        synchronized (tagLock) {
-            Repository repo = requireRepo(repoName, registryId, region);
+        Repository repo = requireRepo(repoName, registryId, region);
+        modifyRepository(repo, region, next -> {
             if (tags != null) {
-                Map<String, String> updated = new HashMap<>();
-                repo.getTags().forEach(updated::put);
-                tags.forEach(updated::put);
-                repo.setTags(updated);
+                next.getTags().putAll(tags);
             }
-            repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
-        }
+        });
     }
 
     public void untagResource(String repoName, String registryId, List<String> tagKeys, String region) {
-        synchronized (tagLock) {
-            Repository repo = requireRepo(repoName, registryId, region);
+        Repository repo = requireRepo(repoName, registryId, region);
+        modifyRepository(repo, region, next -> {
             if (tagKeys != null) {
-                Map<String, String> updated = new HashMap<>();
-                repo.getTags().forEach(updated::put);
-                tagKeys.forEach(updated::remove);
-                repo.setTags(updated);
+                tagKeys.forEach(next.getTags()::remove);
             }
-            repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
-        }
+        });
     }
 
     public Map<String, String> listTagsForResource(String repoName, String registryId, String region) {
@@ -1882,9 +1947,7 @@ public class EcrService implements ResourceProvider, Resettable {
         lockLifecycle(lifecycleKey);
         try {
             Repository repo = requireRepo(repoName, registryId, region);
-            repo.setLifecyclePolicyText(policyText);
-            repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
-            return repo;
+            return modifyRepository(repo, region, next -> next.setLifecyclePolicyText(policyText));
         } finally {
             unlockLifecycle(lifecycleKey);
         }
@@ -1929,8 +1992,7 @@ public class EcrService implements ResourceProvider, Resettable {
             Repository repo = getLifecyclePolicy(repoName, registryId, region);
             String text = repo.getLifecyclePolicyText();
             Instant lastEvaluatedAt = lifecyclePolicyEvaluatedAt(repo, region);
-            repo.setLifecyclePolicyText(null);
-            repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
+            modifyRepository(repo, region, next -> next.setLifecyclePolicyText(null));
             lifecycleEvaluations.remove(key(region, repo.getRegistryId(), repoName));
             return new DeletedLifecyclePolicy(repo.getRegistryId(), repoName, text, lastEvaluatedAt);
         } finally {
@@ -2165,9 +2227,7 @@ public class EcrService implements ResourceProvider, Resettable {
 
     public Repository setRepositoryPolicy(String repoName, String registryId, String policyText, String region) {
         Repository repo = requireRepo(repoName, registryId, region);
-        repo.setRepositoryPolicyText(policyText);
-        repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
-        return repo;
+        return modifyRepository(repo, region, next -> next.setRepositoryPolicyText(policyText));
     }
 
     public Repository getRepositoryPolicy(String repoName, String registryId, String region) {
@@ -2181,9 +2241,7 @@ public class EcrService implements ResourceProvider, Resettable {
 
     public Repository deleteRepositoryPolicy(String repoName, String registryId, String region) {
         Repository repo = getRepositoryPolicy(repoName, registryId, region);
-        repo.setRepositoryPolicyText(null);
-        repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
-        return repo;
+        return modifyRepository(repo, region, next -> next.setRepositoryPolicyText(null));
     }
 
     @Override
@@ -2209,6 +2267,280 @@ public class EcrService implements ResourceProvider, Resettable {
         return Set.of(new SupportedResourceType("ecr:repository", "ecr", true));
     }
 
+    record PreviewRepository(String outerAccount, String region, String key, Repository repository) {
+        String scope() { return outerAccount + "/" + key; }
+    }
+
+    PreviewRepository previewRepository(String name, String registryId, String region) {
+        validateRepoName(name);
+        String caller = callerAccount();
+        if (registryId != null && !caller.equals(registryId)) {
+            throw new AwsException("InvalidParameterException",
+                    "Lifecycle previews support only the caller's registry", 400);
+        }
+        String logicalKey = key(region, caller, name);
+        Repository repo = readPreviewRepository(caller, logicalKey, region, name)
+                .orElseThrow(() -> notFound(name, caller));
+        return new PreviewRepository(caller, region, logicalKey, new Repository(repo));
+    }
+
+    /** IAM must not initialize a generation, refresh a URI, migrate a row, or contact the registry. */
+    public Map<String, String> lifecyclePreviewTags(String name, String registryId, String region) {
+        try {
+            return new HashMap<>(previewRepository(name, registryId, region).repository().getTags());
+        } catch (AwsException e) {
+            return Map.of();
+        }
+    }
+
+    private Optional<Repository> readPreviewRepository(String account, String logicalKey, String region, String name) {
+        Optional<Repository> result;
+        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            result = aware.getForAccount(account, logicalKey);
+            if (result.isEmpty()) {
+                result = aware.getLegacyForAccount(account, logicalKey);
+            }
+        } else {
+            result = repoStore.get(logicalKey);
+        }
+        String expected = AwsArnUtils.Arn.of("ecr", region, account, "repository/" + name).toString();
+        return result.filter(repo -> account.equals(repo.getRegistryId()) && name.equals(repo.getRepositoryName())
+                && expected.equals(repo.getRepositoryArn()));
+    }
+
+    private String callerAccount() {
+        return repoStore instanceof AccountAwareStorageBackend<?> aware
+                ? aware.accountId() : regionResolver.getAccountId();
+    }
+
+    private Object repositoryMonitor(String account, String logicalKey) {
+        return repositoryMonitors.computeIfAbsent(account + "/" + logicalKey, ignored -> new Object());
+    }
+
+    private Object repositoryMonitor(Repository repo, String region) {
+        return repositoryMonitor(repo.getRegistryId(), key(region, repo.getRegistryId(), repo.getRepositoryName()));
+    }
+
+    private static boolean sameLifetime(Repository expected, Repository current) {
+        return Objects.equals(expected.getRepositoryGeneration(), current.getRepositoryGeneration())
+                && Objects.equals(expected.getRepositoryArn(), current.getRepositoryArn())
+                && Objects.equals(expected.getRepositoryName(), current.getRepositoryName())
+                && Objects.equals(expected.getRegistryId(), current.getRegistryId())
+                && Objects.equals(expected.getCreatedAt(), current.getCreatedAt());
+    }
+
+    private static void requireSamePhysical(Repository expected, Repository current) {
+        if (!sameLifetime(expected, current)
+                || !Objects.equals(expected.getRegistryRepositoryName(), current.getRegistryRepositoryName())) {
+            throw new AwsException("ServerException", "Repository changed while the operation was pending", 500);
+        }
+    }
+
+    Repository revalidatePreview(PreviewRepository captured) {
+        Repository current = readPreviewRepository(captured.outerAccount(), captured.key(), captured.region(),
+                captured.repository().getRepositoryName())
+                .orElseThrow(() -> notFound(captured.repository().getRepositoryName(), captured.outerAccount()));
+        requireSamePhysical(captured.repository(), current);
+        return new Repository(current);
+    }
+
+    boolean matchesPreview(PreviewRepository captured, PreviewRepository current) {
+        return captured.scope().equals(current.scope()) && sameLifetime(captured.repository(), current.repository())
+                && Objects.equals(captured.repository().getRegistryRepositoryName(),
+                        current.repository().getRegistryRepositoryName());
+    }
+
+    String previewPhysical(PreviewRepository captured, List<String> catalog) {
+        Repository repo = captured.repository();
+        String namespaced = registryManager.internalRepoName(repo.getRegistryId(), captured.region(),
+                repo.getRepositoryName());
+        if (repo.getRegistryRepositoryName() != null && !repo.getRegistryRepositoryName().isBlank()) {
+            String physical = repo.getRegistryRepositoryName();
+            if (!physical.equals(namespaced) && !physical.equals(repo.getRepositoryName())) {
+                throw new AwsException("ServerException", "Repository has an unsupported registry namespace", 500);
+            }
+            if (physical.equals(repo.getRepositoryName()) && otherPreviewScopeClaims(captured)) {
+                throw new AwsException("ServerException", "Legacy registry namespace ownership is ambiguous", 500);
+            }
+            return physical;
+        }
+        if (catalog.contains(namespaced)) {
+            return namespaced;
+        }
+        if (catalog.contains(repo.getRepositoryName()) && !otherPreviewScopeClaims(captured)) {
+            return repo.getRepositoryName();
+        }
+        return namespaced;
+    }
+
+    private boolean otherPreviewScopeClaims(PreviewRepository captured) {
+        String suffix = "::" + captured.repository().getRepositoryName();
+        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            for (Map.Entry<String, Repository> row : aware.scanAllAccountsWithRawKeys().entrySet()) {
+                String raw = row.getKey();
+                boolean scoped = raw.matches("[0-9]{12}/.*");
+                String logical = scoped ? raw.substring(13) : raw;
+                if (logical.endsWith(suffix) && (!logical.equals(captured.key())
+                        || (scoped && !raw.startsWith(captured.outerAccount() + "/"))
+                        || !sameLifetime(captured.repository(), row.getValue()))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return repoStore.keys().stream().anyMatch(k -> k.endsWith(suffix) && !k.equals(captured.key()));
+    }
+
+    List<EcrLifecyclePreviewInventory.Metadata> previewMetadata(PreviewRepository captured) {
+        List<EcrLifecyclePreviewInventory.Metadata> result = new ArrayList<>();
+        String prefix = captured.key() + "::";
+        if (imageMetaStore instanceof AccountAwareStorageBackend<ImageMetadata> aware) {
+            Map<String, ImageMetadata> selected = new HashMap<>();
+            for (String logical : aware.keysForAccount(captured.outerAccount())) {
+                if (logical.startsWith(prefix)) {
+                    aware.getForAccount(captured.outerAccount(), logical).ifPresent(value -> selected.put(logical, value));
+                }
+            }
+            for (String raw : aware.scanAllAccountsWithRawKeys().keySet()) {
+                if (raw.startsWith(prefix) && !selected.containsKey(raw)) {
+                    aware.getLegacyForAccount(captured.outerAccount(), raw).ifPresent(value -> selected.put(raw, value));
+                }
+            }
+            selected.forEach((logical, value) -> addPreviewMetadata(result, prefix, logical, value));
+        } else {
+            for (String logical : imageMetaStore.keys()) {
+                if (logical.startsWith(prefix)) {
+                    imageMetaStore.get(logical).ifPresent(value -> addPreviewMetadata(result, prefix, logical, value));
+                }
+            }
+        }
+        return result;
+    }
+
+    private static void addPreviewMetadata(List<EcrLifecyclePreviewInventory.Metadata> result,
+                                            String prefix, String logical, ImageMetadata value) {
+        if (!logical.equals(prefix + value.getDigest())) {
+            throw new AwsException("ServerException", "Image metadata key does not match its digest", 500);
+        }
+        result.add(new EcrLifecyclePreviewInventory.Metadata(value.getDigest(), value.getPushedAt(),
+                value.getRepositoryGeneration(), value.isNativeFirstPush()));
+    }
+
+    EcrLifecyclePreviewInventory previewInventory() {
+        RegistryHttpClient client = registryManager.httpClient();
+        if (client == null) {
+            throw new AwsException("ServerException", "The backing registry is unavailable", 500);
+        }
+        return new EcrLifecyclePreviewInventory(client.baseUrl());
+    }
+
+    LifecyclePolicyPreview completePreview(PreviewRepository captured, String policy, Instant evaluatedAt,
+                                            List<LifecyclePolicyPreview.Result> results) {
+        synchronized (repositoryMonitor(captured.outerAccount(), captured.key())) {
+            Repository next = revalidatePreview(captured);
+            if (next.getRepositoryGeneration() == null) {
+                next.setRepositoryGeneration(UUID.randomUUID().toString());
+            }
+            LifecyclePolicyPreview preview = new LifecyclePolicyPreview(UUID.randomUUID().toString(),
+                    next.getRepositoryGeneration(), policy, evaluatedAt, results);
+            next.setLifecyclePolicyPreview(preview);
+            if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+                // Authorized migration is separate from the following atomic replacement.
+                aware.getForAccountMigratingLegacy(captured.outerAccount(), captured.key(),
+                        value -> sameLifetime(captured.repository(), value));
+                aware.putAllAtomicallyForAccount(captured.outerAccount(), Map.of(captured.key(), next));
+            } else {
+                repoStore.putAllAtomically(Map.of(captured.key(), next));
+            }
+            return preview;
+        }
+    }
+
+    public EcrLifecyclePreviews.View startLifecyclePolicyPreview(String name, String registryId,
+                                                                 String policy, String region) {
+        return previews.start(name, registryId, policy, region);
+    }
+
+    public EcrLifecyclePreviews.View getLifecyclePolicyPreview(String name, String registryId,
+                                                               List<ImageIdentifier> ids, String tagStatus,
+                                                               Integer maxResults, String token, String region) {
+        return previews.get(name, registryId, ids, tagStatus, maxResults, token, region);
+    }
+
+    private Repository currentRepository(Repository captured, String region, boolean physical) {
+        Repository current = registryRepository(captured.getRepositoryName(), captured.getRegistryId(), region)
+                .orElseThrow(() -> notFound(captured.getRepositoryName(), captured.getRegistryId()));
+        if (physical) {
+            requireSamePhysical(captured, current);
+        } else if (!sameLifetime(captured, current)) {
+            throw new AwsException("ServerException", "Repository lifetime changed while the operation was pending", 500);
+        }
+        return new Repository(current);
+    }
+
+    private Repository modifyRepository(Repository captured, String region, Consumer<Repository> change) {
+        synchronized (repositoryMonitor(captured, region)) {
+            Repository next = currentRepository(captured, region, false);
+            change.accept(next);
+            saveRepository(next, region);
+            return new Repository(next);
+        }
+    }
+
+    private void saveRepository(Repository repo, String region) {
+        Map<String, Repository> values = Map.of(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            aware.putAllAtomicallyForAccount(repo.getRegistryId(), values);
+        } else {
+            repoStore.putAllAtomically(values);
+        }
+    }
+
+    private Repository nativeRepository(Repository captured, String region) {
+        synchronized (repositoryMonitor(captured, region)) {
+            Repository current = currentRepository(captured, region, true);
+            if (current.getRepositoryGeneration() == null) {
+                current.setRepositoryGeneration(UUID.randomUUID().toString());
+                saveRepository(current, region);
+            }
+            return current;
+        }
+    }
+
+    private void removeImageMetadata(Repository captured, String region, String digest) {
+        synchronized (repositoryMonitor(captured, region)) {
+            currentRepository(captured, region, true);
+            synchronized (imageMetaStore) {
+                String account = captured.getRegistryId();
+                String logical = imageMetaKey(region, account, captured.getRepositoryName(), digest);
+                ImageMetadata value = AccountAwareStorageBackend.readInAccount(imageMetaStore, account, logical).orElse(null);
+                if (value != null && belongsToGeneration(value, captured)) {
+                    deleteImageMetadataKeys(account, Set.of(logical));
+                }
+                ImageMetadata pending = pendingImagePushes.get(logical);
+                if (pending != null && belongsToGeneration(pending, captured)) {
+                    pendingImagePushes.remove(logical);
+                }
+            }
+        }
+    }
+
+    private static boolean belongsToGeneration(ImageMetadata value, Repository repo) {
+        return value.getRepositoryGeneration() == null
+                || Objects.equals(value.getRepositoryGeneration(), repo.getRepositoryGeneration());
+    }
+
+    private void deleteImageMetadataKeys(String account, Set<String> keys) {
+        if (imageMetaStore instanceof AccountAwareStorageBackend<ImageMetadata> aware) {
+            for (String logical : keys) {
+                aware.getForAccountMigratingLegacy(account, logical, value -> logical.endsWith("::" + value.getDigest()));
+            }
+            aware.deleteAllAtomicallyForAccounts(Map.of(account, keys));
+        } else {
+            imageMetaStore.deleteAllAtomically(keys);
+        }
+    }
+
     // ============================================================
     // Result records
     // ============================================================
@@ -2221,10 +2553,59 @@ public class EcrService implements ResourceProvider, Resettable {
     // Helpers
     // ============================================================
 
+    /** Read the selected registry owner without trusting the HTTP caller's account namespace. */
+    public Optional<Repository> registryRepository(String name, String account, String region) {
+        String repositoryKey = key(region, account, name);
+        return AccountAwareStorageBackend.readInAccount(repoStore, account, repositoryKey);
+    }
+
     private Repository requireRepo(String name, String registryId, String region) {
         String account = effectiveAccount(registryId);
-        Repository repo = repoStore.get(key(region, account, name)).orElseThrow(() -> notFound(name, account));
+        Repository repo = registryRepository(name, account, region).orElseThrow(() -> notFound(name, account));
         return refreshRepositoryUri(repo, region);
+    }
+
+    private ImageMetadata recordImageMetadata(Repository repo, String region, String digest, Instant pushedAt,
+                                               boolean nativeFirstPush, boolean allowPending) {
+        String account = repo.getRegistryId();
+        String logical = imageMetaKey(region, account, repo.getRepositoryName(), digest);
+        synchronized (imageMetaStore) {
+            ImageMetadata stored = AccountAwareStorageBackend.readInAccount(imageMetaStore, account, logical).orElse(null);
+            String generation = repo.getRepositoryGeneration();
+            if (stored != null && Objects.equals(generation, stored.getRepositoryGeneration())) {
+                return stored;
+            }
+            ImageMetadata pending = pendingImagePushes.get(logical);
+            ImageMetadata previous = stored != null && stored.getRepositoryGeneration() == null ? stored : pending;
+            if (previous != null && previous.getRepositoryGeneration() != null
+                    && !Objects.equals(generation, previous.getRepositoryGeneration())) {
+                previous = null;
+            }
+            ImageMetadata next;
+            if (previous == null) {
+                next = new ImageMetadata(digest, pushedAt, generation, nativeFirstPush);
+            } else {
+                next = new ImageMetadata(digest, previous.getPushedAt(), generation,
+                        Objects.equals(generation, previous.getRepositoryGeneration()) && previous.isNativeFirstPush());
+            }
+            pendingImagePushes.put(logical, next);
+            try {
+                if (imageMetaStore instanceof AccountAwareStorageBackend<ImageMetadata> aware) {
+                    aware.getForAccountMigratingLegacy(account, logical, value -> digest.equals(value.getDigest()));
+                    aware.putAllAtomicallyForAccount(account, Map.of(logical, next));
+                } else {
+                    imageMetaStore.putAllAtomically(Map.of(logical, next));
+                }
+                pendingImagePushes.remove(logical);
+                return next;
+            } catch (RuntimeException storageFailure) {
+                if (!allowPending) {
+                    throw storageFailure;
+                }
+                LOG.debugv(storageFailure, "Using pending ECR push time for {0} in {1}", digest, repo.getRepositoryName());
+                return next;
+            }
+        }
     }
 
     public ImageMetadata recordImagePush(String account, String region, String repositoryName,
@@ -2306,9 +2687,21 @@ public class EcrService implements ResourceProvider, Resettable {
     }
 
     private Repository refreshRepositoryUri(Repository repo, String region) {
-        repo.setRepositoryUri(registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName()));
-        repoStore.put(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
-        return repo;
+        String uri = registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName());
+        synchronized (repositoryMonitor(repo, region)) {
+            Repository stored = registryRepository(repo.getRepositoryName(), repo.getRegistryId(), region).orElse(null);
+            // A describe can finish with its captured row after deletion, without restoring it
+            // or refreshing a replacement repository's URI from the old lifetime.
+            if (stored == null || !sameLifetime(repo, stored)) {
+                return new Repository(repo);
+            }
+            Repository current = new Repository(stored);
+            if (!Objects.equals(uri, current.getRepositoryUri())) {
+                current.setRepositoryUri(uri);
+                saveRepository(current, region);
+            }
+            return current;
+        }
     }
 
     private String registryRepositoryName(Repository repo, String region) {
@@ -2346,7 +2739,7 @@ public class EcrService implements ResourceProvider, Resettable {
 
     private boolean hasRepositories() {
         if (repoStore instanceof AccountAwareStorageBackend<?> accountAware) {
-            return !accountAware.scanAllAccounts().isEmpty();
+            return !accountAware.scanAllAccountsWithRawKeys().isEmpty();
         }
         return !repoStore.scan(k -> true).isEmpty();
     }

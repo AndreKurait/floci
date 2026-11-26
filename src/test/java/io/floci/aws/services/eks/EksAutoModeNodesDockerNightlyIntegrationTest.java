@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -143,7 +144,11 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
         assertEquals(profile.getArn(), instance.getIamInstanceProfileArn());
         // A second pass while the node hasn't joined launches no other.
         RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
-        assertEquals(1, RequestScopes.callAs(ACCOUNT, REGION, () -> compute.instancesOf(cluster, REGION, "pending", "running")).size());
+        List<Instance> waiting = RequestScopes.callAs(ACCOUNT, REGION,
+                () -> compute.instancesOf(cluster, REGION, "pending", "running"));
+        assertEquals(List.of(instance.getInstanceId()), waiting.stream().map(Instance::getInstanceId).toList(),
+                () -> "A newly launched node must retain its registration window: launched=" + instance.getLaunchTime()
+                        + ", now=" + Instant.now());
 
         RequestScopes.runAs(ACCOUNT, REGION, () -> eksClusterManager.joinInstance(cluster, instance));
         RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));

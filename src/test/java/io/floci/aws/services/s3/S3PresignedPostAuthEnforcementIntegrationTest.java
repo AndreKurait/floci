@@ -18,6 +18,11 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.kms.KmsClient;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -556,44 +561,54 @@ class S3PresignedPostAuthEnforcementIntegrationTest {
         String bucket = "presigned-post-encryption-" + expectedStatus + "-"
                 + (field.endsWith("key-id") ? "key" : "method");
         String key = "uploads/encrypted.txt";
-        String value = field.endsWith("key-id") ? "approved-key" : "aws:kms";
-        createBucket(bucket);
-        putBucketPolicy(bucket, """
-                {"Version":"2012-10-17","Statement":[
-                  {"Effect":"Deny","Principal":"*","Action":"s3:PutObject",
-                   "Resource":"arn:aws:s3:::%s/*","Condition":{"%s":{"s3:%s":"%s"}}}
-                ]}""".formatted(bucket, operator, field, value));
-        String policy = """
-                {"expiration":"%s","conditions":[
-                  {"bucket":"%s"},{"key":"%s"},
-                  {"x-amz-server-side-encryption":"aws:kms"},
-                  {"x-amz-server-side-encryption-aws-kms-key-id":"approved-key"}
-                ]}""".formatted(Instant.now().plusSeconds(3600), bucket, key);
-        String policyBase64 = Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8));
-        String credential = LEGACY_ACCESS_KEY_ID + "/20260101/us-east-1/s3/aws4_request";
+        try (KmsClient kms = KmsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(LEGACY_ACCESS_KEY_ID, LEGACY_SECRET_KEY)))
+                .httpClientBuilder(UrlConnectionHttpClient.builder()).build()) {
+            String keyArn = kms.createKey(request -> {}).keyMetadata().arn();
+            try {
+                String value = field.endsWith("key-id") ? keyArn : "aws:kms";
+                createBucket(bucket);
+                putBucketPolicy(bucket, """
+                        {"Version":"2012-10-17","Statement":[
+                          {"Effect":"Deny","Principal":"*","Action":"s3:PutObject",
+                           "Resource":"arn:aws:s3:::%s/*","Condition":{"%s":{"s3:%s":"%s"}}}
+                        ]}""".formatted(bucket, operator, field, value));
+                String policy = """
+                        {"expiration":"%s","conditions":[
+                          {"bucket":"%s"},{"key":"%s"},
+                          {"x-amz-server-side-encryption":"aws:kms"},
+                          {"x-amz-server-side-encryption-aws-kms-key-id":"%s"}
+                        ]}""".formatted(Instant.now().plusSeconds(3600), bucket, key, keyArn);
+                String policyBase64 = Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8));
+                String credential = LEGACY_ACCESS_KEY_ID + "/20260101/us-east-1/s3/aws4_request";
 
-        given()
-            .header(field, "header-only-value")
-            .multiPart("key", key)
-            .multiPart("policy", policyBase64)
-            .multiPart("x-amz-algorithm", "AWS4-HMAC-SHA256")
-            .multiPart("x-amz-credential", credential)
-            .multiPart("x-amz-date", AMZ_DATE)
-            .multiPart("x-amz-signature", signPolicy(policyBase64, credential, LEGACY_SECRET_KEY))
-            .multiPart("X-Amz-Server-Side-Encryption", "aws:kms")
-            .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "approved-key")
-            .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
-        .when()
-            .post("/" + bucket)
-        .then()
-            .statusCode(expectedStatus);
+                given()
+                    .header(field, "header-only-value")
+                    .multiPart("key", key)
+                    .multiPart("policy", policyBase64)
+                    .multiPart("x-amz-algorithm", "AWS4-HMAC-SHA256")
+                    .multiPart("x-amz-credential", credential)
+                    .multiPart("x-amz-date", AMZ_DATE)
+                    .multiPart("x-amz-signature", signPolicy(policyBase64, credential, LEGACY_SECRET_KEY))
+                    .multiPart("X-Amz-Server-Side-Encryption", "aws:kms")
+                    .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", keyArn)
+                    .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
+                .when()
+                    .post("/" + bucket)
+                .then()
+                    .statusCode(expectedStatus);
 
-        given()
-            .filter(S3RequestSigner.signedAs(LEGACY_ACCESS_KEY_ID, LEGACY_SECRET_KEY))
-        .when()
-            .get("/" + bucket + "/" + key)
-        .then()
-            .statusCode(expectedStatus == 403 ? 404 : 200);
+                given()
+                    .filter(S3RequestSigner.signedAs(LEGACY_ACCESS_KEY_ID, LEGACY_SECRET_KEY))
+                .when()
+                    .get("/" + bucket + "/" + key)
+                .then()
+                    .statusCode(expectedStatus == 403 ? 404 : 200);
+            } finally {
+                kms.scheduleKeyDeletion(request -> request.keyId(keyArn).pendingWindowInDays(7));
+            }
+        }
     }
 
         @ParameterizedTest

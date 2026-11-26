@@ -135,7 +135,7 @@ class DynamoDbPartitionedItemStoreTest {
     void expiredItemsTheSweeperRemovesStayRemovedAfterARestart() {
         service.updateTimeToLive("Nodes", "expires", true, REGION);
         ObjectNode expired = item("node-1", "beat-1");
-        expired.set("expires", mapper.createObjectNode().put("N", "1"));
+        expired.set("expires", mapper.createObjectNode().put("N", String.valueOf(Instant.now().getEpochSecond() - 3600)));
         service.putItem("Nodes", expired, REGION);
         service.putItem("Nodes", item("node-2", "beat-1"), REGION);
 
@@ -152,7 +152,7 @@ class DynamoDbPartitionedItemStoreTest {
         DynamoDbService swept = new DynamoDbService(tableStore, openItemStore(), resolver, streams, null);
         swept.updateTimeToLive("Nodes", "expires", true, REGION);
         ObjectNode expired = item("node-1", "beat-1");
-        expired.set("expires", mapper.createObjectNode().put("N", "1"));
+        expired.set("expires", mapper.createObjectNode().put("N", String.valueOf(Instant.now().getEpochSecond() - 3600)));
         swept.putItem("Nodes", expired, REGION);
         // The REMOVE event fires after the sweeper drops the item and releases its lock: the
         // moment a new write of the same key can land before the removal reaches disk.

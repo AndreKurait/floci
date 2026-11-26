@@ -151,8 +151,10 @@ class AutoScalingCapacitySuspensionTest {
                 suspensionThread.set(Thread.currentThread());
                 service.suspendProcesses(REGION, "suspended-group", allProcesses ? List.of() : List.of(process));
             });
-            await().atMost(Duration.ofSeconds(5)).until(() -> suspension.isDone()
-                    || suspensionThread.get() != null && suspensionThread.get().getState() == Thread.State.BLOCKED);
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> suspension.isDone()
+                            || suspensionThread.get() != null && suspensionThread.get().getState() == Thread.State.BLOCKED);
             assertFalse(suspension.isDone(), "Suspension must wait for the capacity operation it raced");
             workers.submit(() -> service.suspendProcesses(REGION, "unrelated-group", List.of(process)))
                     .get(5, TimeUnit.SECONDS);
