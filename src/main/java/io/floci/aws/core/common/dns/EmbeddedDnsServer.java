@@ -62,8 +62,8 @@ import java.util.regex.Pattern;
  * inside Lambda containers without requiring wildcard Docker aliases.
  *
  * When floci.dns.spoof-aws-endpoints is enabled, every AWS partition suffix and all of its
- * subdomains resolve to Floci's IP as well (transparent endpoint injection), so
- * clients built with explicit real-AWS endpoints land on the emulator.
+ * subdomains resolve to Floci as well. With public AWS API routing enabled, known VPC
+ * clients receive the managed public destination, so their native routes still govern access.
  *
  * Also answers for any name a {@link DnsRecordSource} owns, which is how a service that holds
  * a private DNS zone (Cloud Map) gets real records rather than only API responses.
@@ -130,6 +130,7 @@ public class EmbeddedDnsServer {
     private final Iterable<DnsRecordSource> recordSources;
     private final Iterable<DnsForwardingRuleSource> forwardingRuleSources;
     private final Iterable<DnsClientVpcSource> clientVpcSources;
+    private boolean publicAwsApi;
 
     EmbeddedDnsServer(List<String> suffixes) {
         this(suffixes, List.of());
@@ -183,6 +184,16 @@ public class EmbeddedDnsServer {
                 .map(EmbeddedDnsServer::authoritativeSuffix).distinct().toList();
     }
 
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources);
+        this.publicAwsApi = publicAwsApi;
+        if (publicAwsApi) {
+            this.suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+        }
+    }
+
     @Inject
     public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
                              Instance<DnsRecordSource> recordSources,
@@ -228,6 +239,8 @@ public class EmbeddedDnsServer {
         LocalStackParity.withDnsSuffixes(config.dns().extraSuffixes()).ifPresent(suffixes::addAll);
         if (config.dns().spoofAwsEndpoints()) {
             suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+            publicAwsApi = config.network().vpcRouting().enabled()
+                    && config.network().vpcRouting().publicAwsApi();
             if (shouldWarnSpoofInvisibleToTls(true, TlsConfigSource.tlsEnabledVisibleToTls(),
                     TlsConfigSource.spoofAwsEndpointsVisibleToTls())) {
                 LOG.warnv("floci.dns.spoof-aws-endpoints is set in application config but the TLS certificate only reads it from FLOCI_DNS_SPOOF_AWS_ENDPOINTS or -Dfloci.dns.spoof-aws-endpoints; https:// calls to {0} will fail the handshake until it is set there.", TlsConfigSource.awsEndpointSuffixes());
@@ -504,7 +517,10 @@ public class EmbeddedDnsServer {
         DnsClientVpcSource.ClientVpc origin = vpcForClient(clientAddress).orElse(null);
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp, origin);
         boolean authoritative = hasAuthoritativeSuffix(name);
-        Optional<DnsAnswer> emulatorName = authoritative ? Optional.empty() : resolveEmulatorName(name, myIp, type);
+        boolean routedApi = publicAwsApi && origin != null && TlsConfigSource.awsEndpointSuffixes().stream()
+                .anyMatch(suffix -> DomainNames.isWithin(name.toLowerCase(Locale.ROOT), suffix));
+        Optional<DnsAnswer> emulatorName = authoritative ? Optional.empty() : resolveEmulatorName(name,
+                routedApi ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }

@@ -158,6 +158,47 @@ final class VpcRoutingCommands {
         return script.append(nft(rules.toString())).toString();
     }
 
+    static String publicApi(String publicAddress, String backendAddress, int backendPort,
+                            String publicDevice, List<Hop> callers) {
+        String external = VpcRouteSelection.ipv4(publicAddress);
+        String backend = VpcRouteSelection.ipv4(backendAddress);
+        String outside = device(publicDevice);
+        if (backendPort < 1 || backendPort > 65535 || external.equals(backend)) {
+            throw new IllegalArgumentException("Public AWS APIs require a distinct backend and one TCP port");
+        }
+        StringBuilder script = new StringBuilder("set -eu\nip -4 route flush default dev ")
+                .append(outside).append("\nip -4 route flush proto 186\n")
+                .append("ip -4 address replace ").append(external).append("/32 dev lo\n");
+        StringBuilder rules = new StringBuilder("""
+                add table inet floci_public_api
+                add chain inet floci_public_api ingress { type filter hook input priority -5; policy drop; }
+                add chain inet floci_public_api egress { type filter hook output priority -5; policy drop; }
+                flush chain inet floci_public_api ingress
+                flush chain inet floci_public_api egress
+                add rule inet floci_public_api ingress iifname lo counter accept
+                add rule inet floci_public_api egress oifname lo counter accept
+                """)
+                .append("add rule inet floci_public_api ingress ip saddr ").append(backend)
+                .append(" tcp sport ").append(backendPort).append(" ct state established,related counter accept\n")
+                .append("add rule inet floci_public_api egress ip daddr ").append(backend)
+                .append(" tcp dport ").append(backendPort).append(" counter accept\n");
+        for (Hop caller : callers) {
+            if (!outside.equals(caller.device()) || !caller.replyOnly()) {
+                throw new IllegalArgumentException("Public API return routes require the public interface");
+            }
+            script.append("ip -4 route replace ").append(caller.destination()).append("/32 via ")
+                    .append(caller.gateway()).append(" dev ").append(outside)
+                    .append(" src ").append(external).append(" proto 186\n");
+            rules.append("add rule inet floci_public_api ingress iifname \"").append(outside)
+                    .append("\" ip saddr ").append(caller.destination()).append(" ip daddr ").append(external)
+                    .append(" tcp dport { 80, 443 } counter accept\n")
+                    .append("add rule inet floci_public_api egress oifname \"").append(outside)
+                    .append("\" ip saddr ").append(external).append(" ip daddr ").append(caller.destination())
+                    .append(" tcp sport { 80, 443 } ct state established,related counter accept\n");
+        }
+        return script.append(nft(rules.toString())).toString();
+    }
+
     static String device(String value) {
         Objects.requireNonNull(value, "Network device");
         if (!value.matches("[a-zA-Z0-9_.-]+") || "lo".equals(value)) {
