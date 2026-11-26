@@ -78,11 +78,20 @@ class MemoryDbParameterGroupValidationIntegrationTest {
                     + "\"ParameterNameValues\":[{\"ParameterName\":\"timeout\",\"ParameterValue\":\"20\"},"
                     + "{\"ParameterName\":\"slowlog-max-len\",\"ParameterValue\":9}]}")
                     .then().using().defaultParser(JSON).statusCode(400);
+            assertEquals(baseline, post("DescribeParameters", Map.of("ParameterGroupName", name))
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString());
+            post("UpdateParameterGroup", Map.of("ParameterGroupName", name, "ParameterNameValues",
+                    List.of(Map.of("ParameterName", "timeout", "ParameterValue", "20"))))
+                    .then().using().defaultParser(JSON).statusCode(200);
+            String updated = post("DescribeParameters", Map.of("ParameterGroupName", name))
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString();
             post("ResetParameterGroup", Map.of("ParameterGroupName", name, "AllParameters", "true"))
                     .then().using().defaultParser(JSON).statusCode(400);
+            assertEquals(updated, post("DescribeParameters", Map.of("ParameterGroupName", name))
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString());
             post("ResetParameterGroup", Map.of("ParameterGroupName", name, "ParameterNames", List.of(1)))
                     .then().using().defaultParser(JSON).statusCode(400);
-            assertEquals(baseline, post("DescribeParameters", Map.of("ParameterGroupName", name))
+            assertEquals(updated, post("DescribeParameters", Map.of("ParameterGroupName", name))
                     .then().using().defaultParser(JSON).statusCode(200).extract().body().asString());
             post("ListTags", Map.of("ResourceArn", arn)).then().using().defaultParser(JSON).statusCode(200)
                     .body("TagList[0].Value", equalTo("retained"));

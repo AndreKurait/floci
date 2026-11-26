@@ -1,5 +1,6 @@
 package io.floci.aws.services.memorydb;
 
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.testing.ValidateSignaturesProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -62,7 +63,7 @@ class MemoryDbParameterGroupIntegrationTest {
                     "default.memorydb-valkey7", "default.memorydb-redis7.search",
                     "default.memorydb-valkey7.search"), defaults);
             for (ParameterGroup group : groups) {
-                assertEquals("arn:aws:memorydb:us-east-1:000000000000:parametergroup/" + group.name(), group.arn());
+                assertGroupArn(group);
                 assertNotNull(group.description());
                 assertNotNull(group.family());
             }
@@ -227,7 +228,7 @@ class MemoryDbParameterGroupIntegrationTest {
                 assertEquals(lower, group.name());
                 assertEquals(" ", group.description());
                 assertEquals("memorydb_redis6", group.family());
-                assertEquals("arn:aws:memorydb:us-east-1:000000000000:parametergroup/" + lower, group.arn());
+                assertGroupArn(group);
                 assertEquals(group, client.describeParameterGroups(request -> request.parameterGroupName(upper))
                         .parameterGroups().getFirst());
                 assertThrows(ParameterGroupAlreadyExistsException.class, () -> client.createParameterGroup(request ->
@@ -252,6 +253,15 @@ class MemoryDbParameterGroupIntegrationTest {
         assertFalse(result.isEmpty());
         assertEquals(new ArrayList<>(result.keySet()), names);
         return result;
+    }
+
+    private static void assertGroupArn(ParameterGroup group) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(group.arn());
+        assertFalse(arn.partition().isBlank());
+        assertEquals("memorydb", arn.service());
+        assertEquals("us-east-1", arn.region());
+        assertEquals("000000000000", arn.accountId());
+        assertEquals("parametergroup/" + group.name(), arn.resource());
     }
 
     private static ParameterNameValue value(String name, String value) {
