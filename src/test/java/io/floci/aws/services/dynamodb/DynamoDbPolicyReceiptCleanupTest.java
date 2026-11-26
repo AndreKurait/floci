@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.services.applicationautoscaling.ApplicationAutoScalingClient;
@@ -98,6 +99,12 @@ class DynamoDbPolicyReceiptCleanupTest {
         exercise(suite, false, "none", true, true);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract", "Clock"})
+    void recoveredDeleteStillReportsUnansweredExchange(String suite) throws Exception {
+        exercise(suite, false, "unanswered");
+    }
+
     private void exercise(String suite, boolean incomplete, String deletion) throws Exception {
         exercise(suite, incomplete, deletion, false);
     }
@@ -185,7 +192,7 @@ class DynamoDbPolicyReceiptCleanupTest {
             if (deletion.equals("absent")) {
                 when(dynamo.describeTable(ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any()))
                         .thenThrow(absent);
-            } else if (deletion.equals("recover") || deletion.equals("acknowledged") || deletion.equals("deleting")) {
+            } else if (deletion.equals("recover") || deletion.equals("unanswered") || deletion.equals("acknowledged") || deletion.equals("deleting")) {
                 when(dynamo.describeTable(ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any()))
                         .thenReturn(DescribeTableResponse.builder().table(owned).build())
                         .thenReturn(DescribeTableResponse.builder().table(deletion.equals("deleting")
@@ -199,7 +206,7 @@ class DynamoDbPolicyReceiptCleanupTest {
             if (deletion.equals("acknowledged")) {
                 when(dynamo.deleteTable(ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any()))
                         .thenReturn(DeleteTableResponse.builder().build());
-            } else {
+            } else if (!deletion.equals("unanswered")) {
                 when(dynamo.deleteTable(ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any()))
                         .thenThrow(SdkClientException.create("Delete received no response"))
                         .thenReturn(DeleteTableResponse.builder().build());
@@ -214,6 +221,19 @@ class DynamoDbPolicyReceiptCleanupTest {
             row.put("responseBase64", "e30=");
         }
         calls.add(row);
+        if (deletion.equals("unanswered")) {
+            when(dynamo.deleteTable(ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any()))
+                    .thenAnswer(invocation -> {
+                        Map<String, Object> attempt = new LinkedHashMap<>();
+                        attempt.put("operation", "DeleteTable");
+                        calls.add(attempt);
+                        if (calls.size() == 2) {
+                            throw SdkClientException.create("Transmitted delete received no response");
+                        }
+                        attempt.put("responseBase64", "e30=");
+                        return DeleteTableResponse.builder().build();
+                    });
+        }
         String directory = switch (suite) {
             case "Workload" -> "dynamodb-policy-workload-wire";
             case "ReadAdmission" -> "dynamodb-policy-read-admission-wire";
@@ -239,6 +259,13 @@ class DynamoDbPolicyReceiptCleanupTest {
                 assertEquals(2, suppressed.size());
                 assertTrue(suppressed.stream().anyMatch(failure -> failure instanceof AssertionError
                         && failure.getMessage().contains("Every attempted exchange")));
+            } else if (deletion.equals("unanswered")) {
+                InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
+                        () -> teardown.invoke(fixture));
+                AssertionError aggregate = assertInstanceOf(AssertionError.class, thrown.getCause());
+                assertEquals(1, aggregate.getSuppressed().length);
+                AssertionError receiptFailure = assertInstanceOf(AssertionError.class, aggregate.getSuppressed()[0]);
+                assertTrue(receiptFailure.getMessage().contains("Every attempted exchange"));
             } else if (alarmFailure) {
                 InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
                         () -> teardown.invoke(fixture));
@@ -263,12 +290,21 @@ class DynamoDbPolicyReceiptCleanupTest {
             }
             if (!deletion.equals("none")) {
                 int deletions = switch (deletion) {
-                    case "recover" -> 2;
+                    case "recover", "unanswered" -> 2;
                     case "absent" -> 0;
                     default -> 1;
                 };
-                verify(dynamo, times(deletions)).deleteTable(
-                        ArgumentMatchers.<Consumer<DeleteTableRequest.Builder>>any());
+                ArgumentCaptor<Consumer<DeleteTableRequest.Builder>> requests = ArgumentCaptor.captor();
+                verify(dynamo, times(deletions)).deleteTable(requests.capture());
+                for (Consumer<DeleteTableRequest.Builder> action : requests.getAllValues()) {
+                    DeleteTableRequest.Builder request = DeleteTableRequest.builder();
+                    action.accept(request);
+                    assertEquals(table, request.build().tableName(), "Every deletion must target the reserved table");
+                }
+                if (deletion.equals("recover") || deletion.equals("unanswered")) {
+                    verify(dynamo, times(3)).describeTable(
+                            ArgumentMatchers.<Consumer<DescribeTableRequest.Builder>>any());
+                }
             }
             verify(dynamo).close();
             verify(metrics).close();
@@ -276,7 +312,15 @@ class DynamoDbPolicyReceiptCleanupTest {
                 verify(scaling).close();
             }
             JsonNode saved = new ObjectMapper().readTree(receipt.toFile());
-            assertEquals(1, saved.get("calls").size());
+            assertEquals(deletion.equals("unanswered") ? 3 : 1, saved.get("calls").size());
+            if (deletion.equals("unanswered")) {
+                JsonNode unanswered = saved.get("calls").get(1);
+                JsonNode retry = saved.get("calls").get(2);
+                assertEquals("DeleteTable", unanswered.get("operation").asText());
+                assertFalse(unanswered.has("responseBase64"));
+                assertEquals("DeleteTable", retry.get("operation").asText());
+                assertTrue(retry.has("responseBase64"));
+            }
             assertEquals(!incomplete, saved.get("calls").get(0).has("responseBase64"));
             assertEquals(alarmFailure ? cachedAlarm ? 3 : 2 : incomplete || deletion.equals("replacement") ? 1 : 0,
                     saved.get("observations").get("cleanupFailures").size());
