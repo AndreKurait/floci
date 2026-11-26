@@ -1679,9 +1679,8 @@ public class ContainerLifecycleManager {
     /**
      * Like {@link #resolveEndpoint(String, int)}, but prefers the container's address on
      * {@code preferredNetwork}, as {@link #createAndStart} does with the spec's network. A
-     * container that publishes ports is created on the default bridge and connected to its
-     * service network after start, so without a preference the bridge address, which Floci
-     * usually cannot reach, can be returned instead.
+     * container attached to several networks must be reached through its service network,
+     * rather than whichever address Docker happens to list first.
      */
     public EndpointInfo resolveEndpoint(String containerId, int containerPort, String preferredNetwork) {
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
@@ -1845,6 +1844,9 @@ public class ContainerLifecycleManager {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
+        if (!linux.networkSysctls().isEmpty()) {
+            hostConfig.withSysctls(linux.networkSysctls());
+        }
         List<Capability> capDrop = new ArrayList<>();
         List<Capability> capAdd = capabilities(linux.capAdd());
         if ("true".equals(ContainerStorageHelper.labelValue(
@@ -1941,9 +1943,8 @@ public class ContainerLifecycleManager {
                     spec.name(), spec.networkMode(), spec.portBindings().keySet());
         }
 
-        // Network mode: set during creation unless the container connects after start (see
-        // connectsAfterStart). host, none and container:<id> publish nothing and cannot be
-        // connected after creation, so they always go on the HostConfig.
+        // Native routing pins protected namespace owners before start. Other published
+        // services retain the Docker Desktop port-mapping path selected by connectsAfterStart.
         if (spec.networkMode() != null && !spec.networkMode().isBlank() && !connectsAfterStart(spec)) {
             hostConfig.withNetworkMode(spec.networkMode());
         }
@@ -2056,16 +2057,15 @@ public class ContainerLifecycleManager {
         return resolved;
     }
 
-    /**
-     * Whether a container joins its network only after it starts. On Docker Desktop, naming the
-     * network at creation together with port bindings suppresses the published ports, so a
-     * container that publishes ports is created on the default bridge and connected afterwards.
-     * Any other daemon publishes them on the named network, so the container is created there and
-     * joins it alone. A daemon that cannot be asked is treated as Docker Desktop, and the answer is
-     * kept either way, so a container's create and its start always take the same path.
-     */
+    /** Pins native routing namespaces while retaining Desktop port publishing elsewhere. */
     private boolean connectsAfterStart(ContainerSpec spec) {
-        return spec.publishesPorts() && isDockerDesktop();
+        EmulatorConfig.NetworkConfig network = config.network();
+        boolean nativeRouting = network != null && network.vpcRouting() != null && network.vpcRouting().enabled();
+        boolean protectedNamespace = "true".equals(ContainerStorageHelper.labelValue(spec.labels(),
+                ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL)) || !spec.linuxOptions().networkSysctls().isEmpty();
+        return spec.publishesPorts()
+                && !(nativeRouting && protectedNamespace)
+                && isDockerDesktop();
     }
 
     private boolean isDockerDesktop() {

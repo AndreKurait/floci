@@ -188,6 +188,9 @@ floci:
   port: 4566
   base-url: "http://localhost:4566"
   network:
+    vpc-routing:
+      enabled: false
+      public-aws-api: false
     security-group-enforcement:
       enabled: false
       helper-image: floci/network-helper:local
@@ -320,6 +323,11 @@ floci:
     # Via env var (comma-separated): FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud,other.internal
     # extra-suffixes:
     #   - localhost.localstack.cloud
+
+    # Serve these suffixes from resource records or scoped VPC forwarding rules only.
+    # Unknown names return NXDOMAIN; wildcard spoofing and upstream recursion do not apply.
+    # authoritative-suffixes:                     # FLOCI_DNS_AUTHORITATIVE_SUFFIXES
+    #   - resources.example
 
     # Public resolvers appended after Floci's embedded DNS on spawned containers' HostConfig.Dns,
     # and used as the fallback upstream for Floci's own DNS forwarder. Lets Lambda/CodeBuild
@@ -518,6 +526,7 @@ floci:
       ephemeral: false
       # Extra Docker create flags for Lambda containers, for example: --env KEY=VALUE --volume /host:/container:ro
       docker-flags: ""
+      # additional-docker-networks: []         # FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS: existing networks joined before start
       ecr-base-uri: public.ecr.aws            # FLOCI_SERVICES_LAMBDA_ECR_BASE_URI — registry for Lambda runtime images (legacy: floci.ecr-base-uri / FLOCI_ECR_BASE_URI)
       # runtime-images:                   # Optional full references keyed by runtime or runtime.os.arch
       #   "python3.12": "public.ecr.aws/lambda/python:3.12@sha256:<digest>"
@@ -890,6 +899,7 @@ floci:
         # so Floci instances sharing a daemon never reconcile each other's networks).
         reconcile-on-startup: true                # FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP
         driver: bridge                            # FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER
+        internal: false                           # FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL
     ecs:
       enabled: true
       mock: false
@@ -1010,6 +1020,8 @@ floci:
     elb:
       enabled: true
       mock: false
+      vpc-frontends: false
+      proxy-image: haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b
     elbv2:
       enabled: true
       mock: false

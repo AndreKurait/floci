@@ -144,6 +144,18 @@ public interface EmulatorConfig {
 
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
+        VpcRoutingConfig vpcRouting();
+    }
+
+    interface VpcRoutingConfig {
+        String PUBLIC_AWS_API_ADDRESS = "192.0.2.1";
+
+        @WithDefault("false")
+        boolean enabled();
+
+        /** Routes spoofed AWS API names from known VPC clients through their public NAT gateways. */
+        @WithDefault("false")
+        boolean publicAwsApi();
     }
 
     interface SecurityGroupEnforcementConfig {
@@ -211,6 +223,13 @@ public interface EmulatorConfig {
          * </pre>
          */
         Optional<List<String>> extraSuffixes();
+
+        /**
+         * Suffixes served only from live resource records or a matching VPC forwarding rule.
+         * Unknown names return NXDOMAIN instead of wildcard spoofing or upstream recursion.
+         * Env: {@code FLOCI_DNS_AUTHORITATIVE_SUFFIXES}, comma-separated.
+         */
+        Optional<List<String>> authoritativeSuffixes();
 
         /**
          * When {@code true} (default), the configured {@link #containerFallbackServers()} are
@@ -3734,6 +3753,14 @@ public interface EmulatorConfig {
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
 
+        /**
+         * Additional existing Docker networks joined before a Lambda container starts.
+         * The primary network remains selected by docker-network or docker-flags.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
+
         /** Additional Docker create flags applied to every Lambda execution container. */
         Optional<String> dockerFlags();
 
@@ -4158,6 +4185,14 @@ public interface EmulatorConfig {
         /** Docker network driver for VPC networks. */
         @WithDefault("bridge")
         String driver();
+
+        /**
+         * Create internal Docker VPC networks without external connectivity through that network.
+         * Other guest attachments retain their own connectivity.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL}.
+         */
+        @WithDefault("false")
+        boolean internal();
     }
 
     interface AppConfigServiceConfig {
@@ -4230,6 +4265,13 @@ public interface EmulatorConfig {
         /** When true, no health check is ever probed and a registered instance is InService at once. */
         @WithDefault("false")
         boolean mock();
+
+        /** Serve supported Classic frontends inside their own protected VPC namespaces. */
+        @WithDefault("false")
+        boolean vpcFrontends();
+
+        @WithDefault("haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b")
+        String proxyImage();
     }
 
     interface ElbV2ServiceConfig {
