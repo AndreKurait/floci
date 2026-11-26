@@ -95,7 +95,7 @@ class Ec2ImageSharingServiceTest {
         Instance restored = launcher.runInstances(REGION, captured.getImageId(), "m6g.large", 1, 1,
                 null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
         ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
-        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
+        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any(), any());
         ResolvedAmiImage original = new AmiImageResolver(catalog).resolveImage("ami-catalog-worker");
         assertEquals(new ResolvedAmiImage("example/legacy-capture:1", original.guestRuntime(),
                 original.cloudInit(), original.dockerPlatform(), original.volumeMounts()), runtime.getValue());
@@ -169,7 +169,7 @@ class Ec2ImageSharingServiceTest {
         assertEquals(root.getSize(), restoredRoot.getSize());
         assertEquals(root.getVolumeType(), restoredRoot.getVolumeType());
         ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
-        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
+        verify(manager).launch(eq(restored), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any(), any());
         ResolvedAmiImage original = new AmiImageResolver(catalog).resolveImage("ami-catalog-worker");
         assertEquals(new ResolvedAmiImage("example/captured:1", original.guestRuntime(),
                 original.cloudInit(), original.dockerPlatform(), original.volumeMounts()), runtime.getValue());
@@ -196,7 +196,7 @@ class Ec2ImageSharingServiceTest {
                 null, List.of(), null, null, List.of(), "native user data", null).getInstances().getFirst();
 
         ArgumentCaptor<ResolvedAmiImage> runtime = ArgumentCaptor.forClass(ResolvedAmiImage.class);
-        verify(manager).launch(eq(instance), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any());
+        verify(manager).launch(eq(instance), runtime.capture(), any(), eq(REGION), any(), any(), any(), any(), any(), any());
         assertEquals(new AmiImageResolver(catalog).resolveImage("ami-catalog-worker"), runtime.getValue());
         assertEquals("example/worker:1", runtime.getValue().dockerImage());
         assertEquals("arm64", instance.getArchitecture());

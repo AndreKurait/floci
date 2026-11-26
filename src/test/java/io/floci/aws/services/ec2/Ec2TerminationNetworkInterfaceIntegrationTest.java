@@ -68,7 +68,7 @@ class Ec2TerminationNetworkInterfaceIntegrationTest {
         doAnswer(call -> {
             call.<Instance>getArgument(0).setState(InstanceState.running());
             return null;
-        }).when(containerManager).launch(any(), any(), any(), anyString(), any(), any(), any(), any(), any());
+        }).when(containerManager).launch(any(), any(), any(), anyString(), any(), any(), any(), any(), any(), any());
         doAnswer(call -> {
             Instance instance = call.getArgument(0);
             Runnable callback = call.getArgument(1);

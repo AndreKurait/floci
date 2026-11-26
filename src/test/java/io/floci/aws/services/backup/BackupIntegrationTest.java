@@ -2105,7 +2105,7 @@ class BackupIntegrationTest {
                 .body("{\"BackupVaultName\": \"%s\", \"ResourceArn\": \"%s\", \"IamRoleArn\": \"%s\"}"
                         .formatted(vault, RESOURCE_ARN, IAM_ROLE))
                 .when().put("/backup-jobs").then().statusCode(200).extract().path("BackupJobId");
-        awaitJobCompleted(regionJobId);
+        completeJob(regionJobId);
         String point = given().header("Authorization", AUTH).when().get("/backup-jobs/" + regionJobId)
                 .then().statusCode(200).extract().path("RecoveryPointArn");
         given().header("Authorization", EU_AUTH).contentType("application/json").body("{}")

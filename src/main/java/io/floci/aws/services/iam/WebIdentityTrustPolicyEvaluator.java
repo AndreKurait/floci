@@ -76,12 +76,24 @@ public class WebIdentityTrustPolicyEvaluator {
 
     public boolean allows(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
                           Map<String, List<String>> claims) {
-        return allows(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, null);
+        return allows(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, null, Map.of());
+    }
+
+    public boolean allows(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
+                          Map<String, List<String>> claims, String roleSessionName) {
+        return allows(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, roleSessionName, Map.of());
     }
 
     public boolean allowsAction(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
                                 Map<String, List<String>> claims, String roleSessionName, String action) {
-        return allows(action, trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, roleSessionName);
+        return allowsAction(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, roleSessionName,
+                action, Map.of());
+    }
+
+    public boolean allowsAction(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
+                                Map<String, List<String>> claims, String roleSessionName, String action,
+                                Map<String, List<String>> roleTags) {
+        return allows(action, trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, roleSessionName, roleTags);
     }
 
     private boolean allows(String action, String trustPolicyDocument, String oidcProviderArn,

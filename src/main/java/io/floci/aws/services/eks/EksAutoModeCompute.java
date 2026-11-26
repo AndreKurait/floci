@@ -28,6 +28,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -89,19 +90,26 @@ public class EksAutoModeCompute implements EksAutoModeCleanup {
     private final IamService iam;
     private final Ec2InstanceTypeCatalog instanceTypes;
     private final EmulatorConfig config;
+    private final Clock clock;
     private Duration terminationWait = TERMINATION_WAIT;
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "eks-auto-mode-compute"));
 
-    @Inject
     public EksAutoModeCompute(EksService eksService, EksClusterManager clusterManager, Ec2Service ec2,
                               IamService iam, Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config) {
+        this(eksService, clusterManager, ec2, iam, instanceTypes, config, Clock.systemUTC());
+    }
+
+    @Inject
+    public EksAutoModeCompute(EksService eksService, EksClusterManager clusterManager, Ec2Service ec2,
+                              IamService iam, Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config, Clock clock) {
         this.eksService = eksService;
         this.clusterManager = clusterManager;
         this.ec2 = ec2;
         this.iam = iam;
         this.instanceTypes = instanceTypes;
         this.config = config;
+        this.clock = clock;
     }
 
     /** For tests: how long a deleted cluster waits for its instances to terminate. */
@@ -170,7 +178,7 @@ public class EksAutoModeCompute implements EksAutoModeCleanup {
             String nodeName = clusterManager.deriveInstanceNodeName(instance, region);
             JsonNode node = nodesByName.get(nodeName);
             boolean starting = instance.getLaunchTime() == null
-                    || instance.getLaunchTime().plus(REGISTRATION_WAIT).isAfter(Instant.now());
+                    || instance.getLaunchTime().plus(REGISTRATION_WAIT).isAfter(clock.instant());
             boolean joining = node == null && starting;
             if (node == null && !joining) {
                 neverRegistered.add(instance);

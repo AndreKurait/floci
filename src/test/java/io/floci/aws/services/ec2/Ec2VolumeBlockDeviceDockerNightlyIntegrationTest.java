@@ -83,6 +83,9 @@ class Ec2VolumeBlockDeviceDockerNightlyIntegrationTest {
     @InjectSpy
     Ec2Service ec2Service;
 
+    @InjectSpy
+    SecurityGroupFirewallManager firewall;
+
     @Inject
     Ec2VolumeBlockDeviceManager volumeBlockDeviceManager;
 
@@ -820,6 +823,9 @@ class Ec2VolumeBlockDeviceDockerNightlyIntegrationTest {
 
     @Test
     void volumeALaunchCreatesIsABlockDeviceByTheTimeTheInstanceRuns() {
+        // Raw block devices require a privileged guest; enforced guests use prepared filesystem mounts.
+        when(firewall.enabled()).thenReturn(false);
+        when(images.resolveImage("ami-alpine")).thenReturn(ResolvedAmiImage.minimal("alpine:3.21"));
         LaunchTemplateData.Ebs ebs = new LaunchTemplateData.Ebs();
         ebs.setVolumeSize(1);
         ebs.setDeleteOnTermination(true);

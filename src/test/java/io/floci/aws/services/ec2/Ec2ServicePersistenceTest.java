@@ -100,10 +100,10 @@ class Ec2ServicePersistenceTest {
         Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
         AtomicReference<Runnable> completion = new AtomicReference<>();
         doAnswer(invocation -> {
-            completion.set(invocation.getArgument(8));
+            completion.set(invocation.getArgument(9));
             return null;
         }).when(containers).launch(any(), any(ResolvedAmiImage.class), isNull(), eq(REGION),
-                any(Ec2PortForwardManager.DesiredPorts.class), anyList(), anyMap(), any(), any());
+                any(Ec2PortForwardManager.DesiredPorts.class), anyList(), anyMap(), any(), any(), any());
         Ec2Service original = newService(dir, containers);
         Instance launched = original.runInstances(REGION, "ami-0abcdef1234567890", "t3.micro",
                 1, 1, null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
@@ -347,10 +347,10 @@ class Ec2ServicePersistenceTest {
         Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
         AtomicReference<Runnable> completion = new AtomicReference<>();
         doAnswer(invocation -> {
-            completion.set(invocation.getArgument(8));
+            completion.set(invocation.getArgument(9));
             return null;
         }).when(containers).launch(any(), any(ResolvedAmiImage.class), isNull(), eq(REGION),
-                any(Ec2PortForwardManager.DesiredPorts.class), anyList(), anyMap(), any(), any());
+                any(Ec2PortForwardManager.DesiredPorts.class), anyList(), anyMap(), any(), any(), any());
         Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
         Ec2ImageCatalog catalog = new Ec2ImageCatalog();
         InMemoryStorageFactory stores = new InMemoryStorageFactory("000000000000")

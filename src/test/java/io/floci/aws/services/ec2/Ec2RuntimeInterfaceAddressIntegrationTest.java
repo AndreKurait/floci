@@ -52,9 +52,9 @@ class Ec2RuntimeInterfaceAddressIntegrationTest {
             host.setDockerContainerId("runtime-interface-sdk");
             host.setState(InstanceState.running());
             Ec2ContainerManager.exposeReachablePrivateAddress(host, "172.17.0.81", false);
-            call.getArgument(8, Runnable.class).run();
+            call.getArgument(9, Runnable.class).run();
             return null;
-        }).when(manager).launch(any(), any(), any(), anyString(), any(Ec2PortForwardManager.DesiredPorts.class), anyList(), anyMap(), any(), any());
+        }).when(manager).launch(any(), any(), any(), anyString(), any(Ec2PortForwardManager.DesiredPorts.class), anyList(), anyMap(), any(), any(), any());
         doAnswer(call -> {
             Instance host = call.getArgument(0);
             host.setState(InstanceState.running());

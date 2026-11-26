@@ -5,6 +5,7 @@ import io.floci.aws.services.iam.AssumeRolePolicyEvaluator.TrustDecision;
 import io.floci.aws.services.iam.model.IamRole;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -508,6 +509,19 @@ class AssumeRolePolicyEvaluatorTest {
         assertFalse(evaluator.allowsService(role, "lambda.amazonaws.com", null, null));
         role.setAssumeRolePolicyDocument(serviceTrust("{\"StringEquals\":{\"iam:ResourceTag/team\":\"Data\"}}"));
         assertTrue(evaluator.allowsService(role, "lambda.amazonaws.com", null, null));
+    }
+
+    @Test
+    void serviceTrustCombinesRoleTagsWithTheExplicitRequestTime() {
+        Instant requestTime = Instant.parse("2025-01-02T03:04:05Z");
+        IamRole role = new IamRole("id", "tagged", "/", "arn:aws:iam::000000000000:role/tagged",
+                serviceTrust("{\"StringEquals\":{\"aws:ResourceTag/Team\":\"data\"},"
+                        + "\"DateEquals\":{\"aws:CurrentTime\":\"2025-01-02T03:04:05Z\"}}"));
+        role.setTags(Map.of("team", "data"));
+        assertTrue(evaluator.allowsService(role, "lambda.amazonaws.com", null, null, requestTime));
+        assertFalse(evaluator.allowsService(role, "lambda.amazonaws.com", null, null, requestTime.plusSeconds(1)));
+        role.setTags(Map.of("team", "other"));
+        assertFalse(evaluator.allowsService(role, "lambda.amazonaws.com", null, null, requestTime));
     }
 
     private static String serviceTrust(String condition) {

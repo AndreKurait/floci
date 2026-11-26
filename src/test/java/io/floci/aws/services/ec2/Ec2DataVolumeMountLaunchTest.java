@@ -125,7 +125,7 @@ class Ec2DataVolumeMountLaunchTest {
 
     private ResolvedAmiImage launchedImage() {
         ArgumentCaptor<ResolvedAmiImage> resolved = ArgumentCaptor.forClass(ResolvedAmiImage.class);
-        verify(containerManager).launch(any(), resolved.capture(), any(), eq(REGION), any(), any(), any(), any(),
+        verify(containerManager).launch(any(), resolved.capture(), any(), eq(REGION), any(), any(), any(), any(), any(),
                 any());
         return resolved.getValue();
     }

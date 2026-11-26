@@ -43,12 +43,22 @@ public class SAMLTrustPolicyEvaluator {
     }
 
     public boolean allows(String document, String providerArn, Map<String, List<String>> claims) {
-        return allows(document, providerArn, claims, null);
+        return allows(document, providerArn, claims, null, Map.of());
+    }
+
+    public boolean allows(String document, String providerArn, Map<String, List<String>> claims,
+                          String roleSessionName) {
+        return allows(document, providerArn, claims, roleSessionName, Map.of());
     }
 
     public boolean allowsAction(String document, String providerArn, Map<String, List<String>> claims,
                                 String roleSessionName, String action) {
-        return allows(action, document, providerArn, claims, roleSessionName);
+        return allowsAction(document, providerArn, claims, roleSessionName, action, Map.of());
+    }
+
+    public boolean allowsAction(String document, String providerArn, Map<String, List<String>> claims,
+                                String roleSessionName, String action, Map<String, List<String>> roleTags) {
+        return allows(action, document, providerArn, claims, roleSessionName, roleTags);
     }
 
     private boolean allows(String action, String document, String providerArn,
