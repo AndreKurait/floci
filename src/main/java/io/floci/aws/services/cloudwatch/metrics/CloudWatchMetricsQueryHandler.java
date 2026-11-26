@@ -152,10 +152,11 @@ public class CloudWatchMetricsQueryHandler {
             }
             statistics.add(stat);
         }
+        List<String> selected = MetricPercentiles.selection(statistics, alarmMembers(params, "ExtendedStatistics"));
 
         List<CloudWatchMetricsService.Datapoint> datapoints =
                 metricsService.getMetricStatistics(namespace, metricName, dimensions,
-                        startTime, endTime, period, statistics, unit, region);
+                        startTime, endTime, period, selected, unit, region);
 
         DateTimeFormatter fmt = DateTimeFormatter.ISO_INSTANT;
         XmlBuilder xml = new XmlBuilder()
@@ -177,6 +178,12 @@ public class CloudWatchMetricsQueryHandler {
             }
             if (statistics.contains("SampleCount")) {
                 xml.elem("SampleCount", String.valueOf(dp.sampleCount()));
+            }
+            if (!dp.extendedStatistics().isEmpty()) {
+                xml.start("ExtendedStatistics");
+                dp.extendedStatistics().forEach((statistic, value) -> xml.start("entry")
+                        .elem("key", statistic).elem("value", value.toString()).end("entry"));
+                xml.end("ExtendedStatistics");
             }
             xml.elem("Unit", dp.unit()).end("member");
         }
@@ -255,7 +262,9 @@ public class CloudWatchMetricsQueryHandler {
             }
 
             queries.add(new CloudWatchMetricsService.MetricDataQuery(
-                    id, metricStat, expression, label, returnData));
+                    id, metricStat, expression, label, returnData,
+                    params.containsKey(prefix + ".Period") ? parseIntParam(params, prefix + ".Period", 0) : null,
+                    params.getFirst(prefix + ".AccountId")));
         }
         return queries;
     }
@@ -828,6 +837,7 @@ public class CloudWatchMetricsQueryHandler {
         a.setNamespace(params.getFirst("Namespace"));
         a.setStatistic(params.getFirst("Statistic"));
         a.setExtendedStatistic(params.getFirst("ExtendedStatistic"));
+        a.setEvaluateLowSampleCountPercentile(params.getFirst("EvaluateLowSampleCountPercentile"));
         a.setMetrics(parseAlarmMetricQueries(params));
         a.setPeriod(a.getMetrics().isEmpty() ? parseIntParam(params, "Period", 60) : null);
         a.setUnit(params.getFirst("Unit"));
@@ -933,7 +943,8 @@ public class CloudWatchMetricsQueryHandler {
         xml.elem("EvaluationPeriods", String.valueOf(a.getEvaluationPeriods()))
                 .elem("Threshold", String.valueOf(a.getThreshold()))
                 .elem("ComparisonOperator", a.getComparisonOperator())
-                .elem("TreatMissingData", a.getTreatMissingData());
+                .elem("TreatMissingData", a.getTreatMissingData())
+                .elem("EvaluateLowSampleCountPercentile", a.getEvaluateLowSampleCountPercentile());
         // Only an alarm the caller gave an M for carries the member, matching what AWS returns.
         if (a.getDatapointsToAlarm() != null) {
             xml.elem("DatapointsToAlarm", String.valueOf(a.getDatapointsToAlarm()));
