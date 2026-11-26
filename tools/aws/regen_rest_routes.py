@@ -75,6 +75,7 @@ MODELS: dict[str, str] = {
     "controlcatalog": "controlcatalog",
     "controltower": "controltower",
     "dsql": "dsql",
+    "efs": "elasticfilesystem",
     "eks": "eks",
     "emr-containers": "emr-containers",
     "emr-serverless": "emr-serverless",
