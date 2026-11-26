@@ -634,6 +634,7 @@ public class CloudWatchMetricsService implements Resettable {
         }
         Alarm previous = alarmStore.get(region + "::" + name).orElse(null);
         ObjectNode before = previous == null ? null : snapshot(previous);
+        long now = clock.instant().getEpochSecond();
         if (previous != null) {
             if (!previous.getClass().equals(alarm.getClass())) {
                 throw new AwsException("ValidationError", "An alarm of another type already has this name", 400);
@@ -645,13 +646,14 @@ public class CloudWatchMetricsService implements Resettable {
             alarm.setStateTransitionedTimestamp(previous.getStateTransitionedTimestamp());
             alarm.setTags(new HashMap<>(previous.getTags()));
         } else {
-            alarm.setStateTransitionedTimestamp(alarm.getStateUpdatedTimestamp());
+            alarm.setStateUpdatedTimestamp(now);
+            alarm.setStateTransitionedTimestamp(now);
         }
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + name));
         }
         alarm.setRegion(region);
-        alarm.setAlarmConfigurationUpdatedTimestamp(clock.instant().getEpochSecond());
+        alarm.setAlarmConfigurationUpdatedTimestamp(now);
         alarmStore.put(region + "::" + name, alarm);
         ObjectNode after = snapshot(alarm);
         ObjectNode data = MAPPER.createObjectNode().put("version", "1.0");
