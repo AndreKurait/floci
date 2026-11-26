@@ -266,6 +266,19 @@ class EventBridgeReplayIntegrationTest {
 
     @Test
     @Order(11)
+    void completedReplayCannotBeCancelled() {
+        given()
+                .contentType(EB_CT)
+                .header("X-Amz-Target", "AWSEvents.CancelReplay")
+                .body("{\"ReplayName\":\"test-replay-1\"}")
+                .when().post("/")
+                .then().statusCode(400)
+                .body("__type", equalTo("IllegalStatusException"))
+                .body("message", equalTo("Replay test-replay-1 is not in a valid state for this operation."));
+    }
+
+    @Test
+    @Order(12)
     void updateArchive() {
         given()
                 .contentType(EB_CT)
@@ -292,7 +305,7 @@ class EventBridgeReplayIntegrationTest {
     }
 
     @Test
-    @Order(12)
+    @Order(13)
     void deleteArchive() {
         given()
                 .contentType(EB_CT)
@@ -311,7 +324,7 @@ class EventBridgeReplayIntegrationTest {
     }
 
     @Test
-    @Order(13)
+    @Order(14)
     void missingReplayUsesAwsResourceNotFoundStatus() {
         given()
                 .contentType(EB_CT)
@@ -323,7 +336,7 @@ class EventBridgeReplayIntegrationTest {
     }
 
     @Test
-    @Order(14)
+    @Order(15)
     void updateArchiveKeepsTheFieldsTheRequestOmits() {
         createPartialUpdateArchive("partial-keep-archive");
 
@@ -339,7 +352,7 @@ class EventBridgeReplayIntegrationTest {
     }
 
     @Test
-    @Order(15)
+    @Order(16)
     void updateArchiveClearsTheDescriptionAndPatternGivenAsEmptyStrings() {
         createPartialUpdateArchive("partial-clear-archive");
 
@@ -355,7 +368,7 @@ class EventBridgeReplayIntegrationTest {
     }
 
     @Test
-    @Order(16)
+    @Order(17)
     void updateArchiveSetsAnExplicitZeroRetention() {
         createPartialUpdateArchive("partial-zero-archive");
 
