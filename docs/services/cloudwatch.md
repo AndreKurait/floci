@@ -492,7 +492,17 @@ invalid values and non-object statistics return `InvalidParameterValue`; combini
 statistics returns `InvalidParameterCombination`. JSON bodies use the corresponding SDK exception
 shape names. `Values` accepts 1 to 150 numeric samples with optional matching, nonnegative
 `Counts`; omitted counts default to one. The public JSON and Query APIs normalize these weighted
-samples without expanding their counts and reject combinations with `Value` or `StatisticValues`.
+samples without expanding their counts. A `StatisticValues` set sent with `Values` summarizes the same
+distribution and is not counted again. Combining `Value` and `Values` is rejected.
+
+Set `FLOCI_SERVICES_CLOUDWATCHMETRICS_PACK_WEIGHTED_VALUES=true`
+(`floci.services.cloudwatchmetrics.pack-weighted-values`, default `false`) to store a multi-value
+batch in one record and reduce its retained memory. Queries reconstruct the per-value distribution.
+Scalar metrics and single-value batches keep the existing record format.
+
+Packed records require a reader that understands their sample arrays. Disabling the option changes
+future writes only; it does not convert existing packed records. Keep a compatible reader for storage
+written while this option was enabled.
 The console's supported numeric values use the same bounds.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
@@ -608,6 +618,28 @@ Alarms stored before Floci recorded it report their last state update.
 `StateReason` and 4000 characters for `StateReasonData` before changing alarm state.
 Length checks count Unicode code points and preserve empty and whitespace values.
 
+### Percentile statistics and alarms
+
+The current Query and JSON APIs, and `AWS::CloudWatch::Alarm`, preserve a single metric's
+`ExtendedStatistic`, such as `p50` or `p90`. The evaluator uses that percentile, and the usual
+`TreatMissingData` policy applies when a period has no eligible samples. An update can switch
+between `Statistic` and `ExtendedStatistic`; specifying both, or combining an extended statistic
+with `Metrics`, is rejected before changing the alarm.
+
+`GetMetricStatistics` accepts either `Statistics` or `ExtendedStatistics`, with up to ten
+percentiles from `p0` through `p100`, and returns the latter in each datapoint's
+`ExtendedStatistics` map. `GetMetricData` accepts the same percentiles in `MetricStat.Stat`.
+Floci computes weighted nearest-rank percentiles from nonnegative scalar samples and statistic
+sets whose minimum and maximum are equal and whose sum agrees with the sample count.
+It does not expand repeated samples in memory. Periods containing negative values or statistic
+sets with an unrecoverable distribution have no percentile datapoint. Exact AWS interpolation
+and precision have not been qualified.
+
+Omitted `EvaluateLowSampleCountPercentile` and explicit `evaluate` are supported. The `ignore`
+policy is rejected because suppression for statistically insignificant samples is not implemented.
+Other extended statistics, such as trimmed means, and the console API's `ExtendedStatistics`
+request shape remain unsupported.
+
 ### Composite alarm evaluation
 
 A composite alarm is evaluated when it is created, when `PutCompositeAlarm` updates it, and when
@@ -657,7 +689,8 @@ single-metric `Trigger`; durable retries, FIFO topics, and metric-math payloads 
 ### Metric-math alarm definitions
 
 `PutMetricAlarm` stores the `Metrics` query definitions and `DescribeAlarms` returns them over
-both JSON and Query protocols. Expressions, labels, `ReturnData`, account IDs, query periods,
+both JSON and Query protocols. `AWS::CloudWatch::Alarm` resolves and stores the same definitions.
+Expressions, labels, `ReturnData`, account IDs, query periods,
 and nested metric statistics (including dimensions and units) survive storage reloads.
 Metric-math alarm responses omit the single-metric fields, including top-level `Period`.
 Updating an alarm replaces its metric definition, so changing between `Metrics` and a single

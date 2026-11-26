@@ -2587,6 +2587,9 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        @WithDefault("false")
+        boolean packWeightedValues();
+
         /**
          * Upper bound on the datapoints kept per account in each namespace a service publishes by
          * itself, such as AWS/SQS. Every datapoint is its own entry in a store that is held in memory
