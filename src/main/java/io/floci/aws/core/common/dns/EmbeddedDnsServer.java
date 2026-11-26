@@ -17,6 +17,7 @@ import io.vertx.core.buffer.Buffer;
 import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
 import io.vertx.core.net.NetServer;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -27,6 +28,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.DatagramPacket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -121,6 +123,7 @@ public class EmbeddedDnsServer {
     public static final List<String> BUILTIN_SUFFIXES = List.of(DEFAULT_SUFFIX, LOCALSTACK_SUFFIX);
 
     private volatile String serverIp;
+    private Listeners listeners;
     private final SequencedSet<String> suffixes = new LinkedHashSet<>();
     private List<String> authoritativeSuffixes = List.of();
     private volatile List<String> upstreamDnsServers = List.of();
@@ -201,12 +204,30 @@ public class EmbeddedDnsServer {
                              Instance<DnsClientVpcSource> clientVpcSources,
                              CurrentContainerNetworkResolver currentContainer,
                              DockerBridgeAddress dockerBridge) {
+        this(config, containerDetector, vertx, recordSources, forwardingRuleSources, clientVpcSources,
+                currentContainer, dockerBridge, DNS_PORT);
+    }
+
+    EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
+                      Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources,
+                      CurrentContainerNetworkResolver currentContainer,
+                      DockerBridgeAddress dockerBridge, int port) {
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
         authoritativeSuffixes = config.dns().authoritativeSuffixes().orElse(List.of()).stream()
                 .map(EmbeddedDnsServer::authoritativeSuffix).distinct().toList();
+        boolean explicit = config.dns().listenAddress().isPresent();
         try {
+            if (explicit) {
+                prepare(config);
+                String address = resolveServerIp(config, currentContainer);
+                listeners = startListeners(vertx, address, port);
+                LOG.infov("Embedded DNS UDP and TCP servers started on {0}:{1}", address, port);
+                return;
+            }
             if (containerDetector.isRunningInContainer()) {
                 prepare(config);
                 if (config.dns().hostPort().isPresent()) {
@@ -226,7 +247,14 @@ public class EmbeddedDnsServer {
                 listenForHost(vertx, hostPort.getAsInt());
             }
             bridge.ifPresent(address -> listenForContainers(vertx, address, true));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while starting the embedded DNS listeners", e);
         } catch (Exception e) {
+            if (explicit) {
+                throw new IllegalStateException("Cannot start DNS at floci.dns.listen-address="
+                        + config.dns().listenAddress().orElseThrow(), e);
+            }
             LOG.warnv("Failed to initialize embedded DNS server: {0}", e.getMessage());
         }
     }
@@ -250,8 +278,10 @@ public class EmbeddedDnsServer {
 
     private void listenForContainers(Vertx vertx, String address, boolean onDockerBridge) {
         Future<Listeners> bound = listenAll(vertx, address, DNS_PORT)
-                .onSuccess(socket -> LOG.infov(
-                        "Embedded DNS server started on {0}:53, resolving {1} → {0}", address, suffixes))
+                .onSuccess(boundListeners -> {
+                    listeners = boundListeners;
+                    LOG.infov("Embedded DNS server started on {0}:53, resolving {1} → {0}", address, suffixes);
+                })
                 .onFailure(error -> {
                     if (onDockerBridge) {
                         LOG.infov("Embedded DNS server could not listen on the Docker bridge at {0}:53 ({1}), so "
@@ -296,6 +326,55 @@ public class EmbeddedDnsServer {
                         LOOPBACK, String.valueOf(port), error.getMessage()));
     }
 
+    int listenerPort() {
+        return listeners == null ? -1 : listeners.udp().localAddress().port();
+    }
+
+    private Listeners startListeners(Vertx vertx, String address, int port) throws Exception {
+        Future<Listeners> opening = listenAll(vertx, address, port);
+        try {
+            return opening.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        } catch (Exception failure) {
+            opening.onSuccess(bound -> {
+                serverIp = null;
+                bound.close();
+            });
+            throw failure;
+        }
+    }
+
+    @PreDestroy
+    void stop() {
+        serverIp = null;
+        if (listeners != null) {
+            try {
+                listeners.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while stopping the embedded DNS listeners", failure);
+            } catch (Exception failure) {
+                throw new IllegalStateException("Cannot stop the embedded DNS listeners", failure);
+            }
+            listeners = null;
+        }
+        if (forwardPool != null) {
+            forwardPool.close();
+        }
+    }
+
+    static String resolveServerIp(EmulatorConfig config, CurrentContainerNetworkResolver networkResolver)
+            throws UnknownHostException {
+        Optional<String> configured = config.dns().listenAddress();
+        if (configured.isPresent()) {
+            InetAddress address = InetAddress.ofLiteral(configured.get());
+            if (!(address instanceof Inet4Address) || address.isAnyLocalAddress() || address.isMulticastAddress()) {
+                throw new IllegalArgumentException("floci.dns.listen-address must be a concrete local IPv4 address");
+            }
+            return address.getHostAddress();
+        }
+        return ownAddress(networkResolver);
+    }
+
     public Optional<String> getServerIp() {
         return Optional.ofNullable(serverIp);
     }
@@ -324,7 +403,7 @@ public class EmbeddedDnsServer {
 
     record Listeners(DatagramSocket udp, NetServer tcp) {
         Future<Void> close() {
-            return udp.close().compose(ignored -> tcp.close());
+            return Future.join(udp.close(), tcp.close()).mapEmpty();
         }
     }
 
