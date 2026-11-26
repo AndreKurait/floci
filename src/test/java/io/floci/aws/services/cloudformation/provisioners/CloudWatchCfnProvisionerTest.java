@@ -30,6 +30,7 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** {@code AWS::CloudWatch::Alarm}. */
@@ -139,6 +140,44 @@ class CloudWatchCfnProvisionerTest {
 
         assertEquals(5, alarm.getEvaluationPeriods());
         assertEquals(2, alarm.getDatapointsToAlarm());
+    }
+
+    @Test
+    void metricQueriesRetainTheirPercentilesAndExpressionsWithoutASingleMetricPeriod() {
+        MetricAlarm alarm = provisionAndCapture("""
+                {"AlarmName": "latency", "Metrics": [
+                  {"Id": "sample", "ReturnData": false, "MetricStat": {
+                    "Metric": {"Namespace": "Example", "MetricName": "Latency"},
+                    "Period": 60, "Stat": "p90"}},
+                  {"Id": "scaled", "Expression": "sample * 2", "ReturnData": true}
+                ]}
+                """);
+        assertNull(alarm.getPeriod());
+        assertEquals(2, alarm.getMetrics().size());
+        assertEquals("p90", alarm.getMetrics().getFirst().metricStat().stat());
+        assertEquals("Example", alarm.getMetrics().getFirst().metricStat().metric().namespace());
+        assertEquals("sample * 2", alarm.getMetrics().getLast().expression());
+        assertTrue(alarm.getMetrics().getLast().returnData());
+    }
+
+    @Test
+    void metricsMustBeAnArrayBeforeCallingTheService() {
+        for (String metricsJson : List.of("{}", "1", "\"invalid\"")) {
+            AwsException refused = assertThrows(AwsException.class, () -> provisionAndCapture(
+                    "{\"AlarmName\": \"latency\", \"Metrics\": " + metricsJson + "}"));
+            assertEquals("InvalidParameterValue", refused.getErrorCode());
+            assertEquals("Metrics must be a list.", refused.getMessage());
+        }
+        verifyNoInteractions(metrics);
+    }
+
+    @Test
+    void extendedStatisticAndMetricQueriesAreRejectedBeforeCallingTheService() {
+        assertThrows(AwsException.class, () -> provisionAndCapture("""
+                {"AlarmName": "latency", "ExtendedStatistic": "p90",
+                 "Metrics": [{"Id": "sample", "Expression": "1"}]}
+                """));
+        verifyNoInteractions(metrics);
     }
 
     /** ActionsEnabled is true on AWS unless explicitly disabled, so an absent property means true. */

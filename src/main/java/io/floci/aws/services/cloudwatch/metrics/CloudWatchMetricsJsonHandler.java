@@ -306,12 +306,15 @@ public class CloudWatchMetricsJsonHandler {
         if (statsNode.isArray()) {
             statsNode.forEach(s -> statistics.add(s.asText()));
         }
+        List<String> extended = new ArrayList<>();
+        request.path("ExtendedStatistics").forEach(stat -> extended.add(stat.asText()));
+        List<String> selected = MetricPercentiles.selection(statistics, extended);
 
         String unit = request.hasNonNull("Unit") ? request.path("Unit").asText() : null;
 
         List<CloudWatchMetricsService.Datapoint> datapoints =
                 metricsService.getMetricStatistics(namespace, metricName, dimensions,
-                        startTime, endTime, period, statistics, unit, region);
+                        startTime, endTime, period, selected, unit, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("Label", metricName);
@@ -324,6 +327,9 @@ public class CloudWatchMetricsJsonHandler {
             if (statistics.contains("Minimum")) dpNode.put("Minimum", dp.minimum());
             if (statistics.contains("Maximum")) dpNode.put("Maximum", dp.maximum());
             if (statistics.contains("SampleCount")) dpNode.put("SampleCount", dp.sampleCount());
+            if (!dp.extendedStatistics().isEmpty()) {
+                dpNode.set("ExtendedStatistics", objectMapper.valueToTree(dp.extendedStatistics()));
+            }
             dpNode.put("Unit", dp.unit());
         }
         return Response.ok(response).build();
@@ -336,6 +342,7 @@ public class CloudWatchMetricsJsonHandler {
         alarm.setNamespace(request.path("Namespace").asText(null));
         alarm.setStatistic(request.path("Statistic").asText(null));
         alarm.setExtendedStatistic(request.path("ExtendedStatistic").asText(null));
+        alarm.setEvaluateLowSampleCountPercentile(request.path("EvaluateLowSampleCountPercentile").asText(null));
         JsonNode metrics = request.path("Metrics");
         if (metrics.isArray()) {
             for (JsonNode query : metrics) {
@@ -473,6 +480,9 @@ public class CloudWatchMetricsJsonHandler {
             node.put("Threshold", a.getThreshold());
             if (a.getComparisonOperator() != null) node.put("ComparisonOperator", a.getComparisonOperator());
             if (a.getTreatMissingData() != null) node.put("TreatMissingData", a.getTreatMissingData());
+            if (a.getEvaluateLowSampleCountPercentile() != null) {
+                node.put("EvaluateLowSampleCountPercentile", a.getEvaluateLowSampleCountPercentile());
+            }
 
         }
         ArrayNode composites = response.putArray("CompositeAlarms");

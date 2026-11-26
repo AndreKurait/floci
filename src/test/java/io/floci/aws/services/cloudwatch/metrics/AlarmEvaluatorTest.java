@@ -180,7 +180,7 @@ class AlarmEvaluatorTest {
     }
 
     @Test
-    void skipsAlarmsConfiguredWithExtendedStatisticOnly() {
+    void evaluatesAlarmsConfiguredWithExtendedStatisticOnly() {
         MetricAlarm alarm = new MetricAlarm();
         alarm.setAlarmName("p99-only-alarm");
         alarm.setRegion(REGION);
@@ -194,8 +194,8 @@ class AlarmEvaluatorTest {
 
         assertDoesNotThrow(() -> evaluator.evaluate(alarm));
 
-        verify(metricsService, never()).getMetricStatistics(
-                any(), any(), any(), any(), any(), anyInt(), any(), any(), anyString());
+        verify(metricsService).getMetricStatistics(
+                any(), any(), any(), any(), any(), eq(300), eq(List.of("p99")), any(), eq(REGION));
     }
 
     @Test
