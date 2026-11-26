@@ -3675,6 +3675,24 @@ def test_a_resource_named_after_its_path_or_signed_for_is_checked():
         assert r._resource_problems("iam:Op", bad, types, USERS_FORMATS), bad
 
 
+@pytest.mark.parametrize("prefix", ["", "(Optional) "])
+def test_documented_resource_creator_account_is_read_only_for_non_creates(tmp_path, prefix):
+    service = model({"GetThing": {"ThingOwnerAWSAccountId": "String"},
+                     "CreateThing": {"ThingOwnerAWSAccountId": "String"},
+                     "GetOther": {"ThingOwnerAWSAccountId": "String"}})
+    for operation in ["GetThing", "CreateThing"]:
+        shape = service["operations"][operation]["input"]["shape"]
+        service["shapes"][shape]["members"]["ThingOwnerAWSAccountId"]["documentation"] = (
+            "<p>" + prefix + "The Amazon Web Services account ID of the account that created the thing.</p>")
+    shape = service["operations"]["GetOther"]["input"]["shape"]
+    service["shapes"][shape]["members"]["ThingOwnerAWSAccountId"]["documentation"] = (
+        "<p>The account to notify when this request completes.</p>")
+    write_models(tmp_path, {"svc": service})
+    models = r.load_models(tmp_path, {"svc"})
+    assert r.account_members(models, "GetThing") == ["ThingOwnerAWSAccountId"]
+    assert r.account_members(models, "CreateThing") == []
+    assert r.account_members(models, "GetOther") == []
+
 
 def reference_endpoint_model():
     return {"ec2": {"operations": {"CreateVpcEndpoint": {"output": {"shape": "Result"}}}, "shapes": {

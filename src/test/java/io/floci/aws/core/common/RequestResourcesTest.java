@@ -53,6 +53,42 @@ class RequestResourcesTest {
     };
 
     @Test
+    void sqsGetQueueUrlNamesTheOwnerAndIgnoresAnUnrelatedQueueUrl() {
+        String request = """
+                {"QueueName":"orders","QueueUrl":"http://localhost/111122223333/decoy",
+                 "QueueOwnerAWSAccountId":"111122223333"}
+                """;
+        assertEquals(List.of("arn:aws:sqs:us-east-1:111122223333:orders"),
+                of("sqs:GetQueueUrl", json(request)));
+        assertEquals(List.of("arn:aws:sqs:us-east-1:000000000000:orders"),
+                of("sqs:CreateQueue", json(request)));
+        assertEquals(List.of("arn:aws:sqs:us-east-1:111122223333:orders"),
+                of("sqs:GetQueueUrl", form("QueueName=orders&QueueOwnerAWSAccountId=111122223333")));
+    }
+
+    @Test
+    void sqsQueueOwnerDefaultsToTheCallerAndKeepsTheRequestPartition() {
+        for (String request : List.of("{\"QueueName\":\"orders\"}",
+                "{\"QueueName\":\"orders\",\"QueueOwnerAWSAccountId\":\"\"}",
+                "{\"QueueName\":\"orders\",\"QueueOwnerAWSAccountId\":null}")) {
+            assertEquals(List.of("arn:aws:sqs:us-east-1:000000000000:orders"),
+                    of("sqs:GetQueueUrl", json(request)));
+        }
+        assertEquals(List.of("arn:aws-us-gov:sqs:us-gov-west-1:111122223333:orders"),
+                RequestResources.of("sqs:GetQueueUrl",
+                        form("QueueName=orders&QueueOwnerAWSAccountId=111122223333"),
+                        "aws-us-gov", "us-gov-west-1", "000000000000"));
+    }
+
+    @Test
+    void sqsMalformedOwnerNamesNoResourceForTheHandlerToUse() {
+        assertEquals(List.of(), of("sqs:GetQueueUrl",
+                form("QueueName=orders&QueueOwnerAWSAccountId=not-an-account")));
+        assertEquals(List.of(), of("sqs:GetQueueUrl",
+                json("{\"QueueName\":\"orders\",\"QueueOwnerAWSAccountId\":\"not-an-account\"}")));
+    }
+
+    @Test
     void detachFindsBothAttachmentEndpointsAndKeepsTypedMissingFallbacks() {
         String prefix = "arn:aws:ec2:us-east-1:000000000000:";
         StoredResourceArns stored = mock(StoredResourceArns.class);

@@ -14,12 +14,21 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.sqs.SqsClient;
 
 import java.net.URI;
+import java.time.Duration;
+import java.util.Map;
 import java.util.UUID;
 
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
@@ -50,6 +59,50 @@ class SqsQueuePolicyEnforcementIntegrationTest {
     }
 
     @Test
+    void queueUrlLookupRequiresTheOwnersArnAndHonorsExplicitDeny() {
+        SqsTestQueue queue = queue();
+        queue.addPermission("url-scoped", OTHER, "GetQueueUrl");
+        String ownerOnly = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                 "Action":"sqs:GetQueueUrl","Resource":"%s"}]}
+                """.formatted(queue.arn());
+        ownerRequest(user(OTHER, ownerOnly), queue).statusCode(200).body(containsString(queue.url()));
+        String callerOnly = ownerOnly.replace(OWNER, OTHER);
+        ownerRequest(user(OTHER, callerOnly), queue).statusCode(403);
+        String denied = """
+                {"Version":"2012-10-17","Statement":[
+                 {"Effect":"Allow","Action":"sqs:GetQueueUrl","Resource":"*"},
+                 {"Effect":"Deny","Action":"sqs:GetQueueUrl","Resource":"%s"}]}
+                """.formatted(queue.arn());
+        ownerRequest(user(OTHER, denied), queue).statusCode(403);
+    }
+
+    @Test
+    void anEmptyOwnerUsesTheCallersQueueAndStillEnforcesItsPolicy() {
+        SqsTestQueue queue = queue();
+        String scoped = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                 "Action":"sqs:GetQueueUrl","Resource":"%s"}]}
+                """.formatted(queue.arn());
+        String allowed = user(OWNER, scoped);
+        String denied = user(OWNER, scoped.replace("\"Allow\"", "\"Deny\""));
+        ownerRequest(allowed, queue, "").statusCode(200).body(containsString(queue.url()));
+        jsonOwnerRequest(allowed, queue, "").statusCode(200).body("QueueUrl", is(queue.url()));
+        ownerRequest(denied, queue, "").statusCode(403);
+        jsonOwnerRequest(denied, queue, "").statusCode(400).body("__type", is("AccessDeniedException"));
+    }
+
+    @Test
+    void aMalformedOwnerNeverFallsBackToAnExistingCallersQueue() {
+        SqsTestQueue queue = queue();
+        String allowed = user(OWNER, READ_ONLY);
+        ownerRequest(allowed, queue, "not-an-account").statusCode(400)
+                .body(containsString("AWS.SimpleQueueService.NonExistentQueue"));
+        jsonOwnerRequest(allowed, queue, "not-an-account").statusCode(400)
+                .body("__type", is("QueueDoesNotExist"));
+    }
+
+    @Test
     void anotherAccountNeedsTheQueueToGrantIt() {
         SqsTestQueue queue = queue();
         String accessKey = user(OTHER, SEND);
@@ -59,6 +112,33 @@ class SqsQueuePolicyEnforcementIntegrationTest {
         queue.addPermission("from-other", OTHER, "SendMessage");
         send(accessKey, queue).statusCode(200);
         assertEquals("hello", queue.receive().getFirst().getBody());
+    }
+
+    @Test
+    void anotherAccountGetsTheQueueUrlByOwnerOnlyWhenTheQueueGrantsIt() {
+        // A producer in another account finds a queue it may send to by name and owner (QueueOwnerAWSAccountId),
+        // as an SDK client resolving a cross-account queue does.
+        SqsTestQueue queue = queue();
+        String name = "sqs-owner-" + UUID.randomUUID();
+        String authorization = auth(OTHER, REGION, "iam");
+        UserCredentials credentials = EnforcementFixtures.createUser(cleanup, baseUri.getPort(), authorization, name);
+        EnforcementFixtures.putUserPolicy(baseUri.getPort(), authorization, name, "p", READ_ONLY);
+
+        ownerRequest(credentials.accessKeyId(), queue).statusCode(403);
+
+        queue.addPermission("url-from-other", OTHER, "GetQueueUrl");
+        ownerRequest(credentials.accessKeyId(), queue).statusCode(200).body(containsString(queue.url()));
+        try (SqsClient client = SqsClient.builder().endpointOverride(baseUri).region(Region.of(REGION))
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(credentials.accessKeyId(), credentials.secretAccessKey())))
+                .httpClientBuilder(UrlConnectionHttpClient.builder())
+                .overrideConfiguration(config -> config.apiCallTimeout(Duration.ofSeconds(10)))
+                .build()) {
+            assertEquals(queue.url(), client.getQueueUrl(request -> request.queueName(queueName(queue))
+                    .queueOwnerAWSAccountId(OWNER)).queueUrl());
+        }
+        // The grant names GetQueueUrl only.
+        send(credentials.accessKeyId(), queue).statusCode(403);
     }
 
     @Test
@@ -91,6 +171,29 @@ class SqsQueuePolicyEnforcementIntegrationTest {
 
         queue.setPolicy(policy("Deny", "arn:aws:iam::" + OWNER + ":user/" + name, queue.arn()));
         send(accessKey, queue).statusCode(403);
+    }
+
+    private ValidatableResponse ownerRequest(String accessKey, SqsTestQueue queue) {
+        return ownerRequest(accessKey, queue, OWNER);
+    }
+
+    private ValidatableResponse ownerRequest(String accessKey, SqsTestQueue queue, String owner) {
+        return given().port(baseUri.getPort()).header("Authorization", auth(accessKey, "sqs"))
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "GetQueueUrl").formParam("Version", "2012-11-05")
+                .formParam("QueueName", queueName(queue)).formParam("QueueOwnerAWSAccountId", owner)
+                .post("/").then();
+    }
+
+    private ValidatableResponse jsonOwnerRequest(String accessKey, SqsTestQueue queue, String owner) {
+        return given().port(baseUri.getPort()).header("Authorization", auth(accessKey, "sqs"))
+                .header("X-Amz-Target", "AmazonSQS.GetQueueUrl").contentType("application/x-amz-json-1.0")
+                .body(Map.of("QueueName", queueName(queue), "QueueOwnerAWSAccountId", owner))
+                .post("/").then();
+    }
+
+    private static String queueName(SqsTestQueue queue) {
+        return queue.url().substring(queue.url().lastIndexOf('/') + 1);
     }
 
     private static String policy(String effect, String principal, String queueArn) {

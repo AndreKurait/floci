@@ -7079,7 +7079,7 @@
     "sqs:DeleteMessageBatch": {"action": "sqs:DeleteMessage", "types": ["queue"], "resources": [{"type": "queue", "fill": {}, "find": ["QueueUrl"]}]},
     "sqs:DeleteQueue": {"action": "sqs:DeleteQueue", "types": ["queue"], "resources": [{"type": "queue", "fill": {}, "find": ["QueueUrl"]}]},
     "sqs:GetQueueAttributes": {"action": "sqs:GetQueueAttributes", "types": ["queue"], "resources": [{"type": "queue", "fill": {}, "find": ["QueueUrl"]}]},
-    "sqs:GetQueueUrl": {"action": "sqs:GetQueueUrl", "types": ["queue"], "resources": [{"type": "queue", "fill": {"QueueName": "QueueName"}}]},
+    "sqs:GetQueueUrl": {"action": "sqs:GetQueueUrl", "types": ["queue"], "resources": [{"type": "queue", "fill": {"QueueName": "QueueName"}, "account": "QueueOwnerAWSAccountId"}]},
     "sqs:ListDeadLetterSourceQueues": {"action": "sqs:ListDeadLetterSourceQueues", "types": ["queue"], "resources": [{"type": "queue", "fill": {}, "find": ["QueueUrl"]}]},
     "sqs:ListMessageMoveTasks": {"action": "sqs:ListMessageMoveTasks", "types": ["queue"], "resources": [{"types": ["queue"], "arn": "SourceArn"}]},
     "sqs:ListQueueTags": {"action": "sqs:ListQueueTags", "types": ["queue"], "resources": [{"type": "queue", "fill": {}, "find": ["QueueUrl"]}]},
