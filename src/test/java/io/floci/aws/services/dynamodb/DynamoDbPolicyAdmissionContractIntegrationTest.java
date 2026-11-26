@@ -543,6 +543,8 @@ class DynamoDbPolicyAdmissionContractIntegrationTest {
         } finally {
             try {
                 wire.save();
+            } catch (Throwable failure) {
+                failures.add(failure);
             } finally {
                 if (dynamo != null) {
                     dynamo.close();
