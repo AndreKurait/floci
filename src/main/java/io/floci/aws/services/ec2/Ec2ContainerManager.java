@@ -784,6 +784,7 @@ public class Ec2ContainerManager {
                 }
                 recorded = true;
                 lifecycleManager.startCreated(containerId, spec);
+                refreshServiceNetworkIp(instance);
                 return new StartedContainer(containerId, sshHostPort);
             } catch (Exception e) {
                 synchronized (instance) {
@@ -1406,6 +1407,7 @@ public class Ec2ContainerManager {
             } catch (Exception e) {
                 LOG.warnv("Error stopping EC2 container {0}: {1}", containerId, e.getMessage());
             }
+            refreshPublicRouting(instance, null);
             if (instance.compareAndSetState(stopping, InstanceState.stopped())) {
                 persist(instance);
             }
@@ -1803,11 +1805,15 @@ public class Ec2ContainerManager {
         if (instance == null) {
             return null;
         }
-        if (config.services().ec2().publicIpFromServiceNetwork()) {
+        boolean nativePublicRouting = nativePublicRoutingEnabled();
+        if (config.services().ec2().publicIpFromServiceNetwork() || nativePublicRouting) {
             retryServiceNetworkIp(instance);
             String serviceNetworkIp = instance.getServiceNetworkIp();
             if (serviceNetworkIp != null && !serviceNetworkIp.isBlank()) {
                 return serviceNetworkIp;
+            }
+            if (nativePublicRouting) {
+                return null;
             }
         }
         String containerIp = instance.getContainerBridgeIp();
@@ -1898,13 +1904,21 @@ public class Ec2ContainerManager {
         }
     }
 
+    private boolean nativePublicRoutingEnabled() {
+        return vpcNetworkManager != null && vpcNetworkManager.enabled()
+                && config.network().securityGroupEnforcement().enabled()
+                && config.network().vpcRouting().enabled() && config.network().vpcRouting().publicAwsApi();
+    }
+
     private String resolveServiceNetworkIp(String instanceId, String containerId) {
-        if (!config.services().ec2().publicIpFromServiceNetwork() || !containerDetector.isRunningInContainer()
-                || containerId == null) {
+        boolean nativePublicRouting = nativePublicRoutingEnabled();
+        if (containerId == null || (!nativePublicRouting
+                && (!config.services().ec2().publicIpFromServiceNetwork()
+                || !containerDetector.isRunningInContainer()))) {
             return null;
         }
         Optional<String> network = containerBuilder.resolveDockerNetwork(Optional.empty());
-        if (network.isEmpty()) {
+        if (network.isEmpty() && !nativePublicRouting) {
             return null;
         }
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
@@ -1913,6 +1927,9 @@ public class Ec2ContainerManager {
         String helperId = namespaceOwnerId(inspect);
         if (helperId != null) {
             inspect = dockerClient.inspectContainerCmd(helperId).exec();
+        }
+        if (nativePublicRouting && (!config.services().ec2().publicIpFromServiceNetwork() || network.isEmpty())) {
+            return Ec2PublicAddressRouting.primaryAddress(inspect);
         }
         if (inspect.getNetworkSettings() == null || inspect.getNetworkSettings().getNetworks() == null) {
             return null;
@@ -1935,6 +1952,19 @@ public class Ec2ContainerManager {
         }
         instance.setPublicIpAddress(publicAddress);
         instance.setPublicDnsName("127.0.0.1".equals(publicAddress) ? "localhost" : publicAddress);
+        refreshPublicRouting(instance);
+    }
+
+    void refreshPublicRouting(Instance instance) {
+        refreshPublicRouting(instance, instance.getPublicIpAddress());
+    }
+
+    void refreshPublicRouting(Instance instance, String address) {
+        if (firewallManager != null && firewallManager.enabled()
+                && instance.getNetworkInterfaces() != null && !instance.getNetworkInterfaces().isEmpty()) {
+            firewallManager.publishPublicAddress(instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId(),
+                    address);
+        }
     }
 
     static void exposeReachablePrivateAddress(Instance instance, String privateIp) {

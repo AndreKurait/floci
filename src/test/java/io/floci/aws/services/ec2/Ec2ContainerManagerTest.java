@@ -1385,6 +1385,44 @@ class Ec2ContainerManagerTest {
         assertEquals("172.20.0.9", manager.reachablePublicAddress(instance));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nativePublicRoutingKeepsTheNamespacePublicAndPrivateAddressesDistinct(boolean inContainer) {
+        DockerClient docker = guestDocker(null, "172.20.0.9");
+        InspectContainerResponse helper = docker.inspectContainerCmd("helper-1").exec();
+        when(helper.getHostConfig()).thenReturn(HostConfig.newHostConfig().withNetworkMode("floci-net"));
+        Map<String, ContainerNetwork> networks = new LinkedHashMap<>();
+        networks.put("vpc", new ContainerNetwork().withIpv4Address("10.84.1.10"));
+        networks.put("floci-net", new ContainerNetwork().withIpv4Address("172.20.0.9"));
+        when(helper.getNetworkSettings().getNetworks()).thenReturn(networks);
+        Ec2ContainerManager manager = managerOnServiceNetwork(false, inContainer, docker,
+                mock(ExecutorService.class), mock(ExecutorService.class), true);
+        Instance instance = serviceNetworkInstance();
+        instance.setContainerBridgeIp("10.84.1.10");
+        instance.setPrivateIpAddress("10.84.1.10");
+
+        manager.refreshServiceNetworkIp(instance);
+
+        assertEquals("172.20.0.9", manager.reachablePublicAddress(instance));
+        assertEquals("10.84.1.10", instance.getPrivateIpAddress());
+        assertEquals("10.84.1.10", instance.getContainerBridgeIp());
+    }
+
+    @Test
+    void nativePublicRoutingDoesNotAdvertiseThePrivateAddressWhenThePrimaryAttachmentIsMissing() {
+        DockerClient docker = guestDocker(null, "172.20.0.9");
+        InspectContainerResponse helper = docker.inspectContainerCmd("helper-1").exec();
+        when(helper.getHostConfig()).thenReturn(HostConfig.newHostConfig().withNetworkMode("missing"));
+        Ec2ContainerManager manager = managerOnServiceNetwork(false, false, docker,
+                mock(ExecutorService.class), mock(ExecutorService.class), true);
+        Instance instance = serviceNetworkInstance();
+        instance.setContainerBridgeIp("10.84.1.10");
+
+        manager.refreshServiceNetworkIp(instance);
+
+        assertNull(manager.reachablePublicAddress(instance));
+    }
+
     @Test
     void reachablePublicAddressReportsTheRecordedAddressWithoutAskingDocker() {
         DockerClient docker = guestDocker("172.20.0.9", null);
@@ -1647,8 +1685,19 @@ class Ec2ContainerManagerTest {
     private static Ec2ContainerManager managerOnServiceNetwork(boolean enabled, boolean inContainer,
                                                                DockerClient docker, ExecutorService executor,
                                                                ExecutorService retryExecutor) {
+        return managerOnServiceNetwork(enabled, inContainer, docker, executor, retryExecutor, false);
+    }
+
+    private static Ec2ContainerManager managerOnServiceNetwork(boolean enabled, boolean inContainer,
+                                                               DockerClient docker, ExecutorService executor,
+                                                               ExecutorService retryExecutor, boolean nativeRouting) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ec2().publicIpFromServiceNetwork()).thenReturn(enabled);
+        when(config.network().securityGroupEnforcement().enabled()).thenReturn(nativeRouting);
+        when(config.network().vpcRouting().enabled()).thenReturn(nativeRouting);
+        when(config.network().vpcRouting().publicAwsApi()).thenReturn(nativeRouting);
+        VpcNetworkManager networks = mock(VpcNetworkManager.class);
+        when(networks.enabled()).thenReturn(nativeRouting);
         ContainerDetector detector = mock(ContainerDetector.class);
         when(detector.isRunningInContainer()).thenReturn(inContainer);
         ContainerBuilder builder = mock(ContainerBuilder.class);
@@ -1667,7 +1716,7 @@ class Ec2ContainerManagerTest {
                 mock(Ec2PortForwardManager.class),
                 mock(RegionResolver.class),
                 mock(ContainerNetworkReachability.class),
-                mock(VpcNetworkManager.class),
+                networks,
                 mock(ContainerReachableEndpoint.class),
                 new Ec2InstanceTypeCatalog(),
                 executor,
