@@ -22,14 +22,12 @@ import io.floci.aws.core.common.WebIdentityToken;
 import io.floci.aws.core.common.WebIdentityTokenVerifier;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.services.apigatewayv2.JwtSignatureVerifier;
-import io.floci.aws.services.cognitoidentity.CognitoIdentityCredentials;
 import io.floci.aws.services.iam.model.DelegationRequest;
 import io.floci.aws.services.iam.model.IamPolicy;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.OpenIDConnectProvider;
 import io.floci.aws.services.iam.model.OutboundWebIdentityFederation;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
@@ -91,16 +89,9 @@ public class StsQueryHandler {
     private final WebIdentityTokenIssuer tokenIssuer;
     private final RequestContext requestContext;
     private final Clock clock;
-    private final StsSessionTagAuthorizer sessionTagAuthorizer;
 
     /** CSPRNG for session secret keys and session tokens; ordinary IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
-
-    @Inject
-    Instance<CognitoIdentityCredentials> cognitoIdentities;
-
-    @Inject
-    RequestContext verifiedRequest;
 
     @Context
     HttpHeaders headers;
@@ -120,10 +111,10 @@ public class StsQueryHandler {
                            DelegationRequestService delegationRequestService,
                            CentralRootAccess centralRootAccess,
                            WebIdentityTokenIssuer tokenIssuer,
-                           RequestContext requestContext, StsSessionTagAuthorizer sessionTagAuthorizer) {
+                           RequestContext requestContext) {
         this(iamService, accountResolver, regionResolver, config, trustPolicyEvaluator, webIdentityTrustEvaluator,
                 tokenVerifier, oidcIssuerKeys, registeredIssuerKeys, samlProviderService, samlTrustEvaluator,
-                delegationRequestService, centralRootAccess, tokenIssuer, requestContext, sessionTagAuthorizer, Clock.systemUTC());
+                delegationRequestService, centralRootAccess, tokenIssuer, requestContext, Clock.systemUTC());
     }
 
     StsQueryHandler(IamService iamService, AccountResolver accountResolver, RegionResolver regionResolver,
@@ -138,7 +129,7 @@ public class StsQueryHandler {
                     CentralRootAccess centralRootAccess,
                     WebIdentityTokenIssuer tokenIssuer,
                     RequestContext requestContext,
-                    StsSessionTagAuthorizer sessionTagAuthorizer, Clock clock) {
+                    Clock clock) {
         this.iamService = iamService;
         this.accountResolver = accountResolver;
         this.regionResolver = regionResolver;
@@ -155,7 +146,6 @@ public class StsQueryHandler {
         this.tokenIssuer = tokenIssuer;
         this.requestContext = requestContext;
         this.clock = clock;
-        this.sessionTagAuthorizer = sessionTagAuthorizer;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params) {
@@ -201,12 +191,6 @@ public class StsQueryHandler {
         if (mfa.denial() != null) {
             return mfa.denial();
         }
-        String sourceIdentity = StsSourceIdentity.resolve(getParam(params, "SourceIdentity"),
-                iamService.findSourceIdentity(callerAccessKeyId(), callerSessionToken(params)));
-        Map<String, String> sessionTags = StsSessionTags.read(params);
-        Map<String, String> form = new LinkedHashMap<>();
-        params.keySet().forEach(key -> form.put(key, params.getFirst(key)));
-        List<String> transitiveKeys = StsSessionTags.transitiveKeys(form);
         String roleArn = getParam(params, "RoleArn");
         String sessionName = getParam(params, "RoleSessionName");
         int durationSeconds = getIntParam(params, "DurationSeconds", 3600);
@@ -228,8 +212,7 @@ public class StsQueryHandler {
         Map<String, String> inheritedTags = inheritedTransitiveTags("AssumeRole");
 
         IamRole role = iamService.findRole(accountId, roleName).orElse(null);
-        Response trustDenied = enforceTrustPolicy(roleArn, role, accountId, params, mfa,
-                inheritedTags, sourceIdentity);
+        Response trustDenied = enforceTrustPolicy(roleArn, role, accountId, params, mfa, inheritedTags);
         if (trustDenied != null) {
             return trustDenied;
         }
@@ -253,7 +236,6 @@ public class StsQueryHandler {
             return collision;
         }
 
-        Map<String, String> effectiveTags = StsSessionTags.inherit(sessionTags, inheritedTags);
         String sessionRoleArn = canonicalRoleArn(role, accountId, roleName);
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
         String assumedRoleId = assumedRoleId(role, sessionName);
@@ -263,30 +245,29 @@ public class StsQueryHandler {
         // these temporary credentials to the assumed role's account. The session records the
         // role's own ARN, path included: it is the session's aws:PrincipalArn, and it keeps naming
         // the role that issued the session even if a role of the same name replaces it later.
-        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
-                AwsArnUtils.parse(sessionRoleArn).partition(), iamService);
-        iamService.registerAssumeRoleSession(
-                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy.inline(), callerAccountId,
-                sessionName, assumedRoleId,
-                !sessionPolicy.managedArns().isEmpty(),
-                requestContext.getVerifiedSession(), effectiveTags,
-                StsSessionTags.transitive(sessionTags, transitiveKeys, inheritedTags), sourceIdentity,
-                sessionPolicy.managedArns());
-        List<String> carriedTransitiveKeys = new ArrayList<>(inheritedTags.keySet());
-        carriedTransitiveKeys.addAll(transitiveKeys);
-        iamService.recordSessionTags(accessKeyId, effectiveTags, carriedTransitiveKeys);
+        String sessionPolicy = getParam(params, "Policy");
+        iamService.registerSession(
+                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
+                sessionName, assumedRoleId);
+        // The tags inherited from the calling session are this session's own from here on, under
+        // the ones the request passes, and the keys they came in under stay transitive so the next
+        // session in the chain inherits them too: in the guide's chain the second session's
+        // inherited tags "continue to be transitive" without the second request naming them.
+        Map<String, String> sessionTags = new LinkedHashMap<>(inheritedTags);
+        sessionTags.putAll(requestTags(params));
+        List<String> transitiveKeys = new ArrayList<>(inheritedTags.keySet());
+        transitiveKeys.addAll(transitiveTagKeys(params));
+        iamService.recordSessionTags(accessKeyId, sessionTags, transitiveKeys);
 
-        XmlBuilder response = new XmlBuilder()
+        String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser")
                   .elem("Arn", assumedRoleArn)
                   .elem("AssumedRoleId", assumedRoleId)
                 .end("AssumedRoleUser")
-                .raw(sessionSizeXml("AssumeRole", assembledSession("AssumeRole", params, inheritedTags)));
-        if (sourceIdentity != null) {
-            response.elem("SourceIdentity", sourceIdentity);
-        }
-        return Response.ok(AwsQueryResponse.envelope("AssumeRole", AwsNamespaces.STS, response.build())).build();
+                .raw(sessionSizeXml("AssumeRole", assembledSession("AssumeRole", params, inheritedTags)))
+                .build();
+        return Response.ok(AwsQueryResponse.envelope("AssumeRole", AwsNamespaces.STS, result)).build();
     }
 
     /**
@@ -535,7 +516,7 @@ public class StsQueryHandler {
      */
     private Response enforceTrustPolicy(String roleArn, IamRole role, String roleAccountId,
                                         MultivaluedMap<String, String> params, MfaOutcome mfa,
-                                        Map<String, String> inheritedTags, String sourceIdentity) {
+                                        Map<String, String> inheritedTags) {
         String callerAccount = regionResolver.getAccountId();
         IamService.CallerArns caller = iamService.resolveCallerArns(callerAccessKeyId())
                 .orElseGet(() -> IamService.CallerArns.accountRoot(
@@ -558,20 +539,12 @@ public class StsQueryHandler {
                     "User: " + callerArn + " is not authorized to perform: sts:AssumeRole on resource: " + roleArn,
                     AwsNamespaces.STS, 403);
         }
-        if (params.containsKey("SerialNumber") || params.containsKey("TokenCode")) {
-            caller = iamService.authenticateRequestMfa(caller, params.getFirst("SerialNumber"),
-                    params.getFirst("TokenCode"), clock.instant());
-        }
         if (!config.services().iam().enforcementEnabled()) {
             return null;
         }
 
         Map<String, List<String>> trustContext = IamConditionContextResolver.withGlobalContext(
                 null, roleArn, regionResolver.getRegion(), callerAccount, roleAccountId);
-        trustContext.putAll(StsSessionTags.context(requestTags(params)));
-        if (sourceIdentity != null) {
-            trustContext.put("sts:SourceIdentity", List.of(sourceIdentity));
-        }
         trustContext.put("sts:RoleSessionName", List.of(getParam(params, "RoleSessionName")));
         String externalId = getParam(params, "ExternalId");
         if (externalId != null) {
@@ -602,17 +575,11 @@ public class StsQueryHandler {
         // carries, and where a base role's tags are passed on by STS "the trust policy must also
         // allow sts:TagSession", the refusal naming that action as this one does.
         if ((!requestTags(params).isEmpty() || !inheritedTags.isEmpty())
-                && !sessionTagAuthorizer.allows(callerAccessKeyId(), caller,
-                        callerAccount, role, trustContext)) {
+                && !trustPolicyEvaluator.allowsTagging(role.getAssumeRolePolicyDocument(), caller,
+                        callerAccount, trustContext)) {
             return AwsQueryResponse.error("AccessDenied", "User: " + callerArn
                     + " is not authorized to perform: " + AssumeRolePolicyEvaluator.TAG_SESSION_ACTION
                     + " on resource: " + roleArn, AwsNamespaces.STS, 403);
-        }
-        if (sourceIdentity != null && !sessionTagAuthorizer.allowsSourceIdentity(callerAccessKeyId(), caller,
-                callerAccount, role, trustContext)) {
-            return AwsQueryResponse.error("AccessDenied", "User: " + callerArn
-                    + " is not authorized to perform: sts:SetSourceIdentity on resource: " + roleArn,
-                    AwsNamespaces.STS, 403);
         }
         return null;
     }
@@ -712,8 +679,9 @@ public class StsQueryHandler {
                 .raw(sessionSizeXml("GetSessionToken", params))
                 .build();
         // No role ARN: the credentials route back to the caller's account and act as the caller.
-        iamService.registerVerifiedSessionToken(accessKeyId, secretKey, sessionToken, expiration,
-                regionResolver.getAccountId(), callerAccessKeyId(), mfa.authenticatedAt());
+        iamService.registerIssuedSession(accessKeyId, secretKey, sessionToken, null, expiration, null,
+                regionResolver.getAccountId(), callerAccessKeyId());
+        recordIssuedSessionMfa(accessKeyId, mfa);
         return Response.ok(AwsQueryResponse.envelope("GetSessionToken", AwsNamespaces.STS, result)).build();
     }
 
@@ -740,33 +708,8 @@ public class StsQueryHandler {
         String callerAccountId = regionResolver.getAccountId();
         String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
 
-        String tokenIssuer = tokenVerifier.peekIssuer(webIdentityToken).orElse(null);
-        RSAPublicKey issuerKey = tokenIssuer == null ? null : oidcIssuerKeys.findVerificationKey(tokenIssuer).orElse(null);
-        if (cognitoIdentities != null && cognitoIdentities.isResolvable()
-                && cognitoIdentities.get().recognizes(webIdentityToken, roleArn, issuerKey != null,
-                        hasRegisteredWebIdentityIssuer(tokenIssuer, roleArn, accountId))) {
-            if (params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns."))) {
-                return AwsQueryResponse.error("ValidationError",
-                        "Managed session-policy ARNs are not supported for Cognito token exchange.", AwsNamespaces.STS, 400);
-            }
-            try {
-                CognitoIdentityCredentials.Credentials issued = cognitoIdentities.get().assumeRole(
-                        webIdentityToken, roleArn, sessionName, durationSeconds, getParam(params, "Policy"),
-                        getIntParam(params, "MinimumSessionTokenSize", 0));
-                String result = new XmlBuilder()
-                        .raw(credentialsXml(issued.accessKeyId(), issued.secretKey(), issued.sessionToken(), issued.expiration()))
-                        .start("AssumedRoleUser").elem("Arn", issued.assumedRoleArn())
-                        .elem("AssumedRoleId", issued.assumedRoleId()).end("AssumedRoleUser")
-                        .elem("PackedPolicySize", "0").elem("Provider", issued.issuer())
-                        .elem("Audience", issued.audience()).elem("SubjectFromWebIdentityToken", issued.identityId()).build();
-                return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithWebIdentity", AwsNamespaces.STS, result)).build();
-            } catch (AwsException e) {
-                return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.STS, e.getHttpStatus());
-            }
-        }
-
         WebIdentityOutcome outcome = verifyWebIdentityToken(webIdentityToken, roleName, accountId, roleArn,
-                sessionName, tokenIssuer, issuerKey);
+                sessionName);
         if (outcome.denial() != null) {
             return outcome.denial();
         }
@@ -806,20 +749,18 @@ public class StsQueryHandler {
                 : (providerId != null && !providerId.isBlank() ? providerId : "accounts.google.com");
         String audience = verified != null ? verified.audience() : STS_AUDIENCE;
         String subject = verified != null ? verified.subject() : "web-identity-subject";
-        String sourceIdentity = verified != null ? verified.sourceIdentity() : null;
 
-        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
-                AwsArnUtils.parse(sessionRoleArn).partition(), iamService);
+        String sessionPolicy = getParam(params, "Policy");
         iamService.registerSession(
-                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy.inline(), callerAccountId,
-                sessionName, assumedRoleId, carriedTags,
-                StsSessionTags.transitive(carriedTags,
-                        verified != null ? verified.transitiveTagKeys() : List.of(), Map.of()), sourceIdentity,
-                sessionPolicy.managedArns());
+                accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
+                sessionName, assumedRoleId);
+        // The token's own claims, this operation declaring no Tags member: a session tag reaches it
+        // "in the JSON Web Token (JWT) when you submit the AssumeRoleWithWebIdentity request", and
+        // the keys to set as transitive arrive in the same namespace.
         iamService.recordSessionTags(accessKeyId, carriedTags,
                 verified != null ? verified.transitiveTagKeys() : List.of());
 
-        XmlBuilder result = new XmlBuilder()
+        String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser")
                   .elem("Arn", assumedRoleArn)
@@ -828,12 +769,9 @@ public class StsQueryHandler {
                 .raw(sessionSizeXml("AssumeRoleWithWebIdentity", session))
                 .elem("Provider", provider)
                 .elem("Audience", audience)
-                .elem("SubjectFromWebIdentityToken", subject);
-        if (sourceIdentity != null) {
-            result.elem("SourceIdentity", sourceIdentity);
-        }
-        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithWebIdentity", AwsNamespaces.STS,
-                result.build())).build();
+                .elem("SubjectFromWebIdentityToken", subject)
+                .build();
+        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithWebIdentity", AwsNamespaces.STS, result)).build();
     }
 
     private Response validateIamRoleArn(String roleArn) {
@@ -858,7 +796,7 @@ public class StsQueryHandler {
     /** The claims of a token Floci issued and verified, used to fill the response accurately. */
     private record VerifiedWebIdentity(String issuer, String subject, String audience,
                                        Map<String, String> principalTags,
-                                       List<String> transitiveTagKeys, String sourceIdentity) {}
+                                       List<String> transitiveTagKeys) {}
 
     private record WebIdentityOutcome(VerifiedWebIdentity verified, IamRole role, Response denial) {
 
@@ -874,44 +812,32 @@ public class StsQueryHandler {
         }
     }
 
-    /** Chooses the registered-provider verification path without treating the token as verified. */
-    private boolean hasRegisteredWebIdentityIssuer(String issuer, String roleArn, String accountId) {
-        if (issuer == null || !issuer.startsWith("https://") || !config.services().iam().enforcementEnabled()) {
-            return false;
-        }
-        String providerArn = AwsArnUtils.Arn.global(
-                AwsArnUtils.partitionOrDefault(roleArn, regionResolver.getPartition()),
-                "iam", accountId, "oidc-provider/" + stripScheme(issuer)).toString();
-        return iamService.findOpenIDConnectProvider(accountId, providerArn).isPresent();
-    }
-
     /**
      * Inspects {@code token} and decides whether it may assume {@code roleArn} as the session
      * {@code sessionName}, which the trust policy reads as {@code sts:RoleSessionName}.
      */
     private WebIdentityOutcome verifyWebIdentityToken(String token, String roleName, String roleAccountId,
-                                                      String roleArn, String sessionName,
-                                                      String tokenIssuer, RSAPublicKey localIssuerKey) {
-        String issuer = tokenIssuer;
-        if (issuer == null) {
+                                                      String roleArn, String sessionName) {
+        Optional<String> issuer = tokenVerifier.peekIssuer(token);
+        if (issuer.isEmpty()) {
             return config.services().iam().enforcementEnabled()
                     ? WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
                     "The web identity token does not identify a trusted issuer.", AwsNamespaces.STS, 400))
                     : WebIdentityOutcome.unverifiable();
         }
         Optional<IamRole> role = iamService.findRole(roleAccountId, roleName);
-        String issuerKeyPrefix = stripScheme(issuer);
+        String issuerKeyPrefix = stripScheme(issuer.get());
         // The provider is an IAM resource of the role's account, so it shares the role's partition.
         String oidcProviderArn = AwsArnUtils.Arn.global(
                 AwsArnUtils.partitionOrDefault(role.map(IamRole::getArn).orElse(roleArn),
                         regionResolver.getPartition()),
                 "iam", roleAccountId, "oidc-provider/" + issuerKeyPrefix).toString();
-        Optional<RSAPublicKey> key = Optional.ofNullable(localIssuerKey);
+        Optional<RSAPublicKey> key = oidcIssuerKeys.findVerificationKey(issuer.get());
         List<String> acceptedAudiences = List.of(STS_AUDIENCE);
         // IAM stores a provider's URL without its scheme and accepts only https, so only an https
         // issuer names one.
         Optional<OpenIDConnectProvider> provider = key.isPresent() || !config.services().iam().enforcementEnabled()
-                || !issuer.startsWith("https://")
+                || !issuer.get().startsWith("https://")
                 ? Optional.empty() : iamService.findOpenIDConnectProvider(roleAccountId, oidcProviderArn);
         if (provider.isPresent()) {
             Optional<String> keyId = tokenVerifier.peekKeyId(token);
@@ -919,7 +845,7 @@ public class StsQueryHandler {
                 return WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
                         "The web identity token names no signing key.", AwsNamespaces.STS, 400));
             }
-            key = registeredIssuerKey(issuer, keyId.get());
+            key = registeredIssuerKey(issuer.get(), keyId.get());
             if (key.isEmpty()) {
                 return WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
                         "Couldn't retrieve verification key from your identity provider, please reference "
@@ -937,7 +863,7 @@ public class StsQueryHandler {
 
         WebIdentityToken claims;
         try {
-            claims = tokenVerifier.verify(token, key.get(), issuer, acceptedAudiences);
+            claims = tokenVerifier.verify(token, key.get(), issuer.get(), acceptedAudiences);
         } catch (WebIdentityTokenVerifier.ExpiredTokenException e) {
             LOG.debugv("Rejecting web identity token for role {0}: {1}", roleArn, e.getMessage());
             return WebIdentityOutcome.deny(AwsQueryResponse.error("ExpiredTokenException",
@@ -954,41 +880,32 @@ public class StsQueryHandler {
             return WebIdentityOutcome.deny(accessDenied(roleArn));
         }
 
-        String sourceIdentity = StsSourceIdentity.resolve(claims.sourceIdentity(), null);
-        Map<String, List<String>> conditionClaims = new LinkedHashMap<>();
-        conditionClaims.put("sub", List.of(claims.subject()));
-        conditionClaims.put("aud", claims.audiences());
-        if (sourceIdentity != null) {
-            conditionClaims.put("sts:SourceIdentity", List.of(sourceIdentity));
-        }
+        Map<String, List<String>> conditionClaims = Map.of(
+                "sub", List.of(claims.subject()),
+                "aud", claims.audiences());
 
+        Map<String, List<String>> roleTags = roleTagKeys(role.get());
         if (!webIdentityTrustEvaluator.allows(role.get().getAssumeRolePolicyDocument(),
-                oidcProviderArn, issuerKeyPrefix, conditionClaims, sessionName)) {
+                oidcProviderArn, issuerKeyPrefix, conditionClaims, sessionName, roleTags)) {
             LOG.debugv("Trust policy on role {0} denies web identity subject {1}",
                     roleArn, claims.subject());
             return WebIdentityOutcome.deny(accessDenied("sts:AssumeRoleWithWebIdentity", roleArn));
         }
         if (!claims.principalTags().isEmpty()
                 && !webIdentityTrustEvaluator.allowsTagging(role.get().getAssumeRolePolicyDocument(),
-                        oidcProviderArn, issuerKeyPrefix, conditionClaims, sessionName)) {
+                        oidcProviderArn, issuerKeyPrefix, conditionClaims, sessionName, roleTags)) {
             LOG.debugv("Trust policy on role {0} does not permit tagging the session of subject {1}",
                     roleArn, claims.subject());
             return WebIdentityOutcome.deny(
                     accessDenied(AssumeRolePolicyEvaluator.TAG_SESSION_ACTION, roleArn));
         }
 
-        if (sourceIdentity != null && !webIdentityTrustEvaluator.allowsAction(role.get().getAssumeRolePolicyDocument(),
-                oidcProviderArn, issuerKeyPrefix, conditionClaims, sessionName, "sts:SetSourceIdentity")) {
-            return WebIdentityOutcome.deny(accessDenied(roleArn));
-        }
-
-
         // verify() already required the audience list to hold one of the accepted audiences.
         String audience = claims.audiences().stream().filter(acceptedAudiences::contains).findFirst()
                 .orElse(STS_AUDIENCE);
         return WebIdentityOutcome.allow(
                 new VerifiedWebIdentity(claims.issuer(), claims.subject(), audience,
-                        claims.principalTags(), claims.transitiveTagKeys(), sourceIdentity), role.get());
+                        claims.principalTags(), claims.transitiveTagKeys()), role.get());
     }
 
     /**
@@ -1003,6 +920,15 @@ public class StsQueryHandler {
             LOG.debugv("Cannot fetch the keys of OIDC issuer {0}: {1}", issuer, e.getMessage());
             return Optional.empty();
         }
+    }
+
+    /**
+     * The tags of the role being assumed under the keys the generated table gives its type, as a trust policy reads
+     * them on that role; empty for a role with none.
+     */
+    private static Map<String, List<String>> roleTagKeys(IamRole role) {
+        Map<String, List<String>> keys = IamConditionContextResolver.resourceTagKeys(role.getArn(), role.getTags());
+        return keys == null ? Map.of() : keys;
     }
 
     private static String assumedRoleId(IamRole role, String sessionName) {
@@ -1074,32 +1000,22 @@ public class StsQueryHandler {
         String roleName = roleArn.contains("/") ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
         IamRole role = iamService.findRole(accountId, roleName).orElseThrow(() ->
                 new AwsException("AccessDenied", "Not authorized to perform sts:AssumeRoleWithSAML on resource: " + roleArn, 403));
-        Map<String, List<String>> assertionClaims = new LinkedHashMap<>(Map.of(
+        Map<String, List<String>> assertionClaims = Map.of(
                 "aud", List.of(STS_AUDIENCE),
                 "iss", List.of(verified.issuer()),
                 "sub", List.of(verified.subject()),
-                "namequalifier", List.of(verified.nameQualifier())));
-        if (verified.sourceIdentity() != null) {
-            assertionClaims.put("sts:SourceIdentity", List.of(verified.sourceIdentity()));
-        }
+                "namequalifier", List.of(verified.nameQualifier()));
+        Map<String, List<String>> roleTags = roleTagKeys(role);
         if (!samlTrustEvaluator.allows(role.getAssumeRolePolicyDocument(), principalArn, assertionClaims,
-                verified.roleSessionName())) {
+                verified.roleSessionName(), roleTags)) {
             throw new AwsException("AccessDenied", "Not authorized to perform sts:AssumeRoleWithSAML on resource: " + roleArn, 403);
         }
         if (!verified.principalTags().isEmpty()
                 && !samlTrustEvaluator.allowsTagging(role.getAssumeRolePolicyDocument(), principalArn,
-                        assertionClaims, verified.roleSessionName())) {
+                        assertionClaims, verified.roleSessionName(), roleTags)) {
             throw new AwsException("AccessDenied", "Not authorized to perform "
                     + AssumeRolePolicyEvaluator.TAG_SESSION_ACTION + " on resource: " + roleArn, 403);
         }
-
-        if (verified.sourceIdentity() != null && !samlTrustEvaluator.allowsAction(
-                role.getAssumeRolePolicyDocument(), principalArn, assertionClaims,
-                verified.roleSessionName(), "sts:SetSourceIdentity")) {
-            throw new AwsException("AccessDenied", "Not authorized to perform sts:SetSourceIdentity on resource: "
-                    + roleArn, 403);
-        }
-
 
         Response roleDurationError = validateMaxSessionDuration(durationSeconds, role);
         if (roleDurationError != null) {
@@ -1132,24 +1048,19 @@ public class StsQueryHandler {
         String assumedRoleArn = assumedRoleArn(sessionRoleArn, accountId, roleName, sessionName);
         String assumedRoleId = assumedRoleId(role, sessionName);
 
-        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
-                AwsArnUtils.parse(sessionRoleArn).partition(), iamService);
-        iamService.registerSession(accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration,
-                sessionPolicy.inline(), callerAccountId, sessionName, assumedRoleId, verified.principalTags(),
-                StsSessionTags.transitive(verified.principalTags(), verified.transitiveTagKeys(), Map.of()),
-                verified.sourceIdentity(), sessionPolicy.managedArns());
-        iamService.recordSessionTags(accessKeyId, verified.principalTags(), verified.transitiveTagKeys());
-        XmlBuilder result = new XmlBuilder()
+        iamService.registerSession(accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, null,
+                callerAccountId, sessionName, assumedRoleId);
+        // The assertion's own attributes, this operation declaring no Tags member either, the
+        // keys to set as transitive arriving as an attribute of their own beside the tags.
+        iamService.recordSessionTags(accessKeyId, verified.principalTags(),
+                verified.transitiveTagKeys());
+        String result = new XmlBuilder()
                 .raw(credentialsXml(accessKeyId, secretKey, sessionToken, expiration))
                 .start("AssumedRoleUser").elem("Arn", assumedRoleArn).elem("AssumedRoleId", assumedRoleId).end("AssumedRoleUser")
                 .raw(sessionSizeXml("AssumeRoleWithSAML", session)).elem("Issuer", verified.issuer())
                 .elem("Audience", "urn:amazon:webservices")
-                .elem("NameQualifier", verified.nameQualifier()).elem("SubjectType", verified.subjectType())
-                .elem("Subject", verified.subject());
-        if (verified.sourceIdentity() != null) {
-            result.elem("SourceIdentity", verified.sourceIdentity());
-        }
-        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithSAML", AwsNamespaces.STS, result.build())).build();
+                .elem("NameQualifier", verified.nameQualifier()).elem("SubjectType", verified.subjectType()).elem("Subject", verified.subject()).build();
+        return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithSAML", AwsNamespaces.STS, result)).build();
     }
 
     /** The access key that signed this request, in the header or presigned in the query. */
@@ -1191,12 +1102,11 @@ public class StsQueryHandler {
         String federatedUserId = accountId + ":" + name;
         String federatedUserArn = regionResolver.buildGlobalArn("sts", accountId, "federated-user/" + name);
 
-        StsSessionPolicies.Resolved sessionPolicy = StsSessionPolicies.resolve(params, accountId,
-                AwsRegions.partitionFor(regionResolver.getRegion()), iamService);
+        String sessionPolicy = getParam(params, "Policy");
         // The session is scoped by its session policy within the permissions of the caller that
         // minted it, so the caller is recorded with it.
         iamService.registerIssuedSession(accessKeyId, secretKey, sessionToken, federatedUserArn, expiration,
-                sessionPolicy.inline(), accountId, callerAccessKeyId(), sessionPolicy.managedArns());
+                sessionPolicy, accountId, callerAccessKeyId());
         // None of them is transitive: this operation declares no TransitiveTagKeys member, and the
         // guide says why, that "you can't set session tags as transitive when you use
         // GetFederationToken, because you can't use the temporary credentials" it returns to
