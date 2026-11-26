@@ -11,10 +11,110 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SecurityGroupNftCompilerTest {
+
+    @Test
+    void isolatedVpcPoliciesDoNotImportAnotherVpcPrivateAddresses() {
+        SecurityGroup group = new SecurityGroup();
+        group.setVpcId("vpc-1");
+        group.setOwnerId("000000000000");
+        IpPermission allow = new IpPermission();
+        allow.setIpProtocol("tcp");
+        allow.setFromPort(443);
+        allow.setToPort(443);
+        IpRange range = new IpRange();
+        range.setCidrIp("0.0.0.0/0");
+        allow.getIpRanges().add(range);
+        group.getIpPermissions().add(allow);
+        group.getIpPermissionsEgress().add(allow);
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint foreign = new SecurityGroupNftCompiler.Endpoint(
+                "222222222222", "us-east-1", "vpc-1", "eni-b", "10.0.0.3", "172.17.0.3",
+                Set.of(), List.of(group), Set.of("10.0.0.3"));
+
+        String rules = SecurityGroupNftCompiler.compile(target, List.of(foreign), Map.of(),
+                List.of("172.17.0.1"), true);
+
+        assertFalse(rules.contains("ip saddr 10.0.0.3 "), "the foreign VPC cannot reserve a local source address");
+        assertFalse(rules.contains("ip daddr 10.0.0.3 "), "the foreign VPC cannot reserve a local destination");
+        assertTrue(rules.indexOf("ip daddr 172.17.0.3 drop")
+                < rules.indexOf("ip daddr 0.0.0.0/0 tcp dport 443 accept"));
+        assertTrue(rules.contains("ip daddr 172.17.0.1 meta l4proto { tcp, udp } th dport 53 snat to 172.17.0.2"));
+        assertFalse(rules.contains("dport 443 snat"), "ordinary application traffic must retain its native source");
+    }
+
+    @Test
+    void everyAttachedAddressUsesTheManagedPeersVpcBoundary() {
+        SecurityGroup group = new SecurityGroup();
+        group.setVpcId("vpc-1");
+        group.setOwnerId("000000000000");
+        IpPermission permission = new IpPermission();
+        permission.setIpProtocol("tcp");
+        permission.setFromPort(443);
+        permission.setToPort(443);
+        IpRange cidr = new IpRange();
+        cidr.setCidrIp("0.0.0.0/0");
+        permission.getIpRanges().add(cidr);
+        group.getIpPermissions().add(permission);
+        group.getIpPermissionsEgress().add(permission);
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint allowed = new SecurityGroupNftCompiler.Endpoint(
+                "000000000000", "us-east-1", "vpc-1", "eni-b", "10.0.0.3", "172.17.0.3",
+                Set.of("sg-1"), List.of(group), Set.of("10.0.0.3"));
+        SecurityGroupNftCompiler.Endpoint denied = new SecurityGroupNftCompiler.Endpoint(
+                "000000000000", "us-east-1", "vpc-2", "eni-c", "10.1.0.3", "172.17.0.4",
+                Set.of("sg-1"), List.of(group), Set.of("10.1.0.3"));
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(allowed, denied), Map.of());
+
+        for (String direction : List.of("ingress ip saddr ", "egress ip daddr ")) {
+            for (String address : List.of("172.17.0.3", "10.0.0.3")) {
+                assertTrue(nft.contains(direction + address + " tcp dport 443 accept"));
+            }
+            for (String address : List.of("172.17.0.4", "10.1.0.3")) {
+                String drop = direction + address + " drop";
+                assertFalse(nft.contains(direction + address + " tcp dport 443 accept"));
+                assertTrue(nft.contains(drop));
+                assertTrue(nft.indexOf(drop) < nft.indexOf(direction + "0.0.0.0/0 tcp dport 443 accept"));
+            }
+        }
+    }
+
+    @Test
+    void additionalTransportsRetainTheirAddressFamilyAcrossPolicyAndIpv6Refresh() {
+        SecurityGroup group = ipv6Group("2600:1f18:0:a600::/64");
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint peer = new SecurityGroupNftCompiler.Endpoint(
+                "000000000000", "us-east-1", "vpc-1", "eni-b", "10.0.0.3",
+                List.of("2600:1f18:0:a600::20"), "172.17.0.3", "fd00::3", Set.of("sg-1"), List.of(group),
+                List.of(new SecurityGroupNftCompiler.ControlConnection("172.17.0.1", 12000)), false,
+                Set.of("10.0.0.3", "fd01::3"));
+        SecurityGroupNftCompiler.Endpoint refreshed = peer.withPolicy(peer.groupIds(), peer.groups())
+                .withIpv6Addresses(peer.logicalIpv6Addresses());
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(refreshed), Map.of());
+
+        assertTrue(nft.contains("ingress ip6 saddr fd01::3 tcp dport 443 accept"));
+        assertFalse(nft.contains("ingress ip saddr 10.0.0.3 tcp dport 443 accept"));
+        assertTrue(nft.contains("ingress ip saddr 10.0.0.3 drop"));
+        assertEquals(peer.additionalTransportAddresses(), refreshed.additionalTransportAddresses());
+        assertEquals(peer.controlConnections(), refreshed.controlConnections());
+        assertFalse(refreshed.instanceMetadataAllowed());
+    }
+
+    @Test
+    void extraTransportAddressesCannotInjectNetworksOrNftExpressions() {
+        for (String address : List.of("10.0.0.0/8", "private.example", "10.0.0.3 accept")) {
+            assertThrows(IllegalArgumentException.class, () -> new SecurityGroupNftCompiler.Endpoint(
+                    "000000000000", "us-east-1", "vpc-1", "eni-a", "10.0.0.2", "172.17.0.2",
+                    Set.of(), List.of(), Set.of(address)));
+        }
+    }
 
     @Test
     void managedPeersAreCheckedBeforeDockerAddressCidrs() {
@@ -163,6 +263,26 @@ class SecurityGroupNftCompilerTest {
     // Catches: an IPv4-only ENI on an IPv6-enabled Docker network sending on its helper's IPv6 address past the
     // managed-peer drop, straight into a broad IPv6 CIDR rule.
     @Test
+    void isolatedVpcRulesKeepForeignIpv6TransportOutOfBroadCidrPermissions() {
+        SecurityGroup group = ipv6Group("::/0");
+        SecurityGroupNftCompiler.Endpoint target = dualStack("eni-a", "10.0.0.2", List.of(), "172.17.0.2",
+                "fd00:d0c::2", group);
+        SecurityGroupNftCompiler.Endpoint foreign = new SecurityGroupNftCompiler.Endpoint(
+                "111111111111", "us-east-1", "vpc-other", "eni-other", "10.0.0.2",
+                List.of("2600:1f18:0:a600::20"), "172.17.0.3", "fd00:d0c::3", Set.of("sg-1"),
+                List.of(group), List.of(), true, Set.of("10.0.0.2"));
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(foreign), Map.of(), List.of(), true);
+
+        assertTrue(nft.contains("ingress ip saddr 172.17.0.3 drop"));
+        assertTrue(nft.contains("ingress ip6 saddr fd00:d0c::3 drop"));
+        assertTrue(nft.indexOf("ingress ip6 saddr fd00:d0c::3 drop")
+                < nft.indexOf("ingress ip6 saddr ::/0 tcp dport 443 accept"));
+        assertFalse(nft.contains("ingress ip saddr 10.0.0.2 drop"));
+        assertFalse(nft.contains("ingress ip6 saddr fd00:d0c::3 tcp dport 443 accept"));
+    }
+
+    @Test
     void aPeersIpv6TransportIsDroppedEvenWithoutAnIpv6Address() {
         SecurityGroup group = ipv6Group("::/0");
         SecurityGroupNftCompiler.Endpoint target = dualStack("eni-a", "10.0.0.2", List.of(), "172.17.0.2",
@@ -220,9 +340,75 @@ class SecurityGroupNftCompilerTest {
         assertTrue(after.contains("ip6 saddr fd00:d0c::3 tcp dport 443 accept"));
     }
 
+    @Test
+    void lambdaRuntimeControlDoesNotOpenOtherPortsOrInstanceMetadata() {
+        SecurityGroup group = new SecurityGroup();
+        SecurityGroupNftCompiler.Endpoint target = new SecurityGroupNftCompiler.Endpoint(
+                "111111111111", "us-east-1", "vpc-1", "eni-lambda", "10.0.1.10", "172.18.0.3",
+                Set.of("sg-lambda"), List.of(group),
+                List.of(new SecurityGroupNftCompiler.ControlConnection("172.18.0.2", 10042)), false);
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(), Map.of());
+
+        assertTrue(nft.contains("egress ip daddr 172.18.0.2 tcp dport 10042 accept"));
+        assertFalse(nft.contains("daddr 172.18.0.2 accept"));
+        assertFalse(nft.contains("dport 4566 accept"));
+        assertFalse(nft.contains("daddr 169.254.169.254 accept"));
+        assertTrue(nft.contains("egress ip daddr 169.254.169.254 drop"));
+        assertTrue(nft.contains("ct original ip daddr 169.254.169.254 ct original proto-dst 80 drop"));
+    }
+
+    @Test
+    void runtimeControlRequiresOneLiteralAddressAndPort() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("172.18.0.2/16", 10042));
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("runtime.example", 10042));
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("172.18.0.2", 0));
+        assertThrows(IllegalArgumentException.class,
+                () -> new SecurityGroupNftCompiler.ControlConnection("172.18.0.2", 65536));
+    }
+
+    @Test
+    void lambdaMetadataDenialPrecedesEveryEgressExemption() {
+        SecurityGroupNftCompiler.Endpoint target = new SecurityGroupNftCompiler.Endpoint(
+                "111111111111", "us-east-1", "vpc-1", "eni-lambda", "10.0.1.10", "172.18.0.3",
+                Set.of("sg-lambda"), List.of(new SecurityGroup()),
+                List.of(new SecurityGroupNftCompiler.ControlConnection("169.254.169.254", 80),
+                        new SecurityGroupNftCompiler.ControlConnection("fd00:ec2::254", 80)), false);
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(), Map.of(),
+                List.of("169.254.169.254"));
+        int firstEgressAccept = nft.indexOf("egress oifname lo accept");
+
+        for (String denied : List.of("ip daddr 169.254.169.254 drop", "ip6 daddr fd00:ec2::254 drop",
+                "ct original ip daddr 169.254.169.254 ct original proto-dst 80 drop",
+                "ct original ip6 daddr fd00:ec2::254 ct original proto-dst 80 drop")) {
+            assertTrue(nft.contains(denied), denied);
+            assertTrue(nft.indexOf(denied) < firstEgressAccept, denied);
+        }
+
+    }
+
     private static SecurityGroupNftCompiler.Endpoint endpoint(String eni, String logical,
                                                                String transport, SecurityGroup group) {
         return new SecurityGroupNftCompiler.Endpoint("000000000000", "us-east-1", "vpc-1",
                 eni, logical, transport, Set.of("sg-1"), List.of(group));
     }
+    @Test
+    void policyAndIpv6RefreshPreserveLambdaControlAndMetadataRestrictions() {
+        SecurityGroup group = new SecurityGroup();
+        SecurityGroupNftCompiler.Endpoint original = new SecurityGroupNftCompiler.Endpoint(
+                "111111111111", "us-east-1", "vpc-1", "eni-lambda", "10.0.1.10", "172.18.0.3",
+                Set.of("sg-lambda"), List.of(group),
+                List.of(new SecurityGroupNftCompiler.ControlConnection("172.18.0.2", 10042)), false);
+        SecurityGroupNftCompiler.Endpoint refreshed = original.withPolicy(Set.of("sg-current"), List.of(group))
+                .withIpv6Addresses(List.of("2600:1f18::10"));
+        String nft = SecurityGroupNftCompiler.compile(refreshed, List.of(), Map.of());
+        assertTrue(nft.contains("egress ip daddr 172.18.0.2 tcp dport 10042 accept"));
+        assertTrue(nft.contains("egress ip daddr 169.254.169.254 drop"));
+        assertFalse(nft.contains("daddr 169.254.169.254 accept"));
+        assertEquals(List.of("2600:1f18::10"), refreshed.logicalIpv6Addresses());
+        assertEquals(Set.of("sg-current"), refreshed.groupIds());
+    }
+
 }

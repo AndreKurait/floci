@@ -25,6 +25,7 @@ import io.floci.aws.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,7 +50,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * A systemd guest sees the Docker host's module tree, read-only, and runs in a private cgroup
@@ -91,9 +94,28 @@ class Ec2SystemdGuestDockerIntegrationTest {
     @Inject
     ContainerReachableEndpoint reachableEndpoint;
 
+    private Ec2MetadataTestFixture metadata;
+    private EmulatorConfig guestConfig;
+
     @BeforeEach
-    void requireDocker() {
+    void requireDocker() throws Exception {
         assumeTrue(DockerAvailability.answers(docker), "Docker must be available for EC2 systemd guest tests");
+        guestConfig = mock(EmulatorConfig.class, delegatesTo(config));
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class,
+                delegatesTo(config.services()));
+        EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class,
+                delegatesTo(config.services().ec2()));
+        when(guestConfig.services()).thenReturn(services);
+        when(services.ec2()).thenReturn(ec2);
+        metadata = new Ec2MetadataTestFixture();
+        metadata.startUnregistered(guestConfig);
+    }
+
+    @AfterEach
+    void stopMetadata() throws Exception {
+        if (metadata != null) {
+            metadata.close();
+        }
     }
 
     @Test
@@ -101,7 +123,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
         String imageId = buildConsoleGuardImage();
         Ec2ContainerManager manager = new Ec2ContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), dockerHostResolver, docker,
-                portAllocator, config, mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class),
+                portAllocator, guestConfig, metadata.server(), mock(Ec2PortForwardManager.class),
                 regionResolver, mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 reachableEndpoint);
         Instance instance = new Instance();
@@ -209,7 +231,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
     void systemdGuestSeesHostModulesReadOnlyInPrivateCgroupNamespace() {
         Ec2ContainerManager manager = new Ec2ContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), dockerHostResolver, docker,
-                portAllocator, config, mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class),
+                portAllocator, guestConfig, metadata.server(), mock(Ec2PortForwardManager.class),
                 regionResolver, mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 reachableEndpoint);
         Instance instance = new Instance();
@@ -261,7 +283,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
             CountDownLatch torndown = new CountDownLatch(1);
             manager.terminate(instance, torndown::countDown);
             try {
-                torndown.await(60, TimeUnit.SECONDS);
+                assertTrue(torndown.await(60, TimeUnit.SECONDS), "guest and helper cleanup timed out");
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -312,7 +334,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
     private Ec2ContainerManager guestShutdownManager() {
         return new Ec2ContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), dockerHostResolver, docker,
-                portAllocator, config, mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class),
+                portAllocator, guestConfig, metadata.server(), mock(Ec2PortForwardManager.class),
                 regionResolver, mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 reachableEndpoint);
     }

@@ -188,6 +188,15 @@ floci:
   port: 4566
   base-url: "http://localhost:4566"
   network:
+    vpc-routing:
+      enabled: false
+      public-aws-api: false
+      # Optional exact IPv4 front door; unset retains Floci's own listener.
+      # Matching upstream DNS A answers use the routed public address for known VPC clients.
+      # public-aws-api-upstream-host: ""
+      public-aws-api-upstream-http-port: 80
+      public-aws-api-upstream-https-port: 443
+      # public-aws-api-hosts: []  # Exact peer names, in addition to native AWS names.
     security-group-enforcement:
       enabled: false
       helper-image: floci/network-helper:local
@@ -314,12 +323,20 @@ floci:
         flush-interval-ms: 5000
 
   dns:
+    # Opt in to host DNS, or select a container listener, on a reachable local IPv4 address.
+    # UDP/TCP port 53 must be available. Unset: preserve automatic and host-port listeners.
+    # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
     # Extra hostname suffixes resolved to Floci's container IP by the embedded DNS server.
     # Useful when migrating from LocalStack — add localhost.localstack.cloud to avoid
     # changing Lambda endpoint environment variables.
     # Via env var (comma-separated): FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud,other.internal
     # extra-suffixes:
     #   - localhost.localstack.cloud
+
+    # Serve these suffixes from resource records or scoped VPC forwarding rules only.
+    # Unknown names return NXDOMAIN; wildcard spoofing and upstream recursion do not apply.
+    # authoritative-suffixes:                     # FLOCI_DNS_AUTHORITATIVE_SUFFIXES
+    #   - resources.example
 
     # Public resolvers appended after Floci's embedded DNS on spawned containers' HostConfig.Dns,
     # and used as the fallback upstream for Floci's own DNS forwarder. Lets Lambda/CodeBuild
@@ -386,6 +403,7 @@ floci:
     # cert-path: ""                    # FLOCI_TLS_CERT_PATH (PEM certificate file)
     # key-path: ""                     # FLOCI_TLS_KEY_PATH (PEM private key file)
     # extra-ca-path: ""                # FLOCI_TLS_EXTRA_CA_PATH (PEM CA certificates Floci's own HTTPS clients also trust; works with TLS on or off)
+    # extra-ca-certs: ""               # FLOCI_TLS_EXTRA_CA_CERTS (additional public PEM trust anchors)
     self-signed: true                  # FLOCI_TLS_SELF_SIGNED: auto-generate a server cert signed by Floci's local CA if no cert-path provided
     aws-https-port: 443                # FLOCI_TLS_AWS_HTTPS_PORT — also bind 443 so CDK cfn-response/AWS-on-443 callbacks reach Floci (0 disables)
 
@@ -518,6 +536,7 @@ floci:
       ephemeral: false
       # Extra Docker create flags for Lambda containers, for example: --env KEY=VALUE --volume /host:/container:ro
       docker-flags: ""
+      # additional-docker-networks: []         # FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS: existing networks joined before start
       ecr-base-uri: public.ecr.aws            # FLOCI_SERVICES_LAMBDA_ECR_BASE_URI — registry for Lambda runtime images (legacy: floci.ecr-base-uri / FLOCI_ECR_BASE_URI)
       # runtime-images:                   # Optional full references keyed by runtime or runtime.os.arch
       #   "python3.12": "public.ecr.aws/lambda/python:3.12@sha256:<digest>"
@@ -840,6 +859,11 @@ floci:
       proxy-max-port: 9499
       keep-running-on-shutdown: false
     ec2:
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
+      # read-only-binds:               # Paths belong to the Docker daemon host.
+      #   - source: /srv/guest-inputs/ca.pem
+      #     target: /etc/guest-ca.pem
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional complete catalog override for locally built guest images.
@@ -847,6 +871,7 @@ floci:
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
       enabled: true
       imds-port: 9169
+      metadata-helper-image: floci/network-helper:local
       # Sweep EC2 containers left on the daemon by a previous run that died mid-launch or
       # mid-terminate (SIGKILL, OOM, docker kill), which no surviving record refers to.
       # Scoped to this deployment's own containers; stopped instances are never swept.
@@ -881,6 +906,7 @@ floci:
       # container actually holds and instances in different VPCs are on different bridges.
       vpc-networks:
         enabled: true                             # FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED
+        isolate-address-spaces: false              # FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES
         # Used only when a declared VPC CIDR cannot be honoured: absent, malformed, outside
         # RFC 1918, or already claimed on this Docker daemon. Substitutions are logged at WARN;
         # a reported private IP that does not match the declared CIDR is never silent.
@@ -890,6 +916,7 @@ floci:
         # so Floci instances sharing a daemon never reconcile each other's networks).
         reconcile-on-startup: true                # FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP
         driver: bridge                            # FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER
+        internal: false                           # FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL
     ecs:
       enabled: true
       mock: false
@@ -1010,6 +1037,8 @@ floci:
     elb:
       enabled: true
       mock: false
+      vpc-frontends: false
+      proxy-image: haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b
     elbv2:
       enabled: true
       mock: false
