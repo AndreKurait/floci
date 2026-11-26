@@ -66,6 +66,7 @@ exposed headers. The disable-CORS switch above also disables this behavior.
 | `FLOCI_TLS_CERT_PATH` | _(none)_ | Path to a PEM certificate file. When set, disables auto-generation |
 | `FLOCI_TLS_KEY_PATH` | _(none)_ | Path to a PEM private key file. Required when `FLOCI_TLS_CERT_PATH` is set |
 | `FLOCI_TLS_EXTRA_CA_PATH` | _(none)_ | Path to a PEM file of extra CA certificates that Floci's own outbound HTTPS clients (EventBridge API destinations, SNS HTTPS subscriptions, API Gateway HTTP and HTTP_PROXY integrations, JWT issuer fetch) trust on top of the JVM's roots. Works with TLS on or off; containers Floci launches do not receive them |
+| `FLOCI_TLS_EXTRA_CA_CERTS` | _(none)_ | With TLS enabled, adds the PEM certificates from this file to workload CA bundles and Java trust stores. Public roots and Floci's CA are retained; private keys are excluded. Invalid explicit trust prevents startup |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate and persist a server certificate signed by Floci's local CA when no cert/key paths are provided |
 
 See [TLS / HTTPS](./tls.md) for SDK configuration examples and WebSocket (`wss://`) support.

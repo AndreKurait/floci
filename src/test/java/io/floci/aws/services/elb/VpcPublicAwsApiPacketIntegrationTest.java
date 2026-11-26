@@ -11,12 +11,16 @@ import io.floci.aws.services.acm.CertificateGenerator;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.services.ec2.model.Address;
 import software.amazon.awssdk.services.ec2.model.IpPermission;
 import software.amazon.awssdk.services.ec2.model.NatGateway;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,6 +43,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 @TestProfile(VpcPublicAwsApiPacketIntegrationTest.PublicAwsApis.class)
 class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketIntegrationTest {
+    private String requestHost = "ec2.us-east-1.amazonaws.com";
+
     public static class PublicAwsApis extends PublicRouting {
         private static final String NAMESPACE = System.getProperty("floci.docker.resource-namespace",
                 "vpc-api-packets-" + UUID.randomUUID()) + "-api";
@@ -50,7 +56,7 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
                 Files.createDirectories(directory);
                 FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(directory);
                 CertificateGenerator.GeneratedCertificate leaf = ca.issueServerCertificate(
-                        "ec2.us-east-1.amazonaws.com", List.of("ec2.us-east-1.amazonaws.com"),
+                        "ec2.us-east-1.amazonaws.com", List.of("ec2.us-east-1.amazonaws.com", "peer-api.example"),
                         KeyAlgorithm.RSA_2048, null);
                 Files.writeString(directory.resolve("server.crt"), leaf.certificatePem());
                 Files.writeString(directory.resolve("server.key"), leaf.privateKeyPem());
@@ -66,6 +72,7 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
             Map<String, String> overrides = new HashMap<>(super.getConfigOverrides());
             overrides.put("floci.docker.resource-namespace", NAMESPACE);
             overrides.put("floci.network.vpc-routing.public-aws-api", "true");
+            overrides.put("floci.network.vpc-routing.public-aws-api-hosts", "peer-api.example");
             overrides.put("floci.services.ec2.container-ips-routable", "true");
             overrides.put("floci.dns.spoof-aws-endpoints", "true");
             overrides.put("floci.tls.enabled", "true");
@@ -75,6 +82,7 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
             overrides.put("quarkus.tls.key-store.pem.0.cert", TLS.resolve("server.crt").toString());
             overrides.put("quarkus.tls.key-store.pem.0.key", TLS.resolve("server.key").toString());
             overrides.put("quarkus.http.insecure-requests", "enabled");
+            overrides.put("floci.services.ec2.imds-port", "19169");
             // The production protocol proxy forwards to these two internal listeners.
             overrides.put("quarkus.http.test-port", "4510");
             overrides.put("quarkus.http.test-ssl-port", "4511");
@@ -82,8 +90,17 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
         }
     }
 
-    @Test
-    void standardAwsHostnameRequiresEgressNatAndInternetRoutesForHttpAndVerifiedTls() throws Exception {
+    @Override
+    @BeforeEach
+    void prepare() throws Exception {
+        endpoint = URI.create("http://127.0.0.1:" + config.port());
+        super.prepare();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ec2.us-east-1.amazonaws.com", "peer-api.example"})
+    void standardAwsHostnameRequiresEgressNatAndInternetRoutesForHttpAndVerifiedTls(String hostname) throws Exception {
+        requestHost = hostname;
         Network network = network(ec2, "10.87.0.0/16", "10.87.2.0/24");
         String privateSubnet = subnet(ec2, network.vpc(), "10.87.1.0/24");
         String privateRoutes = routes(ec2, network.vpc(), privateSubnet);
@@ -98,7 +115,7 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
 
         assertVpcResponse(helper, network.vpc(), false);
         assertVpcResponse(helper, network.vpc(), true);
-        assertEquals("192.0.2.1", exec(helper, "getent", "ahostsv4", "ec2.us-east-1.amazonaws.com")
+        assertEquals("192.0.2.1", exec(helper, "getent", "ahostsv4", hostname)
                 .stdout().lines().findFirst().orElseThrow().split("\\s+")[0]);
         String bridge = apiBridge();
         String sourceIp = nat.natGatewayAddresses().getFirst().publicIp();
@@ -256,15 +273,15 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
     }
 
     private ContainerExec.Result request(String helper, String vpc, boolean tls) {
-        return exec(helper, "curl", "--silent", "--show-error", "--fail", "--max-time", "2",
+        return exec(helper, "curl", "--silent", "--show-error", "--fail-with-body", "--max-time", "2",
                 "--cacert", "/tmp/api-root-ca.pem", "--aws-sigv4", "aws:amz:us-east-1:ec2",
                 "--user", "test:test", "--data", "Action=DescribeVpcs&Version=2016-11-15&VpcId.1=" + vpc,
-                (tls ? "https" : "http") + "://ec2.us-east-1.amazonaws.com/");
+                (tls ? "https" : "http") + "://" + requestHost + "/");
     }
 
     private void assertVpcResponse(String helper, String vpc, boolean tls) {
         ContainerExec.Result result = request(helper, vpc, tls);
-        assertEquals(0, result.exitCode(), () -> result.summary() + networkDiagnostics());
+        assertEquals(0, result.exitCode(), () -> result.summary() + "\n" + result.stdout() + networkDiagnostics());
         assertTrue(result.stdout().contains("<vpcId>" + vpc + "</vpcId>"), result.stdout());
     }
 

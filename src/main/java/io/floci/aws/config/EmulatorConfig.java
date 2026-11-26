@@ -156,6 +156,18 @@ public interface EmulatorConfig {
         /** Routes spoofed AWS API names from known VPC clients through their public NAT gateways. */
         @WithDefault("false")
         boolean publicAwsApi();
+
+        /** Optional explicit IPv4 front door for the public endpoint TCP bridge. */
+        Optional<String> publicAwsApiUpstreamHost();
+
+        @WithDefault("80")
+        int publicAwsApiUpstreamHttpPort();
+
+        @WithDefault("443")
+        int publicAwsApiUpstreamHttpsPort();
+
+        /** Exact additional peer names served by the selected public endpoint front door. */
+        Optional<List<String>> publicAwsApiHosts();
     }
 
     interface SecurityGroupEnforcementConfig {
@@ -4652,6 +4664,9 @@ public interface EmulatorConfig {
 
         /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
         Optional<String> keyPath();
+
+        /** PEM certificates appended to workload trust bundles. Env: FLOCI_TLS_EXTRA_CA_CERTS */
+        Optional<String> extraCaCerts();
 
         /**
          * PEM file of extra CA certificates that Floci's own outbound HTTPS clients trust, on top of

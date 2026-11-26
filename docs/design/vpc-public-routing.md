@@ -41,11 +41,39 @@ The bridge forwards HTTP and TLS bytes to Floci's container-reachable API
 listener. The client keeps its AWS hostname, protocol and certificate verification.
 Use the ordinary TLS configuration and install Floci's CA for HTTPS.
 
+### Declared public endpoint handoff
+
+The transport handoff is implemented. Application qualification remains separate.
+
+A caller may select one explicit upstream IPv4 address and separate HTTP and
+HTTPS ports for the public API bridge. The default remains Floci's listener.
+This lets a local test's existing front door dispatch declared peer hostnames
+and forward AWS requests to Floci without changing the application's hostnames,
+credentials, or TLS verification. The configured upstream supplies its TLS
+certificate; the caller must trust that certificate's issuer.
+
+The bridge still admits only ports 80 and 443 through the caller's native NAT,
+internet-gateway route and security-group policy. Its outbound connections are
+limited to the selected address and ports. It does not give guests a route to
+the upstream's Docker address or a general internet route.
+
+Additional explicitly named public hosts may use this same destination for
+known VPC clients. Exact names may contain underscores or a single label;
+literal IP addresses are not names. Exact names do not imply suffix or wildcard matches.
+Native DNS records and forwarding rules retain precedence; non-VPC lookups
+retain their existing resolution. This configuration supplies a transport
+destination, not an implementation of any peer protocol or authorization.
+
+Qualification must prove a real peer response over verified TLS and a signed
+AWS request through the selected front door, then repeat route withdrawal and
+security-group denial with successful recovery. Source compilation or DNS
+answers alone cannot qualify this handoff.
+
 Private workloads reach that address only through an active native NAT route and
 the NAT subnet's attached internet-gateway route. Workload egress rules still
 apply. The bridge admits ports 80 and 443 from the active NAT EIPs and installs
 explicit return routes to those NATs. Its only new outbound connection is to the
-emulator API listener. It neither routes general internet traffic nor adds a
+selected upstream listener. It neither routes general internet traffic nor adds a
 workload control-network exemption.
 
 An EC2 instance with a native public IPv4 address can instead use its subnet's
@@ -58,8 +86,8 @@ instance's security-group egress. A private neighbor cannot borrow it. Removing
 an Elastic IP or stopping the instance withdraws its admission; reassociation or
 start restores it when the declared public address and internet route exist.
 Removing the last NAT and public caller retires the bridge.
-The existing shared TLS proxy forwards to Quarkus over loopback without preserving
-the original peer address, so this path does not qualify IAM `aws:SourceIp` behavior.
+The TCP bridge opens a new upstream connection after accepting a caller socket,
+so this path does not qualify IAM `aws:SourceIp` behavior.
 
 `VpcPublicAwsApiPacketIntegrationTest` covers normal AWS DNS, signed EC2 requests
 over HTTP and verified HTTPS, observed NAT peers, workload egress denial, private

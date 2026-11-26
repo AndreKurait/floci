@@ -134,6 +134,7 @@ public class EmbeddedDnsServer {
     private final Iterable<DnsForwardingRuleSource> forwardingRuleSources;
     private final Iterable<DnsClientVpcSource> clientVpcSources;
     private boolean publicAwsApi;
+    private List<String> publicApiHosts = List.of();
 
     EmbeddedDnsServer(List<String> suffixes) {
         this(suffixes, List.of());
@@ -190,8 +191,23 @@ public class EmbeddedDnsServer {
     EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
                       Iterable<DnsForwardingRuleSource> forwardingRuleSources,
                       Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi) {
-        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources);
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, publicAwsApi, List.of());
+    }
+
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi, List<String> publicApiHosts) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, publicAwsApi,
+                publicApiHosts, List.of());
+    }
+
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi,
+                      List<String> publicApiHosts, List<String> authoritativeSuffixes) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, authoritativeSuffixes);
         this.publicAwsApi = publicAwsApi;
+        this.publicApiHosts = publicApiHosts.stream().map(EmbeddedDnsServer::publicEndpointHost).distinct().toList();
         if (publicAwsApi) {
             this.suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
         }
@@ -269,6 +285,8 @@ public class EmbeddedDnsServer {
             suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
             publicAwsApi = config.network().vpcRouting().enabled()
                     && config.network().vpcRouting().publicAwsApi();
+            publicApiHosts = config.network().vpcRouting().publicAwsApiHosts().orElse(List.of()).stream()
+                    .map(EmbeddedDnsServer::publicEndpointHost).distinct().toList();
             if (shouldWarnSpoofInvisibleToTls(true, TlsConfigSource.tlsEnabledVisibleToTls(),
                     TlsConfigSource.spoofAwsEndpointsVisibleToTls())) {
                 LOG.warnv("floci.dns.spoof-aws-endpoints is set in application config but the TLS certificate only reads it from FLOCI_DNS_SPOOF_AWS_ENDPOINTS or -Dfloci.dns.spoof-aws-endpoints; https:// calls to {0} will fail the handshake until it is set there.", TlsConfigSource.awsEndpointSuffixes());
@@ -618,6 +636,11 @@ public class EmbeddedDnsServer {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
         return stored.or(() -> resolveFromRecordSources(name, type, false, myIp, origin))
+                .or(() -> publicAwsApi && origin != null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT))
+                        ? Optional.of(type == 1 ? DnsAnswer.records(
+                                List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                                DnsAnswer.DEFAULT_TTL_SECONDS) : DnsAnswer.noData())
+                        : Optional.empty())
                 .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
     }
 
@@ -644,6 +667,25 @@ public class EmbeddedDnsServer {
     private static DnsAnswer authoritativeAnswer(Optional<DnsAnswer> resource) {
         return resource.map(answer -> answer.upstream() ? DnsAnswer.refused() : answer)
                 .orElseGet(DnsAnswer::nxDomain);
+    }
+
+    private static String publicEndpointHost(String value) {
+        if (value == null) {
+            throw new IllegalArgumentException("Public endpoint host must be an exact DNS name");
+        }
+        String host = value.toLowerCase(Locale.ROOT);
+        if (host.endsWith(".")) {
+            host = host.substring(0, host.length() - 1);
+        }
+        if (host.length() > 253
+                || !host.matches("[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?"
+                        + "(?:\\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*")
+                || NetUtil.isValidIpV4Address(host)
+                || Arrays.stream(host.split("\\.")).anyMatch(label ->
+                        label.length() > 63 || label.startsWith("-") || label.endsWith("-"))) {
+            throw new IllegalArgumentException("Public endpoint host must be an exact DNS name");
+        }
+        return host;
     }
 
     private static String authoritativeSuffix(String value) {

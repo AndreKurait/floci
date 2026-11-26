@@ -191,6 +191,11 @@ floci:
     vpc-routing:
       enabled: false
       public-aws-api: false
+      # Optional exact IPv4 front door; unset retains Floci's own listener.
+      # public-aws-api-upstream-host: ""
+      public-aws-api-upstream-http-port: 80
+      public-aws-api-upstream-https-port: 443
+      # public-aws-api-hosts: []  # Exact peer names, in addition to native AWS names.
     security-group-enforcement:
       enabled: false
       helper-image: floci/network-helper:local
@@ -397,6 +402,7 @@ floci:
     # cert-path: ""                    # FLOCI_TLS_CERT_PATH (PEM certificate file)
     # key-path: ""                     # FLOCI_TLS_KEY_PATH (PEM private key file)
     # extra-ca-path: ""                # FLOCI_TLS_EXTRA_CA_PATH (PEM CA certificates Floci's own HTTPS clients also trust; works with TLS on or off)
+    # extra-ca-certs: ""               # FLOCI_TLS_EXTRA_CA_CERTS (additional public PEM trust anchors)
     self-signed: true                  # FLOCI_TLS_SELF_SIGNED: auto-generate a server cert signed by Floci's local CA if no cert-path provided
     aws-https-port: 443                # FLOCI_TLS_AWS_HTTPS_PORT — also bind 443 so CDK cfn-response/AWS-on-443 callbacks reach Floci (0 disables)
 
