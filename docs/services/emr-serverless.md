@@ -326,6 +326,24 @@ The server's port is published on the Docker host's loopback interface only, and
   once the session has ended. The server keeps its event logs on a volume of the session's own, so once the session has
   ended a new link opens a Spark History Server over them, for 30 days, as a run's does.
 
+## EventBridge events
+
+Every state a job run enters is sent to the default EventBridge bus of the run's account and Region, as
+AWS sends it: source `aws.emr-serverless`, detail type `EMR Serverless Job Run State Change`, an empty
+`resources`, and the detail of the EMR Serverless User Guide's example, `jobRunId`, `applicationId`, `arn`,
+`releaseLabel`, `state`, `previousState`, `createdBy`, `updatedAt` and `createdAt`, with times to the
+microsecond (`2026-10-24T09:41:07.123000Z`). A run is `SUBMITTED` first, in an event without
+`previousState`, and each later event's `previousState` is the state the run left. The events go out in
+order, just after the call, or the change of a run's driver, that made them.
+
+| Runner mode | States, in order |
+|---|---|
+| `immediate` | `SUBMITTED`, `RUNNING`, then `SUCCESS`, or `CANCELLED` when the run is cancelled or reaches its timeout |
+| `docker` | `SUBMITTED`, `SCHEDULED`, `RUNNING` once its driver runs, then `SUCCESS` or `FAILED`; `CANCELLING` then `CANCELLED` for a run cancelled or past its timeout; `SCHEDULED` again for a run tried again after its driver failed |
+
+An `immediate` run with a positive `job-run-duration-seconds` settles when it is read, so its end is sent
+when a call first reads the run ended, with the `updatedAt` of that end. Application scheduler limits can leave a run `QUEUED` until a slot becomes available.
+
 ## Running Spark job runs
 
 With `runner-mode` set to `docker` (`FLOCI_SERVICES_EMRSERVERLESS_RUNNER_MODE=docker`), a Spark job
@@ -514,6 +532,6 @@ application's `imageConfiguration`; a `TezTask` image is not used, as Tez's task
   directory; Spark alone unpacks the others, into its own files folder. Floci reads an archive itself,
   whatever the execution role may read, though Spark's own read of it uses the role's credentials.
 * **Custom images**: Floci does not check an `imageUri` against the model's pattern, which would refuse the repository URIs Floci's own ECR hands out, nor that the image was built from its release's base image (AWS refuses one that was not from `emr-7.14.0` and `emr-spark-8.1.0` on), nor the image's size. An image that cannot be pulled fails the run, not the request that names it. An image's digest is resolved as the application starts where its `applicationLevelDigestResolution` is true, or left unset on EMR 7.13 or earlier, as the user guide's table has it, and AWS's "Custom images are resolved to a digest at application start; that digest is used for all jobs until the application restarts": the application's image configuration gets the digest of the image in Floci's ECR as its `resolvedImageDigest`, and each run pulls the image by it until the application starts again; a stopped application reports none. An image outside ECR, one in another account's repository (Floci does not check that the application may pull it), or one Floci's ECR does not hold or cannot read without Docker, has no digest to read and is resolved for each run, as every image is from 7.14 on; any other answer from Floci's ECR fails `StartApplication` with `InternalServerException`; such a run's digest comes from its attempt's own pull (see **Image** above), and a job run's image configurations carry no `applicationLevelDigestResolution`.
-* **Not emulated**: the "EMR Serverless Job Run Retry" event, as Floci sends no EMR Serverless events, the account's limit of 2000 `QUEUED` runs, a session's `totalResourceUtilization` and `billedResourceUtilization`, and a Hive run's (see **Resource utilization**), and Flex capacity (`flexExecution` is kept and given back only).
+* **Not emulated**: the "EMR Serverless Job Run Retry" event, the account's limit of 2000 `QUEUED` runs, a session's `totalResourceUtilization` and `billedResourceUtilization`, and a Hive run's (see **Resource utilization**), and Flex capacity (`flexExecution` is kept and given back only).
 * **Instant Start/Stop**: Floci marks the application `STARTED` or `STOPPED` immediately without provisioning actual compute capacity in the background.
 * **Sessions in the `immediate` mode run nothing**: a session is kept with its lifecycle, but no Spark driver runs for it, and a Spark Connect call to it is refused; the `docker` mode runs one (see [Running a session's Spark Connect server](#running-a-sessions-spark-connect-server)).

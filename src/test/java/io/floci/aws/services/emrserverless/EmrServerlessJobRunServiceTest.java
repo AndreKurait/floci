@@ -1,5 +1,6 @@
 package io.floci.aws.services.emrserverless;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -23,6 +24,7 @@ import io.floci.aws.services.emrserverless.model.RuntimeConfiguration;
 import io.floci.aws.services.emrserverless.model.SchedulerConfiguration;
 import io.floci.aws.services.emrserverless.model.StartJobRunRequest;
 import io.floci.aws.services.emrserverless.model.UpdateApplicationRequest;
+import io.floci.aws.services.eventbridge.EventBridgeService;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import io.floci.aws.testing.MutableClock;
@@ -33,6 +35,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -52,9 +55,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -68,6 +76,10 @@ class EmrServerlessJobRunServiceTest {
     private static final String DIGEST = "sha256:" + "a".repeat(64);
     private static final String OTHER_DIGEST = "sha256:" + "b".repeat(64);
 
+    private static final DateTimeFormatter MICROSECONDS =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSS'Z'").withZone(ZoneOffset.UTC);
+
+    private final List<JsonNode> published = new ArrayList<>();
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
     private EmrServerlessService applications;
     private IamService iamService;
@@ -1959,6 +1971,7 @@ class EmrServerlessJobRunServiceTest {
         final List<String> sessionPolicies = new ArrayList<>();
         // What progress.cancelled() said once the driver ran, and again after whileRunning.
         final List<Boolean> cancelledAsRunning = new ArrayList<>();
+        boolean starts = true;
         Outcome outcome = Outcome.exitedWith(0);
         Runnable whileRunning = () -> { };
         Runnable whileTimingOut = () -> { };
@@ -1977,6 +1990,9 @@ class EmrServerlessJobRunServiceTest {
             // As the Docker runner, a stop counts only for a run in progress, so a cancel before then is read here.
             if (progress.cancelled()) {
                 return Outcome.halted();
+            }
+            if (!starts) {
+                return outcome;
             }
             // The driver's first, so an executors' digest written over it shows.
             resolved(progress, WorkerType.DRIVER, job.customImage(), digests);
@@ -2023,4 +2039,207 @@ class EmrServerlessJobRunServiceTest {
             // A test's drivers live no longer than its runs.
         }
     }
+    @Test
+    void anImmediateRunPublishesEachStateItEntersAsTheGuidesExampleShapesIt() {
+        StartJobRunRequest named = request(null, null);
+        named.setName("nightly");
+        EmrServerlessJobRunService service = publishingService(0, null);
+        JobRun run = service.startJobRun(applicationId, named);
+
+        assertEquals(List.of("SUBMITTED<-", "RUNNING<-SUBMITTED", "SUCCESS<-RUNNING"), transitions());
+        for (JsonNode event : published) {
+            assertEquals("aws.emr-serverless", event.path("source").asText());
+            assertEquals("EMR Serverless Job Run State Change", event.path("detail-type").asText());
+            assertEquals(REGION, event.path("region").asText());
+            JsonNode detail = event.path("detail");
+            List<String> fields = new ArrayList<>();
+            detail.fieldNames().forEachRemaining(fields::add);
+            assertEquals(detail.has("previousState")
+                    ? List.of("jobRunId", "applicationId", "arn", "releaseLabel", "state", "previousState", "createdBy",
+                            "updatedAt", "createdAt")
+                    : List.of("jobRunId", "applicationId", "arn", "releaseLabel", "state", "createdBy", "updatedAt",
+                            "createdAt"), fields);
+            assertEquals(run.getJobRunId(), detail.path("jobRunId").asText());
+            assertEquals(applicationId, detail.path("applicationId").asText());
+            assertEquals(run.getArn(), detail.path("arn").asText());
+            assertEquals("emr-7.5.0", detail.path("releaseLabel").asText());
+            assertEquals(run.getCreatedBy(), detail.path("createdBy").asText());
+            assertEquals(MICROSECONDS.format(run.getCreatedAt()), detail.path("createdAt").asText());
+        }
+        assertEquals(MICROSECONDS.format(run.getUpdatedAt()), published.get(2).at("/detail/updatedAt").asText());
+        assertTrue(published.get(2).at("/detail/updatedAt").asText().matches(
+                "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}Z"));
+
+        service.getJobRun(applicationId, run.getJobRunId(), null);
+        assertEquals(3, published.size());
+    }
+
+    @Test
+    void aRunThatSettlesWhenReadPublishesItsEndOnceAtItsOwnTime() {
+        EmrServerlessJobRunService service = publishingService(30, null);
+        JobRun started = service.startJobRun(applicationId, request(null, null));
+        String listed = service.startJobRun(applicationId, request(null, null)).getJobRunId();
+        // On an application of its own, so that listing the first application's runs leaves it unread.
+        String timingApplication = application("timing", "emr-7.5.0", null);
+        EmrServerlessJobRunService timing = publishingService(600, null);
+        String pastItsTimeout = timing.startJobRun(timingApplication, request(null, 5L)).getJobRunId();
+        published.clear();
+
+        clock.advance(Duration.ofSeconds(29));
+        service.getJobRun(applicationId, started.getJobRunId(), null);
+        assertEquals(List.of(), transitions());
+        clock.advance(Duration.ofSeconds(1));
+        service.getJobRun(applicationId, started.getJobRunId(), null);
+        clock.advance(Duration.ofSeconds(1));
+        service.listJobRuns(applicationId, null, null, null, null, null, null);
+        service.getJobRun(applicationId, listed, null);
+        clock.advance(Duration.ofMinutes(5));
+        timing.getJobRun(timingApplication, pastItsTimeout, null);
+
+        assertEquals(List.of("SUCCESS<-RUNNING", "SUCCESS<-RUNNING", "CANCELLED<-RUNNING"), transitions());
+        assertEquals(List.of(started.getJobRunId(), listed, pastItsTimeout),
+                published.stream().map(event -> event.at("/detail/jobRunId").asText()).toList());
+        assertEquals(MICROSECONDS.format(started.getCreatedAt().plusSeconds(30)),
+                published.get(0).at("/detail/updatedAt").asText());
+    }
+
+    @Test
+    void cancellingAnImmediateRunPublishesItsCancellationAndARefusedCancelNothing() {
+        EmrServerlessJobRunService service = publishingService(60, null);
+        String jobRunId = service.startJobRun(applicationId, request(null, null)).getJobRunId();
+        String streaming = service.startJobRun(applicationId, request("STREAMING", null)).getJobRunId();
+        published.clear();
+
+        service.cancelJobRun(applicationId, jobRunId);
+        service.cancelJobRun(applicationId, streaming);
+        assertThrows(AwsException.class, () -> service.cancelJobRun(applicationId, jobRunId));
+
+        assertEquals(List.of("CANCELLED<-RUNNING", "CANCELLED<-RUNNING"), transitions());
+    }
+
+    @Test
+    void aContainerRunPublishesItsScheduleItsStartAndItsEnd() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = publishingService(0, runner);
+        service.startJobRun(applicationId, request(null, null));
+        assertEquals(List.of("SUBMITTED<-", "SCHEDULED<-SUBMITTED"), transitions());
+
+        runNext();
+
+        assertEquals(List.of("SUBMITTED<-", "SCHEDULED<-SUBMITTED", "RUNNING<-SCHEDULED", "SUCCESS<-RUNNING"),
+                transitions());
+    }
+
+    @Test
+    void cancellingAContainerRunPublishesCancellingThenCancelledWhetherOrNotItsDriverRan() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = publishingService(0, runner);
+        String running = service.startJobRun(applicationId, request(null, null)).getJobRunId();
+        runner.whileRunning = () -> {
+            service.cancelJobRun(applicationId, running);
+            runNext();
+        };
+        runNext();
+        assertEquals(List.of("SUBMITTED<-", "SCHEDULED<-SUBMITTED", "RUNNING<-SCHEDULED", "CANCELLING<-RUNNING",
+                "CANCELLED<-CANCELLING"), transitions());
+
+        published.clear();
+        runner.whileRunning = () -> { };
+        String unstarted = service.startJobRun(applicationId, request(null, null)).getJobRunId();
+        service.cancelJobRun(applicationId, unstarted);
+        tasks.remove(1).run();
+        runNext();
+        assertEquals(List.of("SUBMITTED<-", "SCHEDULED<-SUBMITTED", "CANCELLING<-SCHEDULED", "CANCELLED<-CANCELLING"),
+                transitions());
+    }
+
+    @Test
+    void aRetriedContainerRunPublishesItsNextAttemptAsScheduledAgain() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = publishingService(0, runner);
+        StartJobRunRequest resilient = request(null, null);
+        resilient.setRetryPolicy(Map.of("maxAttempts", 3));
+        service.startJobRun(applicationId, resilient);
+
+        runner.outcome = SparkJobRunner.Outcome.exitedWith(1);
+        runNext();
+        runner.outcome = SparkJobRunner.Outcome.couldNotStart("no such image");
+        runner.starts = false;
+        runNext();
+        runner.outcome = SparkJobRunner.Outcome.exitedWith(1);
+        runner.starts = true;
+        runNext();
+
+        // The second attempt never ran, so the run was SCHEDULED when it was tried again and is not reported again.
+        assertEquals(List.of("SUBMITTED<-", "SCHEDULED<-SUBMITTED", "RUNNING<-SCHEDULED", "SCHEDULED<-RUNNING",
+                "RUNNING<-SCHEDULED", "FAILED<-RUNNING"), transitions());
+    }
+
+    @Test
+    void queuedRunsPublishEveryReplayedTransitionWithItsOwnSnapshot() {
+        EmrServerlessJobRunService service = publishingService(30, null);
+        String app = queuingApplication("emr-7.5.0", Map.of("maxConcurrentRuns", 1));
+        String first = start(service, app, null);
+        String second = start(service, app, null);
+        Instant admitted = service.getJobRun(app, first, null).getCreatedAt();
+        assertEquals("QUEUED", service.getJobRun(app, second, null).getState());
+        published.clear();
+
+        clock.advance(Duration.ofSeconds(60));
+        assertEquals("SUCCESS", service.getJobRun(app, second, null).getState());
+
+        assertEquals(List.of("SUCCESS<-RUNNING", "RUNNING<-QUEUED", "SUCCESS<-RUNNING"), transitions());
+        assertEquals(List.of(first, second, second),
+                published.stream().map(event -> event.at("/detail/jobRunId").asText()).toList());
+        assertEquals(List.of(MICROSECONDS.format(admitted.plusSeconds(30)),
+                        MICROSECONDS.format(admitted.plusSeconds(30)), MICROSECONDS.format(admitted.plusSeconds(60))),
+                published.stream().map(event -> event.at("/detail/updatedAt").asText()).toList());
+    }
+
+    @Test
+    void aQueueTimeoutPublishesCancellationFromTheQueuedState() {
+        EmrServerlessJobRunService service = publishingService(0, null);
+        String app = queuingApplication("emr-7.5.0", Map.of("maxConcurrentRuns", 1, "queueTimeoutMinutes", 15));
+        start(service, app, "STREAMING");
+        String second = start(service, app, null);
+        published.clear();
+
+        clock.advance(Duration.ofMinutes(15));
+        assertEquals("CANCELLED", service.getJobRun(app, second, null).getState());
+
+        assertEquals(List.of("CANCELLED<-QUEUED"), transitions());
+        assertEquals(second, published.getFirst().at("/detail/jobRunId").asText());
+    }
+
+    @Test
+    void refusedStoragePublishesNoAdmissionEvents() {
+        store = spy(AccountAwareStorageBackend.inMemory(ACCOUNT_ID));
+        doThrow(new IllegalStateException("storage refused")).when(store).put(anyString(), any());
+        EmrServerlessJobRunService service = publishingService(0, null);
+
+        assertThrows(IllegalStateException.class, () -> service.startJobRun(applicationId, request(null, null)));
+
+        assertTrue(published.isEmpty());
+    }
+
+    // The service, publishing its events to EventBridge on the test's thread, each one added to published.
+    private EmrServerlessJobRunService publishingService(int runDurationSeconds, SparkJobRunner runner) {
+        EventBridgeService eventBridge = mock(EventBridgeService.class);
+        doAnswer(invocation -> published.add(objectMapper.createObjectNode()
+                .put("source", invocation.<String>getArgument(0))
+                .put("detail-type", invocation.<String>getArgument(1))
+                .put("region", invocation.<String>getArgument(4))
+                .set("detail", objectMapper.readTree(invocation.<String>getArgument(2)))))
+                .when(eventBridge).publishServiceEvent(anyString(), anyString(), anyString(), isNull(), anyString());
+        return new EmrServerlessJobRunService(store, applications, iamService, new RegionResolver(REGION, ACCOUNT_ID),
+                null, objectMapper, runDurationSeconds, clock, runner, tasks::add, null, null, null, 0, false,
+                new EmrServerlessEventPublisher(eventBridge, objectMapper, Runnable::run));
+    }
+
+    // Each event published, as the state it reports and the state before it: "SUBMITTED<-" for a run just submitted.
+    private List<String> transitions() {
+        return published.stream().map(event -> event.at("/detail/state").asText() + "<-"
+                + event.at("/detail/previousState").asText()).toList();
+    }
+
 }
