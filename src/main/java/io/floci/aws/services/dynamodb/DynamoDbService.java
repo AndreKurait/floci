@@ -6012,7 +6012,7 @@ public class DynamoDbService {
                 synchronized (tableControlLock(parts[1], parts[0])) {
                     TableDefinition current = tableStore.get(entry.key()).orElse(null);
                     if (current == null || tableId == null || !tableId.equals(current.getTableId())
-                            || !"ACTIVE".equals(current.getTableStatus())) {
+                            || !capacityAvailable(current)) {
                         return;
                     }
                     boolean provisioned = !"PAY_PER_REQUEST".equals(current.getBillingMode());
@@ -6033,6 +6033,10 @@ public class DynamoDbService {
         return List.copyOf(snapshots);
     }
 
+    private static boolean capacityAvailable(TableDefinition table) {
+        return "ACTIVE".equals(table.getTableStatus()) || "UPDATING".equals(table.getTableStatus());
+    }
+
     record CapacityOwner(boolean current, Set<String> indexes) {}
 
     CapacityOwner currentCapacityOwner(DynamoDbCapacityUsage usage) {
@@ -6043,7 +6047,7 @@ public class DynamoDbService {
             synchronized (tableControlLock(usage.tableName(), usage.region())) {
                 TableDefinition current = tableStore.get(regionKey(usage.region(), usage.tableName())).orElse(null);
                 if (current == null || !usage.tableId().equals(current.getTableId())
-                        || !"ACTIVE".equals(current.getTableStatus())) {
+                        || !capacityAvailable(current)) {
                     return new CapacityOwner(false, Set.of());
                 }
                 Set<String> indexes = new HashSet<>();

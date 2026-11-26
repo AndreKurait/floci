@@ -2,6 +2,7 @@ package io.floci.aws.services.dynamodb;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.ManualClock;
@@ -23,6 +24,7 @@ import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
 import software.amazon.awssdk.services.cloudwatch.model.Dimension;
 import software.amazon.awssdk.services.cloudwatch.model.GetMetricStatisticsResponse;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.CreateTableRequest;
 import software.amazon.awssdk.services.dynamodb.model.GlobalSecondaryIndex;
 import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
@@ -183,6 +185,27 @@ class DynamoDbPeriodicCapacityMetricsIntegrationTest {
                         () -> absentProvisioned("ProvisionedWriteCapacityUnits", true)));
         observations.put("observationFinishedAt", Instant.now().toString());
         assertEquals(configuration(initialTable), configuration(describe()));
+    }
+
+    @Test
+    void updatingTableStillPublishesSuccessfulSdkRequestUsage() {
+        observations.put("operation", "updating-request-usage");
+        observations.put("controlledTableStatus", "UPDATING");
+        RequestScopes.runAs(account, Region.US_EAST_1.id(), () -> {
+            synchronized (tables.tableControlLock(table, Region.US_EAST_1.id())) {
+                tables.describeTable(table, Region.US_EAST_1.id()).setTableStatus("UPDATING");
+            }
+        });
+        Map<String, AttributeValue> key = Map.of("pk", AttributeValue.fromS("owned"),
+                "sk", AttributeValue.fromS("row"));
+        dynamo.putItem(request -> request.tableName(table).item(key));
+        assertEquals(key, dynamo.getItem(request -> request.tableName(table).key(key).consistentRead(true)).item());
+        for (String metric : List.of("ConsumedReadCapacityUnits", "ConsumedWriteCapacityUnits")) {
+            assertEquals(1, statistics(metric, false, start, Instant.now().plusSeconds(60), 60, "Sum")
+                    .datapoints().stream().mapToDouble(point -> point.sum()).sum());
+        }
+        assertEquals("UPDATING", describe().tableStatusAsString());
+        assertEquals(initialTable.tableId(), describe().tableId());
     }
 
     private void absentProvisioned(String metric, boolean index) {

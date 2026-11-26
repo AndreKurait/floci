@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -35,6 +36,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.floci.aws.testing.ThreadStates.awaitBlockedOrDone;
@@ -227,6 +229,82 @@ class DynamoDbCapacityOutcomeTest {
         tables.put(REGION + "::" + TABLE, replacement);
         assertNotEquals(usage.tableId(), replacement.getTableId());
         assertFalse(service.currentCapacityOwner(usage).current());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ACTIVE", "UPDATING"})
+    void nativeRequestsPublishUsageWhileTheSameTableStillServesRequests(String status) throws Exception {
+        CloudWatchMetricsService metrics = metrics(new InMemoryStorage<>());
+        NativeDynamoDbJsonHandler handler = handler(metrics);
+        table.setTableStatus(status);
+        ObjectNode write = JSON.createObjectNode().put("TableName", TABLE);
+        write.set("Item", item("same", 20));
+        assertEquals(200, handler.handle("PutItem", write, REGION).getStatus());
+        ObjectNode read = JSON.createObjectNode().put("TableName", TABLE).put("ConsistentRead", true);
+        read.set("Key", key("same"));
+        assertEquals(200, handler.handle("GetItem", read, REGION).getStatus());
+        assertEquals(item("same", 20), service.getItem(TABLE, key("same"), REGION));
+        assertEquals(1, writeSum(metrics));
+        Instant now = Instant.now();
+        assertEquals(1, metrics.getMetricStatistics("AWS/DynamoDB", "ConsumedReadCapacityUnits",
+                List.of(new Dimension("TableName", TABLE)), now.minusSeconds(120), now.plusSeconds(60),
+                60, List.of("Sum"), null, REGION).stream()
+                .mapToDouble(CloudWatchMetricsService.Datapoint::sum).sum());
+        assertEquals(status, table.getTableStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ACTIVE", "UPDATING"})
+    void failedUsagePublicationSurvivesASweepWhileTheSameTableStillServesRequests(String status) throws Exception {
+        AtomicBoolean fail = new AtomicBoolean(true);
+        InMemoryStorage<String, MetricDatum> store = new InMemoryStorage<>() {
+            @Override
+            public void put(String key, MetricDatum value) {
+                if (fail.get()) {
+                    throw new IllegalStateException("Metric store temporarily unavailable");
+                }
+                super.put(key, value);
+            }
+        };
+        CloudWatchMetricsService metrics = metrics(store);
+        NativeDynamoDbJsonHandler handler = handler(metrics);
+        ObjectNode write = JSON.createObjectNode().put("TableName", TABLE);
+        write.set("Item", item("same", 20));
+        assertEquals(200, handler.handle("PutItem", write, REGION).getStatus());
+        assertEquals(0, writeSum(metrics));
+        table.setTableStatus(status);
+        publisher.tick();
+        fail.set(false);
+        publisher.tick();
+        publisher.tick();
+        assertEquals(1, writeSum(metrics));
+        assertEquals(status, table.getTableStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"CREATING", "DELETING", "ARCHIVING", "ARCHIVED"})
+    void unavailableTableStatesCannotOwnUsageOrRetrySnapshots(String status) {
+        DynamoDbCapacityUsage usage = service.putItemWithCapacity(TABLE, item("same", 20), null, null, null,
+                REGION, "NONE", null).usage();
+        table.setTableStatus(status);
+        assertFalse(service.currentCapacityOwner(usage).current());
+        assertTrue(service.capacitySnapshots().isEmpty());
+    }
+
+    @Test
+    void anUpdatingReplacementCannotInheritAnEarlierIncarnationsUsage() {
+        DynamoDbCapacityUsage usage = service.putItemWithCapacity(TABLE, item("same", 20), null, null, null,
+                REGION, "NONE", null).usage();
+        service.deleteTable(TABLE, REGION);
+        assertFalse(service.currentCapacityOwner(usage).current());
+        assertTrue(service.capacitySnapshots().isEmpty());
+        TableDefinition replacement = new TableDefinition(TABLE, List.of(new KeySchemaElement("pk", "HASH")),
+                List.of(new AttributeDefinition("pk", "S")), REGION, ACCOUNT);
+        replacement.setTableStatus("UPDATING");
+        tables.put(REGION + "::" + TABLE, replacement);
+        assertFalse(service.currentCapacityOwner(usage).current());
+        assertEquals(List.of(replacement.getTableId()), service.capacitySnapshots().stream()
+                .map(DynamoDbService.CapacitySnapshot::tableId).toList());
     }
 
     private CloudWatchMetricsService metrics(InMemoryStorage<String, MetricDatum> store) {
