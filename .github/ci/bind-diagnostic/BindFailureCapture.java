@@ -8,8 +8,8 @@ import java.util.concurrent.TimeUnit;
 /** Private diagnostic overlay only; deliberately absent from production artifacts. */
 final class BindFailureCapture {
     static void capture(int port, IOException original) {
-        String collector = System.getProperty("floci.diagnostic.collector");
-        String directory = System.getProperty("floci.diagnostic.directory");
+        String collector = System.getProperty("floci-bind-diagnostic.collector");
+        String directory = System.getProperty("floci-bind-diagnostic.directory");
         if (!(original instanceof BindException) || collector == null || directory == null) {
             return;
         }

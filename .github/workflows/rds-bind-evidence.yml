@@ -29,8 +29,8 @@ jobs:
 
         chmod 700 "$RUNNER_TEMP/bind-diagnostic"
 
-        printf ''JAVA_TOOL_OPTIONS=%s -Dfloci.diagnostic.collector=%s/.github/ci/bind-diagnostic/capture-local-socket-owner.py
-        -Dfloci.diagnostic.directory=%s/bind-diagnostic\n'' "${JAVA_TOOL_OPTIONS:-}" "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+        printf ''JAVA_TOOL_OPTIONS=%s -Dfloci-bind-diagnostic.collector=%s/.github/ci/bind-diagnostic/capture-local-socket-owner.py
+        -Dfloci-bind-diagnostic.directory=%s/bind-diagnostic\n'' "${JAVA_TOOL_OPTIONS:-}" "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
         >> "$GITHUB_ENV"
 
         '
