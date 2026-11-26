@@ -42,9 +42,18 @@ class DynamoDbRegistrationQuotaServiceTest {
             InMemoryStorage<String, ScalableTarget> targets = new InMemoryStorage<>();
             JsonNode before = JSON.valueToTree(fixture.tables.scan(key -> true));
             int desired = account ? 31 : 40001;
-            assertThrows(AwsException.class, () -> fixture.service.reconcileScalableTarget(
+            AwsException refusal = assertThrows(AwsException.class, () -> fixture.service.reconcileScalableTarget(
                     target.resource(), target.dimension(), desired, desired, REGION,
                     publication(targets, target.resource(), target.dimension(), desired)));
+            assertEquals("LimitExceededException", refusal.getErrorCode());
+            if (account) {
+                assertTrue(refusal.getMessage().contains("limit to be exceeded for the account"));
+                assertTrue(refusal.getMessage().contains("Limit: 80000."));
+            } else {
+                assertTrue(refusal.getMessage().contains("above the per "
+                        + (target.index ? "index" : "table") + " maximum"));
+                assertTrue(refusal.getMessage().contains("Per table maximum: 40000."));
+            }
             assertEquals(before, JSON.valueToTree(fixture.tables.scan(key -> true)));
             assertTrue(targets.isEmpty());
         }
