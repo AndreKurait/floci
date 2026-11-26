@@ -350,6 +350,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     jakarta.enterprise.inject.Instance<ResourceGroupsService> resourceGroupsServices;
     // Null in the test-shaped constructors, which fall back to the region's own partition.
     RegionResolver regionResolver;
+    // Lazy lookup avoids a cycle with the provider-side endpoint service.
+    @Inject
+    jakarta.enterprise.inject.Instance<Ec2PrivateLinkService> privateLinkServices;
     private final StorageBackend<String, Host> hosts;
     private final StorageBackend<String, EgressOnlyInternetGateway> egressOnlyInternetGateways;
     // Serialises a launch onto a host against ModifyHosts/ReleaseHosts, so a host cannot be
@@ -7716,12 +7719,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         for (String securityGroupId : securityGroupIds) {
             getRequiredSecurityGroup(region, securityGroupId);
         }
+        Optional<String> connectionState = privateLinkServices == null || privateLinkServices.isUnsatisfied()
+                ? Optional.empty()
+                : privateLinkServices.get().admitEndpoint(region, serviceName, effectiveType);
 
         VpcEndpoint endpoint = new VpcEndpoint();
         endpoint.setVpcEndpointId("vpce-" + randomHex(17));
         endpoint.setVpcId(vpcId);
         endpoint.setServiceName(serviceName);
         endpoint.setVpcEndpointType(effectiveType);
+        connectionState.ifPresent(endpoint::setState);
         endpoint.setIpAddressType(ipAddressType != null ? ipAddressType : "ipv4");
         boolean isInterface = "Interface".equalsIgnoreCase(endpoint.getVpcEndpointType());
         endpoint.setPrivateDnsEnabled(privateDnsEnabled != null ? privateDnsEnabled : isInterface);
@@ -7971,6 +7978,55 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
         }
         return deleted;
+    }
+
+    /**
+     * The endpoints in {@code region}, in every account, that connect to one of {@code serviceNames}:
+     * the connections a VPC endpoint service's provider sees. The account is the endpoint's owner.
+     */
+    public List<AccountAwareStorageBackend.OwnedEntry<VpcEndpoint>> endpointsOfServices(String region,
+                                                                                       Set<String> serviceNames) {
+        List<AccountAwareStorageBackend.OwnedEntry<VpcEndpoint>> entries = new ArrayList<>();
+        if (vpcEndpoints instanceof AccountAwareStorageBackend<VpcEndpoint> accountAware) {
+            for (AccountAwareStorageBackend.AccountEntry<VpcEndpoint> entry : accountAware.scanAllAccountEntries(k -> true)) {
+                entries.add(new AccountAwareStorageBackend.OwnedEntry<>(entry.accountId(), entry.value()));
+            }
+        } else {
+            vpcEndpoints.scan(k -> true).forEach(endpoint ->
+                    entries.add(new AccountAwareStorageBackend.OwnedEntry<>(callerAccountId(), endpoint)));
+        }
+        return entries.stream()
+                .filter(entry -> region.equals(entry.value().getRegion())
+                        && serviceNames.contains(entry.value().getServiceName()))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Moves the state of {@code accountId}'s endpoint to {@code to} when it connects to
+     * {@code serviceName} and its state is one of {@code from}: an endpoint service's provider
+     * accepting or rejecting a connection. Empty when there is no such endpoint; the endpoint as it
+     * is when its state is not one of {@code from}.
+     */
+    public Optional<VpcEndpoint> changeEndpointConnectionState(String accountId, String region, String endpointId,
+                                                               String serviceName, Set<String> from, String to) {
+        synchronized (lockFor(key(region, endpointId))) {
+            Optional<VpcEndpoint> found = vpcEndpoints instanceof AccountAwareStorageBackend<VpcEndpoint> accountAware
+                    ? accountAware.getForAccount(accountId, key(region, endpointId))
+                    : vpcEndpoints.get(key(region, endpointId));
+            if (found.isEmpty() || !serviceName.equals(found.get().getServiceName())) {
+                return Optional.empty();
+            }
+            VpcEndpoint endpoint = found.get();
+            if (from.contains(endpoint.getState())) {
+                endpoint.setState(to);
+                if (vpcEndpoints instanceof AccountAwareStorageBackend<VpcEndpoint> accountAware) {
+                    accountAware.putForAccount(accountId, key(region, endpointId), endpoint);
+                } else {
+                    vpcEndpoints.put(key(region, endpointId), endpoint);
+                }
+            }
+            return Optional.of(endpoint);
+        }
     }
 
     /**
@@ -12194,6 +12250,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (resourceId.startsWith("lt-")) {
             return "launch-template";
+        }
+        // Checked before the endpoint prefix, which it starts with.
+        if (resourceId.startsWith("vpce-svc-")) {
+            return "vpc-endpoint-service";
         }
         if (resourceId.startsWith("vpce-")) {
             return "vpc-endpoint";

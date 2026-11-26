@@ -71,13 +71,15 @@ public class Ec2QueryHandler {
     private final Ec2IpamService ipamService;
     private final RegionResolver regionResolver;
     private final Ec2ClientVpnHandler clientVpnHandler;
+    private final Ec2PrivateLinkService privateLinkService;
+    private final Ec2PrivateLinkHandler privateLinkHandler;
 
     @Inject
     public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
                            Ec2EbsEncryptionService ebsEncryptionService,
                            Ec2BlockPublicAccessService blockPublicAccessService,
                            Ec2IpamService ipamService, RegionResolver regionResolver,
-                           Ec2ClientVpnService clientVpnService) {
+                           Ec2ClientVpnService clientVpnService, Ec2PrivateLinkService privateLinkService) {
         this.service = service;
         this.config = config;
         this.flowLogService = flowLogService;
@@ -86,6 +88,18 @@ public class Ec2QueryHandler {
         this.ipamService = ipamService;
         this.regionResolver = regionResolver;
         this.clientVpnHandler = clientVpnService == null ? null : new Ec2ClientVpnHandler(clientVpnService, service);
+        this.privateLinkService = privateLinkService;
+        this.privateLinkHandler = privateLinkService == null ? null : new Ec2PrivateLinkHandler(privateLinkService, service);
+    }
+
+    /** For callers that exercise no VPC endpoint service operation. */
+    public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
+                           Ec2EbsEncryptionService ebsEncryptionService,
+                           Ec2BlockPublicAccessService blockPublicAccessService,
+                           Ec2IpamService ipamService, RegionResolver regionResolver,
+                           Ec2ClientVpnService clientVpnService) {
+        this(service, config, flowLogService, ebsEncryptionService, blockPublicAccessService, ipamService,
+                regionResolver, clientVpnService, null);
     }
 
     /** For unit tests that exercise no Client VPN operation. */
@@ -153,6 +167,17 @@ public class Ec2QueryHandler {
                 case "DescribeVpcEndpoints" -> handleDescribeVpcEndpoints(params, region);
                 case "ModifyVpcEndpoint" -> handleModifyVpcEndpoint(params, region);
                 case "DeleteVpcEndpoints" -> handleDeleteVpcEndpoints(params, region);
+                // VPC endpoint services (PrivateLink, provider side)
+                case "CreateVpcEndpointServiceConfiguration" -> privateLinkHandler.create(params, region,
+                        parseTagsForResource(params, "vpc-endpoint-service", Set.of("vpc-endpoint-service")));
+                case "DescribeVpcEndpointServiceConfigurations" -> privateLinkHandler.describe(params, region);
+                case "ModifyVpcEndpointServiceConfiguration" -> privateLinkHandler.modify(params, region);
+                case "DeleteVpcEndpointServiceConfigurations" -> privateLinkHandler.delete(params, region);
+                case "DescribeVpcEndpointServicePermissions" -> privateLinkHandler.describePermissions(params, region);
+                case "ModifyVpcEndpointServicePermissions" -> privateLinkHandler.modifyPermissions(params, region);
+                case "DescribeVpcEndpointConnections" -> privateLinkHandler.describeConnections(params, region);
+                case "AcceptVpcEndpointConnections" -> privateLinkHandler.acceptConnections(params, region);
+                case "RejectVpcEndpointConnections" -> privateLinkHandler.rejectConnections(params, region);
                 // Flow Logs
                 case "CreateFlowLogs" -> handleCreateFlowLogs(params, region);
                 case "DescribeFlowLogs" -> handleDescribeFlowLogs(params, region);
@@ -2070,15 +2095,31 @@ public class Ec2QueryHandler {
             xml.end("availabilityZoneSet")
                     .elem("owner", svc.owner)
                     .elem("acceptanceRequired", svc.acceptanceRequired)
-                    .elem("managesVpcEndpoints", svc.managesVpcEndpoints)
-                    .end("item");
+                    .elem("managesVpcEndpoints", svc.managesVpcEndpoints);
+            if (svc.endpointService != null) {
+                VpcEndpointServiceConfiguration own = svc.endpointService;
+                xml.elem("serviceId", own.getServiceId())
+                        .elem("serviceRegion", own.getRegion())
+                        .start("baseEndpointDnsNameSet")
+                        .elem("item", Ec2PrivateLinkService.baseEndpointDnsName(own))
+                        .end("baseEndpointDnsNameSet")
+                        .start("supportedIpAddressTypeSet");
+                for (String ipType : own.getSupportedIpAddressTypes()) xml.elem("item", ipType);
+                xml.end("supportedIpAddressTypeSet")
+                        .elem("privateDnsName", own.getPrivateDnsName())
+                        .elem("privateDnsNameVerificationState", Ec2PrivateLinkService.privateDnsVerificationState(own))
+                        .raw(tagSetXml(svc.tags));
+            }
+            xml.end("item");
         }
         xml.end("serviceDetailSet").end("DescribeVpcEndpointServicesResponse");
         return xmlResponse(xml.build());
     }
 
     /**
-     * Service detail for VPC endpoint service, used for filtering.
+     * Service detail for VPC endpoint service, used for filtering. {@code endpointService} is set
+     * for an endpoint service an account created, and {@code tags} are its tags when the caller
+     * owns it.
      */
     private record ServiceDetail(
             String serviceName,
@@ -2088,7 +2129,24 @@ public class Ec2QueryHandler {
             String acceptanceRequired,
             String managesVpcEndpoints,
             String serviceRegion,
-            List<String> supportedIpAddressTypes) {
+            List<String> supportedIpAddressTypes,
+            VpcEndpointServiceConfiguration endpointService,
+            List<Tag> tags) {
+
+        private ServiceDetail(String serviceName, List<String> serviceTypes, List<String> availabilityZones,
+                              String owner, String acceptanceRequired, String managesVpcEndpoints,
+                              String serviceRegion, List<String> supportedIpAddressTypes) {
+            this(serviceName, serviceTypes, availabilityZones, owner, acceptanceRequired, managesVpcEndpoints,
+                    serviceRegion, supportedIpAddressTypes, null, List.of());
+        }
+    }
+
+    private ServiceDetail endpointServiceDetail(VpcEndpointServiceConfiguration own) {
+        return new ServiceDetail(own.getServiceName(), List.of(own.getServiceType()), own.getAvailabilityZones(),
+                own.getOwnerId(), String.valueOf(own.isAcceptanceRequired()), "false", own.getRegion(),
+                own.getSupportedIpAddressTypes(), own,
+                privateLinkService.ownedByCaller(own) ? service.resourceTags(own.getRegion(), own.getServiceId())
+                        : List.of());
     }
 
     private List<ServiceDetail> buildServiceDetails(String region, List<String> requested, List<String> azNames) {
@@ -2122,6 +2180,12 @@ public class Ec2QueryHandler {
         }
 
         for (String full : fullNames) {
+            Optional<VpcEndpointServiceConfiguration> own = !requested.isEmpty() && privateLinkService != null
+                    ? privateLinkService.visibleService(region, full) : Optional.empty();
+            if (own.isPresent()) {
+                services.add(endpointServiceDetail(own.get()));
+                continue;
+            }
             List<String> serviceTypes;
             String gatewayInterface = gatewayInterfaces.get(full);
             if (gatewayInterface == null) {
@@ -2140,6 +2204,9 @@ public class Ec2QueryHandler {
                     "false",
                     region,
                     List.of("ipv4", "ipv6")));
+        }
+        if (requested.isEmpty() && privateLinkService != null) {
+            privateLinkService.visibleServices(region).forEach(own -> services.add(endpointServiceDetail(own)));
         }
 
         return services;
@@ -2196,11 +2263,10 @@ public class Ec2QueryHandler {
             case "service-type" -> svc.serviceTypes.stream().anyMatch(t -> values.contains(t));
             case "supported-ip-address-types" -> svc.supportedIpAddressTypes.stream()
                     .anyMatch(t -> values.contains(t));
-            case String n when n.startsWith("tag:") -> {
-                // VPC endpoint services don't have user tags, so no tag filters match
-                yield false;
-            }
-            case "tag-key" -> false; // No tags on these services
+            // Only an endpoint service an account created carries tags, and only its owner sees them.
+            case String n when n.startsWith("tag:") -> svc.tags.stream().anyMatch(tag ->
+                    tag.getKey().equals(n.substring("tag:".length())) && values.contains(tag.getValue()));
+            case "tag-key" -> svc.tags.stream().anyMatch(tag -> values.contains(tag.getKey()));
             default -> throw new AwsException("InvalidFilter",
                     "The filter '" + filterName + "' is invalid.", 400);
         };
