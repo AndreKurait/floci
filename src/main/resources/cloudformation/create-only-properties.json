@@ -439,6 +439,10 @@
     "DnsOptions/PrivateDnsPreference",
     "DnsOptions/PrivateDnsSpecifiedDomains"
   ],
+  "AWS::EC2::VPCEndpointService": [],
+  "AWS::EC2::VPCEndpointServicePermissions": [
+    "ServiceId"
+  ],
   "AWS::EC2::VPCGatewayAttachment": [
     "VpcId"
   ],
