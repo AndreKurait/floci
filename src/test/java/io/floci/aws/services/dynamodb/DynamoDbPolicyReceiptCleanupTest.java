@@ -92,11 +92,22 @@ class DynamoDbPolicyReceiptCleanupTest {
         exercise(suite, false, "none", true);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"Workload", "ReadAdmission", "ConditionalAdmission", "AdmissionContract"})
+    void cachedAlarmWithChangedActionIsNotDeleted(String suite) throws Exception {
+        exercise(suite, false, "none", true, true);
+    }
+
     private void exercise(String suite, boolean incomplete, String deletion) throws Exception {
         exercise(suite, incomplete, deletion, false);
     }
 
     private void exercise(String suite, boolean incomplete, String deletion, boolean alarmFailure) throws Exception {
+        exercise(suite, incomplete, deletion, alarmFailure, false);
+    }
+
+    private void exercise(String suite, boolean incomplete, String deletion,
+                          boolean alarmFailure, boolean cachedAlarm) throws Exception {
         Object fixture = switch (suite) {
             case "Workload" -> new DynamoDbPolicyWorkloadIntegrationTest();
             case "ReadAdmission" -> new DynamoDbPolicyReadAdmissionIntegrationTest();
@@ -147,10 +158,23 @@ class DynamoDbPolicyReceiptCleanupTest {
             MetricAlarm unowned = owned.toBuilder().alarmName("TargetTracking-" + resource + "-unowned")
                     .alarmArn("arn:aws:cloudwatch:us-east-1:" + account + ":alarm:unowned")
                     .alarmActions(policyArn + "-unexpected").build();
+            if (cachedAlarm) {
+                @SuppressWarnings("unchecked")
+                Map<String, String> cache = (Map<String, String>) get(fixture, "ownedAlarms");
+                cache.put(unowned.alarmName(), unowned.alarmArn());
+            }
             when(metrics.describeAlarms(ArgumentMatchers.<Consumer<DescribeAlarmsRequest.Builder>>any()))
-                    .thenReturn(DescribeAlarmsResponse.builder().metricAlarms(unowned, owned).build())
-                    .thenReturn(DescribeAlarmsResponse.builder().metricAlarms(owned).build())
-                    .thenReturn(DescribeAlarmsResponse.builder().metricAlarms(unowned).build());
+                    .thenAnswer(invocation -> {
+                        Consumer<DescribeAlarmsRequest.Builder> action = invocation.getArgument(0);
+                        DescribeAlarmsRequest.Builder request = DescribeAlarmsRequest.builder();
+                        action.accept(request);
+                        List<String> names = request.build().alarmNames();
+                        if (!names.isEmpty()) {
+                            return DescribeAlarmsResponse.builder().metricAlarms(
+                                    names.equals(List.of(owned.alarmName())) ? owned : unowned).build();
+                        }
+                        return DescribeAlarmsResponse.builder().metricAlarms(unowned, owned).build();
+                    });
         }
         if (!deletion.equals("none")) {
             set(fixture, "createAttempted", true);
@@ -219,8 +243,8 @@ class DynamoDbPolicyReceiptCleanupTest {
                 InvocationTargetException thrown = assertThrows(InvocationTargetException.class,
                         () -> teardown.invoke(fixture));
                 AssertionError aggregate = assertInstanceOf(AssertionError.class, thrown.getCause());
-                assertEquals(2, aggregate.getSuppressed().length,
-                        "Both the unowned action and the retained alarm inventory must be reported");
+                assertEquals(cachedAlarm ? 3 : 2, aggregate.getSuppressed().length,
+                        "Discovery, cached ownership and retained inventory failures must be reported");
                 verify(metrics).deleteAlarms(ArgumentMatchers.<Consumer<DeleteAlarmsRequest.Builder>>argThat(action -> {
                     DeleteAlarmsRequest.Builder request = DeleteAlarmsRequest.builder();
                     action.accept(request);
@@ -254,7 +278,7 @@ class DynamoDbPolicyReceiptCleanupTest {
             JsonNode saved = new ObjectMapper().readTree(receipt.toFile());
             assertEquals(1, saved.get("calls").size());
             assertEquals(!incomplete, saved.get("calls").get(0).has("responseBase64"));
-            assertEquals(alarmFailure ? 2 : incomplete || deletion.equals("replacement") ? 1 : 0,
+            assertEquals(alarmFailure ? cachedAlarm ? 3 : 2 : incomplete || deletion.equals("replacement") ? 1 : 0,
                     saved.get("observations").get("cleanupFailures").size());
         } finally {
             Files.deleteIfExists(receipt);

@@ -574,6 +574,13 @@ class DynamoDbPolicyConditionalAdmissionIntegrationTest {
                         for (MetricAlarm alarm : current.metricAlarms()) {
                             assertEquals(owned.getKey(), alarm.alarmName());
                             assertEquals(owned.getValue(), alarm.alarmArn());
+                            assertEquals(1, alarm.alarmActions().size());
+                            String action = alarm.alarmActions().getFirst();
+                            assertTrue(action.contains(":" + account + ":scalingPolicy:"));
+                            assertTrue(action.endsWith(":resource/dynamodb/" + resource + ":policyName/" + policyName));
+                            if (policyArn != null) {
+                                assertEquals(policyArn, action);
+                            }
                             metrics.deleteAlarms(request -> request.alarmNames(owned.getKey()));
                         }
                     });
