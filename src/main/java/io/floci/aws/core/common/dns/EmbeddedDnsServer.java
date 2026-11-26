@@ -616,7 +616,8 @@ public class EmbeddedDnsServer {
         boolean authoritative = hasAuthoritativeSuffix(name);
         boolean routedApi = publicAwsApi && origin != null && TlsConfigSource.awsEndpointSuffixes().stream()
                 .anyMatch(suffix -> DomainNames.isWithin(name.toLowerCase(Locale.ROOT), suffix));
-        Optional<DnsAnswer> emulatorName = authoritative ? Optional.empty() : resolveEmulatorName(name,
+        boolean externalPeer = publicAwsApi && origin == null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT));
+        Optional<DnsAnswer> emulatorName = authoritative || externalPeer ? Optional.empty() : resolveEmulatorName(name,
                 routedApi ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
@@ -631,7 +632,7 @@ public class EmbeddedDnsServer {
             return QueryPlan.answeringReservedAuthority(authoritativeAnswer(stored.or(
                     () -> resolveFromRecordSources(name, type, false, myIp, origin))));
         }
-        if (standardQuery && matchesSuffix(name) && (type == 1 || type == 28)
+        if (standardQuery && !externalPeer && matchesSuffix(name) && (type == 1 || type == 28)
                 && stored.filter(answer -> answer.responseCode() == 5).isPresent()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
