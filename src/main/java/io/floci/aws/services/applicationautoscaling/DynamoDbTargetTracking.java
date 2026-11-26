@@ -293,6 +293,8 @@ final class DynamoDbTargetTracking {
             service.recordScalingActivity(applied, "Setting desired capacity to " + result.capacity(),
                     "monitor alarm " + alarm.getAlarmName() + " in state ALARM triggered policy "
                             + policy.getPolicyName(), region);
+            reconcile(applied, region);
+            return;
         }
         reconcile(policy, region);
     }

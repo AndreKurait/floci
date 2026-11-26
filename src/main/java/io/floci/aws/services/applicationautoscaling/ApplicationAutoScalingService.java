@@ -632,7 +632,12 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             throw failure;
         }
         if (dynamoPolicy && existing != null && DynamoDbTargetTracking.supports(policy)) {
-            policy = dynamoDbTargetTracking.deleteObsoleteAlarms(policy, region);
+            try {
+                policy = dynamoDbTargetTracking.deleteObsoleteAlarms(policy, region);
+            } catch (RuntimeException cleanupFailure) {
+                LOG.warnv(cleanupFailure, "Retaining obsolete alarm cleanup for committed policy {0}",
+                        policy.getPolicyArn());
+            }
         }
         LOG.infov("PutScalingPolicy: {0} ({1}) for {2} {3} in {4}",
                 policyName, policy.getPolicyType(), serviceNamespace, resourceId, region);

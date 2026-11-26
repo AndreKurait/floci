@@ -29,12 +29,16 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongUnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -214,6 +218,70 @@ class DynamoDbPolicyConfigurationAdmissionTest {
         assertEquals(4, replacement.getAlarms().size());
         assertTrue(storedPolicy().getPendingAlarmDeletions().isEmpty());
         assertEquals(4, metrics.describeAlarms(null, null, REGION).size());
+    }
+
+    @Test
+    void committedReplacementSurvivesCleanupMetadataFailureAndRetries() {
+        trackingPolicy(70);
+        doCallRealMethod().doThrow(new IllegalStateException("controlled cleanup metadata failure"))
+                .doCallRealMethod().when(policies).put(anyString(), any(ScalingPolicy.class));
+        ScalingPolicy replacement = assertDoesNotThrow(() -> trackingPolicy(60));
+        assertEquals(60, replacement.getTargetTrackingConfiguration().getTargetValue());
+        assertEquals(60, storedPolicy().getTargetTrackingConfiguration().getTargetValue());
+        assertEquals(4, replacement.getPendingAlarmDeletions().size());
+        assertEquals(4, storedPolicy().getPendingAlarmDeletions().size());
+        assertEquals(4, metrics.describeAlarms(null, null, REGION).size());
+        service.reconcileDynamoDbPolicies(Instant.EPOCH);
+        assertTrue(storedPolicy().getPendingAlarmDeletions().isEmpty());
+        assertEquals(60, storedPolicy().getTargetTrackingConfiguration().getTargetValue());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void obsoleteAlarmCleanupPreservesCompletedScalingMetadata(boolean scaleOut) {
+        ScalingPolicy original = trackingPolicy(70);
+        String blocked = original.getAlarms().getFirst().getAlarmName();
+        blockDeletion(blocked);
+        ScalingPolicy policy = trackingPolicy(60);
+        policy.getTargetTrackingConfiguration().setScaleInCooldown(300);
+        policy.setLastScaleInTime(scaleOut ? 1799999999L : 0);
+        service.savePolicy(policy, REGION);
+        assertEquals(1, storedPolicy().getPendingAlarmDeletions().size());
+        metrics.deleteAlarms(List.of("cleanup-blocker"), REGION);
+        AtomicLong capacity = new AtomicLong(scaleOut ? 50 : 200);
+        when(dynamo.decideScalableCapacity(anyString(), anyString(), anyString(), any(LongUnaryOperator.class)))
+                .thenAnswer(invocation -> {
+                    long previous = capacity.get();
+                    LongUnaryOperator decision = invocation.getArgument(3);
+                    long next = decision.applyAsLong(previous);
+                    capacity.set(next);
+                    return new ScalableCapacityDecision(true, previous, next);
+                });
+        Clock clock = Clock.fixed(Instant.ofEpochSecond(1800000000L), ZoneOffset.UTC);
+        DynamoDbTargetTracking tracking = new DynamoDbTargetTracking(service, dynamo, metrics, clock);
+        MetricAlarm alarm = metrics.describeAlarms(
+                List.of(policy.getAlarms().get(scaleOut ? 0 : 1).getAlarmName()), null, REGION).getFirst();
+        ScalableTarget target = targets.scan(key -> true).getFirst();
+        tracking.execute(policy, target, alarm, 3600, REGION);
+        assertEquals(100, capacity.get());
+        ScalingPolicy stored = storedPolicy();
+        assertEquals(100, stored.getLastAppliedCapacity());
+        assertEquals(scaleOut ? 0 : 1800000000L, stored.getLastScaleInTime());
+        assertEquals(scaleOut ? 1800000000L : 0, stored.getLastScaleOutTime());
+        if (scaleOut) {
+            assertEquals(100, stored.getLastScaleOutCapacity());
+        }
+        assertTrue(stored.getPendingAlarmDeletions().isEmpty());
+        assertTrue(metrics.describeAlarms(List.of(blocked), null, REGION).isEmpty());
+        if (!scaleOut) {
+            ScalingPolicy reloaded = JSON.convertValue(stored, ScalingPolicy.class);
+            DynamoDbTargetTracking next = new DynamoDbTargetTracking(service, dynamo, metrics,
+                    Clock.fixed(clock.instant().plusSeconds(1), ZoneOffset.UTC));
+            MetricAlarm current = metrics.describeAlarms(
+                    List.of(reloaded.getAlarms().get(1).getAlarmName()), null, REGION).getFirst();
+            next.execute(reloaded, target, current, 1800, REGION);
+            assertEquals(100, capacity.get(), "Completed cleanup must not allow a second scale-in during cooldown");
+        }
     }
 
     private ScalingPolicy trackingPolicy(double targetValue) {
