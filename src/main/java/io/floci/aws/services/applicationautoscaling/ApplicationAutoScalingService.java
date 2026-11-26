@@ -599,6 +599,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         try {
             if (DynamoDbTargetTracking.supports(policy)) {
                 policy.setAlarms(dynamoDbTargetTracking.createAlarms(policy, existing, region));
+                DynamoDbTargetTracking.retainObsoleteAlarms(policy, existing);
             } else if ("TargetTrackingScaling".equals(policy.getPolicyType())) {
                 if (existing != null) {
                     deleteAlarms(existing, region);
@@ -631,11 +632,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             throw failure;
         }
         if (dynamoPolicy && existing != null && DynamoDbTargetTracking.supports(policy)) {
-            List<String> retained = policy.getAlarms().stream().map(Alarm::getAlarmName).toList();
-            ScalingPolicy obsolete = DynamoDbTargetTracking.copyPolicy(existing);
-            obsolete.setAlarms(existing.getAlarms().stream()
-                    .filter(alarm -> !retained.contains(alarm.getAlarmName())).toList());
-            deleteAlarms(obsolete, region);
+            policy = dynamoDbTargetTracking.deleteObsoleteAlarms(policy, region);
         }
         LOG.infov("PutScalingPolicy: {0} ({1}) for {2} {3} in {4}",
                 policyName, policy.getPolicyType(), serviceNamespace, resourceId, region);
@@ -789,6 +786,14 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
      * that names an alarm a composite alarm still names, and the others should go regardless.
      */
     private void deleteAlarms(ScalingPolicy policy, String region) {
+        if (!policy.getPendingAlarmDeletions().isEmpty()) {
+            try {
+                dynamoDbTargetTracking.deleteObsoleteAlarms(policy, region);
+            } catch (RuntimeException failure) {
+                LOG.debugv(failure, "Could not persist obsolete alarm cleanup for policy {0} in {1}",
+                        policy.getPolicyArn(), region);
+            }
+        }
         for (Alarm alarm : policy.getAlarms()) {
             try {
                 cloudWatchMetricsService.deleteAlarms(List.of(alarm.getAlarmName()), region);

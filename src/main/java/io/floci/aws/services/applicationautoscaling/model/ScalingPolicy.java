@@ -25,6 +25,7 @@ public class ScalingPolicy {
     private String scalableDimension;
     private double creationTime;
     private List<Alarm> alarms = new ArrayList<>();
+    private List<Alarm> pendingAlarmDeletions = new ArrayList<>();
     private TargetTrackingConfiguration targetTrackingConfiguration;
     private StepScalingConfiguration stepScalingConfiguration;
     private double lastScaleOutTime;
@@ -55,6 +56,11 @@ public class ScalingPolicy {
 
     public List<Alarm> getAlarms() { return alarms; }
     public void setAlarms(List<Alarm> v) { this.alarms = v == null ? new ArrayList<>() : new ArrayList<>(v); }
+
+    public List<Alarm> getPendingAlarmDeletions() { return pendingAlarmDeletions; }
+    public void setPendingAlarmDeletions(List<Alarm> v) {
+        this.pendingAlarmDeletions = v == null ? new ArrayList<>() : new ArrayList<>(v);
+    }
 
     public TargetTrackingConfiguration getTargetTrackingConfiguration() { return targetTrackingConfiguration; }
     public void setTargetTrackingConfiguration(TargetTrackingConfiguration v) { this.targetTrackingConfiguration = v; }

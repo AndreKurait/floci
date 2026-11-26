@@ -17,18 +17,21 @@ import io.floci.aws.services.applicationautoscaling.model.ScheduledAction;
 import io.floci.aws.services.applicationautoscaling.model.TargetTrackingConfiguration;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.cloudwatch.metrics.model.AlarmHistoryItem;
+import io.floci.aws.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.DynamoDbService.ScalableCapacityDecision;
 import io.floci.aws.testing.StorageFactories;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -125,6 +128,113 @@ class DynamoDbPolicyConfigurationAdmissionTest {
         assertNull(history.nextToken());
         assertFalse(history.items().isEmpty());
         refuse(test);
+    }
+
+    @Test
+    void reconcileRetainsBlockedObsoleteAlarmAndDeletesEveryOtherAlarm() throws Exception {
+        ScalingPolicy original = trackingPolicy(70);
+        String blocked = original.getAlarms().getFirst().getAlarmName();
+        blockDeletion(blocked);
+        original.getTargetTrackingConfiguration().setDisableScaleIn(true);
+        service.savePolicy(original, REGION);
+        service.reconcileDynamoDbPolicies(Instant.EPOCH);
+        ScalingPolicy replacement = storedPolicy();
+        assertEquals(3, replacement.getAlarms().size());
+        assertEquals(List.of(blocked), replacement.getPendingAlarmDeletions().stream()
+                .map(alarm -> alarm.getAlarmName()).toList());
+        assertEquals(4, metrics.describeAlarms(null, null, REGION).size());
+        for (int index = 1; index < original.getAlarms().size(); index++) {
+            assertTrue(metrics.describeAlarms(List.of(original.getAlarms().get(index).getAlarmName()), null, REGION).isEmpty());
+        }
+        ScalingPolicy restored = JSON.readValue(JSON.writeValueAsBytes(replacement), ScalingPolicy.class);
+        service.savePolicy(restored, REGION);
+        metrics.deleteAlarms(List.of("cleanup-blocker"), REGION);
+        service.reconcileDynamoDbPolicies(Instant.EPOCH);
+        assertTrue(storedPolicy().getPendingAlarmDeletions().isEmpty());
+        assertEquals(replacement.getAlarms().stream().map(alarm -> alarm.getAlarmName()).toList(),
+                storedPolicy().getAlarms().stream().map(alarm -> alarm.getAlarmName()).toList());
+        assertTrue(metrics.describeAlarms(List.of(blocked), null, REGION).isEmpty());
+    }
+
+    @Test
+    void policyUpdatesKeepBlockedCleanupAcrossFurtherReplacements() {
+        ScalingPolicy original = trackingPolicy(70);
+        String blocked = original.getAlarms().getFirst().getAlarmName();
+        blockDeletion(blocked);
+        trackingPolicy(60);
+        ScalingPolicy latest = trackingPolicy(50);
+        assertEquals(4, latest.getAlarms().size());
+        assertEquals(List.of(blocked), storedPolicy().getPendingAlarmDeletions().stream()
+                .map(alarm -> alarm.getAlarmName()).toList());
+        assertEquals(5, metrics.describeAlarms(null, null, REGION).size());
+        metrics.deleteAlarms(List.of("cleanup-blocker"), REGION);
+        service.reconcileDynamoDbPolicies(Instant.EPOCH);
+        assertTrue(storedPolicy().getPendingAlarmDeletions().isEmpty());
+        assertEquals(4, metrics.describeAlarms(null, null, REGION).size());
+    }
+
+    @Test
+    void failedCleanupMetadataSaveKeepsRetryUntilAbsentAlarmIsRecorded() {
+        ScalingPolicy original = trackingPolicy(70);
+        String blocked = original.getAlarms().getFirst().getAlarmName();
+        blockDeletion(blocked);
+        trackingPolicy(60);
+        assertEquals(1, storedPolicy().getPendingAlarmDeletions().size());
+        metrics.deleteAlarms(List.of("cleanup-blocker"), REGION);
+        doThrow(new IllegalStateException("controlled cleanup metadata failure")).doCallRealMethod()
+                .when(policies).put(anyString(), any(ScalingPolicy.class));
+        service.reconcileDynamoDbPolicies(Instant.EPOCH);
+        assertTrue(metrics.describeAlarms(List.of(blocked), null, REGION).isEmpty());
+        assertEquals(1, storedPolicy().getPendingAlarmDeletions().size());
+        service.reconcileDynamoDbPolicies(Instant.EPOCH);
+        assertTrue(storedPolicy().getPendingAlarmDeletions().isEmpty());
+    }
+
+    @Test
+    void pendingCleanupNeverDeletesAnAlarmWhoseActionChanged() {
+        ScalingPolicy original = trackingPolicy(70);
+        String blocked = original.getAlarms().getFirst().getAlarmName();
+        blockDeletion(blocked);
+        trackingPolicy(60);
+        assertEquals(1, storedPolicy().getPendingAlarmDeletions().size());
+        metrics.deleteAlarms(List.of("cleanup-blocker"), REGION);
+        MetricAlarm retained = metrics.describeAlarms(List.of(blocked), null, REGION).getFirst();
+        retained.setAlarmActions(List.of("different-owner"));
+        metrics.putMetricAlarm(retained, REGION);
+        service.reconcileDynamoDbPolicies(Instant.EPOCH);
+        assertEquals(1, storedPolicy().getPendingAlarmDeletions().size());
+        assertEquals(List.of("different-owner"), metrics.describeAlarms(List.of(blocked), null, REGION)
+                .getFirst().getAlarmActions());
+    }
+
+    @Test
+    void successfulReplacementLeavesNoPendingDeletion() {
+        trackingPolicy(70);
+        ScalingPolicy replacement = trackingPolicy(60);
+        assertEquals(4, replacement.getAlarms().size());
+        assertTrue(storedPolicy().getPendingAlarmDeletions().isEmpty());
+        assertEquals(4, metrics.describeAlarms(null, null, REGION).size());
+    }
+
+    private ScalingPolicy trackingPolicy(double targetValue) {
+        TargetTrackingConfiguration configuration = new TargetTrackingConfiguration();
+        configuration.setTargetValue(targetValue);
+        PredefinedMetricSpecification predefined = new PredefinedMetricSpecification();
+        predefined.setPredefinedMetricType("DynamoDBWriteCapacityUtilization");
+        configuration.setPredefinedMetricSpecification(predefined);
+        return service.putScalingPolicy("owned", "TargetTrackingScaling", "dynamodb", RESOURCE, DIMENSION,
+                configuration, null, REGION);
+    }
+
+    private ScalingPolicy storedPolicy() {
+        return policies.scan(key -> true).getFirst();
+    }
+
+    private void blockDeletion(String name) {
+        CompositeAlarm composite = new CompositeAlarm();
+        composite.setAlarmName("cleanup-blocker");
+        composite.setAlarmRule("ALARM(\"" + name + "\")");
+        metrics.putCompositeAlarm(composite, REGION);
     }
 
     private void refuse(ConfigurationCase test) {

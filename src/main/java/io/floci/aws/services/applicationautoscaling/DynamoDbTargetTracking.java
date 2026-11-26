@@ -11,6 +11,7 @@ import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.DynamoDbService.ScalableCapacityDecision;
+import org.jboss.logging.Logger;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -25,6 +26,7 @@ import java.util.UUID;
  * This internal path does not assume a service-linked role or authorize an UpdateTable request.
  */
 final class DynamoDbTargetTracking {
+    private static final Logger LOG = Logger.getLogger(DynamoDbTargetTracking.class);
     private static final List<String> SUFFIXES =
             List.of("AlarmHigh", "AlarmLow", "ProvisionedCapacityHigh", "ProvisionedCapacityLow");
 
@@ -169,6 +171,7 @@ final class DynamoDbTargetTracking {
     }
 
     void reconcile(ScalingPolicy policy, String region) {
+        policy = deleteObsoleteAlarms(policy, region);
         ScalableCapacityDecision current = snapshot(policy, region);
         if (!current.active()) {
             return;
@@ -176,15 +179,14 @@ final class DynamoDbTargetTracking {
         if (policy.getAlarms().size() != alarmKinds(policy).size()) {
             ScalingPolicy restored = copyPolicy(policy);
             restored.setAlarms(createAlarms(restored, null, region));
+            retainObsoleteAlarms(restored, policy);
             try {
                 service.savePolicy(restored, region);
             } catch (RuntimeException failure) {
                 deleteNewAlarms(restored, policy, region, failure);
                 throw failure;
             }
-            for (Alarm old : policy.getAlarms()) {
-                cloudWatch.deleteAlarms(List.of(old.getAlarmName()), region);
-            }
+            deleteObsoleteAlarms(restored, region);
             return;
         }
         List<Integer> kinds = alarmKinds(policy);
@@ -204,6 +206,54 @@ final class DynamoDbTargetTracking {
             }
             cloudWatch.putMetricAlarm(desired, region);
         }
+    }
+
+    static void retainObsoleteAlarms(ScalingPolicy replacement, ScalingPolicy previous) {
+        if (previous == null) {
+            return;
+        }
+        List<Alarm> pending = new ArrayList<>(previous.getPendingAlarmDeletions());
+        List<String> retained = replacement.getAlarms().stream().map(Alarm::getAlarmName).toList();
+        for (Alarm alarm : previous.getAlarms()) {
+            if (!retained.contains(alarm.getAlarmName()) && pending.stream().noneMatch(old ->
+                    Objects.equals(old.getAlarmName(), alarm.getAlarmName())
+                            && Objects.equals(old.getAlarmArn(), alarm.getAlarmArn()))) {
+                pending.add(alarm);
+            }
+        }
+        replacement.setPendingAlarmDeletions(pending);
+    }
+
+    ScalingPolicy deleteObsoleteAlarms(ScalingPolicy policy, String region) {
+        List<Alarm> pending = new ArrayList<>(policy.getPendingAlarmDeletions());
+        for (Alarm alarm : policy.getPendingAlarmDeletions()) {
+            try {
+                if (policy.getAlarms().stream().anyMatch(active ->
+                        Objects.equals(active.getAlarmName(), alarm.getAlarmName()))) {
+                    continue;
+                }
+                List<MetricAlarm> existing = cloudWatch.describeAlarms(List.of(alarm.getAlarmName()), null, region);
+                if (!existing.isEmpty()) {
+                    MetricAlarm stored = existing.getFirst();
+                    if (!Objects.equals(alarm.getAlarmArn(), stored.getAlarmArn())
+                            || !stored.getAlarmActions().equals(List.of(policy.getPolicyArn()))) {
+                        continue;
+                    }
+                    cloudWatch.deleteAlarms(List.of(alarm.getAlarmName()), region);
+                }
+                pending.remove(alarm);
+            } catch (RuntimeException failure) {
+                LOG.debugv(failure, "Could not delete obsolete target-tracking alarm {0} in {1}",
+                        alarm.getAlarmName(), region);
+            }
+        }
+        if (pending.size() == policy.getPendingAlarmDeletions().size()) {
+            return policy;
+        }
+        ScalingPolicy cleaned = copyPolicy(policy);
+        cleaned.setPendingAlarmDeletions(pending);
+        service.savePolicy(cleaned, region);
+        return cleaned;
     }
 
     void execute(ScalingPolicy policy, ScalableTarget target, MetricAlarm alarm, double metricValue, String region) {
@@ -393,6 +443,7 @@ final class DynamoDbTargetTracking {
         copy.setScalableDimension(source.getScalableDimension());
         copy.setCreationTime(source.getCreationTime());
         copy.setAlarms(source.getAlarms());
+        copy.setPendingAlarmDeletions(source.getPendingAlarmDeletions());
         copy.setTargetTrackingConfiguration(source.getTargetTrackingConfiguration());
         copy.setStepScalingConfiguration(source.getStepScalingConfiguration());
         copy.setLastScaleOutTime(source.getLastScaleOutTime());
