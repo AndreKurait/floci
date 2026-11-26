@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "1.0",
+  "description": "Run one non-interactive command on a managed node",
+  "sessionType": "NonInteractiveCommands",
+  "parameters": {
+    "command": {"type": "String", "description": "The command to run."},
+    "separateOutputStream": {"type": "String", "default": "false", "allowedValues": ["true", "false"],
+      "description": "Deliver stderr and the exit code separately from stdout."}
+  },
+  "properties": {
+    "windows": {"commands": "{{ command }}", "runAsElevated": false,
+      "separateOutputStream": "{{ separateOutputStream }}"},
+    "linux": {"commands": "{{ command }}", "runAsElevated": false,
+      "separateOutputStream": "{{ separateOutputStream }}"},
+    "macos": {"commands": "{{ command }}", "runAsElevated": false,
+      "separateOutputStream": "{{ separateOutputStream }}"}
+  }
+}

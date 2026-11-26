@@ -370,6 +370,20 @@ class RequestResourcesTest {
                 of("ssm:StartSession", json("{\"Target\":\"" + target + "\"}"), stored));
     }
 
+    @Test
+    void startSessionChecksTheManagedInstanceTargetAndDefaultDocument() {
+        String target = "mi-0123456789abcdef0";
+        String instance = "arn:aws:ssm:us-east-1:000000000000:managed-instance/" + target;
+        String document = "arn:aws:ssm:us-east-1:000000000000:document/SSM-SessionManagerRunShell";
+        StoredResourceArns stored = mock(StoredResourceArns.class);
+        when(stored.through("Target", target, "us-east-1")).thenReturn(List.of(instance));
+        when(stored.findDefault("document", "us-east-1")).thenReturn(Optional.of(document));
+        assertEquals(List.of(document, instance),
+                of("ssm:StartSession", json("{\"Target\":\"" + target + "\"}"), stored));
+        assertEquals(List.of(instance),
+                of("ssm:GetConnectionStatus", json("{\"Target\":\"" + target + "\"}"), stored));
+    }
+
     /**
      * DynamoDB is built by hand, but the table reads {@code ListTables}: AWS was measured to check it on the literal
      * {@code table/*} of the request's partition, Region and account, whatever table its request names, though the
