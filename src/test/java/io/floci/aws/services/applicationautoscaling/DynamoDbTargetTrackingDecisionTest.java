@@ -18,7 +18,6 @@ import org.mockito.ArgumentCaptor;
 
 import java.time.Clock;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -39,15 +38,19 @@ class DynamoDbTargetTrackingDecisionTest {
     private final DynamoDbService dynamo = mock(DynamoDbService.class);
     private final CloudWatchMetricsService metrics = mock(CloudWatchMetricsService.class);
     private final AtomicLong capacity = new AtomicLong(3);
+    private final AtomicLong epochSecond = new AtomicLong(NOW);
+    private final AtomicLong writeDuration = new AtomicLong();
+    private final Clock clock = mock(Clock.class);
     private final AtomicBoolean deciding = new AtomicBoolean();
     private final Map<String, MetricAlarm> stored = new LinkedHashMap<>();
     private final DynamoDbTargetTracking helper = new DynamoDbTargetTracking(service, dynamo, metrics,
-            Clock.fixed(Instant.ofEpochSecond(NOW), ZoneOffset.UTC));
+            clock);
     private ScalingPolicy policy;
     private ScalableTarget target;
 
     @BeforeEach
     void prepareOwnedPolicyAndIndependentCapacityBoundary() {
+        when(clock.instant()).thenAnswer(invocation -> Instant.ofEpochSecond(epochSecond.get()));
         policy = policy();
         target = new ScalableTarget();
         target.setServiceNamespace("dynamodb");
@@ -63,6 +66,9 @@ class DynamoDbTargetTrackingDecisionTest {
                         LongUnaryOperator operation = invocation.getArgument(3);
                         long next = operation.applyAsLong(before);
                         capacity.set(next);
+                        if (next != before) {
+                            epochSecond.addAndGet(writeDuration.get());
+                        }
                         return new ScalableCapacityDecision(true, before, next);
                     } finally {
                         deciding.set(false);
@@ -133,6 +139,76 @@ class DynamoDbTargetTrackingDecisionTest {
         verify(service).savePolicy(saved.capture(), eq(REGION));
         assertEquals(NOW, saved.getValue().getLastScaleInTime());
         assertNull(saved.getValue().getTargetTrackingConfiguration().getScaleInCooldown());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0,3,9000,215", "1,215,4200,100"})
+    void cooldownStartsWhenTheCapacityWriteCompletes(int kind, long initial, double sum, long expected) {
+        capacity.set(initial);
+        writeDuration.set(10);
+        helper.execute(policy, target, alarm(kind), sum, REGION);
+        ArgumentCaptor<ScalingPolicy> saved = ArgumentCaptor.forClass(ScalingPolicy.class);
+        verify(service).savePolicy(saved.capture(), eq(REGION));
+        assertEquals(expected, capacity.get());
+        assertEquals(NOW + 10, kind == 0 ? saved.getValue().getLastScaleOutTime()
+                : saved.getValue().getLastScaleInTime());
+    }
+
+    @Test
+    void slowScaleInRetainsTheEntireCooldownAfterCompletion() {
+        capacity.set(215);
+        writeDuration.set(10);
+        policy.getTargetTrackingConfiguration().setScaleInCooldown(300);
+        helper.execute(policy, target, alarm(1), 4200, REGION);
+        ArgumentCaptor<ScalingPolicy> saved = ArgumentCaptor.forClass(ScalingPolicy.class);
+        verify(service).savePolicy(saved.capture(), eq(REGION));
+        policy = saved.getValue();
+        writeDuration.set(0);
+        epochSecond.set(NOW + 309);
+        clearInvocations(service);
+        helper.execute(policy, target, alarm(1), 0, REGION);
+        assertEquals(100, capacity.get());
+        verify(service, never()).savePolicy(any(), anyString());
+        epochSecond.set(NOW + 310);
+        helper.execute(policy, target, alarm(1), 0, REGION);
+        assertEquals(1, capacity.get());
+        verify(service).savePolicy(any(), eq(REGION));
+    }
+
+    @Test
+    void successfulScaleOutEndsThePreviousScaleInCooldown() {
+        policy.getTargetTrackingConfiguration().setScaleInCooldown(3600);
+        policy.setLastScaleInTime(NOW - 1200);
+        helper.execute(policy, target, alarm(0), 9000, REGION);
+        ArgumentCaptor<ScalingPolicy> saved = ArgumentCaptor.forClass(ScalingPolicy.class);
+        verify(service).savePolicy(saved.capture(), eq(REGION));
+        assertEquals(0, saved.getValue().getLastScaleInTime());
+        assertEquals(NOW - 1200, policy.getLastScaleInTime());
+        policy = saved.getValue();
+        clearInvocations(service);
+        helper.execute(policy, target, alarm(1), 0, REGION);
+        assertEquals(1, capacity.get());
+        verify(service).savePolicy(any(), eq(REGION));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"suspended", "failed"})
+    void unsuccessfulScaleOutPreservesThePreviousScaleInCooldown(String outcome) {
+        policy.getTargetTrackingConfiguration().setScaleInCooldown(3600);
+        policy.setLastScaleInTime(NOW - 1200);
+        if ("suspended".equals(outcome)) {
+            target.getSuspendedState().setDynamicScalingOutSuspended(true);
+            helper.execute(policy, target, alarm(0), 9000, REGION);
+        } else {
+            IllegalStateException failure = new IllegalStateException("capacity write failed");
+            when(dynamo.decideScalableCapacity(anyString(), anyString(), eq(REGION), any()))
+                    .thenThrow(failure);
+            assertSame(failure, assertThrows(IllegalStateException.class,
+                    () -> helper.execute(policy, target, alarm(0), 9000, REGION)));
+        }
+        assertEquals(NOW - 1200, policy.getLastScaleInTime());
+        assertEquals(3, capacity.get());
+        verifyNoInteractions(service);
     }
 
     @Test

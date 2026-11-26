@@ -229,11 +229,13 @@ final class DynamoDbTargetTracking {
         if (result.capacity() != result.previousCapacity()) {
             ScalingPolicy applied = copyPolicy(policy);
             boolean scaleOut = result.capacity() > result.previousCapacity();
+            long completed = clock.instant().getEpochSecond();
             if (scaleOut) {
-                applied.setLastScaleOutTime(now);
+                applied.setLastScaleOutTime(completed);
+                applied.setLastScaleInTime(0);
                 applied.setLastScaleOutCapacity(Math.toIntExact(result.capacity()));
             } else {
-                applied.setLastScaleInTime(now);
+                applied.setLastScaleInTime(completed);
             }
             applied.setLastAppliedCapacity(Math.toIntExact(result.capacity()));
             // The capacity write has already succeeded. Later metadata failures do not undo it.
