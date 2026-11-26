@@ -3127,8 +3127,9 @@ class Ec2ServiceTest {
                 .anyMatch(instance -> instance.getPublicIpAddress().equals(replacement.getPublicIpAddress())));
     }
 
-    @Test
-    void mockPublicAddressPoolExhaustionPreservesAnElasticIpAssociation() {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void mockPublicAddressPoolExhaustionPreservesAnElasticIpAssociation(boolean dryRun) {
         Ec2Service service = mockModeService(mockPublicPoolConfig("198.51.100.8/32"));
         String region = "us-east-1";
         String subnetId = publicSubnet(service, region, "10.243.0.0/24");
@@ -3143,9 +3144,9 @@ class Ec2ServiceTest {
                 null, List.of(), subnetId, null, List.of(), null, null);
 
         AwsException error = assertThrows(AwsException.class,
-                () -> service.disassociateAddress(region, associationId));
+                () -> service.disassociateAddress(region, associationId, dryRun));
 
-        assertEquals("AddressLimitExceeded", error.getErrorCode());
+        assertEquals(dryRun ? "DryRunOperation" : "AddressLimitExceeded", error.getErrorCode());
         assertEquals(associationId, elastic.getAssociationId());
         assertEquals(first.getInstanceId(), elastic.getInstanceId());
         assertEquals(publicIp, first.getPublicIpAddress());

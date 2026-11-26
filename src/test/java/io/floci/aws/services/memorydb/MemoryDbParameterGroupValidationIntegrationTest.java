@@ -1,36 +1,33 @@
 package io.floci.aws.services.memorydb;
 
-import io.floci.aws.testing.RestAssuredJsonUtils;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.testing.ValidateSignaturesProfile;
 import io.floci.aws.testutil.AwsRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
+import static io.restassured.parsing.Parser.JSON;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @QuarkusTest
 @TestProfile(ValidateSignaturesProfile.class)
 class MemoryDbParameterGroupValidationIntegrationTest {
+    private static final ObjectMapper MAPPER = new ObjectMapper();
     @TestHTTPResource
     URI endpoint;
-
-    @BeforeAll
-    static void configureContentTypes() {
-        RestAssuredJsonUtils.configureAwsContentTypes();
-    }
 
     @ParameterizedTest
     @ValueSource(strings = {
@@ -50,22 +47,22 @@ class MemoryDbParameterGroupValidationIntegrationTest {
         } else {
             body = body.substring(0, body.length() - 1) + "," + malformed + "}";
         }
-        post("CreateParameterGroup", body).then().statusCode(400);
-        post("DescribeParameterGroups", Map.of("ParameterGroupName", name)).then().statusCode(400)
+        post("CreateParameterGroup", body).then().using().defaultParser(JSON).statusCode(400);
+        post("DescribeParameterGroups", Map.of("ParameterGroupName", name)).then().using().defaultParser(JSON).statusCode(400)
                 .body("__type", equalTo("ParameterGroupNotFoundFault"));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"5", "null", "[]", "{} {}", "{\"ParameterGroupName\":\"not-admitted\"} true"})
     void sharedJsonRouteRejectsMalformedOrNonObjectCreateBody(String body) {
-        post("CreateParameterGroup", body).then().statusCode(400);
+        post("CreateParameterGroup", body).then().using().defaultParser(JSON).statusCode(400);
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"\"20\"", "20.5", "true", "[]", "2147483648"})
     void paginationRequiresAnActualBoundedIntegralNumber(String value) {
         post("DescribeParameters", "{\"ParameterGroupName\":\"default.memorydb-redis6\",\"MaxResults\":"
-                + value + "}").then().statusCode(400);
+                + value + "}").then().using().defaultParser(JSON).statusCode(400);
     }
 
     @Test
@@ -73,35 +70,46 @@ class MemoryDbParameterGroupValidationIntegrationTest {
         String name = fresh();
         String arn = post("CreateParameterGroup", Map.of("ParameterGroupName", name, "Family", "memorydb_redis6",
                 "Tags", List.of(Map.of("Key", "team", "Value", "retained"))))
-                .then().statusCode(200).extract().path("ParameterGroup.ARN");
+                .then().using().defaultParser(JSON).statusCode(200).extract().path("ParameterGroup.ARN");
         try {
             String baseline = post("DescribeParameters", Map.of("ParameterGroupName", name))
-                    .then().statusCode(200).extract().body().asString();
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString();
             post("UpdateParameterGroup", "{\"ParameterGroupName\":\"" + name + "\","
                     + "\"ParameterNameValues\":[{\"ParameterName\":\"timeout\",\"ParameterValue\":\"20\"},"
                     + "{\"ParameterName\":\"slowlog-max-len\",\"ParameterValue\":9}]}")
-                    .then().statusCode(400);
-            post("ResetParameterGroup", Map.of("ParameterGroupName", name, "AllParameters", "true"))
-                    .then().statusCode(400);
-            post("ResetParameterGroup", Map.of("ParameterGroupName", name, "ParameterNames", List.of(1)))
-                    .then().statusCode(400);
+                    .then().using().defaultParser(JSON).statusCode(400);
             assertEquals(baseline, post("DescribeParameters", Map.of("ParameterGroupName", name))
-                    .then().statusCode(200).extract().body().asString());
-            post("ListTags", Map.of("ResourceArn", arn)).then().statusCode(200)
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString());
+            post("UpdateParameterGroup", Map.of("ParameterGroupName", name, "ParameterNameValues",
+                    List.of(Map.of("ParameterName", "timeout", "ParameterValue", "20"))))
+                    .then().using().defaultParser(JSON).statusCode(200);
+            String updated = post("DescribeParameters", Map.of("ParameterGroupName", name))
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString();
+            post("ResetParameterGroup", Map.of("ParameterGroupName", name, "AllParameters", "true"))
+                    .then().using().defaultParser(JSON).statusCode(400);
+            assertEquals(updated, post("DescribeParameters", Map.of("ParameterGroupName", name))
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString());
+            post("ResetParameterGroup", Map.of("ParameterGroupName", name, "ParameterNames", List.of(1)))
+                    .then().using().defaultParser(JSON).statusCode(400);
+            assertEquals(updated, post("DescribeParameters", Map.of("ParameterGroupName", name))
+                    .then().using().defaultParser(JSON).statusCode(200).extract().body().asString());
+            post("ListTags", Map.of("ResourceArn", arn)).then().using().defaultParser(JSON).statusCode(200)
                     .body("TagList[0].Value", equalTo("retained"));
             post("UntagResource", Map.of("ResourceArn", arn, "TagKeys", List.of("team", "missing")))
-                    .then().statusCode(200).body("TagList.size()", equalTo(1))
+                    .then().using().defaultParser(JSON).statusCode(200).body("TagList.size()", equalTo(1))
                     .body("TagList[0].Key", equalTo("team")).body("TagList[0].Value", equalTo("retained"));
-            post("ListTags", Map.of("ResourceArn", arn)).then().statusCode(200).body("TagList.size()", equalTo(0));
+            post("ListTags", Map.of("ResourceArn", arn)).then().using().defaultParser(JSON).statusCode(200).body("TagList.size()", equalTo(0));
         } finally {
-            post("DeleteParameterGroup", Map.of("ParameterGroupName", name)).then().statusCode(200);
+            post("DeleteParameterGroup", Map.of("ParameterGroupName", name)).then().using().defaultParser(JSON).statusCode(200);
         }
     }
 
     private Response post(String operation, Object body) {
+        byte[] payload = (body instanceof String text ? text : MAPPER.valueToTree(body).toString())
+                .getBytes(StandardCharsets.UTF_8);
         return given().filter(AwsRequestSigner.signedAs("test", "test", "memorydb"))
                 .contentType("application/x-amz-json-1.1").header("X-Amz-Target", "AmazonMemoryDB." + operation)
-                .body(body).post(endpoint);
+                .body(payload).post(endpoint);
     }
 
     private static String fresh() {

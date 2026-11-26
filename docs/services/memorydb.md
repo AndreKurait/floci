@@ -83,8 +83,10 @@ the latter returns the tags removed.
 
 Names are stored lowercase, with the documented 1-255 ASCII character syntax.
 Custom groups retain descriptions, tags and parameter overrides in the configured
-storage mode, scoped to the caller's account, Region and partition. Default group
-parameters cannot be changed or deleted; their tags use a separate stored overlay.
+storage mode, scoped to the caller's account, Region and partition. New
+storage keys include the partition. Existing same-scope records remain readable
+and mutable at their legacy keys without migration during authorization lookups.
+Default group parameters cannot be changed or deleted; their tags use a separate stored overlay.
 Updates and resets validate the complete batch before publishing an immutable
 replacement. Reset drains current group operations and refuses new operations
 until storage reset finishes, including when another reset hook fails.
@@ -97,6 +99,9 @@ This is a bounded metadata catalog, with some source-derived descriptions and
 minimum engine versions; it is not a complete, independently verified AWS catalog.
 An unavailable stored catalog version fails explicitly instead of changing defaults.
 Parameter groups are not attached to clusters and do not configure running engines.
+`maxmemory-clients` is a source-derived local extension. In a November 2026
+`us-east-1` probe, MemoryDB's Redis 7 and Valkey 7 parameter groups rejected that
+parameter as unknown. Its local text domain is not an AWS value-validation claim.
 
 Both describe operations return sorted pages. The local `MaxResults` range is
 20-100, with a default of 100. Authenticated continuation tokens bind the operation,

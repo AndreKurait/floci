@@ -5829,7 +5829,6 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteLaunchTemplate(MultivaluedMap<String, String> p, String region) {
-        checkDryRun(p);
         LaunchTemplate launchTemplate = service.deleteLaunchTemplate(
                 region, p.getFirst("LaunchTemplateId"), p.getFirst("LaunchTemplateName"), dryRun(p));
         XmlBuilder xml = new XmlBuilder()

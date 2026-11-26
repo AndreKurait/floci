@@ -69,7 +69,7 @@ public class MemoryDbParameterGroupService implements Resettable, StoredResource
             throw invalid("Description exceeds the supported 255 character limit.");
         }
         Map<String, String> selectedTags = tags(tags);
-        if (groups.getForAccount(scope.account(), key(scope, canonical)).isPresent()) {
+        if (stored(scope, canonical) != null) {
             throw new AwsException("ParameterGroupAlreadyExistsFault", "Parameter group already exists.", 400);
         }
         MemoryDbParameterGroup created = new MemoryDbParameterGroup(scope.account(), region, scope.partition(),
@@ -85,7 +85,7 @@ public class MemoryDbParameterGroupService implements Resettable, StoredResource
         Scope scope = scope(region);
         MemoryDbParameterGroup current = required(scope, name(name, false));
         mutable(current);
-        groups.deleteAllAtomicallyForAccounts(Map.of(scope.account(), Set.of(key(scope, current.name()))));
+        groups.deleteAllAtomicallyForAccounts(Map.of(scope.account(), Set.of(storageKey(scope, current.name()))));
         return current;
     }
 
@@ -102,9 +102,10 @@ public class MemoryDbParameterGroupService implements Resettable, StoredResource
             Map<String, MemoryDbParameterGroup> values = new TreeMap<>();
             catalog.defaults().keySet().forEach(group -> values.put(group, required(scope, group)));
             for (MemoryDbParameterGroup group : groups.scanForAccount(scope.account(),
-                    relative -> relative.startsWith(region + ":"))) {
+                    relative -> relative.startsWith(scope.partition() + ":" + region + ":")
+                            || relative.startsWith(region + ":"))) {
                 if (owned(scope, group) && !catalog.defaults().containsKey(group.name())
-                        && groups.getForAccount(scope.account(), key(scope, group.name())).filter(group::equals).isPresent()) {
+                        && group.equals(stored(scope, group.name()))) {
                     validateStored(group);
                     values.put(group.name(), group);
                 }
@@ -238,7 +239,7 @@ public class MemoryDbParameterGroupService implements Resettable, StoredResource
         } catch (AwsException invalidTarget) {
             return Map.of();
         }
-        MemoryDbParameterGroup stored = groups.getForAccount(account, key(scope, selected)).orElse(null);
+        MemoryDbParameterGroup stored = stored(scope, selected);
         if (stored == null || !owned(scope, stored) || !selected.equals(stored.name())) {
             return Map.of();
         }
@@ -291,7 +292,7 @@ public class MemoryDbParameterGroupService implements Resettable, StoredResource
     }
 
     private MemoryDbParameterGroup required(Scope scope, String name) {
-        MemoryDbParameterGroup stored = groups.getForAccount(scope.account(), key(scope, name)).orElse(null);
+        MemoryDbParameterGroup stored = stored(scope, name);
         if (stored != null) {
             if (!owned(scope, stored) || !name.equals(stored.name())) {
                 throw missing();
@@ -337,7 +338,21 @@ public class MemoryDbParameterGroupService implements Resettable, StoredResource
     }
 
     private void publish(Scope scope, MemoryDbParameterGroup group) {
-        groups.putAllAtomicallyForAccount(scope.account(), Map.of(key(scope, group.name()), group));
+        groups.putAllAtomicallyForAccount(scope.account(), Map.of(storageKey(scope, group.name()), group));
+    }
+
+    private MemoryDbParameterGroup stored(Scope scope, String name) {
+        return groups.getForAccount(scope.account(), storageKey(scope, name)).orElse(null);
+    }
+
+    private String storageKey(Scope scope, String name) {
+        String current = key(scope, name);
+        if (groups.getForAccount(scope.account(), current).isPresent()) {
+            return current;
+        }
+        String legacy = scope.region() + ":" + name;
+        MemoryDbParameterGroup previous = groups.getForAccount(scope.account(), legacy).orElse(null);
+        return owned(scope, previous) && name.equals(previous.name()) ? legacy : current;
     }
 
     private Scope scope(String region) {
@@ -345,7 +360,7 @@ public class MemoryDbParameterGroupService implements Resettable, StoredResource
     }
 
     private static String key(Scope scope, String name) {
-        return scope.region() + ":" + name;
+        return scope.partition() + ":" + scope.region() + ":" + name;
     }
 
     private String name(String supplied, boolean create) {

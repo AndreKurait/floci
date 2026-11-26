@@ -14,11 +14,13 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import static io.floci.aws.services.memorydb.MemoryDbParameterGroupTestFixture.*;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.when;
 
 class MemoryDbParameterGroupPersistenceServiceTest {
     private static final TypeReference<Map<String, MemoryDbParameterGroup>> TYPE = new TypeReference<>() {};
@@ -78,7 +80,7 @@ class MemoryDbParameterGroupPersistenceServiceTest {
         assertThrows(IllegalStateException.class, () -> fixture.create("not-created"));
         assertSame(before, fixture.current("retained"));
         assertArrayEquals(bytes, Files.readAllBytes(file));
-        assertEquals(Set.of(ACCOUNT + "/" + REGION + ":retained"), storage.keys());
+        assertEquals(Set.of(ACCOUNT + "/aws:" + REGION + ":retained"), storage.keys());
         storage.reject = false;
         fixture.service.update("retained", update("timeout", "20"), REGION);
         assertNotEquals(before, fixture.current("retained"));
@@ -94,7 +96,7 @@ class MemoryDbParameterGroupPersistenceServiceTest {
         MemoryDbParameterGroup unsupported = new MemoryDbParameterGroup(known.accountId(), known.region(), known.partition(), known.name(),
                 known.arn(), known.family(), known.description(), known.generation(), known.revision(),
                 "unavailable-catalog-v99", known.overrides(), known.tags());
-        original.put(ACCOUNT + "/" + REGION + ":unknown", unsupported);
+        original.put(ACCOUNT + "/aws:" + REGION + ":unknown", unsupported);
         byte[] before = Files.readAllBytes(file);
         PersistentStorage<String, MemoryDbParameterGroup> loaded = new PersistentStorage<String, MemoryDbParameterGroup>(file, TYPE);
         loaded.load();
@@ -103,7 +105,58 @@ class MemoryDbParameterGroupPersistenceServiceTest {
         error("InvalidParameterGroupStateFault",
                 () -> reader.service.iamTags(known.arn(), known.partition(), REGION, ACCOUNT));
         assertArrayEquals(before, Files.readAllBytes(file));
-        assertEquals(unsupported, loaded.get(ACCOUNT + "/" + REGION + ":unknown").orElseThrow());
+        assertEquals(unsupported, loaded.get(ACCOUNT + "/aws:" + REGION + ":unknown").orElseThrow());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void partitionChangePreservesLegacyRecordsAndIndependentLifetimes(String mode, @TempDir Path directory)
+            throws Exception {
+        String region = "future-memorydb-audit-1";
+        String legacyKey = ACCOUNT + "/" + region + ":shared";
+        StorageBackend<String, MemoryDbParameterGroup> original = backend(mode, directory);
+        MemoryDbParameterGroup china;
+        try {
+            original.load();
+            MemoryDbParameterGroupTestFixture fixture = new MemoryDbParameterGroupTestFixture(original);
+            when(fixture.regions.partitionForRegion(region)).thenReturn("aws-cn");
+            china = fixture.service.create("shared", FAMILY, "legacy", Map.of("partition", "china"), region);
+            original.delete(ACCOUNT + "/aws-cn:" + region + ":shared");
+            original.put(legacyKey, china);
+            original.flush();
+        } finally {
+            stop(original);
+        }
+        StorageBackend<String, MemoryDbParameterGroup> reloaded = backend(mode, directory);
+        try {
+            reloaded.load();
+            MemoryDbParameterGroupTestFixture fixture = new MemoryDbParameterGroupTestFixture(reloaded);
+            when(fixture.regions.partitionForRegion(region)).thenReturn("aws");
+            error("ParameterGroupNotFoundFault",
+                    () -> fixture.service.describe("shared", null, null, region));
+            MemoryDbParameterGroup commercial = fixture.service.create(
+                    "shared", FAMILY, "new partition", Map.of("partition", "commercial"), region);
+            assertEquals(china, reloaded.get(legacyKey).orElseThrow());
+            assertNotEquals(china.arn(), commercial.arn());
+            assertEquals(List.of(commercial),
+                    fixture.service.describe(null, null, null, region).values().stream()
+                            .filter(group -> group.name().equals("shared")).toList());
+            when(fixture.regions.partitionForRegion(region)).thenReturn("aws-cn");
+            reloaded.flush();
+            byte[] before = Files.readAllBytes(directory.resolve(FILE));
+            assertEquals(china.tags(), fixture.service.iamTags(china.arn(), "aws-cn", region, ACCOUNT));
+            assertEquals(china, fixture.service.describe("shared", null, null, region).values().getFirst());
+            assertArrayEquals(before, Files.readAllBytes(directory.resolve(FILE)));
+            fixture.service.update("shared", update("timeout", "20"), region);
+            assertEquals("20", reloaded.get(legacyKey).orElseThrow().overrides().get("timeout"));
+            fixture.service.delete("shared", region);
+            assertTrue(reloaded.get(legacyKey).isEmpty());
+            when(fixture.regions.partitionForRegion(region)).thenReturn("aws");
+            assertEquals(commercial, fixture.service.describe("shared", null, null, region).values().getFirst());
+            reloaded.flush();
+        } finally {
+            stop(reloaded);
+        }
     }
 
     private static StorageBackend<String, MemoryDbParameterGroup> backend(String mode, Path directory) {
