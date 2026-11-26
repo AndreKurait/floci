@@ -162,6 +162,12 @@ jobs:
               -Dtest.classes.mode=concurrent || status=$?
           fi
           if [ -s quarkus.txt ]; then
+            # The automatic DNS listener needs the private Docker bridge and permission to bind port53.
+            dns_address="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+            test -n "$dns_address"
+            port_floor="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+            trap 'sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=$port_floor" >/dev/null' EXIT
+            sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
             ./mvnw surefire:test -B \
               -Dsurefire.includesFile="$GITHUB_WORKSPACE/quarkus.txt" \
               -Dsurefire.failIfNoTests=true \

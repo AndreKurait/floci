@@ -20,6 +20,7 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.services.ec2.model.SecurityGroup;
+import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.Test;
@@ -68,6 +69,59 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class SecurityGroupFirewallManagerTest {
+
+    @Test
+    void overlappingVpcDnsOriginsUseTheirControlAddressAndLiveVpcAttachment() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ec2().vpcNetworks().isolateAddressSpaces()).thenReturn(true);
+        when(config.port()).thenReturn(4650);
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(docker,
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
+                mock(EmbeddedDnsServer.class)));
+        doNothing().when(manager).reconcileAll();
+        String[] accounts = {"111111111111", "222222222222"};
+        Container[] observed = new Container[2];
+        for (int index = 0; index < accounts.length; index++) {
+            String helper = "helper-" + index;
+            String control = "172.18.0." + (index + 2);
+            String network = VpcNetworkManager.nativeNetworkName(config, accounts[index],
+                    "us-east-1", "vpc-default");
+            observed[index] = dnsHelper(helper, "running", control);
+            Map<String, ContainerNetwork> networks = new HashMap<>(
+                    observed[index].getNetworkSettings().getNetworks());
+            networks.put(network, new ContainerNetwork());
+            when(observed[index].getNetworkSettings().getNetworks()).thenReturn(networks);
+            when(docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks()).thenReturn(networks);
+            manager.register(new SecurityGroupNftCompiler.Endpoint(accounts[index], "us-east-1", "vpc-default",
+                    "eni-" + index, "10.0.1.10", control, Set.of(), List.of(), Set.of("10.0.1.10")),
+                    helper, Map.of());
+        }
+        when(docker.listContainersCmd().withShowAll(true).withIdFilter(any(List.class)).exec())
+                .thenReturn(List.of(observed));
+        manager.retireDnsOrigins();
+        assertTrue(manager.vpcForClient("10.0.1.10").isEmpty(), "repeated private addresses cannot identify DNS callers");
+        for (int index = 0; index < accounts.length; index++) {
+            assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc(accounts[index], "us-east-1", "vpc-default")),
+                    manager.vpcForClient("172.18.0." + (index + 2)));
+        }
+        assertThrows(IllegalStateException.class, () -> manager.register(
+                new SecurityGroupNftCompiler.Endpoint(accounts[0], "us-east-1", "vpc-default",
+                        "eni-duplicate", "10.0.1.10", "172.18.0.4", Set.of(), List.of(), Set.of("10.0.1.10")),
+                "duplicate", Map.of()));
+        assertThrows(IllegalStateException.class, () -> manager.register(
+                new SecurityGroupNftCompiler.Endpoint("333333333333", "us-east-1", "vpc-other",
+                        "eni-control", "10.0.2.10", "172.18.0.2", Set.of(), List.of(), Set.of("10.0.2.10")),
+                "collision", Map.of()));
+
+        Container detached = dnsHelper("helper-0", "running", "172.18.0.2");
+        when(docker.listContainersCmd().withShowAll(true).withIdFilter(any(List.class)).exec())
+                .thenReturn(List.of(detached, observed[1]));
+        manager.retireDnsOrigins();
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty(), "a detached VPC must lose its private DNS identity");
+        assertTrue(manager.vpcForClient("172.18.0.3").isPresent(), "the other account keeps its DNS identity");
+    }
 
     @ParameterizedTest
     @CsvSource({"222222222222,us-east-1", "111111111111,us-west-2"})
@@ -290,7 +344,7 @@ class SecurityGroupFirewallManagerTest {
     void unregisterRetiresDnsBeforeDockerRemovalCompletes() {
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
-                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
         doAnswer(ignored -> {
@@ -311,7 +365,7 @@ class SecurityGroupFirewallManagerTest {
         when(listing.exec()).thenReturn(List.of());
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
-                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
         manager.retireDnsOrigins();
@@ -334,7 +388,7 @@ class SecurityGroupFirewallManagerTest {
         when(listing.exec()).thenReturn(List.of());
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
-                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+                mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         registerOrigin(manager, "eni-old", "helper-a", "172.18.0.2", "vpc-old");
         manager.retireDnsOrigins();
@@ -360,7 +414,7 @@ class SecurityGroupFirewallManagerTest {
 
     private static SecurityGroupFirewallManager dnsManager(DockerClient dockerClient) {
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(dockerClient,
-                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class),
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         return manager;
@@ -387,7 +441,7 @@ class SecurityGroupFirewallManagerTest {
     @Test
     void dnsOriginsUseRegisteredTransportAddressesAndTheirCompleteVpcScope() {
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(mock(DockerClient.class),
-                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class),
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         DnsClientVpcSource origins = assertInstanceOf(DnsClientVpcSource.class, manager);
@@ -542,7 +596,7 @@ class SecurityGroupFirewallManagerTest {
     private static SecurityGroupFirewallManager dnsManager(ContainerLifecycleManager lifecycle) {
         SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(
                 mock(DockerClient.class, RETURNS_DEEP_STUBS), mock(ContainerBuilder.class), lifecycle,
-                mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+                mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         return manager;
     }

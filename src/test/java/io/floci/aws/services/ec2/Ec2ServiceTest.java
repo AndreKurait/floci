@@ -5614,6 +5614,32 @@ class Ec2ServiceTest {
                 .getInstances().getFirst().getPrivateIpAddress());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void isolatedDefaultVpcIgnoresAnotherAccountsPrivateAddress(boolean requested) {
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000");
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other",
+                defaultSubnetInstance("i-other", "172.31.0.50", InstanceState.running()));
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        when(vpcNetworks.isolatesAddressSpaces()).thenReturn(true);
+        when(vpcNetworks.effectiveSubnetCidr("000000000000", "us-east-1", subnetId)).thenReturn(Optional.of("172.31.0.0/20"));
+        when(vpcNetworks.allocatePrivateIp("000000000000", "us-east-1", subnetId))
+                .thenReturn(Optional.of("172.31.0.50"), Optional.of("172.31.0.51"));
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-instances.json", instanceStore), vpcNetworks);
+
+        String address = requested
+                ? launchWithPrivateIp(service, subnetId, 1, "172.31.0.50")
+                    .getInstances().getFirst().getPrivateIpAddress()
+                : launchAddresses(service, subnetId, 1).getFirst();
+
+        assertEquals("172.31.0.50", address);
+        AwsException duplicate = assertThrows(AwsException.class,
+                () -> launchWithPrivateIp(service, subnetId, 1, address));
+        assertEquals("InvalidIPAddress.InUse", duplicate.getErrorCode(),
+                "Isolation must still reject an address held in the caller's own subnet");
+    }
+
     @Test
     void aRequestedPrivateIpIsLeasedSoTheRealVpcNetworkDoesNotHandItOutAgain() {
         // The manager's allocator consults only its own lease table. Without the lease it would

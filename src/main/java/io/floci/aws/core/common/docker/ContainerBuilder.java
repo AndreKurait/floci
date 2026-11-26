@@ -236,6 +236,7 @@ public class ContainerBuilder {
         private Long memoryBytes;
         private Long nanoCpus;
         private Integer cpuShares;
+        private final Map<String, ContainerSpec.ResourceLimit> ulimits = new HashMap<>();
         private boolean readonlyRootfs;
         private boolean init;
         private final Map<Integer, Integer> portBindings = new HashMap<>();
@@ -361,6 +362,15 @@ public class ContainerBuilder {
          */
         public Builder withMemoryBytes(long memoryBytes) {
             this.memoryBytes = memoryBytes;
+            return this;
+        }
+
+        /** Sets one process resource limit without changing the daemon's defaults for other limits. */
+        public Builder withUlimit(String name, long soft, long hard) {
+            if (name == null || !name.matches("[a-z][a-z0-9]*")) {
+                throw new IllegalArgumentException("Invalid container resource limit name: " + name);
+            }
+            ulimits.put(name, new ContainerSpec.ResourceLimit(soft, hard));
             return this;
         }
 
@@ -947,7 +957,8 @@ public class ContainerBuilder {
                             shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, networkSysctls),
                     javaTrustStore,
                     dnsName,
-                    List.copyOf(joinedNetworks)
+                    List.copyOf(joinedNetworks),
+                    Map.copyOf(ulimits)
             );
         }
     }

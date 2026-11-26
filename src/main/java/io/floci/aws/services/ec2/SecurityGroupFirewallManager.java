@@ -20,6 +20,7 @@ import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
 import io.floci.aws.services.ec2.model.SecurityGroup;
+import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.net.VpcRoutingManager;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
@@ -115,6 +116,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return;
         }
         Map<String, Set<String>> liveAddresses = new HashMap<>();
+        Map<String, Set<String>> liveNetworks = new HashMap<>();
         List<String> helperIds = observed.values().stream().map(DnsOrigin::helperId).distinct().toList();
         for (Container container : dockerClient.listContainersCmd().withShowAll(true).withIdFilter(helperIds).exec()) {
             if ("running".equals(container.getState()) && container.getNetworkSettings() != null
@@ -125,11 +127,14 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                                 network.getIpAddress(), network.getGlobalIPv6Address()))
                         .filter(address -> address != null && !address.isBlank()).forEach(addresses::add);
                 liveAddresses.put(container.getId(), addresses);
+                liveNetworks.put(container.getId(), container.getNetworkSettings().getNetworks().keySet());
             }
         }
         List<DnsOrigin> retired = new ArrayList<>();
         observed.forEach((address, origin) -> {
-            if (!liveAddresses.getOrDefault(origin.helperId(), Set.of()).contains(address)) {
+            if (!liveAddresses.getOrDefault(origin.helperId(), Set.of()).contains(address)
+                    || origin.nativeNetwork() != null
+                    && !liveNetworks.getOrDefault(origin.helperId(), Set.of()).contains(origin.nativeNetwork())) {
                 // A new registration may already own this address; retire only the observed identity.
                 dnsOrigins.computeIfPresent(address, (key, current) -> {
                     if (current != origin) {
@@ -374,12 +379,28 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         List<String> addresses = endpoint.transportAddresses();
         if (endpoints.values().stream().map(ProtectedEndpoint::endpoint)
                 .anyMatch(existing -> !existing.eniId().equals(endpoint.eniId())
-                        && existing.transportAddresses().stream().anyMatch(addresses::contains))) {
+                        && sharesTransport(existing, endpoint))) {
             quarantine(helperId);
             throw new IllegalStateException("Two managed ENIs share a Docker transport address");
         }
+        String nativeNetwork = null;
+        if (isolatedAddressSpaces()) {
+            nativeNetwork = VpcNetworkManager.nativeNetworkName(
+                    config, endpoint.accountId(), endpoint.region(), endpoint.vpcId());
+            InspectContainerResponse helper = dockerClient.inspectContainerCmd(helperId).exec();
+            if (!endpoint.additionalTransportAddresses().contains(endpoint.logicalAddress())
+                    || helper.getNetworkSettings() == null || helper.getNetworkSettings().getNetworks() == null
+                    || !helper.getNetworkSettings().getNetworks().containsKey(nativeNetwork)) {
+                quarantine(helperId);
+                throw new IllegalStateException("The protected endpoint has no native VPC attachment");
+            }
+            addresses = List.of(endpoint.transportAddress());
+        }
         ProtectedEndpoint previous = endpoints.put(endpoint.eniId(),
-                new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists)));
+                new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists),
+                        new DnsOrigin(endpoint.eniId(), helperId,
+                                new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()),
+                                addresses, nativeNetwork)));
         try {
             reconcileAll();
             if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
@@ -414,6 +435,19 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         if (endpoint != null) {
             lifecycleManager.removeIfExistsStrict(endpoint.helperId());
         }
+    }
+
+    private boolean isolatedAddressSpaces() {
+        return config.services().ec2().vpcNetworks().isolateAddressSpaces();
+    }
+
+    private boolean sharesTransport(SecurityGroupNftCompiler.Endpoint first,
+                                     SecurityGroupNftCompiler.Endpoint second) {
+        if (!isolatedAddressSpaces() || first.sameVpc(second)) {
+            return first.transports().stream().anyMatch(second.transports()::contains);
+        }
+        return first.transports().stream().anyMatch(second.primaryTransports()::contains)
+                || second.transports().stream().anyMatch(first.primaryTransports()::contains);
     }
 
     public synchronized void unregister(String eniId) {
@@ -502,7 +536,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         for (ProtectedEndpoint protectedEndpoint : new ArrayList<>(endpoints.values())) {
             try {
                 String rules = SecurityGroupNftCompiler.compile(protectedEndpoint.endpoint(), peers,
-                        protectedEndpoint.prefixLists(), vpcResolvers);
+                        protectedEndpoint.prefixLists(), vpcResolvers, isolatedAddressSpaces());
                 apply(protectedEndpoint.helperId(), rules);
             } catch (RuntimeException e) {
                 endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
@@ -511,7 +545,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
     }
 
-    private record DnsOrigin(String eniId, String helperId, ClientVpc vpc, List<String> transportAddresses) {}
+    private record DnsOrigin(String eniId, String helperId, ClientVpc vpc, List<String> transportAddresses,
+                             String nativeNetwork) {}
 
     /** Refreshes the caller's EC2 instances and ECS tasks after a control-plane rule change. */
     public synchronized void refreshPolicies(String accountId, String region, Map<String, SecurityGroup> groups,
@@ -632,12 +667,5 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
     }
     private record ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
-                                     Map<String, List<String>> prefixLists, DnsOrigin dnsOrigin) {
-        private ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
-                                  Map<String, List<String>> prefixLists) {
-            this(endpoint, helperId, prefixLists, new DnsOrigin(endpoint.eniId(), helperId,
-                    new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()),
-                    endpoint.transportAddresses()));
-        }
-    }
+                                     Map<String, List<String>> prefixLists, DnsOrigin dnsOrigin) {}
 }

@@ -9968,7 +9968,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Image image = registerImage(region, name, description,
                 sourceImage != null ? sourceImage.getArchitecture() : null,
                 sourceImage != null ? sourceImage.getRootDeviceName() : null,
-                captureBlockDeviceMappings(region, source, sourceImage));
+                captureBlockDeviceMappings(region, source, sourceImage), false);
 
         // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
         // of falling through to the catalog default. This is also the fallback when the file
@@ -10374,6 +10374,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public Image registerImage(String region, String name, String description, String architecture,
                                String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings) {
+        return registerImage(region, name, description, architecture, rootDeviceName, blockDeviceMappings, true);
+    }
+
+    private Image registerImage(String region, String name, String description, String architecture,
+                                String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
+                                boolean bindRegistrationName) {
         if (name == null || name.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter Name", 400);
         }
@@ -10383,13 +10389,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // DeregisterImage scans before deleting a snapshot; both run under the registry lock so
         // a registration cannot slip between that scan and the delete.
         synchronized (imageRegistryLock) {
-            return registerImageLocked(region, name, description, architecture, rootDeviceName,
-                    blockDeviceMappings);
+            Ec2ImageCatalog.CatalogImage source = bindRegistrationName
+                    ? imageCatalog.findByRegistrationName(name).orElse(null) : null;
+            if (source != null && architecture != null && !source.architecture.equals(architecture)) {
+                throw new AwsException("InvalidParameterValue",
+                        "Architecture '" + architecture + "' does not match the catalog image bound to Name '"
+                                + name + "' (" + source.architecture + ").", 400);
+            }
+            return registerImageLocked(region, name, description,
+                    source != null ? source.architecture : architecture, rootDeviceName,
+                    blockDeviceMappings, source != null ? source.imageId : null);
         }
     }
 
     private Image registerImageLocked(String region, String name, String description, String architecture,
-                                      String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings) {
+                                      String rootDeviceName, List<BlockDeviceMapping> blockDeviceMappings,
+                                      String sourceImageId) {
         boolean duplicateName = registeredImages.scan(k -> true).stream()
                 .filter(img -> region.equals(img.getRegion()))
                 // A deregistered AMI no longer holds its name: "If you have recently deregistered
@@ -10416,6 +10431,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         image.setHypervisor("xen");
         image.setCreationDate(ISO_FMT.format(Instant.now()));
         image.setRegion(region);
+        image.setSourceImageId(sourceImageId);
         image.setBlockDeviceMappings(blockDeviceMappings != null ? new ArrayList<>(blockDeviceMappings) : List.of());
         registeredImages.put(key(region, image.getImageId()), image);
         for (BlockDeviceMapping mapping : image.getBlockDeviceMappings()) {
@@ -10663,7 +10679,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // to take the other's backing with it, and the copy's snapshots live in the
             // destination region anyway.
             Image copy = registerImage(destinationRegion, name, description, source.getArchitecture(),
-                    source.getRootDeviceName(), sourceImageMappings(source));
+                    source.getRootDeviceName(), sourceImageMappings(source), false);
             if (!copiedTags.isEmpty()) {
                 copy.setTags(new ArrayList<>(copiedTags));
                 putTags(destinationRegion, copy.getImageId(), new ArrayList<>(copiedTags));

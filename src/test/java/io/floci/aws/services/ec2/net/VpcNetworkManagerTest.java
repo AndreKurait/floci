@@ -190,6 +190,106 @@ class VpcNetworkManagerTest {
     }
 
     @Test
+    void isolatedVpcNetworksPreserveOverlappingDeclaredAddresses() {
+        enableAddressSpaceIsolation();
+        manager.declareVpc("111111111111", REGION, "vpc-a", "10.0.0.0/16");
+        manager.declareSubnet("111111111111", REGION, "vpc-a", "subnet-a", "10.0.1.0/24");
+        manager.declareVpc("111111111111", REGION, "vpc-b", "10.0.0.0/16");
+        manager.declareSubnet("111111111111", REGION, "vpc-b", "subnet-b", "10.0.1.0/24");
+
+        assertEquals(Optional.of("10.0.0.0/16"), manager.effectiveVpcCidr("111111111111", REGION, "vpc-a"));
+        assertEquals(Optional.of("10.0.0.0/16"), manager.effectiveVpcCidr("111111111111", REGION, "vpc-b"));
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp("111111111111", REGION, "subnet-a"));
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp("111111111111", REGION, "subnet-b"));
+        assertFalse(manager.isSubstituted("111111111111", REGION, "vpc-a"));
+        assertFalse(manager.isSubstituted("111111111111", REGION, "vpc-b"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void isolatedAccountsCanUseTheSameDefaultVpcAndSubnetIds() {
+        enableAddressSpaceIsolation();
+        String firstAccount = "111111111111";
+        String secondAccount = "222222222222";
+        manager.declareVpc(firstAccount, REGION, "vpc-default", "10.0.0.0/16");
+        manager.declareSubnet(firstAccount, REGION, "vpc-default", "subnet-default", "10.0.1.0/24");
+        String firstNetwork = manager.networkNameFor(firstAccount, REGION, "vpc-default").orElseThrow();
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp(firstAccount, REGION, "subnet-default"));
+
+        manager.declareVpc(secondAccount, REGION, "vpc-default", "10.0.0.0/16");
+        manager.declareSubnet(secondAccount, REGION, "vpc-default", "subnet-default", "10.0.1.0/24");
+        String secondNetwork = manager.networkNameFor(secondAccount, REGION, "vpc-default").orElseThrow();
+        assertNotEquals(firstNetwork, secondNetwork);
+        assertEquals(Optional.of("10.0.1.10"), manager.allocatePrivateIp(secondAccount, REGION, "subnet-default"));
+
+        manager.deleteVpcNetwork(firstAccount, REGION, "vpc-default");
+        assertEquals(Optional.of(secondNetwork), manager.networkNameFor(secondAccount, REGION, "vpc-default"));
+        assertEquals(Optional.of("10.0.1.11"), manager.allocatePrivateIp(secondAccount, REGION, "subnet-default"));
+    }
+
+    @Test
+    void nativeAddressSpacesRejectInvalidSubnetsInsteadOfSubstituting() {
+        enableAddressSpaceIsolation();
+        manager.declareVpc("111111111111", REGION, "vpc-a", "10.0.0.0/16");
+        manager.declareSubnet("111111111111", REGION, "vpc-a", "subnet-a", "10.1.1.0/24");
+        assertThrows(IllegalStateException.class, () -> manager.effectiveSubnetCidr("111111111111", REGION, "subnet-a"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void nativeAddressSpacesRequireCompleteAccountIdentity() {
+        enableAddressSpaceIsolation();
+        for (String account : List.of("", "customer", "11111111111", "1111111111111")) {
+            assertThrows(IllegalStateException.class,
+                    () -> manager.declareVpc(account, REGION, "vpc-a", "10.0.0.0/16"));
+        }
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void nativeAddressSpacesRequireProtectedNamespaces() {
+        enableAddressSpaceIsolation();
+        when(config.network().securityGroupEnforcement().enabled()).thenReturn(false);
+        manager.declareVpc("111111111111", REGION, "vpc-a", "10.0.0.0/16");
+        assertThrows(IllegalStateException.class, () -> manager.effectiveVpcCidr("111111111111", REGION, "vpc-a"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void nativeAddressSpacesRejectInternalTransportBeforeCreatingResources() {
+        enableAddressSpaceIsolation();
+        when(config.services().ec2().vpcNetworks().internal()).thenReturn(true);
+        manager.declareVpc("111111111111", REGION, "vpc-a", "10.0.0.0/16");
+        assertThrows(IllegalStateException.class, () -> manager.effectiveVpcCidr("111111111111", REGION, "vpc-a"));
+        verifyNoInteractions(docker);
+    }
+
+    @Test
+    void nativeAddressRestorationRejectsUnrelatedSubnetsAndOutOfRangeAddresses() {
+        enableAddressSpaceIsolation();
+        manager.declareVpc("111111111111", REGION, "vpc-a", "10.0.0.0/16");
+        manager.declareSubnet("111111111111", REGION, "vpc-a", "subnet-a", "10.0.1.0/24");
+        manager.declareVpc("111111111111", REGION, "vpc-b", "10.0.0.0/16");
+        manager.declareSubnet("111111111111", REGION, "vpc-b", "subnet-b", "10.0.1.0/24");
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-a", "subnet-b", "helper", "10.0.1.10"));
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-a", "subnet-a", "helper", "10.0.2.10"));
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-a", "subnet-a", "helper", null));
+        assertThrows(IllegalStateException.class, () -> manager.requireNativePrivateAddress(
+                REGION, "vpc-missing", "subnet-a", "helper", "10.0.1.10"));
+        verifyNoInteractions(docker);
+    }
+
+    private void enableAddressSpaceIsolation() {
+        when(config.defaultAccountId()).thenReturn("111111111111");
+        when(config.services().ec2().vpcNetworks().isolateAddressSpaces()).thenReturn(true);
+        when(config.services().ec2().awsFaithfulPrivateIp()).thenReturn(true);
+        when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);
+    }
+
+    @Test
     void deletingAVpcAfterARestartRemovesTheNetworkItsPredecessorCreated() {
         // A restarted process declares the VPC again but has not materialised it: no instance in
         // it has started since. The network from before the restart must still go with the VPC.
