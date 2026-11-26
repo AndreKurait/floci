@@ -43,7 +43,7 @@ class BackupServiceTimingTest {
     private BackupService newService() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().backup().jobCompletionDelaySeconds()).thenReturn(COMPLETION_DELAY_SECONDS);
-        return new BackupService(storage, config, new RegionResolver("us-east-1", ACCOUNT), new ObjectMapper(),
+        return new BackupService(storage, config, new RegionResolver(REGION, ACCOUNT), new ObjectMapper(),
                 mock(SnsService.class), time.clock(), time.newScheduler());
     }
 
