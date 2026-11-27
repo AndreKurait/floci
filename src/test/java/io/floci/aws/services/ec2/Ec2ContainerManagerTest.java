@@ -17,6 +17,7 @@ import com.github.dockerjava.api.command.InspectImageCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.PingCmd;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
+import com.github.dockerjava.api.command.RenameContainerCmd;
 import com.github.dockerjava.api.command.RestartContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
@@ -3924,6 +3925,148 @@ class Ec2ContainerManagerTest {
             verify(start, stillRunning ? never() : times(1)).exec();
             assertEquals("running", guest.getState().getName());
             assertEquals(TEST_CONTAINER_ID, guest.getDockerContainerId());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    private static final String REPLACED_CONTAINER_ID = "container-replaced";
+
+    /** Stubs the guest a root volume replacement starts from: owned, inside helper-replace. */
+    private static RenameContainerCmd stubReplaceableGuest(LaunchHarness harness, String instanceId, String owner) {
+        when(harness.config.port()).thenReturn(4566);
+        EmulatorConfig.DockerConfig dockerConfig = mock(EmulatorConfig.DockerConfig.class);
+        when(dockerConfig.resourceNamespace()).thenReturn(Optional.empty());
+        when(harness.config.docker()).thenReturn(dockerConfig);
+        InspectContainerResponse old = mock(InspectContainerResponse.class);
+        ContainerConfig oldConfig = mock(ContainerConfig.class);
+        // Resolve the owner before stubbing: ownerIdentity reads the config mock, which must not happen mid-stub.
+        String labelOwner = owner == null ? ContainerStorageHelper.ownerIdentity(harness.config) : owner;
+        when(oldConfig.getLabels()).thenReturn(Map.of(
+                Ec2ContainerManager.LABEL_OWNER, labelOwner,
+                Ec2ContainerManager.LABEL_RESOURCE_ID, instanceId));
+        when(old.getConfig()).thenReturn(oldConfig);
+        HostConfig hostConfig = mock(HostConfig.class);
+        when(hostConfig.getNetworkMode()).thenReturn("container:helper-replace");
+        when(old.getHostConfig()).thenReturn(hostConfig);
+        InspectContainerCmd inspectOld = mock(InspectContainerCmd.class);
+        when(inspectOld.exec()).thenReturn(old);
+        when(harness.dockerClient.inspectContainerCmd(REPLACED_CONTAINER_ID)).thenReturn(inspectOld);
+        // The new workload shares the helper's namespace, so Docker reports no network of its own.
+        InspectContainerCmd inspectNew = mock(InspectContainerCmd.class);
+        when(inspectNew.exec()).thenReturn(mock(InspectContainerResponse.class));
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspectNew);
+        RenameContainerCmd rename = mock(RenameContainerCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        when(harness.dockerClient.renameContainerCmd(REPLACED_CONTAINER_ID)).thenReturn(rename);
+        StopContainerCmd stop = mock(StopContainerCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        when(harness.dockerClient.stopContainerCmd(REPLACED_CONTAINER_ID)).thenReturn(stop);
+        return rename;
+    }
+
+    private static Instance replaceableInstance(String instanceId) {
+        Instance guest = instance(instanceId);
+        guest.setRegion("us-west-2");
+        guest.setState(InstanceState.running());
+        guest.setDockerContainerId(REPLACED_CONTAINER_ID);
+        guest.setContainerBridgeIp("172.17.0.7");
+        guest.setPrivateIpAddress("10.0.1.10");
+        guest.setPrivateDnsName("logical-dns");
+        guest.setSshHostPort(2201);
+        return guest;
+    }
+
+    @Test
+    void replaceRootRecreatesTheGuestFromTheNewImageInsideTheSameHelper() {
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).execute(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        stubReplaceableGuest(harness, "i-replace", null);
+        Instance guest = replaceableInstance("i-replace");
+        AtomicInteger inProgress = new AtomicInteger();
+        AtomicInteger replaced = new AtomicInteger();
+        AtomicReference<String> failed = new AtomicReference<>();
+        try {
+            harness.manager.replaceRoot(guest, ResolvedAmiImage.minimal("ubuntu:26.04"), null,
+                    inProgress::incrementAndGet, replaced::incrementAndGet, failed::set);
+            assertEquals(1, tasks.size());
+            assertTrue(harness.manager.isContainerRunning(guest),
+                    "Auto Scaling must not replace an instance while its root volume is replaced");
+            verify(harness.lifecycleManager, never()).probeContainer(REPLACED_CONTAINER_ID);
+
+            tasks.removeFirst().run();
+
+            assertNull(failed.get());
+            assertEquals(1, inProgress.get());
+            assertEquals(1, replaced.get());
+            verify(harness.containerBuilder).newContainer("ubuntu:26.04");
+            verify(harness.builder).withNetworkMode("container:helper-replace");
+            verify(harness.dockerClient).stopContainerCmd(REPLACED_CONTAINER_ID);
+            verify(harness.lifecycleManager).startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class));
+            verify(harness.lifecycleManager).removeIfExists(REPLACED_CONTAINER_ID);
+            assertEquals(TEST_CONTAINER_ID, guest.getDockerContainerId());
+            assertEquals("running", guest.getState().getName());
+            assertEquals("10.0.1.10", guest.getPrivateIpAddress());
+            assertEquals("logical-dns", guest.getPrivateDnsName());
+            assertEquals("172.17.0.7", guest.getContainerBridgeIp());
+            assertEquals(2201, guest.getSshHostPort());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void replaceRootThatFailsToStartTheNewGuestKeepsTheOldOneRunning() {
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).execute(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        RenameContainerCmd rename = stubReplaceableGuest(harness, "i-replace-fails", null);
+        doThrow(new IllegalStateException("start refused"))
+                .when(harness.lifecycleManager).startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class));
+        StartContainerCmd startOld = mock(StartContainerCmd.class);
+        when(harness.dockerClient.startContainerCmd(REPLACED_CONTAINER_ID)).thenReturn(startOld);
+        Instance guest = replaceableInstance("i-replace-fails");
+        AtomicInteger replaced = new AtomicInteger();
+        AtomicReference<String> failed = new AtomicReference<>();
+        try {
+            harness.manager.replaceRoot(guest, ResolvedAmiImage.minimal("ubuntu:26.04"), null,
+                    () -> { }, replaced::incrementAndGet, failed::set);
+            tasks.removeFirst().run();
+
+            assertEquals(0, replaced.get());
+            assertTrue(failed.get() != null && failed.get().contains("start refused"), String.valueOf(failed.get()));
+            assertEquals(REPLACED_CONTAINER_ID, guest.getDockerContainerId());
+            assertEquals("running", guest.getState().getName());
+            assertEquals("10.0.1.10", guest.getPrivateIpAddress());
+            verify(harness.lifecycleManager).removeIfExists(TEST_CONTAINER_ID);
+            verify(harness.lifecycleManager, never()).removeIfExists(REPLACED_CONTAINER_ID);
+            // Parked under another name, then given its own name back, then started again.
+            verify(rename, times(2)).exec();
+            verify(startOld).exec();
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void replaceRootRefusesAGuestThisEmulatorDoesNotOwn() {
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).execute(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        RenameContainerCmd rename = stubReplaceableGuest(harness, "i-replace-foreign", "4620");
+        Instance guest = replaceableInstance("i-replace-foreign");
+        AtomicReference<String> failed = new AtomicReference<>();
+        try {
+            harness.manager.replaceRoot(guest, ResolvedAmiImage.minimal("ubuntu:26.04"), null,
+                    () -> { }, () -> { }, failed::set);
+            tasks.removeFirst().run();
+
+            assertTrue(failed.get() != null && failed.get().contains("not owned"), String.valueOf(failed.get()));
+            verify(rename, never()).exec();
+            verify(harness.lifecycleManager, never()).create(any(ContainerSpec.class));
+            assertEquals(REPLACED_CONTAINER_ID, guest.getDockerContainerId());
         } finally {
             harness.manager.stop();
         }
