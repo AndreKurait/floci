@@ -127,7 +127,7 @@ class ElbV2InitialHealthIntegrationTest {
                 }
                 URI address = URI.create(protocol.toString().toLowerCase() + "://localhost:" + listenerPort + "/");
                 try (HttpClient wire = transport.build()) {
-                    await().atMost(Duration.ofSeconds(5)).ignoreException(IOException.class)
+                    await().atMost(Duration.ofSeconds(5)).ignoreExceptionsInstanceOf(IOException.class)
                             .untilAsserted(() -> assertEquals("serving", response(wire, address)));
                     registerTarget(groupArn, "127.0.0.1", replacement.port());
                     assertTrue(replacement.probeStarted().await(5, TimeUnit.SECONDS),
