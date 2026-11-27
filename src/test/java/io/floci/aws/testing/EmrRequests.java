@@ -9,11 +9,9 @@ import io.restassured.response.Response;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
-import java.util.function.Supplier;
 
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** One EMR JSON-protocol call, in the default Region or a named one. */
 public final class EmrRequests {
@@ -69,22 +67,6 @@ public final class EmrRequests {
                                 .then().statusCode(200).extract().response(),
                         response -> !UNFINISHED_STEP_STATES.contains(
                                 response.jsonPath().getString("Step.Status.State")));
-    }
-
-    /** Keeps the step response when optional log retrieval fails while explaining an assertion failure. */
-    public static String stepFailureMessage(Response step, Supplier<String> logs) {
-        String status = step.asString();
-        try {
-            return status + "\n" + logs.get();
-        } catch (RuntimeException unavailable) {
-            return status + "\nStep logs unavailable: " + unavailable;
-        }
-    }
-
-    /** A driver cannot become ready after its step has ended. */
-    public static void requireUnfinishedStep(Response step) {
-        assertTrue(UNFINISHED_STEP_STATES.contains(step.jsonPath().getString("Step.Status.State")),
-                () -> "Step ended before its driver was ready: " + step.asString());
     }
 
     /**

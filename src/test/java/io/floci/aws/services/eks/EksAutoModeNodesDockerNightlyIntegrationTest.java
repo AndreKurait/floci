@@ -13,7 +13,6 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.InstanceProfile;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.EksTestNode;
-import io.floci.aws.testing.MutableClock;
 import io.floci.aws.testing.RdsMockProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -70,9 +69,6 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
 
     @Inject
     EksService eksService;
-
-    @Inject
-    MutableClock clock;
 
     private Cluster cluster;
     private String role;
@@ -216,10 +212,6 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
                 () -> compute.instancesOf(cluster, REGION, "pending", "running")).size());
 
         node.kubectl("delete", "pod", "web", "--grace-period=0", "--force");
-        await("the workload pod is gone").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
-                .ignoreExceptions().until(() -> node.kubectl("get", "pod", "web").exitCode() != 0);
-        RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
-        clock.advance(Duration.ofSeconds(2));
 
         await("the empty node is removed").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
                 .ignoreExceptions().until(() -> {

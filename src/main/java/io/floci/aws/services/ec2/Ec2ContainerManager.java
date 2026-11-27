@@ -47,7 +47,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -174,7 +173,6 @@ public class Ec2ContainerManager {
     private final DockerClient dockerClient;
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
-    private Clock clock = Clock.systemUTC();
     private final Ec2MetadataServer metadataServer;
     private final Ec2PortForwardManager portForwardManager;
     private final RegionResolver regionResolver;
@@ -289,30 +287,6 @@ public class Ec2ContainerManager {
     }
 
     @Inject
-    public Ec2ContainerManager(ContainerBuilder containerBuilder,
-                               ContainerLifecycleManager lifecycleManager,
-                               ContainerLogStreamer logStreamer,
-                               ContainerDetector containerDetector,
-                               DockerHostResolver dockerHostResolver,
-                               DockerClient dockerClient,
-                               PortAllocator portAllocator,
-                               EmulatorConfig config,
-                               Ec2MetadataServer metadataServer,
-                               Ec2PortForwardManager portForwardManager,
-                               RegionResolver regionResolver,
-                               ContainerNetworkReachability containerNetworkReachability,
-                               VpcNetworkManager vpcNetworkManager,
-                               ContainerReachableEndpoint reachableEndpoint,
-                               SecurityGroupFirewallManager firewallManager,
-                               Ec2InstanceTypeCatalog instanceTypeCatalog,
-                               Clock clock) {
-        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver,
-                dockerClient, portAllocator, config, metadataServer, portForwardManager, regionResolver,
-                containerNetworkReachability, vpcNetworkManager, reachableEndpoint, firewallManager,
-                instanceTypeCatalog);
-        this.clock = clock;
-    }
-
     public Ec2ContainerManager(ContainerBuilder containerBuilder,
                                ContainerLifecycleManager lifecycleManager,
                                ContainerLogStreamer logStreamer,
@@ -1030,7 +1004,7 @@ public class Ec2ContainerManager {
                     && instance.getDockerContainerId() == null
                     && instance.getSshHostPort() <= 0
                     && (instance.getContainerBridgeIp() == null || instance.getContainerBridgeIp().isBlank());
-            instance.markTerminated(clock.millis());
+            instance.markTerminated(System.currentTimeMillis());
             containerId = instance.getDockerContainerId();
             sshHostPort = instance.getSshHostPort();
             containerIp = instance.getContainerBridgeIp();
@@ -1098,7 +1072,7 @@ public class Ec2ContainerManager {
             if ("running".equals(state)) {
                 return false;
             }
-            instance.markTerminated(clock.millis());
+            instance.markTerminated(System.currentTimeMillis());
         }
         failLaunch(instance);
         return true;
@@ -1894,7 +1868,7 @@ public class Ec2ContainerManager {
             } finally {
                 // Whatever the teardown managed, the instance must not stay shutting-down: nothing
                 // else would ever finish it, and a leftover container is collected on the next start.
-                instance.markTerminated(clock.millis());
+                instance.markTerminated(System.currentTimeMillis());
                 persist(instance);
                 if (afterTeardown != null && containerGone) {
                     try {
