@@ -1907,7 +1907,7 @@ public class Ec2ContainerManager {
     private boolean nativePublicRoutingEnabled() {
         return vpcNetworkManager != null && vpcNetworkManager.enabled()
                 && config.network().securityGroupEnforcement().enabled()
-                && config.network().vpcRouting().enabled() && config.network().vpcRouting().publicAwsApi();
+                && config.network().vpcRouting().enabled();
     }
 
     private String resolveServiceNetworkIp(String instanceId, String containerId) {

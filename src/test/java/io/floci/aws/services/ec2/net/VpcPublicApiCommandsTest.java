@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -25,6 +26,37 @@ class VpcPublicApiCommandsTest {
     void defaultSharedListenerNeedsOnlyOneUpstreamPermission() {
         String script = VpcRoutingCommands.publicApi("192.0.2.1", "172.20.0.5", 4566, 4566, "eth1", List.of());
         assertEquals(1, script.lines().filter(line -> line.contains("egress ip daddr")).count());
+    }
+
+    @Test
+    void publicInstanceTranslatesItsPublicAddressToThePrivateListener() {
+        String script = VpcRoutingCommands.publicInstanceSource(
+                "10.0.2.10", "172.18.0.2", "eth2", List.of("172.18.0.3"));
+        assertTrue(script.contains("add rule ip floci_instance_api incoming iifname \"eth2\""
+                + " ip daddr 172.18.0.2 dnat to 10.0.2.10"));
+        assertTrue(script.contains("ip saddr 10.0.2.10 ip daddr 172.18.0.3 snat to 172.18.0.2"));
+    }
+
+    @Test
+    void publicInstancePreservesSourceOnEachDeclaredRouteInterface() {
+        String script = VpcRoutingCommands.publicInstanceSourceRoutes("10.0.2.10", "172.18.0.2", "eth2",
+                List.of(new VpcRoutingCommands.Hop("172.18.0.3", "240.0.0.3", "eth2", false),
+                        new VpcRoutingCommands.Hop("192.0.2.1", "172.18.0.4", "eth0", false),
+                        new VpcRoutingCommands.Hop("203.0.113.1", "240.0.0.5", "eth2", true)));
+        assertTrue(script.contains("outgoing oifname \"eth2\" ip saddr 10.0.2.10"
+                + " ip daddr 172.18.0.3 snat to 172.18.0.2"));
+        assertTrue(script.contains("outgoing oifname \"eth0\" ip saddr 10.0.2.10"
+                + " ip daddr 192.0.2.1 snat to 172.18.0.2"));
+        assertFalse(script.contains("ip daddr 203.0.113.1 snat"));
+    }
+
+    @Test
+    void withdrawingThePublicAddressRemovesBothTranslationDirections() {
+        String script = VpcRoutingCommands.publicInstanceSource(null, null, null, List.of());
+        assertTrue(script.contains("flush chain ip floci_instance_api incoming"));
+        assertTrue(script.contains("flush chain ip floci_instance_api outgoing"));
+        assertFalse(script.contains("dnat to"));
+        assertFalse(script.contains("snat to"));
     }
 
     @Test

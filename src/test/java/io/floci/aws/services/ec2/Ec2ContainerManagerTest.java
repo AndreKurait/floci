@@ -1386,8 +1386,9 @@ class Ec2ContainerManagerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void nativePublicRoutingKeepsTheNamespacePublicAndPrivateAddressesDistinct(boolean inContainer) {
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void nativePublicRoutingKeepsTheNamespacePublicAndPrivateAddressesDistinct(boolean inContainer,
+                                                                              boolean publicAwsApi) {
         DockerClient docker = guestDocker(null, "172.20.0.9");
         InspectContainerResponse helper = docker.inspectContainerCmd("helper-1").exec();
         when(helper.getHostConfig()).thenReturn(HostConfig.newHostConfig().withNetworkMode("floci-net"));
@@ -1396,7 +1397,7 @@ class Ec2ContainerManagerTest {
         networks.put("floci-net", new ContainerNetwork().withIpv4Address("172.20.0.9"));
         when(helper.getNetworkSettings().getNetworks()).thenReturn(networks);
         Ec2ContainerManager manager = managerOnServiceNetwork(false, inContainer, docker,
-                mock(ExecutorService.class), mock(ExecutorService.class), true);
+                mock(ExecutorService.class), mock(ExecutorService.class), true, publicAwsApi);
         Instance instance = serviceNetworkInstance();
         instance.setContainerBridgeIp("10.84.1.10");
         instance.setPrivateIpAddress("10.84.1.10");
@@ -1691,11 +1692,19 @@ class Ec2ContainerManagerTest {
     private static Ec2ContainerManager managerOnServiceNetwork(boolean enabled, boolean inContainer,
                                                                DockerClient docker, ExecutorService executor,
                                                                ExecutorService retryExecutor, boolean nativeRouting) {
+        return managerOnServiceNetwork(enabled, inContainer, docker, executor, retryExecutor,
+                nativeRouting, nativeRouting);
+    }
+
+    private static Ec2ContainerManager managerOnServiceNetwork(boolean enabled, boolean inContainer,
+                                                               DockerClient docker, ExecutorService executor,
+                                                               ExecutorService retryExecutor, boolean nativeRouting,
+                                                               boolean publicAwsApi) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ec2().publicIpFromServiceNetwork()).thenReturn(enabled);
         when(config.network().securityGroupEnforcement().enabled()).thenReturn(nativeRouting);
         when(config.network().vpcRouting().enabled()).thenReturn(nativeRouting);
-        when(config.network().vpcRouting().publicAwsApi()).thenReturn(nativeRouting);
+        when(config.network().vpcRouting().publicAwsApi()).thenReturn(publicAwsApi);
         VpcNetworkManager networks = mock(VpcNetworkManager.class);
         when(networks.enabled()).thenReturn(nativeRouting);
         ContainerDetector detector = mock(ContainerDetector.class);

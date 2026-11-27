@@ -3,6 +3,7 @@ package io.floci.aws.services.ec2.net;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.ec2.SecurityGroupNftCompiler.ControlConnection;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
@@ -21,16 +22,30 @@ final class VpcRoutingCommands {
     record LocalRoute(Cidr4 destination, boolean allowed) {}
 
     static String endpointGuard() {
-        return """
-                set -eu
-                nft add table inet floci_vpc_routes
-                nft 'add chain inet floci_vpc_routes ingress { type filter hook input priority -5; policy drop; }'
-                nft 'add chain inet floci_vpc_routes egress { type filter hook output priority -5; policy drop; }'
-                nft -f - <<'FLOCI_RULES'
+        return endpointGuard(List.of());
+    }
+
+    static String endpointGuard(List<String> resolvers) {
+        StringBuilder rules = new StringBuilder("""
+                add table inet floci_vpc_routes
+                add chain inet floci_vpc_routes ingress { type filter hook input priority -5; policy drop; }
+                add chain inet floci_vpc_routes egress { type filter hook output priority -5; policy drop; }
                 flush chain inet floci_vpc_routes ingress
                 flush chain inet floci_vpc_routes egress
-                FLOCI_RULES
-                """;
+                """);
+        for (String resolver : resolvers) {
+            if (!resolver.contains(":")) {
+                String address = VpcRouteSelection.ipv4(resolver);
+                for (String protocol : List.of("udp", "tcp")) {
+                    rules.append("add rule inet floci_vpc_routes egress ip daddr ").append(address)
+                            .append(" ").append(protocol).append(" dport 53 counter accept\n")
+                            .append("add rule inet floci_vpc_routes ingress ip saddr ").append(address)
+                            .append(" ").append(protocol)
+                            .append(" sport 53 ct state established ct direction reply counter accept\n");
+                }
+            }
+        }
+        return "set -eu\n" + nft(rules.toString());
     }
 
     static String endpoint(String privateAddress, String privateDevice, List<LocalRoute> localRoutes, List<Hop> hops,
@@ -122,16 +137,36 @@ final class VpcRoutingCommands {
     }
 
     static String publicInstanceSource(String privateAddress, String publicAddress, String publicDevice) {
+        return publicInstanceSource(privateAddress, publicAddress, publicDevice,
+                List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS));
+    }
+
+    static String publicInstanceSource(String privateAddress, String publicAddress, String publicDevice,
+                                       List<String> destinations) {
+        List<Hop> routes = publicAddress == null ? List.of() : destinations.stream()
+                .map(destination -> new Hop(destination, destination, publicDevice, false)).toList();
+        return publicInstanceSourceRoutes(privateAddress, publicAddress, publicDevice, routes);
+    }
+
+    static String publicInstanceSourceRoutes(String privateAddress, String publicAddress, String publicDevice,
+                                             List<Hop> routes) {
         String rules = """
                 add table ip floci_instance_api
+                add chain ip floci_instance_api incoming { type nat hook prerouting priority dstnat; }
                 add chain ip floci_instance_api outgoing { type nat hook postrouting priority srcnat; }
+                flush chain ip floci_instance_api incoming
                 flush chain ip floci_instance_api outgoing
                 """;
         if (publicAddress != null) {
-            rules += "add rule ip floci_instance_api outgoing oifname \"" + device(publicDevice)
-                    + "\" ip saddr " + VpcRouteSelection.ipv4(privateAddress) + " ip daddr "
-                    + EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS
-                    + " snat to " + VpcRouteSelection.ipv4(publicAddress) + "\n";
+            rules += "add rule ip floci_instance_api incoming iifname \"" + device(publicDevice)
+                    + "\" ip daddr " + VpcRouteSelection.ipv4(publicAddress)
+                    + " dnat to " + VpcRouteSelection.ipv4(privateAddress) + "\n";
+            for (Hop route : routes.stream().filter(hop -> !hop.replyOnly()).distinct()
+                    .sorted(Comparator.comparing(Hop::destination).thenComparing(Hop::device)).toList()) {
+                rules += "add rule ip floci_instance_api outgoing oifname \"" + route.device()
+                        + "\" ip saddr " + VpcRouteSelection.ipv4(privateAddress) + " ip daddr "
+                        + route.destination() + " snat to " + VpcRouteSelection.ipv4(publicAddress) + "\n";
+            }
         }
         return nft(rules);
     }

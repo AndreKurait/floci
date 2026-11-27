@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /** Builds only rules for an endpoint's private nftables table. Docker's tables are untouched. */
 public final class SecurityGroupNftCompiler {
@@ -205,6 +206,13 @@ public final class SecurityGroupNftCompiler {
     public static String compile(Endpoint target, Collection<Endpoint> peers,
                                   Map<String, List<String>> prefixLists, List<String> vpcResolvers,
                                   boolean isolatedAddressSpaces) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, peer -> true, Set.of());
+    }
+
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                 Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                 boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
+                                 Set<String> routedPublicAddresses) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
@@ -293,8 +301,14 @@ public final class SecurityGroupNftCompiler {
             // evaluated against its Docker bridge IP instead of its logical ENI address.
             Set<String> transports = new LinkedHashSet<>();
             for (Endpoint peer : managed) {
-                transports.addAll(isolatedAddressSpaces && !target.sameVpc(peer)
-                        ? peer.primaryTransports() : peer.transports());
+                List<String> visible = isolatedAddressSpaces && !target.sameVpc(peer)
+                        ? peer.primaryTransports() : peer.transports();
+                for (String address : visible) {
+                    if (egress && admitted.test(peer) && routedPublicAddresses.contains(address)) {
+                        continue;
+                    }
+                    transports.add(address);
+                }
             }
             for (String transport : transports) {
                 appendRule(rules, chain, addressField, transport, "drop");

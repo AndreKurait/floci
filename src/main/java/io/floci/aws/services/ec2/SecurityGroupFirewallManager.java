@@ -45,6 +45,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -482,7 +483,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             throw new IllegalStateException("Public address has no admitted security-group endpoint");
         }
         if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
-            vpcRouting.get().attachPublicInstance(current.endpoint(), current.helperId(), address);
+            VpcRoutingManager routing = vpcRouting.get();
+            Set<String> previous = routing.publicInstanceAddresses();
+            routing.attachPublicInstance(current.endpoint(), current.helperId(), address);
+            if (!previous.equals(routing.publicInstanceAddresses())) {
+                reconcileAll();
+            }
         }
     }
 
@@ -546,10 +552,15 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         List<SecurityGroupNftCompiler.Endpoint> peers = endpoints.values().stream()
                 .map(ProtectedEndpoint::endpoint).toList();
         List<String> vpcResolvers = vpcResolvers();
+        Set<String> admitted = dnsOrigins.values().stream().map(DnsOrigin::eniId)
+                .collect(Collectors.toSet());
+        Set<String> publicAddresses = vpcRouting == null || vpcRouting.isUnsatisfied()
+                ? Set.of() : vpcRouting.get().publicInstanceAddresses();
         for (ProtectedEndpoint protectedEndpoint : new ArrayList<>(endpoints.values())) {
             try {
                 String rules = SecurityGroupNftCompiler.compile(protectedEndpoint.endpoint(), peers,
-                        protectedEndpoint.prefixLists(), vpcResolvers, isolatedAddressSpaces());
+                        protectedEndpoint.prefixLists(), vpcResolvers, isolatedAddressSpaces(),
+                        peer -> admitted.contains(peer.eniId()), publicAddresses);
                 apply(protectedEndpoint.helperId(), rules);
             } catch (RuntimeException e) {
                 endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));

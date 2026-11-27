@@ -84,6 +84,16 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         return config.network().vpcRouting().enabled();
     }
 
+    /** Public destinations remain subject to the independently installed native route policy. */
+    public synchronized Set<String> publicInstanceAddresses() {
+        if (!enabled() || draining) {
+            return Set.of();
+        }
+        return endpoints.values().stream().map(endpoint -> endpoint.publicAddress)
+                .filter(address -> address != null && address.transport() != null)
+                .map(NativePublicAddress::address).collect(Collectors.toUnmodifiableSet());
+    }
+
     public void validateConfiguration() {
         if (!vpcs.enabled() || !config.services().ec2().awsFaithfulPrivateIp()
                 || !config.network().securityGroupEnforcement().enabled()) {
@@ -155,7 +165,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
 
     public synchronized void attachPublicInstance(SecurityGroupNftCompiler.Endpoint identity, String helper,
                                                   String publicIp) {
-        if (!enabled() || !awsApi.enabled()) {
+        if (!enabled()) {
             return;
         }
         requireActive();
@@ -192,25 +202,20 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             }
             detachPublicInstance(endpoint);
         }
-        String network = matches.getFirst().getNetworkID();
-        if (!Boolean.TRUE.equals(docker.inspectNetworkCmd().withNetworkId(network).exec().getInternal())) {
-            endpoint.publicAddress = new NativePublicAddress(VpcRouteSelection.ipv4(publicIp),
-                    network, deviceFor(helper, publicIp), publicIp, false);
-            reconcile();
-            return;
-        }
-        // Docker internal bridges reject off-subnet destinations, even between their own members.
+        // Use the same transport as NAT gateways; Docker control bridges cannot carry every routed source.
+        String addressNetwork = matches.getFirst().getNetworkID();
+        String addressDevice = deviceFor(helper, publicIp);
         String transportNetwork = publicNetwork();
         endpoint.publicAddress = new NativePublicAddress(VpcRouteSelection.ipv4(publicIp),
-                transportNetwork, null, null, true);
+                addressNetwork, addressDevice, transportNetwork, null, null, true);
         try {
             if (docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks().values().stream()
                     .noneMatch(value -> transportNetwork.equals(value.getNetworkID()))) {
                 docker.connectToNetworkCmd().withNetworkId(transportNetwork).withContainerId(helper).exec();
             }
             String transport = networkAddress(helper, transportNetwork);
-            endpoint.publicAddress = new NativePublicAddress(publicIp, transportNetwork, deviceFor(helper, transport),
-                    transport, true);
+            endpoint.publicAddress = new NativePublicAddress(publicIp, addressNetwork, addressDevice,
+                    transportNetwork, deviceFor(helper, transport), transport, true);
             reconcile();
         } catch (RuntimeException failure) {
             try {
@@ -401,6 +406,14 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                         nat.publicDevice, false));
             }
         }
+        for (Endpoint endpoint : endpoints.values()) {
+            NativePublicAddress address = endpoint.publicAddress;
+            if (address != null && address.transport() != null && publicNetwork.equals(address.network())
+                    && internet(address.address(), routes, nat.vpc, topology)) {
+                destinations.add(new VpcRoutingCommands.Hop(address.address(), address.transport(),
+                        nat.publicDevice, false));
+            }
+        }
         String script = VpcRoutingCommands.nat(nat.publicIp, vpcCidr(nat.account, nat.region, nat.vpc), nat.privateDevice,
                 nat.publicDevice, destinations);
         if (!script.equals(nat.applied)) {
@@ -430,14 +443,35 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 denied.add(destination.address);
             }
         }
+        NativePublicAddress nativeAddress = endpoint.publicAddress;
+        for (Endpoint peer : endpoints.values()) {
+            NativePublicAddress destination = peer.publicAddress;
+            if (peer == endpoint || destination == null) {
+                continue;
+            }
+            int previous = hops.size();
+            if (destination.transport() != null) {
+                addDestination(endpoint, topology, routes, own,
+                        destination.address(), destination.transport(), hops);
+            }
+            if (hops.size() == previous && nativeAddress != null && destination.transport() != null
+                    && nativeAddress.network().equals(destination.network())
+                    && internet(destination.address(), routes, vpc, topology)) {
+                hops.add(new VpcRoutingCommands.Hop(destination.address(), destination.transport(),
+                        nativeAddress.device(), false));
+            }
+            if (hops.size() == previous) {
+                denied.add(destination.address());
+            }
+        }
         if (awsApi.enabled()) {
             String apiAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
             int previous = hops.size();
             if (awsApi.transport() != null && endpoint.publicAddress != null
                     && internet(apiAddress, routes, vpc, topology)) {
                 NativePublicAddress address = endpoint.publicAddress;
-                VpcAwsApiBridge.NetworkEndpoint api = awsApi.onNetwork(address.network());
-                hops.add(new VpcRoutingCommands.Hop(apiAddress, api.address(), address.device(), false));
+                VpcAwsApiBridge.NetworkEndpoint api = awsApi.onNetwork(address.addressNetwork());
+                hops.add(new VpcRoutingCommands.Hop(apiAddress, api.address(), address.addressDevice(), false));
             } else if (awsApi.transport() != null) {
                 addDestination(endpoint, topology, routes, null, apiAddress, awsApi.transport(), hops);
             }
@@ -446,10 +480,13 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             }
         }
         List<String> inbound = new ArrayList<>();
-        if (own != null) {
+        String returnDevice = own != null ? own.device : nativeAddress == null ? null : nativeAddress.device();
+        if (returnDevice != null) {
+            hops.stream().filter(hop -> returnDevice.equals(hop.device()))
+                    .map(VpcRoutingCommands.Hop::destination).forEach(inbound::add);
             for (NatRuntime nat : nats.values()) {
                 if (!nat.retiring && nat.transport != null && internet(nat.publicIp, routes, vpc, topology)) {
-                    hops.add(new VpcRoutingCommands.Hop(nat.publicIp, nat.transport, own.device, true));
+                    hops.add(new VpcRoutingCommands.Hop(nat.publicIp, nat.transport, returnDevice, true));
                     inbound.add(nat.publicIp);
                 }
             }
@@ -460,14 +497,14 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 .toList();
         String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), endpoint.privateDevice,
                 local, hops, denied, endpoint.resolvers, identity.controlConnections(),
-                identity.instanceMetadataAllowed(), own == null ? null : own.device, inbound);
+                identity.instanceMetadataAllowed(), returnDevice, inbound);
         if (endpoint.publicAddress != null) {
             NativePublicAddress address = endpoint.publicAddress;
-            script += VpcRoutingCommands.publicInstanceSource(identity.logicalAddress(), address.address(),
-                    address.device());
+            script += VpcRoutingCommands.publicInstanceSourceRoutes(identity.logicalAddress(), address.address(),
+                    address.device(), hops);
         }
         if (!script.equals(endpoint.applied)) {
-            run(endpoint.helper, VpcRoutingCommands.endpointGuard());
+            run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
             endpoint.applied = null;
             run(endpoint.helper, script);
             endpoint.applied = script;
@@ -523,8 +560,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                     if (internet(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS,
                             routes(identity.region(), identity.vpcId(), endpoint.subnet, topology),
                             identity.vpcId(), topology)) {
-                        VpcAwsApiBridge.NetworkEndpoint api = awsApi.onNetwork(address.network());
-                        callers.add(new VpcRoutingCommands.Hop(address.address(), address.transport(),
+                        VpcAwsApiBridge.NetworkEndpoint api = awsApi.onNetwork(address.addressNetwork());
+                        callers.add(new VpcRoutingCommands.Hop(address.address(), address.address(),
                                 api.device(), true));
                     }
                 });
@@ -708,6 +745,11 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     }
 
     @Override
+    public synchronized void beginTeardown() {
+        draining = true;
+    }
+
+    @Override
     public synchronized void stopManagedContainers() {
         draining = true;
         for (Map.Entry<String, NatRuntime> entry : List.copyOf(nats.entrySet())) {
@@ -760,8 +802,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
 
     private record Topology(List<RouteTable> tables, List<NatGateway> nats, List<InternetGateway> gateways) {}
 
-    private record NativePublicAddress(String address, String network, String device, String transport,
-                                       boolean separateTransport) {}
+    private record NativePublicAddress(String address, String addressNetwork, String addressDevice,
+                                       String network, String device, String transport, boolean separateTransport) {}
 
     private static final class Endpoint {
         final SecurityGroupNftCompiler.Endpoint identity;
