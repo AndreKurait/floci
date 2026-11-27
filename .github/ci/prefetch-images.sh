@@ -128,6 +128,14 @@ starts EcsImagePullDockerIntegrationTest && [ -n "$REGISTRY_IMAGE" ] && pull "$R
 PYTHON_ALPINE_IMAGE="$(test_image PYTHON_ALPINE)"
 starts ContainerCaBundleDockerIntegrationTest EcsCredentialsProxyDockerNightlyIntegrationTest SageMakerDockerNightlyIntegrationTest \
     && [ -n "$PYTHON_ALPINE_IMAGE" ] && pull "$PYTHON_ALPINE_IMAGE"
+# DNS lifecycle guests use Python, including inherited protected/shared checks. Their network helpers build
+# from alpine:3.21 locally, so prefetch the base rather than pulling the locally built helper image.
+if starts EcsPrivateDnsGuestDockerNightlyIntegrationTest EcsSharedPrivateDnsGuestDockerNightlyIntegrationTest \
+          EcsProtectedPrivateDnsGuestDockerNightlyIntegrationTest Ec2PrivateDnsGuestDockerNightlyIntegrationTest \
+          Ec2ProtectedPrivateDnsGuestDockerNightlyIntegrationTest; then
+    [ -n "$PYTHON_ALPINE_IMAGE" ] && pull "$PYTHON_ALPINE_IMAGE"
+    pull alpine:3.21
+fi
 CORRETTO_8_IMAGE="$(test_image CORRETTO_8)"
 starts ContainerCaBundleDockerIntegrationTest && [ -n "$CORRETTO_8_IMAGE" ] && pull "$CORRETTO_8_IMAGE"
 # The Firelens test names the log router image itself rather than taking it from config.
@@ -199,6 +207,12 @@ configured_image() {
 if grep -q '/neptune/' "$SHARD_FILE"; then
     configured_image neptune default-neo4j-image
     configured_image neptune default-image
+fi
+# NeptuneGraphVolumeDockerNightlyIntegrationTest keeps a graph across containers on both engines' configured images,
+# and NeptuneClusterRestartDockerNightlyIntegrationTest restarts clusters on the Gremlin one.
+if starts NeptuneGraphVolumeDockerNightlyIntegrationTest NeptuneClusterRestartDockerNightlyIntegrationTest; then
+    configured_image neptune default-image
+    configured_image neptune default-neo4j-image
 fi
 # DocDbClusterRestartDockerNightlyIntegrationTest restarts clusters on the configured MongoDB image.
 starts DocDbClusterRestartDockerNightlyIntegrationTest && configured_image docdb default-image

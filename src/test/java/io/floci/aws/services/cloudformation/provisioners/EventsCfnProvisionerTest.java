@@ -38,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -170,6 +171,32 @@ class EventsCfnProvisionerTest {
         assertEquals("orders-bus|my-stack-Rule-ab12cd", r.getPhysicalId());
         verify(events).putRule(eq("my-stack-Rule-ab12cd"), eq("orders-bus"), any(), any(), any(), any(), any(),
                 any(), anyString());
+    }
+
+    @Test
+    void anEventPatternWrittenAsAStringReachesPutRuleAsWritten() {
+        // The defect: serializing the resolved node again turned a string pattern into a quoted
+        // JSON string, which PutRule refuses with "Event pattern must be a JSON object."
+        stubPutRule();
+        String pattern = "{ \"source\": [ \"aws.autoscaling\" ], \"detail-type\": [ \"EC2 Instance Launch Successful\" ]}";
+
+        provisioner.provision(resource("AWS::Events::Rule", "Rule"),
+                mapper.createObjectNode().put("Name", "asg-events").put("EventPattern", pattern), ctx(null));
+
+        verify(events).putRule(eq("asg-events"), any(), eq(pattern), any(), any(), any(), any(), any(),
+                anyString());
+    }
+
+    @Test
+    void anEventPatternWrittenAsAnObjectReachesPutRuleAsItsJson() {
+        stubPutRule();
+        ObjectNode props = mapper.createObjectNode().put("Name", "asg-events");
+        props.putObject("EventPattern").putArray("source").add("aws.autoscaling");
+
+        provisioner.provision(resource("AWS::Events::Rule", "Rule"), props, ctx(null));
+
+        verify(events).putRule(eq("asg-events"), any(), eq("{\"source\":[\"aws.autoscaling\"]}"), any(), any(),
+                any(), any(), any(), anyString());
     }
 
     @ParameterizedTest(name = "{0}")
@@ -640,6 +667,106 @@ class EventsCfnProvisionerTest {
     // ── a failed stack update puts the rule's targets back ────────────────────
 
     private static final String RULE_TARGETS_SNAPSHOT_ATTR = CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void rollbackRestoresThePriorIdentityIncludingAbsentAttributes(boolean customBus) {
+        stubPutRule();
+        StackResource r = priorRule(customBus);
+        String priorId = r.getPhysicalId();
+        String priorArn = r.getAttributes().get("Arn");
+        ObjectNode props = ruleProps();
+        if (!customBus) {
+            props.put("EventBusName", "new-bus");
+        }
+        provisioner.provision(r, props, ctx(priorId));
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals(priorId, r.getPhysicalId());
+        assertEquals(priorArn, r.getAttributes().get("Arn"));
+        assertEquals("original", r.getAttributes().get("RuleName"));
+        assertEquals(customBus ? "old-bus" : null, r.getAttributes().get("EventBusName"));
+    }
+
+    @Test
+    void aFailedTargetRestoreCarriesTheCurrentSnapshotForRetry() {
+        stubPutRule();
+        when(events.listTargetsByRule(anyString(), any(), anyString()))
+                .thenReturn(List.of(storedTarget("keep")));
+        AwsException failure = new AwsException("InternalException", "restore unavailable", 500);
+        doThrow(failure).when(events).putTargets(anyString(), any(), any(), anyString());
+        doThrow(failure).when(events).restoreAcceptedTargets(anyString(), any(), any(), anyString());
+        StackResource previous = priorRule(true);
+        previous.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "stale committed snapshot");
+        StackResource attempted = priorRule(true);
+
+        assertThrows(AwsException.class,
+                () -> provisioner.provision(attempted, ruleProps("keep"), ctx(previous.getPhysicalId())));
+        String currentSnapshot = attempted.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR);
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+        assertEquals(currentSnapshot, previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+
+        doReturn(0).when(events).restoreAcceptedTargets(anyString(), any(), any(), anyString());
+        assertTrue(provisioner.rollbackUpdate(previous));
+        assertEquals("old-bus|original", previous.getPhysicalId());
+        assertEquals("old-bus", previous.getAttributes().get("EventBusName"));
+        assertNull(previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aFailedUpdateWithNoPendingRestoreDiscardsTheCommittedSnapshot(boolean hasAttemptSnapshot) {
+        StackResource previous = priorRule(true);
+        previous.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "stale committed snapshot");
+        StackResource attempted = priorRule(true);
+        if (hasAttemptSnapshot) {
+            attempted.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "spent attempted snapshot");
+        }
+
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+
+        assertNull(previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+        assertEquals("old-bus|original", previous.getPhysicalId());
+    }
+
+    @Test
+    void aFailedRollbackWithoutAnAttemptSnapshotDoesNotReviveACommittedSnapshot() {
+        StackResource previous = priorRule(true);
+        previous.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "stale committed snapshot");
+        StackResource attempted = priorRule(true);
+        attempted.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, "failed before snapshot");
+
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+
+        assertNull(previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void aLegacyTargetSnapshotDoesNotClearIdentityItDidNotCapture() {
+        StackResource r = priorRule(true);
+        r.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, """
+                {"ruleName":"original","busName":"old-bus","region":"us-east-1","targets":[]}
+                """);
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals("old-bus|original", r.getPhysicalId());
+        assertEquals("old-bus", r.getAttributes().get("EventBusName"));
+        assertEquals("original", r.getAttributes().get("RuleName"));
+        assertEquals(RULE_ARN, r.getAttributes().get("Arn"));
+    }
+
+    private StackResource priorRule(boolean customBus) {
+        StackResource r = resource("AWS::Events::Rule", "Rule");
+        r.setPhysicalId(customBus ? "old-bus|original" : "original");
+        r.getAttributes().put("Arn", RULE_ARN);
+        r.getAttributes().put("RuleName", "original");
+        if (customBus) {
+            r.getAttributes().put("EventBusName", "old-bus");
+        }
+        return r;
+    }
 
     @Test
     void aRollbackPutsBackATargetTheUpdateDropped() {

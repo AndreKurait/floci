@@ -23,6 +23,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.Resettable;
 import io.floci.aws.core.common.ServicePrincipals;
+import io.floci.aws.core.common.Utf8;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.core.resource.ExplorerResource;
@@ -6793,28 +6794,36 @@ public class S3Service implements Resettable, ResourceProvider {
 
     /**
      * Stores the bucket replication configuration for round-trip fidelity. The document is
-     * validated minimally (a {@code Role} and at least one {@code Rule} with a
-     * {@code Destination/Bucket}) and stored verbatim; Floci performs no actual replication.
+     * validated minimally (well-formed as a whole, one {@code Role} and at least one {@code Rule}
+     * with a {@code Destination/Bucket}) and stored verbatim; Floci performs no actual replication.
      */
     public void putBucketReplication(String bucketName, String replicationXml) {
         mutateBucket(bucketName, bucket -> {
-            if (!"ReplicationConfiguration".equals(XmlParser.rootElementName(replicationXml))) {
+            // The whole document is parsed, as S3 parses it: one that is not well-formed after its
+            // configuration ends is refused, not stored for the part that parsed.
+            XmlParser.XmlElement root = XmlParser.parseDocumentElementTree(replicationXml);
+            if (root == null || !"ReplicationConfiguration".equals(root.name())) {
                 throw new AwsException("MalformedXML",
                         "The XML you provided was not well-formed or did not validate against our published schema.",
                         400);
             }
-            String role = XmlParser.extractFirst(replicationXml, "Role", null);
             List<Map<String, List<String>>> rules = XmlParser.extractGroupsMulti(replicationXml, "Rule");
+            // Role is a required scalar member of ReplicationConfiguration (botocore
+            // s3/2006-03-01/service-2.json: "Role":{"shape":"Role"}, a string), read from the
+            // configuration's own children and counted as Destination's Bucket is below: a second
+            // Role, or one holding elements, does not validate, and the one Role there is is the
+            // role IAM checks iam:PassRole on.
+            List<XmlParser.XmlElement> roles = root.children().stream()
+                    .filter(c -> "Role".equals(c.name())).toList();
+            XmlParser.XmlElement role = roles.size() == 1 && roles.get(0).children().isEmpty() ? roles.get(0) : null;
             // A document-wide count of Rule vs Destination elements can't tell a well-formed
             // document from one where a rule has two Destinations and another has none (the
             // totals still balance). Destination is a direct child of Rule, so walking the parsed
             // element tree and inspecting each Rule's own children is the only way to require
             // that every rule carries exactly its own destination.
-            XmlParser.XmlElement root = XmlParser.extractElementTree(replicationXml, "ReplicationConfiguration");
-            List<XmlParser.XmlElement> ruleElements = root == null
-                    ? List.of()
-                    : root.children().stream().filter(c -> "Rule".equals(c.name())).toList();
-            if (role == null || role.isBlank() || ruleElements.isEmpty()) {
+            List<XmlParser.XmlElement> ruleElements = root.children().stream()
+                    .filter(c -> "Rule".equals(c.name())).toList();
+            if (role == null || role.text().isBlank() || ruleElements.isEmpty()) {
                 throw new AwsException("MalformedXML",
                         "The XML you provided was not well-formed or did not validate against our published schema.",
                         400);
@@ -8194,7 +8203,7 @@ public class S3Service implements Resettable, ResourceProvider {
         if (representable && utf8Length(segment) <= budget && !hasEncodedShape(segment, budget)) {
             return segment;
         }
-        String prefix = truncateUtf8(segment, budget - 1 - SHA256_HEX_CHARS);
+        String prefix = Utf8.truncate(segment, budget - 1 - SHA256_HEX_CHARS);
         if (WINDOWS_FILE_NAMES) {
             prefix = windowsSafePrefix(prefix);
         }
@@ -8265,23 +8274,6 @@ public class S3Service implements Resettable, ResourceProvider {
             }
         }
         return true;
-    }
-
-    private static String truncateUtf8(String segment, int maxBytes) {
-        int end = 0;
-        int used = 0;
-        int i = 0;
-        while (i < segment.length()) {
-            int codePoint = segment.codePointAt(i);
-            int byteCount = codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
-            if (used + byteCount > maxBytes) {
-                break;
-            }
-            used += byteCount;
-            i += Character.charCount(codePoint);
-            end = i;
-        }
-        return segment.substring(0, end);
     }
 
     private static int utf8Length(String segment) {
@@ -8794,19 +8786,21 @@ public class S3Service implements Resettable, ResourceProvider {
             metadata.putAll(effectiveOptions.getReplacementMetadata());
         }
 
-        String effectiveContentType = replaceMetadata && effectiveOptions.getContentType() != null
-                ? effectiveOptions.getContentType()
+        // REPLACE takes these headers from the request only; an omitted one is not carried over,
+        // and an omitted Content-Type becomes S3's binary/octet-stream.
+        String effectiveContentType = replaceMetadata
+                ? (effectiveOptions.getContentType() != null ? effectiveOptions.getContentType() : "binary/octet-stream")
                 : source.getContentType();
         String effectiveStorageClass = effectiveOptions.getStorageClass() != null
                 ? effectiveOptions.getStorageClass()
                 : source.getStorageClass();
-        String effectiveContentEncoding = replaceMetadata && effectiveOptions.getContentEncoding() != null
+        String effectiveContentEncoding = replaceMetadata
                 ? effectiveOptions.getContentEncoding()
                 : source.getContentEncoding();
-        String effectiveContentDisposition = replaceMetadata && effectiveOptions.getContentDisposition() != null
+        String effectiveContentDisposition = replaceMetadata
                 ? effectiveOptions.getContentDisposition()
                 : source.getContentDisposition();
-        String effectiveCacheControl = replaceMetadata && effectiveOptions.getCacheControl() != null
+        String effectiveCacheControl = replaceMetadata
                 ? effectiveOptions.getCacheControl()
                 : source.getCacheControl();
         String effectiveSseKmsKeyId = new ObjectEncryption(normalizedServerSideEncryption,
