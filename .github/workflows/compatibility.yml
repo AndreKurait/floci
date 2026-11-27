@@ -57,10 +57,6 @@ jobs:
   compat-aws-cli-shim:
     name: compat / aws CLI endpoint resolution
     runs-on: ubuntu-24.04-arm
-    concurrency:
-      group: floci-compat-slot-3
-      cancel-in-progress: false
-      queue: max
     timeout-minutes: 10
     # Same draft condition as docker-runner-regression above.
     if: >-
@@ -183,13 +179,8 @@ jobs:
     # but an amd64 build here cost 7 to 9 minutes of every run for one 2-minute suite. The amd64
     # image is proven instead by compat-partitions.yml's amd64 job, after each Nightly, against the
     # published multi-arch nightly image.
-    concurrency:
-      group: floci-compat-native-build
-      cancel-in-progress: false
-      queue: max
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - arch: arm64
@@ -317,13 +308,8 @@ jobs:
     # than they take to run. The x86_64 snappy JNI library (the resource that can go missing per
     # platform, see the build-native comment) is checked after each Nightly by compat-partitions.yml's
     # amd64 sdk-test-python job, which carries the Firehose compression delivery test.
-    concurrency:
-      group: floci-compat-slot-${{ matrix.slot }}
-      cancel-in-progress: false
-      queue: max
     strategy:
       fail-fast: false
-      max-parallel: 3
       matrix:
         arch:
           - arm64
@@ -339,22 +325,6 @@ jobs:
         include:
           - arch: arm64
             runner: ubuntu-24.04-arm
-          - test: sdk-test-node
-            slot: 1
-          - test: sdk-test-python
-            slot: 2
-          - test: sdk-test-java
-            slot: 3
-          - test: sdk-test-go
-            slot: 1
-          - test: sdk-test-awscli
-            slot: 2
-          - test: compat-cdk
-            slot: 3
-          - test: compat-terraform
-            slot: 1
-          - test: compat-opentofu
-            slot: 2
 
     steps:
       - name: Download native floci image
@@ -453,8 +423,8 @@ jobs:
           exit 1
 
       # Keep the first Neptune request inside its existing test deadline on a cold runner.
-      - name: Pre-pull Neptune image for Node SDK
-        if: matrix.test == 'sdk-test-node'
+      - name: Pre-pull Neptune image for Node SDK and AWS CLI
+        if: matrix.test == 'sdk-test-node' || matrix.test == 'sdk-test-awscli'
         run: |
           image="$(bash .github/ci/service-image.sh neptune default-image)"
           if [ -z "$image" ]; then
@@ -571,10 +541,6 @@ jobs:
     name: native arm64 / ec2-containers
     needs: build-native
     runs-on: ubuntu-24.04-arm
-    concurrency:
-      group: floci-compat-slot-2
-      cancel-in-progress: false
-      queue: max
     timeout-minutes: 20
     # The suites above run EC2 in mock mode, so no native test reached the Docker calls that only
     # container-backed EC2 makes: building the security group helper image, committing an instance

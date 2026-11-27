@@ -13,8 +13,7 @@ public class Ec2TerminatedInstanceScheduler extends SweepScheduler {
 
     @Inject
     public Ec2TerminatedInstanceScheduler(Ec2Service service, EmulatorConfig config) {
-        // Retention must use the clock that stamped EC2's lifecycle records.
         super(new SweepWorker("ec2-terminated-instance-pruning", config.services().ec2().enabled(),
-                SWEEP_INTERVAL_SECONDS, false, ignored -> service.pruneTerminatedInstances()));
+                SWEEP_INTERVAL_SECONDS, false, service::pruneTerminatedInstances));
     }
 }
