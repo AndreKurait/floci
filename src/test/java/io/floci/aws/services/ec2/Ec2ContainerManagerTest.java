@@ -4073,6 +4073,78 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void replaceRootKeepsTheGuestsDataVolumeMountsOnTheNewGuest() {
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).execute(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        stubReplaceableGuest(harness, "i-replace-data", null);
+        Instance guest = replaceableInstance("i-replace-data");
+        Ec2ImageCatalog.VolumeMount mapping = new Ec2ImageCatalog.VolumeMount("sdf", "/app-data", "ext4");
+        Ec2VolumeBlockDeviceManager.PreparedMount kept =
+                new Ec2VolumeBlockDeviceManager.PreparedMount("vol-data", "/dev/sdf", "/dev/loop42",
+                        "floci-vol-data", "/app-data");
+        AtomicReference<String> readFrom = new AtomicReference<>();
+        AtomicInteger replaced = new AtomicInteger();
+        AtomicReference<String> failed = new AtomicReference<>();
+        try {
+            harness.manager.replaceRoot(guest,
+                    new ResolvedAmiImage("ubuntu:26.04", ResolvedAmiImage.DEFAULT_RUNTIME, false, null,
+                            List.of(mapping)),
+                    null, () -> {
+                        // The mounts are read back while the instance still names its old guest.
+                        readFrom.set(guest.getDockerContainerId());
+                        verify(harness.lifecycleManager, never()).create(any(ContainerSpec.class));
+                        return List.of(kept);
+                    }, () -> { }, replaced::incrementAndGet, failed::set);
+            tasks.removeFirst().run();
+
+            assertNull(failed.get());
+            assertEquals(1, replaced.get());
+            assertEquals(REPLACED_CONTAINER_ID, readFrom.get());
+            verify(harness.builder).withNamedVolume("floci-vol-data", "/app-data");
+            verify(harness.builder).withDevice("/dev/loop42", "/dev/sdf", "rw");
+            verify(harness.builder).withDevice("/dev/loop42", "/dev/loop42", "rw");
+            verify(harness.builder).withCapAdd("SYS_RESOURCE");
+            verify(harness.builder).withPrivileged(false);
+            verify(harness.builder).withNetworkMode("container:helper-replace");
+            assertEquals(TEST_CONTAINER_ID, guest.getDockerContainerId());
+            assertEquals("i-replace-data", guest.getInstanceId());
+            assertEquals("10.0.1.10", guest.getPrivateIpAddress());
+            assertEquals(2201, guest.getSshHostPort());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
+    void replaceRootWhoseDataVolumesCannotBeKeptLeavesTheOldGuestUntouched() {
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).execute(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        RenameContainerCmd rename = stubReplaceableGuest(harness, "i-replace-lost-data", null);
+        Instance guest = replaceableInstance("i-replace-lost-data");
+        AtomicReference<String> failed = new AtomicReference<>();
+        try {
+            harness.manager.replaceRoot(guest, ResolvedAmiImage.minimal("ubuntu:26.04"), null, () -> {
+                throw new IllegalStateException("guest does not retain its data mount");
+            }, () -> { }, () -> { }, failed::set);
+            tasks.removeFirst().run();
+
+            assertTrue(failed.get() != null && failed.get().contains("guest does not retain its data mount"),
+                    String.valueOf(failed.get()));
+            verify(rename, never()).exec();
+            verify(harness.lifecycleManager, never()).create(any(ContainerSpec.class));
+            verify(harness.dockerClient, never()).stopContainerCmd(REPLACED_CONTAINER_ID);
+            assertEquals(REPLACED_CONTAINER_ID, guest.getDockerContainerId());
+            assertEquals("running", guest.getState().getName());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
     void rebootWithoutAContainerDoesNotPublishAddresses() {
         LaunchHarness harness = launchHarness();
         Instance guest = instance("i-no-reboot-container");

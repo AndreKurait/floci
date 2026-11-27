@@ -816,10 +816,10 @@ class Ec2ServiceTest {
         AtomicReference<Runnable> inProgress = new AtomicReference<>();
         AtomicReference<Consumer<String>> failed = new AtomicReference<>();
         doAnswer(call -> {
-            inProgress.set(call.getArgument(3));
-            failed.set(call.getArgument(5));
+            inProgress.set(call.getArgument(4));
+            failed.set(call.getArgument(6));
             return null;
-        }).when(manager).replaceRoot(any(Instance.class), any(), any(), any(), any(), any());
+        }).when(manager).replaceRoot(any(Instance.class), any(), any(), any(), any(), any(), any());
 
         ReplaceRootVolumeTask task = service.createReplaceRootVolumeTask("us-east-1", instanceId, "ami-new",
                 null, false, "token-1", List.of(), false);
@@ -828,7 +828,7 @@ class Ec2ServiceTest {
         // The same client token answers with the same task instead of starting another.
         assertEquals(taskId, service.createReplaceRootVolumeTask("us-east-1", instanceId, "ami-new",
                 null, false, "token-1", List.of(), false).getReplaceRootVolumeTaskId());
-        verify(manager, times(1)).replaceRoot(any(Instance.class), any(), any(), any(), any(), any());
+        verify(manager, times(1)).replaceRoot(any(Instance.class), any(), any(), any(), any(), any(), any());
 
         inProgress.get().run();
         assertEquals("in-progress", service.describeReplaceRootVolumeTasks("us-east-1", List.of(taskId),
@@ -846,6 +846,67 @@ class Ec2ServiceTest {
                 .getFirst().getInstances().getFirst();
         assertEquals("ami-test", after.getImageId());
         assertEquals("running", after.getState().getName());
+    }
+
+    @Test
+    void replaceRootVolumeTaskKeepsTheDataVolumeMountsAnImageDeclares() {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        Ec2VolumeBlockDeviceManager blockDevices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class), resolver,
+                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, blockDevices);
+        String region = "us-east-1";
+        String instanceId = launchWithDataVolume(service, false).getInstances().getFirst().getInstanceId();
+        service.describeInstances(region, List.of(), Map.of());
+        Instance before = describedInstance(service, instanceId);
+        String dataVolume = service.describeVolumes(region, List.of(), Map.of()).stream()
+                .filter(volume -> "/dev/sdf".equals(volume.getAttachments().getFirst().getDevice()))
+                .findFirst().orElseThrow().getVolumeId();
+        when(config.services().ec2().mock()).thenReturn(false);
+        Ec2ImageCatalog.VolumeMount mapping = new Ec2ImageCatalog.VolumeMount("sdf", "/app-data", "ext4");
+        when(resolver.resolveImage("ami-data")).thenReturn(
+                new ResolvedAmiImage("app-guest:2", ResolvedAmiImage.DEFAULT_RUNTIME, false, null, List.of(mapping)));
+        when(resolver.resolveImage("ami-plain")).thenReturn(ResolvedAmiImage.minimal("app-guest:3"));
+        Ec2VolumeBlockDeviceManager.PreparedMount mount = new Ec2VolumeBlockDeviceManager.PreparedMount(
+                dataVolume, "/dev/sdf", "/dev/loop42", "floci-" + dataVolume, "/app-data");
+        when(blockDevices.prepareMount(any(Volume.class), any(Instance.class), eq(mapping))).thenReturn(mount);
+        when(blockDevices.retainedMount(any(Volume.class), any(Instance.class), eq("/dev/sdf")))
+                .thenReturn(Optional.of(mount));
+        AtomicReference<Supplier<List<Ec2VolumeBlockDeviceManager.PreparedMount>>> mounts = new AtomicReference<>();
+        AtomicReference<Runnable> replaced = new AtomicReference<>();
+        doAnswer(call -> {
+            mounts.set(call.getArgument(3));
+            replaced.set(call.getArgument(5));
+            return null;
+        }).when(manager).replaceRoot(any(Instance.class), any(), any(), any(), any(), any(), any());
+
+        // The new image declares the data volume: it is prepared on that volume, as launch prepares it.
+        String declaredTask = service.createReplaceRootVolumeTask(region, instanceId, "ami-data", null, false,
+                null, List.of(), false).getReplaceRootVolumeTaskId();
+        assertEquals(List.of(mount), mounts.get().get());
+        verify(blockDevices).prepareMount(argThat(volume -> dataVolume.equals(volume.getVolumeId())),
+                any(Instance.class), eq(mapping));
+        replaced.get().run();
+        assertEquals("succeeded", service.describeReplaceRootVolumeTasks(region, List.of(declaredTask),
+                List.of(), null, null).items().getFirst().getTaskState());
+
+        // An image that declares nothing still keeps the mount the old guest holds, from the same source.
+        service.createReplaceRootVolumeTask(region, instanceId, "ami-plain", null, false, null, List.of(), false);
+        assertEquals(List.of(mount), mounts.get().get());
+        verify(blockDevices).retainedMount(argThat(volume -> dataVolume.equals(volume.getVolumeId())),
+                any(Instance.class), eq("/dev/sdf"));
+        replaced.get().run();
+
+        Instance after = describedInstance(service, instanceId);
+        assertEquals(instanceId, after.getInstanceId());
+        assertEquals("ami-plain", after.getImageId());
+        assertEquals(before.getPrivateIpAddress(), after.getPrivateIpAddress());
+        assertEquals("running", after.getState().getName());
+        Volume kept = service.describeVolumes(region, List.of(dataVolume), Map.of()).getFirst();
+        assertEquals(instanceId, kept.getAttachments().getFirst().getInstanceId());
+        assertEquals("/dev/sdf", kept.getAttachments().getFirst().getDevice());
     }
 
     @Test

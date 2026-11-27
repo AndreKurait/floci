@@ -7586,9 +7586,85 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 KeyPair keyPair = findKeyPair(region, inst.getKeyName());
                 publicKey = keyPair == null ? null : keyPair.getPublicKey();
             }
-            containerManager.replaceRoot(inst, image, publicKey, inProgress, replaced, failed);
+            containerManager.replaceRoot(inst, image, publicKey,
+                    () -> RequestScopes.callAs(accountId, region,
+                            () -> prepareReplacementMounts(region, inst, image.volumeMounts())),
+                    inProgress, replaced, failed);
         }
         return answer;
+    }
+
+    /**
+     * The data-volume mounts a replacement guest takes over. The new image's mounts are picked as
+     * RunInstances picks them: one per declared device the instance has a volume at, prepared on
+     * that volume's existing Docker volume and loop device. Every other mount the old guest holds is
+     * carried over unchanged, as a real root volume swap leaves non-root EBS volumes attached.
+     */
+    private List<Ec2VolumeBlockDeviceManager.PreparedMount> prepareReplacementMounts(
+            String region, Instance instance, List<Ec2ImageCatalog.VolumeMount> mappings) {
+        List<Volume> attached = volumes.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(volume -> volume != null && !volume.getVolumeId().equals(instance.getRootVolumeId()))
+                .filter(volume -> volume.getAttachments().stream()
+                        .anyMatch(attachment -> instance.getInstanceId().equals(attachment.getInstanceId())))
+                .toList();
+        List<Ec2ImageCatalog.VolumeMount> declared = new ArrayList<>();
+        for (Ec2ImageCatalog.VolumeMount mapping : mappings) {
+            List<Volume> matches = attached.stream().filter(volume -> volume.getAttachments().stream()
+                    .anyMatch(attachment -> instance.getInstanceId().equals(attachment.getInstanceId())
+                            && isSameDevice(mapping.device(), attachment.getDevice()))).toList();
+            boolean root = isSameDevice(mapping.device(), instance.getRootDeviceName());
+            // As at launch: a declared device with no volume gets no managed mount.
+            if (matches.isEmpty() && !root) {
+                continue;
+            }
+            if (root || matches.size() != 1 || matches.getFirst().getSnapshotId() != null
+                    && !matches.getFirst().getSnapshotId().isBlank()) {
+                throw replacementMountFailure("the new image's data-volume mount at " + mapping.device()
+                        + " needs one snapshot-free non-root volume attached there");
+            }
+            declared.add(mapping);
+        }
+        boolean retains = attached.stream().anyMatch(volume -> volume.getManagedFilesystem() != null);
+        if (declared.isEmpty() && !retains) {
+            return List.of();
+        }
+        if (volumeBlockDeviceManager == null || !callerAccountId().equals(instance.getOwnerId())
+                || !region.equals(instance.getRegion())) {
+            throw replacementMountFailure("its data volumes' owner cannot be resolved");
+        }
+        List<Ec2VolumeBlockDeviceManager.PreparedMount> prepared =
+                new ArrayList<>(prepareInstanceMounts(region, instance, declared));
+        for (Volume volume : attached) {
+            if (volume.getManagedFilesystem() == null) {
+                continue;
+            }
+            for (VolumeAttachment attachment : volume.getAttachments()) {
+                if (!instance.getInstanceId().equals(attachment.getInstanceId())
+                        || declared.stream().anyMatch(mapping -> isSameDevice(mapping.device(), attachment.getDevice()))) {
+                    continue;
+                }
+                // Empty for a raw-device guest; the post-replace hook attaches those volumes again.
+                Optional<Ec2VolumeBlockDeviceManager.PreparedMount> retained = withVolumeLock(volume.getVolumeId(),
+                        () -> volumeBlockDeviceManager.retainedMount(volume, instance, attachment.getDevice()));
+                retained.ifPresent(prepared::add);
+            }
+        }
+        for (int i = 0; i < prepared.size(); i++) {
+            Path first = Path.of(prepared.get(i).target()).normalize();
+            for (int j = i + 1; j < prepared.size(); j++) {
+                Path second = Path.of(prepared.get(j).target()).normalize();
+                if (first.startsWith(second) || second.startsWith(first)) {
+                    throw replacementMountFailure("the data-volume mount of " + prepared.get(i).volumeId()
+                            + " at " + first + " overlaps the mount of " + prepared.get(j).volumeId()
+                            + " at " + second);
+                }
+            }
+        }
+        return List.copyOf(prepared);
+    }
+
+    private static AwsException replacementMountFailure(String reason) {
+        return new AwsException("InternalError", "Its data volumes cannot be kept: " + reason, 500);
     }
 
     /** The image a replacement guest runs, resolved as RunInstances resolves the AMI it launches. */

@@ -3453,6 +3453,17 @@ public class Ec2ContainerManager {
      */
     public void replaceRoot(Instance instance, ResolvedAmiImage image, String publicKey,
                             Runnable inProgress, Runnable replaced, Consumer<String> failed) {
+        replaceRoot(instance, image, publicKey, List::of, inProgress, replaced, failed);
+    }
+
+    /**
+     * @param prepareMounts the data-volume mounts the new guest takes over, as launch's supplier
+     *                      prepares them; it runs on the lifecycle worker while the old guest still
+     *                      runs, so it can read back the mounts that guest holds
+     */
+    public void replaceRoot(Instance instance, ResolvedAmiImage image, String publicKey,
+                            Supplier<List<PreparedMount>> prepareMounts,
+                            Runnable inProgress, Runnable replaced, Consumer<String> failed) {
         Runnable callbackCompleted = admitCallback(true);
         String oldId = instance.getDockerContainerId();
         if (oldId == null) {
@@ -3472,7 +3483,7 @@ public class Ec2ContainerManager {
                 return;
             }
             inProgress.run();
-            String reason = recreateGuest(instance, oldId, image, publicKey, accountId);
+            String reason = recreateGuest(instance, oldId, image, publicKey, accountId, prepareMounts);
             if (reason != null) {
                 failed.accept(reason);
                 return;
@@ -3492,7 +3503,7 @@ public class Ec2ContainerManager {
 
     /** Swaps the workload container; returns null on success, or the reason the old guest was kept. */
     private String recreateGuest(Instance instance, String oldId, ResolvedAmiImage image, String publicKey,
-                                 String accountId) {
+                                 String accountId, Supplier<List<PreparedMount>> prepareMounts) {
         String instanceId = instance.getInstanceId();
         String region = instance.getRegion();
         InspectContainerResponse old;
@@ -3515,10 +3526,6 @@ public class Ec2ContainerManager {
         if (oldNative != image.systemdV1()) {
             return "Replacing the root volume cannot change the guest's init runtime.";
         }
-        // shortcut: image data-volume mounts need their loop devices prepared again; refuse until a caller needs them.
-        if (!image.volumeMounts().isEmpty()) {
-            return "Images with data-volume mounts are not supported for root volume replacement.";
-        }
         boolean enforced = ALIASES.matches(labels, ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true");
         String name = ContainerStorageHelper.resourceName(config, "ec2", null, instanceId);
         String parkedName = name + "-replaced-" + oldId.substring(0, Math.min(12, oldId.length()));
@@ -3529,6 +3536,10 @@ public class Ec2ContainerManager {
         try {
             GuestOptions options = guestOptions(config.services().ec2());
             validateMountOptions(image, options);
+            // Read while the old guest still runs and the instance still names it: the mounts it
+            // holds are carried over with the same Docker volume and loop device, as an EBS data
+            // volume stays attached through a real root volume swap.
+            List<PreparedMount> mounts = List.copyOf(prepareMounts.get());
             if (image.systemdV1()) {
                 systemdV1.prepare(instance, accountId, region);
             }
@@ -3536,7 +3547,7 @@ public class Ec2ContainerManager {
             parked = true;
             ContainerSpec spec = buildContainerSpec(name, image, region, guestServiceEndpoint(options), instanceId,
                     helperId, enforced, instance.getIamInstanceProfileArn() != null, instance.getInstanceType(),
-                    options, List.of());
+                    options, mounts);
             newId = image.dockerPlatform() == null
                     ? lifecycleManager.create(spec)
                     : lifecycleManager.create(spec, image.dockerPlatform());

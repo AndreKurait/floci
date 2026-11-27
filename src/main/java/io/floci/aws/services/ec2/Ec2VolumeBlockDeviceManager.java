@@ -221,6 +221,25 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
             verifyRetainedRawVolume(volume, instance, device, true);
             return;
         }
+        verifyMount(volume, instance, readRetainedMount(volume, instance, device));
+    }
+
+    /**
+     * The data mount the instance's current guest holds for {@code volume}, read back from Docker and
+     * verified, so a guest recreated in its place mounts the same Docker volume and loop device at the
+     * same target. Empty for a raw-device guest: its volumes are attached again once the new guest runs.
+     */
+    public Optional<PreparedMount> retainedMount(Volume volume, Instance instance, String device) {
+        requireAvailable(volume.getVolumeId());
+        if (isRawDeviceGuest(instance)) {
+            return Optional.empty();
+        }
+        PreparedMount mount = readRetainedMount(volume, instance, device);
+        verifyMount(volume, instance, mount);
+        return Optional.of(mount);
+    }
+
+    private PreparedMount readRetainedMount(Volume volume, Instance instance, String device) {
         String name = managedVolumeName(volume.getVolumeId());
         InspectVolumeResponse existing = inspectManagedVolume(name, managedLabels(volume, instance.getOwnerId()));
         if (existing == null || instance.getDockerContainerId() == null) {
@@ -238,8 +257,8 @@ public class Ec2VolumeBlockDeviceManager implements ContainerTeardown, Resettabl
         if (!Boolean.TRUE.equals(mounted.getRW()) || !mapped) {
             throw storageFailure(volume.getVolumeId(), "guest mount or block device changed");
         }
-        verifyMount(volume, instance, new PreparedMount(volume.getVolumeId(),
-                Ec2Service.normalizedDevice(device), loop, name, mounted.getDestination().getPath()));
+        return new PreparedMount(volume.getVolumeId(),
+                Ec2Service.normalizedDevice(device), loop, name, mounted.getDestination().getPath());
     }
 
     private boolean isRawDeviceGuest(Instance instance) {
