@@ -8,6 +8,24 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 > see [ELB Classic (v1)](elb-classic.md). Requests are routed by their `Version` parameter:
 > `2015-12-01` here, `2012-06-01` there.
 
+## Local ALB configuration
+
+Application Load Balancers require subnets in two Availability Zones by default.
+`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS` accepts a comma-separated list of
+12-digit account IDs whose ALBs may use one zone; the default list is empty.
+Invalid account IDs fail startup. Existing global and regional `alb-zone-rule`
+settings remain available, with `aws`, `allow-single-zone`, and
+`require-two-zones` values. The account list is an additional explicit exception.
+
+`FLOCI_SERVICES_ELBV2_DNS_NAME_STRATEGY` controls newly generated load balancer
+names. The default `floci` retains the emulator hostname format. `aws` generates
+the AWS name format with the load balancer region's partition DNS suffix.
+
+`FLOCI_SERVICES_ELBV2_MAX_HEALTH_CHECK_INTERVAL_MILLIS` optionally caps the
+local probe interval for faster local feedback. Its default `0` preserves each
+target group's configured interval. Negative values fail startup. The cap does
+not change the interval returned by the management API.
+
 ## Supported Actions
 
 ### Load Balancers

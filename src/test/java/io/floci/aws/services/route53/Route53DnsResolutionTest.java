@@ -541,6 +541,15 @@ class Route53DnsResolutionTest {
     }
 
     @Test
+    void unknownCallerCannotReadThroughTheExplicitPrivateResolver() {
+        String zone = uniqueZone();
+        addRecord(createPrivateZone(zone), "api." + zone, "A", "10.0.1.100");
+
+        assertTrue(dnsRecordSource.resolvePrivate("api." + zone, 1, null).isEmpty());
+        assertTrue(dnsRecordSource.resolvePrivate("api." + zone, 28, null).isEmpty());
+    }
+
+    @Test
     void unknownCallerRetainsPrivateRecords() {
         String zone = uniqueZone();
         String id = createPrivateZone(zone);

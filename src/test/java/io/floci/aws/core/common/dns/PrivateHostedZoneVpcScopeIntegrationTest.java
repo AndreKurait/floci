@@ -15,6 +15,8 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
@@ -30,6 +32,9 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @QuarkusTest
 class PrivateHostedZoneVpcScopeIntegrationTest {
@@ -221,6 +226,98 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
         }
         assertEquals(List.of("203.0.113.7"),
                 answer("api." + name, "192.0.2.20", List.of(cloudMapRecords)).orElseThrow().addresses());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"A", "CNAME", "NS"})
+    void publicRegistrationPreservesExplicitRecordsAndDelegation(String type) {
+        String name = uniqueName();
+        String namespace = cloudMapNamespace(name, null);
+        register(namespace, "api.child", "203.0.113.7");
+        String backingZone = cloudMap.getNamespace(namespace).getHostedZoneId();
+        ResourceRecordSet stored = new ResourceRecordSet();
+        stored.setName(("NS".equals(type) ? "child." : "api.child.") + name);
+        stored.setType(type);
+        stored.setTtl(60L);
+        stored.setRecords(List.of(new ResourceRecord(switch (type) {
+            case "A" -> "192.0.2.72";
+            case "CNAME" -> "ip-192-0-2-73.ec2.internal.";
+            default -> "target.example.";
+        })));
+        route53.changeResourceRecordSets(
+                backingZone, List.of(Map.of("action", "CREATE", "rrs", stored)), null);
+        try {
+            for (List<DnsRecordSource> sources : sourceOrders()) {
+                DnsAnswer resolved = answer("api.child." + name, null, sources).orElseThrow();
+                if ("A".equals(type)) {
+                    assertEquals(List.of("192.0.2.72"), resolved.addresses());
+                } else if ("CNAME".equals(type)) {
+                    assertEquals(List.of("192.0.2.73"), resolved.addresses());
+                } else {
+                    assertEquals(5, resolved.responseCode());
+                }
+            }
+        } finally {
+            route53.changeResourceRecordSets(
+                    backingZone, List.of(Map.of("action", "DELETE", "rrs", stored)), null);
+        }
+    }
+
+    @Test
+    void publicCnameTargetRetainsTheQueryingVpcVisibility() {
+        String privateName = uniqueName();
+        addAddress(zone(privateName, firstVpc), "target." + privateName, "10.73.1.7");
+        String publicName = uniqueName();
+        String publicZone = zone(publicName, null);
+        ResourceRecordSet cname = new ResourceRecordSet();
+        cname.setName("alias." + publicName);
+        cname.setType("CNAME");
+        cname.setTtl(30L);
+        cname.setRecords(List.of(new ResourceRecord("target." + privateName)));
+        route53.changeResourceRecordSets(publicZone, List.of(Map.of("action", "CREATE", "rrs", cname)), null);
+        DnsLookupHelper fallback = mock(DnsLookupHelper.class);
+        when(fallback.resolveIpv4(anyString())).thenReturn(List.of());
+        List<DnsRecordSource> sources = new ArrayList<>();
+        DnsClientVpcSource clients = address -> Optional.of(new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "192.0.2.10".equals(address) ? firstVpc : secondVpc));
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), sources, List.of(), List.of(clients));
+        sources.add(new Route53DnsRecordSource(route53, config, fallback, server));
+        DnsAnswer visible = server.planQuery("alias." + publicName, "192.0.2.10", "127.0.0.1", 1)
+                .answer().orElseThrow();
+        assertEquals(List.of("10.73.1.7"), visible.addresses());
+        assertEquals(30, visible.ttlSeconds());
+        assertTrue(server.planQuery("alias." + publicName, "192.0.2.20", "127.0.0.1", 1)
+                .answer().orElseThrow().isEmpty());
+    }
+
+    @Test
+    void privateAwsEndpointZoneOverridesSpoofingOnlyForItsAssociatedVpc() {
+        String name = "endpoint-" + UUID.randomUUID() + ".amazonaws.com";
+        String privateZone = zone(name, firstVpc);
+        addAddress(privateZone, "api." + name, "10.73.1.7");
+        DnsClientVpcSource clients = address -> switch (address) {
+            case "192.0.2.10" -> Optional.of(new DnsClientVpcSource.ClientVpc(
+                    config.defaultAccountId(), "us-east-1", firstVpc));
+            case "192.0.2.20" -> Optional.of(new DnsClientVpcSource.ClientVpc(
+                    config.defaultAccountId(), "us-east-1", secondVpc));
+            default -> Optional.empty();
+        };
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(records), List.of(),
+                List.of(clients), true, List.of(), List.of(), "172.17.0.1");
+        assertEquals(List.of("10.73.1.7"), server.planQuery("api." + name, "192.0.2.10", "127.0.0.1", 1)
+                .answer().orElseThrow().addresses());
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                server.planQuery("api." + name, "192.0.2.20", "127.0.0.1", 1).answer().orElseThrow().addresses());
+        assertEquals(List.of("127.0.0.1"), server.planQuery("api." + name, "192.0.2.30", "127.0.0.1", 1)
+                .answer().orElseThrow().addresses());
+        assertEquals(3, server.planQuery("missing." + name, "192.0.2.10", "127.0.0.1", 1)
+                .answer().orElseThrow().responseCode());
+        route53.associateVpcWithHostedZone(privateZone, new VpcAssociation(secondVpc, "us-east-1"), null);
+        route53.disassociateVpcFromHostedZone(privateZone, new VpcAssociation(firstVpc, "us-east-1"), null);
+        assertEquals(List.of("10.73.1.7"), server.planQuery("api." + name, "192.0.2.20", "127.0.0.1", 1)
+                .answer().orElseThrow().addresses());
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                server.planQuery("api." + name, "192.0.2.10", "127.0.0.1", 1).answer().orElseThrow().addresses());
     }
 
     private List<List<DnsRecordSource>> sourceOrders() {

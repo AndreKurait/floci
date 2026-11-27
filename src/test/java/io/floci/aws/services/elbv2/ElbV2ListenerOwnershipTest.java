@@ -20,6 +20,7 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.net.SSLOptions;
+import io.vertx.core.net.SocketAddress;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
@@ -706,6 +707,8 @@ class ElbV2ListenerOwnershipTest {
 
         private void serves(int port, String body) {
             HttpServerRequest request = mock(HttpServerRequest.class);
+            when(request.localAddress()).thenReturn(
+                    SocketAddress.inetSocketAddress(port, "127.0.0.1"));
             HttpServerResponse response = mock(HttpServerResponse.class);
             when(request.host()).thenReturn(HOST);
             when(request.response()).thenReturn(response);

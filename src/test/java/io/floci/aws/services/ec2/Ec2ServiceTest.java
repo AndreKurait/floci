@@ -44,6 +44,7 @@ import io.floci.aws.services.ec2.model.PrefixList;
 import io.floci.aws.services.ec2.model.PrefixListEntry;
 import io.floci.aws.services.ec2.model.PrefixListId;
 import io.floci.aws.services.ec2.model.Reservation;
+import io.floci.aws.services.ec2.model.Route;
 import io.floci.aws.services.ec2.model.RouteTable;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.SecurityGroupRule;
@@ -215,6 +216,70 @@ class Ec2ServiceTest {
             assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
         }
     }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void routeTableDeleteWaitsForGatewayRetirementWithoutResurrection(boolean nat) throws Exception {
+        String region = "us-east-1";
+        ParkingStore<RouteTable> parked = new ParkingStore<>();
+        AccountAwareStorageBackend<RouteTable> tables =
+                new AccountAwareStorageBackend<>(parked, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-route-tables.json", tables)));
+        String vpc = service.createVpc(region, "10.134.0.0/16", false).getVpcId();
+        String gateway;
+        if (nat) {
+            String subnet = service.createSubnet(region, vpc, "10.134.1.0/24", region + "a").getSubnetId();
+            gateway = service.createNatGateway(region, subnet, null, "private", List.of()).getNatGatewayId();
+        } else {
+            gateway = service.createEgressOnlyInternetGateway(region, vpc, null, List.of())
+                    .getEgressOnlyInternetGatewayId();
+        }
+        RouteTable table = service.createRouteTable(region, vpc);
+        Route route = new Route();
+        route.setDestinationCidrBlock("0.0.0.0/0");
+        route.setState("active");
+        if (nat) {
+            route.setNatGatewayId(gateway);
+        } else {
+            route.setEgressOnlyInternetGatewayId(gateway);
+        }
+        table.getRoutes().add(route);
+        tables.put(region + "::" + table.getRouteTableId(), table);
+        parked.parkNextWrite();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> retirement = pool.submit(() -> {
+                if (nat) {
+                    service.deleteNatGateway(region, gateway);
+                } else {
+                    service.deleteEgressOnlyInternetGateway(region, gateway);
+                }
+            });
+            assertTrue(parked.awaitParked(), "gateway retirement must reach the route write");
+            AtomicReference<Thread> deleting = new AtomicReference<>();
+            Future<?> deletion = pool.submit(() -> {
+                deleting.set(Thread.currentThread());
+                service.deleteRouteTable(region, table.getRouteTableId());
+            });
+            awaitBlockedOrDone(deleting, deletion);
+            assertFalse(deletion.isDone(), "deletion must wait for the in-flight route write");
+            parked.release();
+            retirement.get(2, TimeUnit.SECONDS);
+            deletion.get(2, TimeUnit.SECONDS);
+            assertTrue(tables.get(region + "::" + table.getRouteTableId()).isEmpty());
+            assertTrue(service.describeRouteTables(region, List.of(table.getRouteTableId()), Map.of()).isEmpty());
+            AwsException missing = assertThrows(AwsException.class,
+                    () -> service.deleteRouteTable(region, table.getRouteTableId()));
+            assertEquals("InvalidRouteTableID.NotFound", missing.getErrorCode());
+        } finally {
+            parked.release();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
 
     @ParameterizedTest
     @CsvSource({
@@ -5549,6 +5614,32 @@ class Ec2ServiceTest {
                 .getInstances().getFirst().getPrivateIpAddress());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void isolatedDefaultVpcIgnoresAnotherAccountsPrivateAddress(boolean requested) {
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000");
+        AccountAwareStorageBackend<Instance> instanceStore = AccountAwareStorageBackend.inMemory("000000000000");
+        instanceStore.putForAccount("111122223333", "us-east-1::i-other",
+                defaultSubnetInstance("i-other", "172.31.0.50", InstanceState.running()));
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        when(vpcNetworks.isolatesAddressSpaces()).thenReturn(true);
+        when(vpcNetworks.effectiveSubnetCidr("000000000000", "us-east-1", subnetId)).thenReturn(Optional.of("172.31.0.0/20"));
+        when(vpcNetworks.allocatePrivateIp("000000000000", "us-east-1", subnetId))
+                .thenReturn(Optional.of("172.31.0.50"), Optional.of("172.31.0.51"));
+        Ec2Service service = mockedVpcNetworkService(Map.of("ec2-instances.json", instanceStore), vpcNetworks);
+
+        String address = requested
+                ? launchWithPrivateIp(service, subnetId, 1, "172.31.0.50")
+                    .getInstances().getFirst().getPrivateIpAddress()
+                : launchAddresses(service, subnetId, 1).getFirst();
+
+        assertEquals("172.31.0.50", address);
+        AwsException duplicate = assertThrows(AwsException.class,
+                () -> launchWithPrivateIp(service, subnetId, 1, address));
+        assertEquals("InvalidIPAddress.InUse", duplicate.getErrorCode(),
+                "Isolation must still reject an address held in the caller's own subnet");
+    }
+
     @Test
     void aRequestedPrivateIpIsLeasedSoTheRealVpcNetworkDoesNotHandItOutAgain() {
         // The manager's allocator consults only its own lease table. Without the lease it would
@@ -10155,6 +10246,30 @@ class Ec2ServiceTest {
                         .getFirst().getInstances().getFirst().getPublicIpAddress());
     }
 
+    @Test
+    void failedPublicRouteDoesNotPublishAnUnreachableElasticAddressAndCanBeRetried() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        when(manager.reachablePublicAddress(argThat(i -> i != null))).thenReturn("192.168.215.9");
+        Ec2Service service = eipService(manager);
+        String instanceId = launchOne(service);
+        Instance instance = service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                .getFirst().getInstances().getFirst();
+        String previousAddress = instance.getPublicIpAddress();
+        Address allocated = service.allocateAddress("us-east-1");
+        doThrow(new IllegalStateException("Routing namespace unavailable")).doNothing()
+                .when(manager).refreshPublicRouting(instance, "192.168.215.9");
+
+        assertThrows(IllegalStateException.class,
+                () -> service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId));
+        assertEquals(previousAddress, instance.getPublicIpAddress(),
+                "Failed route admission must leave the instance address eligible for retry");
+
+        Address associated = service.associateAddress("us-east-1", allocated.getAllocationId(), instanceId);
+        assertEquals("192.168.215.9", associated.getPublicIp());
+        assertEquals("192.168.215.9", instance.getPublicIpAddress());
+        verify(manager, times(2)).refreshPublicRouting(instance, "192.168.215.9");
+    }
+
     /**
      * DescribeAddresses is where Terraform refreshes public_ip, and Docker hands out a new
      * bridge IP after a stop/start, so the association has to be re-resolved on read.
@@ -11632,5 +11747,37 @@ class Ec2ServiceTest {
         assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
         context.setAccountId("111111111111");
         assertEquals(capacityId, service.capacityReservationAssociations(region).get(instanceId));
+    }
+
+    @Test
+    void serviceInterfaceGroupsValidateBeforeMutationAndRestoreTheVpcDefault() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Subnet subnet = service.describeSubnets(region, List.of(), Map.of()).getFirst();
+        NetworkInterface eni = service.createNetworkInterface(region, subnet.getSubnetId(), null,
+                null, List.of(), List.of(), List.of());
+        String eniId = eni.getNetworkInterfaceId();
+        List<GroupIdentifier> defaults = List.copyOf(eni.getGroups());
+        SecurityGroup group = service.createSecurityGroup(region, "alb-backend", "backend", subnet.getVpcId());
+
+        assertEquals("InvalidNetworkInterface.InUse", assertThrows(AwsException.class,
+                () -> service.setNetworkInterfaceGroupsForService(region, eniId, List.of(group.getGroupId())))
+                .getErrorCode());
+        service.holdNetworkInterfaceForService(region, eniId);
+        service.setNetworkInterfaceGroupsForService(region, eniId, List.of(group.getGroupId()));
+        assertEquals(List.of(group.getGroupId()), readInterface(service, eniId).getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        String foreignVpc = service.createVpc(region, "10.93.0.0/16", false).getVpcId();
+        SecurityGroup foreign = service.createSecurityGroup(region, "foreign-alb", "foreign", foreignVpc);
+        assertEquals("InvalidGroup.NotFound", assertThrows(AwsException.class,
+                () -> service.setNetworkInterfaceGroupsForService(region, eniId,
+                        List.of(group.getGroupId(), foreign.getGroupId()))).getErrorCode());
+        assertEquals(List.of(group.getGroupId()), readInterface(service, eniId).getGroups().stream()
+                .map(GroupIdentifier::getGroupId).toList());
+        service.setNetworkInterfaceGroupsForService(region, eniId, List.of());
+        assertEquals(defaults.stream().map(GroupIdentifier::getGroupId).toList(),
+                readInterface(service, eniId).getGroups().stream().map(GroupIdentifier::getGroupId).toList());
     }
 }
