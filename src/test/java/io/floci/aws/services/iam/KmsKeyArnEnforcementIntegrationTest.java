@@ -231,25 +231,34 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .then().statusCode(200).body("KeyId", equalTo(destinationArn)).body("SourceKeyId", equalTo(sourceArn));
     }
 
-    /**
-     * A RetireGrant naming its grant by its token alone names no key the table reads, so it is
-     * checked on {@code *}: a policy granting retirement on every resource allows it, one scoped
-     * to the grant's key does not.
-     */
+    /** A grant token identifies its key, so key-scoped IAM retirement permissions apply. */
     @Test
-    void aTokenOnlyRetireGrantIsCheckedOnStar() {
+    void aTokenOnlyRetireGrantIsCheckedOnItsKey() {
         String keyArn = createKey();
-        Grant refused = createGrantOn(keyArn);
-        Grant retired = createGrantOn(keyArn);
+        String otherKeyArn = createKey();
+        Grant scoped = createGrantOn(keyArn);
+        Grant wildcard = createGrantOn(keyArn);
         Session onTheGrantsKey = assumeRoleWith(grantOperationOn("kms:RetireGrant", keyArn));
+        Session onAnotherKey = assumeRoleWith(grantOperationOn("kms:RetireGrant", otherKeyArn));
         Session onEverything = assumeRoleWith(grantOperationOn("kms:RetireGrant", "*"));
+        Session deniedOnTheKey = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:RetireGrant","Resource":"*"},
+                  {"Effect":"Deny","Action":"kms:RetireGrant","Resource":"%s"}]}"""
+                .formatted(keyArn));
 
-        keyCall(onTheGrantsKey, "RetireGrant", "{\"GrantToken\": \"" + refused.token() + "\"}")
+        keyCall(onAnotherKey, "RetireGrant", "{\"GrantToken\": \"" + scoped.token() + "\"}")
                 .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
-        keyCall(onEverything, "RetireGrant", "{\"GrantToken\": \"" + retired.token() + "\"}")
+        keyCall(deniedOnTheKey, "RetireGrant", "{\"GrantToken\": \"" + scoped.token() + "\"}")
+                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+        accountCall("ListGrants", "{\"KeyId\": \"" + keyArn + "\"}")
+                .then().statusCode(200).body("Grants.size()", equalTo(2));
+        keyCall(onTheGrantsKey, "RetireGrant", "{\"GrantToken\": \"" + scoped.token() + "\"}")
+                .then().statusCode(200);
+        keyCall(onEverything, "RetireGrant", "{\"GrantToken\": \"" + wildcard.token() + "\"}")
                 .then().statusCode(200);
         accountCall("ListGrants", "{\"KeyId\": \"" + keyArn + "\"}")
-                .then().statusCode(200).body("Grants.size()", equalTo(1));
+                .then().statusCode(200).body("Grants.size()", equalTo(0));
     }
 
     /**

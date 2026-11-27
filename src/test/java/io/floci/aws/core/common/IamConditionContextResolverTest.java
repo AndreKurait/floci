@@ -27,6 +27,7 @@ import io.floci.aws.services.iam.model.IamUser;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
 import io.floci.aws.services.s3.S3Service;
+import io.floci.aws.testing.MockQueryRequests;
 import io.floci.aws.testing.ParallelLocks;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.WebApplicationException;
@@ -110,6 +111,26 @@ class IamConditionContextResolverTest {
                 {"accessConfig":{"authenticationMode":null},"resourcesVpcConfig":{"endpointPrivateAccess":[]}}"""));
         assertNull(resolver.resolve("eks", "eks:CreateCluster", request));
         assertNull(resolver.resolve("eks", "eks:UpdateClusterConfig", request));
+    }
+
+    @Test
+    void kmsCallerAccountDoesNotRequireAnEncryptionContext() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("{\"KeyId\":\"key\"}"));
+        assertEquals(Map.of("kms:CallerAccount", List.of("123456789012")),
+                resolver.resolve("kms", "kms:DescribeKey", request));
+    }
+
+    @Test
+    void kmsCallerAccountCannotBeOverriddenByRequestMembers() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
+                {"CallerAccount":"999999999999", "EncryptionContext":{"purpose":"test"}}
+                """));
+        Map<String, List<String>> conditions = resolver.resolve("kms", "kms:Encrypt", request);
+        assertEquals(List.of("123456789012"), conditions.get("kms:CallerAccount"));
+        assertEquals(List.of("test"), conditions.get("kms:EncryptionContext:purpose"));
+        assertEquals(List.of("purpose"), conditions.get("kms:EncryptionContextKeys"));
     }
 
     @SuppressWarnings("unchecked")
@@ -273,7 +294,7 @@ class IamConditionContextResolverTest {
                 .thenReturn(MediaType.valueOf("application/x-www-form-urlencoded"));
         when(containerRequest.getEntityStream())
                 .thenAnswer(invocation -> new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
-        return containerRequest;
+        return MockQueryRequests.postedToRoot(containerRequest);
     }
 
     /** An XML request whose body can be read again, as a real request's restored stream can. */
@@ -917,15 +938,18 @@ class IamConditionContextResolverTest {
         tags.putForAccount("123456789012", "eu-west-1::vpce-0123456789", List.of(new Tag("Team", "caller-west")));
         tags.putForAccount("111111111111", "us-east-1::vpce-0123456789", List.of(new Tag("Team", "foreign-east")));
         tags.putForAccount("111111111111", "eu-west-1::vpce-0123456789", List.of(new Tag("Team", "foreign-west")));
+        tags.putForAccount(targetAccount, "::vpce-0123456789", List.of(new Tag("Team", "empty-region")));
         IamConditionContextResolver stored = resolverWithStoredEc2Tags(tags);
         String prefix = targetAccount.equals("123456789012") ? "caller" : "foreign";
-        for (String region : List.of("us-east-1", "eu-west-1")) {
+        for (String region : List.of("us-east-1", "eu-west-1", "")) {
             Map<String, List<String>> context = ec2ResourceContext(stored, "ec2", "ec2:ModifyVpcEndpoint",
                     "arn:aws:ec2:" + region + ":" + targetAccount + ":vpc-endpoint/vpce-0123456789",
                     "us-east-1", "123456789012", Map.of("aws:ResourceTag/Team", List.of("stale")));
-            assertEquals(List.of(prefix + (region.equals("us-east-1") ? "-east" : "-west")),
+            assertEquals(List.of(prefix + (region.equals("eu-west-1") ? "-west" : "-east")),
                     context.get("aws:ResourceTag/Team"));
         }
+        assertEquals(List.of(prefix + "-west"), stored.resourceTags(
+                "arn:aws:ec2:eu-west-1:" + targetAccount + ":vpc-endpoint/vpce-0123456789").get("aws:ResourceTag/Team"));
     }
 
     @Test

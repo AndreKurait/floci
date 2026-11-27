@@ -467,7 +467,9 @@ launches nodes on AWS. Floci checks every 10 seconds.
 
 - **Pool.** The pod goes to the first NodePool, by `weight` then name, with an instance type the pool's requirements
   allow, whose node the pod's `nodeSelector`, required node affinity and tolerations accept, and that fits its CPU and
-  memory requests. A requirement on a label Floci doesn't give its nodes (a GPU count, say) is left out. A pod one of
+  memory requests. A type whose node would take the pool's nodes, joined or joining, past its `limits` (`cpu`,
+  `memory`, `nodes`) is left out, as AWS stopped at two 2-vCPU nodes for a pool limited to 4 vCPUs, so a pod such a
+  pool can't take goes to the next pool, or waits. A requirement on a label Floci doesn't give its nodes (a GPU count, say) is left out. A pod one of
   the pool's schedulable nodes has room for, joined or still joining, waits for the scheduler instead. A joined
   node's room is its `status.allocatable` CPU, memory and pods less its pods' requests (sidecars included); one still
   joining has its instance type's whole size and 110 pods. A cordoned node, one with a taint of its own the pod
@@ -476,7 +478,9 @@ launches nodes on AWS. Floci checks every 10 seconds.
   key isn't modelled; the taints a node carries while it starts (`node.kubernetes.io/not-ready` and the
   like) don't count in the 3 minutes after its launch, as Karpenter counts a starting node.
 - **Instance.** One node a pool and pass, of the smallest type in the instance type catalog with at least 2 vCPUs
-  that fits all of the pool's waiting pods, or else the largest of them. AWS picked a 2-vCPU `c6a.large` for a pod of
+  that fits all of the pool's waiting pods and the DaemonSet pods that would run on it (by their node selector,
+  required node affinity and tolerations, against its labels and region), or else the largest of them. A node still joining has room for its
+  DaemonSet pods taken too. AWS picked a 2-vCPU `c6a.large` for a pod of
   100m CPU. It is launched in a subnet of the pool's NodeClass, in the zone the pods ask for if they do, with its
   security groups, the instance
   profile `eks-<region>-<cluster>-<number>` (path `/eks/<region>/<cluster>/`) holding the NodeClass's role, and the
@@ -493,6 +497,39 @@ launches nodes on AWS. Floci checks every 10 seconds.
   honours those flags too. The labels are: `karpenter.sh/nodepool`,
   `eks.amazonaws.com/compute-type: auto`, `node.kubernetes.io/instance-type`, `karpenter.sh/capacity-type`, and the
   `eks.amazonaws.com/instance-*` category, generation, family, size, CPU and memory labels.
+- **Empty nodes.** A node that runs no workload (DaemonSet and static pods aside) and that no pending pod is counting
+  on is removed once it has been empty for its pool's `disruption.consolidateAfter`, as Auto Mode's consolidation
+  removes it: it is tainted `karpenter.sh/disrupted:NoSchedule`, as Karpenter marks a node it removes, and unless
+  the scheduler bound a pod to it meanwhile, it is drained (`kubectl drain`, so a pod that tolerates the taint and
+  arrived late is evicted, its disruption budget kept; on Floci's own Ready node, which has no kubelet to finish a
+  pod's shutdown, evicted pods go at once), its node is taken out and its instance terminated. A node a removal
+  that was called off or failed left with the taint, and that isn't being removed, has it taken off by the next pass. AWS removed an empty node within 90
+  seconds. A pool whose `consolidateAfter` is `Never` keeps its nodes. Each pass removes no more of a pool's nodes
+  than its disruption budgets that cover emptiness allow (a percentage is of its joined nodes, as Karpenter leaves
+  out nodes not yet initialized), less its nodes already not Ready or being deleted (a percentage rounded up, 10% without a budget; one whose
+  `reasons` leave out `Empty` doesn't count); a budget with a `schedule` is
+  left out, as Floci doesn't model its window. How long a node has been empty is kept in memory, so a restart starts
+  the wait again.
+- **Deleted pools.** The nodes of a NodePool that is deleted (or being deleted, held by its NodeClaims), or that
+  `UpdateClusterConfig` drops, are tainted, drained and removed the same way, whatever they run, as Karpenter removes
+  them. A pool being deleted launches nothing more. So is the node of a NodeClaim that is deleted (`kubectl delete
+  nodeclaim`), as deleting a claim is how Karpenter removes a node; the claim goes once its instance has.
+  The node of an Auto Mode instance that is terminated (one that registered while its instance was being
+  terminated, say), by its provider ID, is deleted by the next pass, while EC2 keeps the instance, an hour as on AWS, with compute on or
+  off.
+- **NodeClaim.** Each node has a `NodeClaim` (`karpenter.sh/v1`), as on AWS: named after its pool with five
+  characters (`general-purpose-kw46r`) no other instance's claim has, kept in its instance's `karpenter.sh/nodeclaim`
+  tag as Karpenter tags its instances, owned by its NodePool and held by the `karpenter.sh/termination` finalizer,
+  labelled as its node, with the pool's requirements (plus the chosen instance type, the pool and the NodeClass), its
+  pods' requests, and the pool's `expireAfter` and `terminationGracePeriod` (336h and 24h0m0s when the pool doesn't
+  say, as on AWS). Its status says `Launched` once the instance is up, then, once the node joins, `Registered`,
+  `Initialized` and `Ready`
+  (as the node's own Ready), with the node's name, capacity and allocatable, kept in step as they change. It goes
+  with its instance, Karpenter's finalizer taken off (other finalizers stay). A claim that couldn't be made is made
+  on a later pass. Floci touches only the claims labelled `app.kubernetes.io/managed-by: eks`. `kubectl get
+  nodeclaims` shows the type, capacity type, zone, node and readiness, as Karpenter's columns do.
+- **Pool status.** Each pool's `status.resources` (`cpu`, `memory`, `pods`, `nodes`) and `status.nodes` say what its
+  joined nodes have, the sum of their capacity, as AWS shows them.
 - **Removal.** Turning compute off terminates the cluster's Auto Mode instances and takes their nodes out of it.
   Deleting the cluster terminates them, waits up to a minute for them to finish terminating, as they hold the
   cluster security group deleted next (one that doesn't fails the delete, which can be retried), and deletes the
@@ -500,7 +537,8 @@ launches nodes on AWS. Floci checks every 10 seconds.
 
 On AWS, a node is named after its instance ID and is a managed instance a plain `DescribeInstances` doesn't list.
 In Floci it is named as other joined instances are, after its private DNS name, and `DescribeInstances` lists it.
-Floci makes no `NodeClaim` objects, and doesn't yet remove empty nodes.
+Floci doesn't replace underutilized nodes with smaller ones, and a NodeClaim's requirements name only the instance
+type chosen, where AWS lists every type that would do.
 
 ### Auto Mode load balancing for Services
 

@@ -29,6 +29,7 @@ import io.floci.aws.core.common.docker.PortAllocator;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
 import io.floci.aws.core.common.docker.UserDataPipeline;
 import io.floci.aws.services.ec2.Ec2InstanceTypeCatalog.CatalogInstanceType;
+import io.floci.aws.services.ec2.Ec2MetadataServer.DnsSuspension;
 import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceNetworkInterface;
@@ -46,6 +47,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -172,6 +174,7 @@ public class Ec2ContainerManager {
     private final DockerClient dockerClient;
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
+    private Clock clock = Clock.systemUTC();
     private final Ec2MetadataServer metadataServer;
     private final Ec2PortForwardManager portForwardManager;
     private final RegionResolver regionResolver;
@@ -286,6 +289,30 @@ public class Ec2ContainerManager {
     }
 
     @Inject
+    public Ec2ContainerManager(ContainerBuilder containerBuilder,
+                               ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer,
+                               ContainerDetector containerDetector,
+                               DockerHostResolver dockerHostResolver,
+                               DockerClient dockerClient,
+                               PortAllocator portAllocator,
+                               EmulatorConfig config,
+                               Ec2MetadataServer metadataServer,
+                               Ec2PortForwardManager portForwardManager,
+                               RegionResolver regionResolver,
+                               ContainerNetworkReachability containerNetworkReachability,
+                               VpcNetworkManager vpcNetworkManager,
+                               ContainerReachableEndpoint reachableEndpoint,
+                               SecurityGroupFirewallManager firewallManager,
+                               Ec2InstanceTypeCatalog instanceTypeCatalog,
+                               Clock clock) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, dockerHostResolver,
+                dockerClient, portAllocator, config, metadataServer, portForwardManager, regionResolver,
+                containerNetworkReachability, vpcNetworkManager, reachableEndpoint, firewallManager,
+                instanceTypeCatalog);
+        this.clock = clock;
+    }
+
     public Ec2ContainerManager(ContainerBuilder containerBuilder,
                                ContainerLifecycleManager lifecycleManager,
                                ContainerLogStreamer logStreamer,
@@ -1003,7 +1030,7 @@ public class Ec2ContainerManager {
                     && instance.getDockerContainerId() == null
                     && instance.getSshHostPort() <= 0
                     && (instance.getContainerBridgeIp() == null || instance.getContainerBridgeIp().isBlank());
-            instance.markTerminated(System.currentTimeMillis());
+            instance.markTerminated(clock.millis());
             containerId = instance.getDockerContainerId();
             sshHostPort = instance.getSshHostPort();
             containerIp = instance.getContainerBridgeIp();
@@ -1071,7 +1098,7 @@ public class Ec2ContainerManager {
             if ("running".equals(state)) {
                 return false;
             }
-            instance.markTerminated(System.currentTimeMillis());
+            instance.markTerminated(clock.millis());
         }
         failLaunch(instance);
         return true;
@@ -1176,8 +1203,10 @@ public class Ec2ContainerManager {
         portForwardManager.unpublishAll(instance);
         try {
             dockerClient.stopContainerCmd(containerId).withTimeout(5).exec();
-        } catch (NotFoundException e) {
-            // already gone
+            metadataServer.suspendDns(instance);
+        } catch (NotFoundException | NotModifiedException ignored) {
+            // The workload is confirmed absent or already stopped.
+            metadataServer.suspendDns(instance);
         } catch (Exception e) {
             LOG.warnv("Error stopping EC2 container {0} on shutdown: {1}", containerId, e.getMessage());
         }
@@ -1226,10 +1255,10 @@ public class Ec2ContainerManager {
             portForwardManager.unpublishAll(instance);
             try {
                 dockerClient.stopContainerCmd(containerId).withTimeout(30).exec();
-            } catch (NotFoundException ignored) {
-                // An already removed container needs no further stop.
-            } catch (NotModifiedException ignored) {
-                // An already stopped container, such as a guest that powered itself off, needs no stop.
+                metadataServer.suspendDns(instance);
+            } catch (NotFoundException | NotModifiedException ignored) {
+                // The workload is confirmed absent or already stopped.
+                metadataServer.suspendDns(instance);
             } catch (Exception e) {
                 LOG.warnv("Error stopping EC2 container {0}: {1}", containerId, e.getMessage());
             }
@@ -1264,6 +1293,8 @@ public class Ec2ContainerManager {
         instance.setState(pending);
         submitLifecycleOperation(containerId, () -> RequestScopes.runAs(accountId, instance.getRegion(), () -> {
             boolean setUpMetadataEndpoint = false;
+            boolean confirmedRunning = false;
+            DnsSuspension dnsSuspension = metadataServer.suspendDns(instance);
             String protectedMetadataAddress = null;
             boolean retainedMetadataRegistration = false;
             try {
@@ -1287,6 +1318,7 @@ public class Ec2ContainerManager {
                         Thread.sleep(500);
                     }
                 }
+                confirmedRunning = running;
                 // A protected workload shares the helper's namespace, so it has no Docker network
                 // attachment of its own to rediscover: the helper keeps the transport address
                 // across the workload's stop/start, exactly as launch used it.
@@ -1335,6 +1367,9 @@ public class Ec2ContainerManager {
             if (!instance.compareAndSetState(pending, running)) {
                 rollbackProtectedMetadataRegistration(instance, protectedMetadataAddress, retainedMetadataRegistration);
                 return;
+            }
+            if (confirmedRunning) {
+                metadataServer.resumeDns(instance, dnsSuspension);
             }
             persist(instance);
             watchForGuestShutdown(instance, containerId);
@@ -1441,7 +1476,14 @@ public class Ec2ContainerManager {
                         && stillDeclared.test(region, instanceId)) {
                     continue;
                 }
-                lifecycleManager.removeIfExists(container.getId());
+                try {
+                    lifecycleManager.removeIfExistsStrict(container.getId());
+                } catch (RuntimeException e) {
+                    LOG.warnv(e, "Could not remove orphaned EC2 container {0}; retaining its DNS origin",
+                            container.getId());
+                    continue;
+                }
+                metadataServer.suspendContainerDns(container.getId());
                 removed++;
                 LOG.infov("Reconciled orphaned EC2 container {0} (instance {1}) left by a previous run",
                         container.getId(), String.valueOf(instanceId));
@@ -1482,6 +1524,7 @@ public class Ec2ContainerManager {
             return false;
         }
         String containerId = instance.getDockerContainerId();
+        DnsSuspension dnsSuspension = metadataServer.dnsSuspension(instance);
         if (!lifecycleManager.isContainerRunning(containerId)) {
             return false;
         }
@@ -1509,6 +1552,7 @@ public class Ec2ContainerManager {
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
         refreshImdsSourceRegistration(instance, containerId, containerIp);
         refreshMetadataAddresses(instance, containerId);
+        metadataServer.resumeDns(instance, dnsSuspension);
         return true;
     }
 
@@ -1810,6 +1854,7 @@ public class Ec2ContainerManager {
             firewallEniId = instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()
                     ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
             instance.setState(InstanceState.shuttingDown());
+            metadataServer.revokeInstanceCredentials(instance);
             // In-flight lookups no longer match and publish nothing; later ones see the state.
             serviceNetworkRetries.remove(instance.getInstanceId());
             serviceNetworkLookups.remove(instance.getInstanceId());
@@ -1821,8 +1866,13 @@ public class Ec2ContainerManager {
                 cleanupStep(instance, "port forwards", () -> portForwardManager.unpublishAll(instance));
                 if (containerId != null) {
                     containerGone = removeContainer(containerId);
+                    if (containerGone) {
+                        metadataServer.suspendDns(instance);
+                    }
                     // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
                     pause(500);
+                } else {
+                    metadataServer.suspendDns(instance);
                 }
                 if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
                     cleanupStep(instance, "firewall registration", () -> firewallManager.unregister(firewallEniId));
@@ -1830,21 +1880,21 @@ public class Ec2ContainerManager {
                 if (sshHostPort > 0) {
                     cleanupStep(instance, "SSH host port", () -> portAllocator.release(sshHostPort));
                 }
-                cleanupStep(instance, "metadata registrations", () -> {
-                    metadataServer.unregisterContainer(containerIp, instance);
-                    metadataServer.unregisterContainer(imdsSourceIp, instance);
-                    metadataServer.unregisterInstance(instance);
-                });
-                // Give the address back only now that the container is gone: releasing it while
-                // Docker still holds the endpoint would hand the same IP to the next launch and
-                // have Docker refuse it.
-                cleanupStep(instance, "private address", () -> vpcNetworkManager.releasePrivateIp(
-                        instance.getOwnerId(), instance.getRegion(), instance.getSubnetId(),
-                        instance.getPrivateIpAddress()));
+                if (containerGone) {
+                    cleanupStep(instance, "metadata registrations", () -> {
+                        metadataServer.unregisterContainer(containerIp, instance);
+                        metadataServer.unregisterContainer(imdsSourceIp, instance);
+                        metadataServer.unregisterInstance(instance);
+                    });
+                    // A surviving Docker endpoint still owns its address and transport identity.
+                    cleanupStep(instance, "private address", () -> vpcNetworkManager.releasePrivateIp(
+                            instance.getOwnerId(), instance.getRegion(), instance.getSubnetId(),
+                            instance.getPrivateIpAddress()));
+                }
             } finally {
                 // Whatever the teardown managed, the instance must not stay shutting-down: nothing
                 // else would ever finish it, and a leftover container is collected on the next start.
-                instance.markTerminated(System.currentTimeMillis());
+                instance.markTerminated(clock.millis());
                 persist(instance);
                 if (afterTeardown != null && containerGone) {
                     try {
@@ -1898,10 +1948,15 @@ public class Ec2ContainerManager {
     boolean stopAndConfirm(Instance instance) {
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
+            metadataServer.suspendDns(instance);
             return true;
         }
         stopForShutdown(instance);
-        return lifecycleManager.probeContainer(containerId) == ContainerLiveness.NOT_RUNNING;
+        boolean stopped = lifecycleManager.probeContainer(containerId) == ContainerLiveness.NOT_RUNNING;
+        if (stopped) {
+            metadataServer.suspendDns(instance);
+        }
+        return stopped;
     }
 
     /**

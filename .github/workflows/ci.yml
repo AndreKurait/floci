@@ -254,6 +254,7 @@ jobs:
             all-classes.txt
             prefetch-images.log
             target/surefire-reports/
+            target/autoscaling-event-wire/
           if-no-files-found: error
 
   # The enforced completeness gate: fails on any shard failure, any class assigned

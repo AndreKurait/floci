@@ -90,6 +90,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Files;
@@ -601,7 +602,7 @@ class RdsServiceTest {
             dsql.stop();
         }
         int releasedRdsPort = rdsPort;
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(5)).ignoreException(BindException.class).untilAsserted(() -> {
             try (ServerSocket dsqlReleased = new ServerSocket();
                     ServerSocket rdsReleased = new ServerSocket()) {
                 dsqlReleased.setReuseAddress(true);
@@ -12320,7 +12321,7 @@ class RdsServiceTest {
         return new RdsService(containerManager, proxyManager, ec2Service, regionResolver, config,
                 instances, clusters, parameterGroups, clusterParameterGroups, subnetGroups,
                 null, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), null, kmsService, eventPublisher);
+                new InMemoryStorage<>(), null, kmsService, eventPublisher, null);
     }
 
     private RdsService newService(RdsContainerManager containerManager,
@@ -12333,7 +12334,7 @@ class RdsServiceTest {
         return new RdsService(containerManager, proxyManager, ec2Service, regionResolver, config,
                 instances, clusters, parameterGroups, clusterParameterGroups, new InMemoryStorage<>(),
                 secretsManager, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), null, kmsService, eventPublisher);
+                new InMemoryStorage<>(), null, kmsService, eventPublisher, null);
     }
 
     private RdsService proxyStoreService(
