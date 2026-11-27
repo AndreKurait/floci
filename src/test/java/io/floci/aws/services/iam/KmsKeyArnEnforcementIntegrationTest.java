@@ -129,6 +129,43 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .then().statusCode(200).body("KeyId", equalTo(keyArn));
     }
 
+    /**
+     * A key the account does not hold has no key policy to grant or refuse anything, so a caller
+     * whose own policy allows the action on the account's keys reaches the handler and gets the
+     * NotFoundException KMS answers, whether the key is named by id, by ARN, by alias or by alias ARN. A caller
+     * whose policy does not allow the action is still refused, and so is a call on another account's
+     * missing key that no grant could admit, since no key policy admits it across accounts.
+     */
+    @Test
+    void aMissingKeyAnswersNotFoundToACallerAllowedOnTheAccountsKeys() {
+        String missingId = UUID.randomUUID().toString();
+        String missingAlias = "alias/missing-" + UUID.randomUUID().toString().substring(0, 8);
+        Session allowed = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:DescribeKey","Resource":"%s*"}]}"""
+                .formatted(KEY_ARN_PREFIX));
+
+        for (String keyId : new String[]{missingId, KEY_ARN_PREFIX + missingId, missingAlias,
+                ALIAS_ARN_PREFIX + missingAlias.substring("alias/".length())}) {
+            keyCall(allowed, "DescribeKey", "{\"KeyId\": \"" + keyId + "\"}")
+                    .then().statusCode(400).body("__type", equalTo("NotFoundException"));
+        }
+
+        Session notAllowed = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:Encrypt","Resource":"%s*"}]}"""
+                .formatted(KEY_ARN_PREFIX));
+        keyCall(notAllowed, "DescribeKey", "{\"KeyId\": \"" + missingId + "\"}")
+                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+
+        Session anyKey = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:GetKeyRotationStatus","Resource":"*"}]}""");
+        keyCall(anyKey, "GetKeyRotationStatus",
+                "{\"KeyId\": \"arn:aws:kms:us-east-1:222222222222:key/" + missingId + "\"}")
+                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+    }
+
     @Test
     void aDecryptNamingNoKeyIdIsAuthorizedAgainstTheKeyThatEncryptedTheCiphertext() {
         String keyArn = createKey();

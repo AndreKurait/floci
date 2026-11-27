@@ -41,8 +41,13 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
         if (!arn.resource().startsWith("key/") || arn.resource().length() == 4 || arn.resource().contains("*")) {
             return List.of();
         }
+        boolean present = service.findKeyArnOfAccount(resource, arn.accountId(), arn.region())
+                .filter(resource::equals).isPresent();
+        if (!present) {
+            return List.of(new ResourcePolicy(null, arn.accountId(), false));
+        }
         String policy = service.findKeyPolicy(resource).orElse(null);
-        if (request == null || service.findKeyArnOfAccount(resource, arn.accountId(), arn.region()).isEmpty()) {
+        if (request == null) {
             return List.of(new ResourcePolicy(policy, arn.accountId(), true));
         }
         String previous = request.getAccountId();

@@ -82,11 +82,25 @@ class KmsKeyOfAccountTest {
         assertTrue(policies.getFirst().grantRequired());
         assertThat(policies.getFirst().policyDocument(), containsString("kms:*"));
         String missing = "arn:aws:kms:" + REGION + ":777788889999:key/" + key.getKeyId();
-        assertEquals(List.of(new ResourcePolicy(null, "777788889999", true)), provider.getResourcePolicies("kms", missing));
+        assertEquals(List.of(new ResourcePolicy(null, "777788889999", false)), provider.getResourcePolicies("kms", missing));
         assertTrue(provider.getResourcePolicies("kms", "arn:aws:kms:" + REGION + ":" + OWNER + ":alias/snapshots")
                 .isEmpty());
         assertTrue(provider.getResourcePolicies("kms", "arn:aws:kms:" + REGION + ":" + OWNER + ":key/*").isEmpty());
         assertTrue(provider.getResourcePolicies("kms", "*").isEmpty());
+    }
+
+    @Test
+    void aMissingOrWrongPartitionKeyHasNoPolicyGrantRequirement() {
+        KmsResourcePolicyProvider provider = new KmsResourcePolicyProvider(callers);
+        for (String missing : List.of(key.getArn().replace(OWNER, CALLER),
+                key.getArn().replace("arn:aws:", "arn:aws-cn:"))) {
+            List<ResourcePolicy> policies = provider.getResourcePolicies("kms", missing);
+            assertEquals(1, policies.size());
+            assertFalse(policies.getFirst().grantRequired());
+            assertEquals(null, policies.getFirst().policyDocument());
+        }
+        key.setPolicy("");
+        assertTrue(provider.getResourcePolicies("kms", key.getArn()).getFirst().grantRequired());
     }
 
     @Test
