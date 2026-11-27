@@ -31,6 +31,7 @@ import java.net.DatagramPacket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
@@ -41,9 +42,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.SequencedSet;
@@ -91,6 +94,9 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 @Startup
 public class EmbeddedDnsServer {
+
+    private Vertx listenerVertx;
+    private final Map<String, Listeners> networkListeners = new LinkedHashMap<>();
 
     private static final Logger LOG = Logger.getLogger(EmbeddedDnsServer.class);
     static final int DNS_PORT = 53;
@@ -249,6 +255,7 @@ public class EmbeddedDnsServer {
                       Iterable<DnsClientVpcSource> clientVpcSources,
                       CurrentContainerNetworkResolver currentContainer,
                       DockerBridgeAddress dockerBridge, int port) {
+        listenerVertx = vertx;
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
@@ -383,22 +390,34 @@ public class EmbeddedDnsServer {
     }
 
     @PreDestroy
-    void stop() {
+    synchronized void stop() {
         serverIp = null;
+        List<Listeners> closing = new ArrayList<>(networkListeners.values());
         if (listeners != null) {
-            try {
-                listeners.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
-            } catch (InterruptedException failure) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted while stopping the embedded DNS listeners", failure);
-            } catch (Exception failure) {
-                throw new IllegalStateException("Cannot stop the embedded DNS listeners", failure);
-            }
+            closing.add(listeners);
+        }
+        try {
+            closeListeners(closing).toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+            networkListeners.clear();
             listeners = null;
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while stopping the embedded DNS listeners", failure);
+        } catch (Exception failure) {
+            throw new IllegalStateException("Cannot stop the embedded DNS listeners", failure);
+        } finally {
+            if (forwardPool != null) {
+                forwardPool.close();
+            }
         }
-        if (forwardPool != null) {
-            forwardPool.close();
+    }
+
+    static Future<Void> closeListeners(List<Listeners> closing) {
+        List<Future<Void>> closed = new ArrayList<>();
+        for (Listeners listener : closing) {
+            closed.add(listener.close());
         }
+        return Future.join(closed).mapEmpty();
     }
 
     static String resolveServerIp(EmulatorConfig config, CurrentContainerNetworkResolver networkResolver)
@@ -416,6 +435,45 @@ public class EmbeddedDnsServer {
 
     public Optional<String> getServerIp() {
         return Optional.ofNullable(serverIp);
+    }
+
+    /** Only addresses whose additional UDP and TCP listeners completed their bind. */
+    public synchronized List<String> networkResolverIps() {
+        return List.copyOf(networkListeners.keySet());
+    }
+
+    /** Serve a connected container network without replacing the primary advertised resolver. */
+    public synchronized String resolverOnLocalAddress(String address) {
+        if (serverIp == null || listeners == null || listenerVertx == null) {
+            throw new IllegalStateException("The embedded DNS resolver is not listening");
+        }
+        if (serverIp.equals(address)) {
+            return address;
+        }
+        try {
+            InetAddress local = InetAddress.ofLiteral(address);
+            if (!(local instanceof Inet4Address) || local.isAnyLocalAddress() || local.isMulticastAddress()
+                    || NetworkInterface.getByInetAddress(local) == null) {
+                throw new IllegalArgumentException("A network resolver must use an owned local IPv4 address");
+            }
+            if (!networkListeners.containsKey(address)) {
+                Future<Listeners> opening = bindAll(listenerVertx, address, listenerPort(), true);
+                Listeners bound;
+                try {
+                    bound = opening.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+                } catch (Exception failure) {
+                    opening.onSuccess(Listeners::close);
+                    throw failure;
+                }
+                networkListeners.put(address, bound);
+            }
+            return address;
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while binding a network DNS resolver", failure);
+        } catch (Exception failure) {
+            throw new IllegalStateException("Cannot serve DNS on connected network address " + address, failure);
+        }
     }
 
     /** Starts the listener the containers Floci launches are given as their resolver. */

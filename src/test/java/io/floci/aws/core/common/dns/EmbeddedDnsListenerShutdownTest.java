@@ -1,10 +1,12 @@
 package io.floci.aws.core.common.dns;
 
+import io.floci.aws.testing.ParallelLocks;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.net.NetServer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.lang.reflect.Field;
 import java.util.List;
@@ -14,10 +16,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class EmbeddedDnsListenerShutdownTest {
     @Test
     void bothTransportsFinishClosingBeforeFailureIsReported() {
@@ -57,6 +61,26 @@ class EmbeddedDnsListenerShutdownTest {
         when(udp.close()).thenReturn(Future.succeededFuture());
         server.stop();
         assertNull(listeners.get(server));
+    }
+
+    @Test
+    void aFailedAdditionalCloseStillClosesThePrimaryAndOtherListeners() {
+        DatagramSocket additionalUdp = mock(DatagramSocket.class);
+        NetServer additionalTcp = mock(NetServer.class);
+        DatagramSocket primaryUdp = mock(DatagramSocket.class);
+        NetServer primaryTcp = mock(NetServer.class);
+        when(additionalUdp.close()).thenReturn(Future.failedFuture("additional close failed"));
+        when(additionalTcp.close()).thenReturn(Future.succeededFuture());
+        when(primaryUdp.close()).thenReturn(Future.succeededFuture());
+        when(primaryTcp.close()).thenReturn(Future.succeededFuture());
+        Future<Void> closed = EmbeddedDnsServer.closeListeners(List.of(
+                new EmbeddedDnsServer.Listeners(additionalUdp, additionalTcp),
+                new EmbeddedDnsServer.Listeners(primaryUdp, primaryTcp)));
+        assertTrue(closed.failed());
+        verify(additionalUdp).close();
+        verify(additionalTcp).close();
+        verify(primaryUdp).close();
+        verify(primaryTcp).close();
     }
 
 }

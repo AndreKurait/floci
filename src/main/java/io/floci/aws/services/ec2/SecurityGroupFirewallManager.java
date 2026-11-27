@@ -10,6 +10,7 @@ import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
+import com.github.dockerjava.api.model.Network;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.SweepWorker;
 import io.floci.aws.core.common.dns.DnsAnswer;
@@ -654,7 +655,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             policyWriters.initialize(helperId);
             apply(helperId, SecurityGroupNftCompiler.initialRuleset());
-            String resolver = embeddedDnsServer.getServerIp().orElse(null);
+            String resolver = namespaceResolver(spec.networkMode());
             if (resolver != null) {
                 // Docker's resolver does not forward from internal networks. Workloads inherit
                 // this file, so finish configuring the VPC resolver before admitting any workload.
@@ -696,6 +697,32 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
      */
     private int namespaceSetupTimeoutSeconds() {
         return Math.max(MIN_NAMESPACE_SETUP_TIMEOUT_SECONDS, config.docker().apiTimeoutSeconds());
+    }
+
+    String namespaceResolver(String networkMode) {
+        String primary = embeddedDnsServer.getServerIp().orElse(null);
+        if (primary == null || currentContainer == null || networkMode == null || networkMode.isBlank()
+                || networkMode.startsWith("container:") || Set.of("host", "none", "bridge", "default")
+                .contains(networkMode)) {
+            return primary;
+        }
+        Optional<String> container = currentContainer.resolveContainerId();
+        if (container.isEmpty()) {
+            return primary;
+        }
+        Network network = dockerClient.inspectNetworkCmd().withNetworkId(networkMode).exec();
+        if (!Boolean.TRUE.equals(network.getInternal())) {
+            return primary;
+        }
+        Map<String, ContainerNetwork> connected = dockerClient.inspectContainerCmd(container.get()).exec()
+                .getNetworkSettings().getNetworks();
+        ContainerNetwork own = connected == null ? null : connected.values().stream()
+                .filter(candidate -> network.getId().equals(candidate.getNetworkID()))
+                .findFirst().orElse(null);
+        if (own == null || own.getIpAddress() == null || own.getIpAddress().isBlank()) {
+            throw new IllegalStateException("Floci has no owned resolver address on internal network " + networkMode);
+        }
+        return embeddedDnsServer.resolverOnLocalAddress(own.getIpAddress());
     }
 
     private void ensureHelperImage() {
@@ -1734,7 +1761,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
      * groups never filter on AWS. The fallback resolvers are ordinary internet destinations.
      */
     List<String> vpcResolvers() {
-        return embeddedDnsServer.getServerIp().map(List::of).orElse(List.of());
+        LinkedHashSet<String> resolvers = new LinkedHashSet<>();
+        embeddedDnsServer.getServerIp().ifPresent(resolvers::add);
+        resolvers.addAll(embeddedDnsServer.networkResolverIps());
+        return List.copyOf(resolvers);
     }
 
     private void quarantineAll(List<String> helperIds) {
