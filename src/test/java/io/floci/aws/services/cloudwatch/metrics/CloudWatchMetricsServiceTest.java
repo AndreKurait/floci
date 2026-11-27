@@ -22,8 +22,10 @@ import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -46,6 +48,49 @@ class CloudWatchMetricsServiceTest {
                 new InMemoryStorage<>(),
                 new RegionResolver("us-east-1", "000000000000")
         );
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void initialAlarmStateUsesTheServiceClock(boolean composite) {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+        service = new CloudWatchMetricsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"), null,
+                Clock.fixed(now, ZoneOffset.UTC));
+        Alarm alarm = putClockAlarm(composite, "created");
+        assertAll(() -> assertEquals(now.getEpochSecond(), alarm.getStateUpdatedTimestamp()),
+                () -> assertEquals(now.getEpochSecond(), alarm.getStateTransitionedTimestamp()),
+                () -> assertEquals(now.getEpochSecond(), alarm.getAlarmConfigurationUpdatedTimestamp()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void alarmConfigurationUpdatePreservesEarlierStateTimestamps(boolean composite) {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+        service = new CloudWatchMetricsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"), null,
+                Clock.fixed(now, ZoneOffset.UTC));
+        Alarm original = putClockAlarm(composite, "updated-clock");
+        original.setStateUpdatedTimestamp(now.minusSeconds(60).getEpochSecond());
+        original.setStateTransitionedTimestamp(now.minusSeconds(120).getEpochSecond());
+        Alarm replacement = putClockAlarm(composite, "updated-clock");
+        assertAll(() -> assertEquals(original.getStateUpdatedTimestamp(), replacement.getStateUpdatedTimestamp()),
+                () -> assertEquals(original.getStateTransitionedTimestamp(), replacement.getStateTransitionedTimestamp()),
+                () -> assertEquals(now.getEpochSecond(), replacement.getAlarmConfigurationUpdatedTimestamp()));
+    }
+
+    private Alarm putClockAlarm(boolean composite, String name) {
+        if (composite) {
+            CompositeAlarm alarm = new CompositeAlarm();
+            alarm.setAlarmName(name);
+            alarm.setAlarmRule("FALSE");
+            service.putCompositeAlarm(alarm, REGION);
+            return alarm;
+        }
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName(name);
+        service.putMetricAlarm(alarm, REGION);
+        return alarm;
     }
 
     @Test
