@@ -27,8 +27,8 @@ BASE_IMAGE = (
     "957ff255a4ca9c60138ea636b8ae09e29ba146ea7bc95d0dae3923a5faeeb122"
 )
 AWS_CLI_IMAGE = (
-    "public.ecr.aws/aws-cli/aws-cli@sha256:"
-    "1c2d7a51b1ff4f460bc3f1e1ee46a6cef47c7429ad9089ef99012a95e472a1a5"
+    "docker.io/amazon/aws-cli@sha256:"
+    "7637f1a9537dd19b1f74fa69d2000c8affd0a2229a55f493d21a10cb6cbd5f1f"
 )
 AMI = "ami-00000000000000001"
 REGION = "ap-southeast-7"
