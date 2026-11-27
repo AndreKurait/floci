@@ -58,6 +58,7 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 
 import java.io.IOException;
 import java.time.Instant;
@@ -472,14 +473,12 @@ public class ApiGatewayController {
     @GET
     @Path("/restapis/{apiId}/resources")
     public Response getResources(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
-                                 @QueryParam("embed") List<String> embed) {
+                                 @QueryParam("embed") List<String> embed,
+                                 @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        List<ApiGatewayResource> resources = service.getResources(region, apiId);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
         boolean embedMethods = embed != null && embed.contains("methods");
-        resources.forEach(r -> items.add(toResourceNode(r, embedMethods)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        return pageResponse(service.getResourcePage(region, apiId, pageLimit(limit), position),
+                resource -> toResourceNode(resource, embedMethods));
     }
 
     @GET
@@ -1315,7 +1314,14 @@ public class ApiGatewayController {
 
     @GET
     @Path("/domainnames")
-    public Response getDomainNames(@Context HttpHeaders headers) {
+    public Response getDomainNames(@Context HttpHeaders headers,
+                                   @Context UriInfo uriInfo) {
+        String resourceOwner = uriInfo.getQueryParameters().getFirst("resourceOwner");
+        List<String> owners = List.of("SELF", "OTHER_ACCOUNTS");
+        if (resourceOwner != null && !owners.contains(resourceOwner)) {
+            throw SmithyValidationErrors.validationException(
+                    SmithyValidationErrors.notInEnum(resourceOwner, "resourceOwner", owners));
+        }
         String region = regionResolver.resolveRegion(headers);
         List<CustomDomain> domains = service.getDomainNames(region);
         ObjectNode root = objectMapper.createObjectNode();

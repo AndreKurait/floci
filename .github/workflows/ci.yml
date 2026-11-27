@@ -7,6 +7,8 @@ on:
     paths:
       - 'src/**'
       - 'pom.xml'
+      - 'mvnw'
+      - '.mvn/wrapper/maven-wrapper.properties'
       - '.github/ci/**'
       - '.github/workflows/ci.yml'
   pull_request:
@@ -16,6 +18,8 @@ on:
     paths:
       - 'src/**'
       - 'pom.xml'
+      - 'mvnw'
+      - '.mvn/wrapper/maven-wrapper.properties'
       - '.github/ci/**'
       - '.github/workflows/ci.yml'
 
@@ -59,10 +63,28 @@ jobs:
         github.event.pull_request.state != 'closed' &&
         github.event.action != 'edited'
       )
+    # Share four test slots across PRs and main. Queue every shard; the default
+    # single pending job would cancel another PR's required tests.
+    concurrency:
+      group: floci-ci-slot-${{ matrix.slot }}
+      cancel-in-progress: false
+      queue: max
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: [1, 2, 3, 4, 5]
+        include:
+          - shard: 1
+            slot: 1
+          - shard: 2
+            slot: 2
+          - shard: 3
+            slot: 3
+          - shard: 4
+            slot: 4
+          - shard: 5
+            slot: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -91,8 +113,8 @@ jobs:
       - id: maven-wrapper-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.m2/wrapper
-          key: maven-wrapper-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          path: ~/.m2/wrapper/dists
+          key: maven-wrapper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
 
       # Derived from test sources, not target/test-classes, so shard.txt exists
       # before Compile and the image prefetch below overlaps the compile instead
@@ -121,6 +143,19 @@ jobs:
         run: |
           grep -v 'NightlyIntegrationTest$' shard.txt > prefetch.txt || true
           .github/ci/prefetch-images.sh prefetch.txt || true
+
+      - name: Test Maven bootstrap
+        if: matrix.shard == 1
+        run: python3 -m unittest discover -s .github/ci -p test_bootstrap_maven.py
+
+      - name: Bootstrap Maven distribution
+        run: bash .github/ci/bootstrap-maven.sh
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push' && matrix.shard == 1 && steps.maven-wrapper-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/.m2/wrapper/dists
+          key: ${{ steps.maven-wrapper-cache.outputs.cache-primary-key }}
 
       - name: Compile
         run: ./mvnw test-compile -B
@@ -162,12 +197,6 @@ jobs:
               -Dtest.classes.mode=concurrent || status=$?
           fi
           if [ -s quarkus.txt ]; then
-            # The automatic DNS listener needs the private Docker bridge and permission to bind port53.
-            dns_address="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
-            test -n "$dns_address"
-            port_floor="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
-            trap 'sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=$port_floor" >/dev/null' EXIT
-            sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
             ./mvnw surefire:test -B \
               -Dsurefire.includesFile="$GITHUB_WORKSPACE/quarkus.txt" \
               -Dsurefire.failIfNoTests=true \
@@ -215,14 +244,6 @@ jobs:
           path: ~/.m2/repository
           key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
 
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: >-
-          always() && matrix.shard == 1 && github.event_name == 'push'
-          && steps.maven-wrapper-cache.outputs.cache-hit != 'true'
-        with:
-          path: ~/.m2/wrapper
-          key: maven-wrapper-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
-
       - name: Upload shard manifest and results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -233,6 +254,7 @@ jobs:
             all-classes.txt
             prefetch-images.log
             target/surefire-reports/
+            target/autoscaling-event-wire/
           if-no-files-found: error
 
   # The enforced completeness gate: fails on any shard failure, any class assigned

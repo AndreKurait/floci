@@ -524,6 +524,11 @@ public class ApiGatewayService implements ResourceProvider, Resettable {
         return resourceStore.scan(k -> k.startsWith(prefix));
     }
 
+    public PaginatedResult<ApiGatewayResource> getResourcePage(String region, String apiId, Integer limit,
+                                                               String position) {
+        return pageById(getResources(region, apiId), ApiGatewayResource::getId, limit, position);
+    }
+
     /** The root resource id, with a resource-store fallback for data persisted before it was stored on the API. */
     public Optional<String> findRootResourceId(String region, String apiId) {
         Optional<RestApi> api = apiStore.get(apiKey(region, apiId));
@@ -3551,28 +3556,6 @@ public class ApiGatewayService implements ResourceProvider, Resettable {
     // ──────────────────────────── Custom Domain Resolution ────────────────────────────
 
     public record CustomDomainRoute(String accountId, String region, String domainName) {}
-
-    public record DomainDnsTarget(String hostedZoneId) {}
-
-    /** Read the actual target across owners; a DNS query has no management account. */
-    public Optional<DomainDnsTarget> findDomainDnsTarget(String target) {
-        if (target == null) {
-            return Optional.empty();
-        }
-        String normalized = target.endsWith(".") ? target.substring(0, target.length() - 1) : target;
-        List<DomainDnsTarget> matches = domainStore.scanAllAccountEntries(key -> true).stream()
-                .map(AccountAwareStorageBackend.AccountEntry::value)
-                .filter(domain -> "REGIONAL".equals(domain.getEndpointConfigurationType())
-                        ? normalized.equalsIgnoreCase(domain.getRegionalDomainName())
-                        : "EDGE".equals(domain.getEndpointConfigurationType())
-                                && normalized.equalsIgnoreCase(domain.getDistributionDomainName()))
-                .map(domain -> new DomainDnsTarget("REGIONAL".equals(domain.getEndpointConfigurationType())
-                        ? domain.getRegionalHostedZoneId() : domain.getDistributionHostedZoneId())).toList();
-        if (matches.size() > 1) {
-            throw new AwsException("ConflictException", "Custom domain DNS target is ambiguous", 409);
-        }
-        return matches.stream().findFirst();
-    }
 
     /**
      * Resolves a custom domain by its regionalDomainName (e.g., "my-domain.regional.local").

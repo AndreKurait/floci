@@ -20,14 +20,11 @@ public class ContainerHandle {
     private final boolean hotReload;
     private final String executionRoleAccessKeyId;
     private final String executionRoleSessionAccountId;
-    private final LambdaVpcNetworkManager.Attachment vpcNetwork;
     private volatile ContainerState state;
     private volatile long lastUsedMs;
     private Closeable logStream;
     private Function<Boolean, Supplier<String>> logTailReader = initialization -> () -> "";
     private final AtomicBoolean invoked = new AtomicBoolean();
-    private String dnsResolverVolume;
-    private boolean runtimeApiReleased;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -42,14 +39,6 @@ public class ContainerHandle {
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state, boolean hotReload,
                            String executionRoleAccessKeyId, String executionRoleSessionAccountId) {
-        this(containerId, functionName, runtimeApiServer, state, hotReload, executionRoleAccessKeyId,
-                executionRoleSessionAccountId, null);
-    }
-
-    ContainerHandle(String containerId, String functionName,
-                    RuntimeApiServer runtimeApiServer, ContainerState state, boolean hotReload,
-                    String executionRoleAccessKeyId, String executionRoleSessionAccountId,
-                    LambdaVpcNetworkManager.Attachment vpcNetwork) {
         this.containerId = containerId;
         this.functionName = functionName;
         this.runtimeApiServer = runtimeApiServer;
@@ -57,7 +46,6 @@ public class ContainerHandle {
         this.hotReload = hotReload;
         this.executionRoleAccessKeyId = executionRoleAccessKeyId;
         this.executionRoleSessionAccountId = executionRoleSessionAccountId;
-        this.vpcNetwork = vpcNetwork;
         this.createdAt = System.currentTimeMillis();
         this.lastUsedMs = this.createdAt;
     }
@@ -67,7 +55,6 @@ public class ContainerHandle {
     public boolean isHotReload() { return hotReload; }
     public String getExecutionRoleAccessKeyId() { return executionRoleAccessKeyId; }
     public String getExecutionRoleSessionAccountId() { return executionRoleSessionAccountId; }
-    LambdaVpcNetworkManager.Attachment getVpcNetwork() { return vpcNetwork; }
     public RuntimeApiServer getRuntimeApiServer() { return runtimeApiServer; }
     public long getCreatedAt() { return createdAt; }
     public long getLastUsedMs() { return lastUsedMs; }
@@ -77,10 +64,6 @@ public class ContainerHandle {
 
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
-    String getDnsResolverVolume() { return dnsResolverVolume; }
-    void setDnsResolverVolume(String volume) { this.dnsResolverVolume = volume; }
-    boolean isRuntimeApiReleased() { return runtimeApiReleased; }
-    void markRuntimeApiReleased() { runtimeApiReleased = true; }
 
     public void setLogTailReader(Function<Boolean, Supplier<String>> reader) { this.logTailReader = reader; }
 

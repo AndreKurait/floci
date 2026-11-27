@@ -25,7 +25,6 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
-import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
@@ -904,9 +903,27 @@ public class ContainerLifecycleManager {
         }
     }
 
+    /** Reports a confirmed stop before removal or log draining can block. */
+    public boolean stopAndConfirmRemoved(String containerId, Closeable logStream, int stopTimeoutSeconds,
+                                         boolean removeAnonymousVolumes, Runnable onStopped) {
+        try {
+            stopAndRemoveStrict(containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes, onStopped);
+            return true;
+        } catch (RuntimeException e) {
+            LOG.warnv("Container {0} was not confirmed removed: {1}", containerId, e.getMessage());
+            return false;
+        }
+    }
+
     /** Strict teardown that can also reclaim the container's anonymous volumes. */
     public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds,
                                      boolean removeAnonymousVolumes) {
+        stopAndRemoveStrict(containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes, () -> { });
+    }
+
+    /** Strict teardown with a notification as soon as the container cannot send more traffic. */
+    public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds,
+                                    boolean removeAnonymousVolumes, Runnable onStopped) {
         LOG.infov("Stopping container {0}", containerId);
 
         Exception stopFailure = null;
@@ -914,6 +931,7 @@ public class ContainerLifecycleManager {
             dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
         } catch (NotFoundException e) {
             LOG.debugv("Container {0} not found (already removed)", containerId);
+            onStopped.run();
             closeLogStreamIfPresent(logStream);
             return;
         } catch (NotModifiedException e) {
@@ -922,6 +940,9 @@ public class ContainerLifecycleManager {
         } catch (Exception e) {
             stopFailure = e;
             LOG.warnv("Error stopping container {0}: {1}", containerId, e.getMessage());
+        }
+        if (stopFailure == null) {
+            onStopped.run();
         }
         readLastLogLines(logStream);
 
@@ -949,6 +970,9 @@ public class ContainerLifecycleManager {
                 throw cleanupFailure;
             }
             LOG.debugv("Container {0} is absent after its removal response failed", containerId);
+        }
+        if (stopFailure != null) {
+            onStopped.run();
         }
         // Closed only once the container is stopped and gone, as in stopAndRemove, so the follower
         // can drain the final tail.
@@ -1680,8 +1704,9 @@ public class ContainerLifecycleManager {
     /**
      * Like {@link #resolveEndpoint(String, int)}, but prefers the container's address on
      * {@code preferredNetwork}, as {@link #createAndStart} does with the spec's network. A
-     * container attached to several networks must be reached through its service network,
-     * rather than whichever address Docker happens to list first.
+     * container that publishes ports is created on the default bridge and connected to its
+     * service network after start, so without a preference the bridge address, which Floci
+     * usually cannot reach, can be returned instead.
      */
     public EndpointInfo resolveEndpoint(String containerId, int containerPort, String preferredNetwork) {
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
@@ -1845,9 +1870,6 @@ public class ContainerLifecycleManager {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
-        if (!linux.networkSysctls().isEmpty()) {
-            hostConfig.withSysctls(linux.networkSysctls());
-        }
         List<Capability> capDrop = new ArrayList<>();
         List<Capability> capAdd = capabilities(linux.capAdd());
         if ("true".equals(ContainerStorageHelper.labelValue(
@@ -1902,12 +1924,6 @@ public class ContainerLifecycleManager {
         if (spec.hasMemoryLimit()) {
             hostConfig.withMemory(spec.memoryBytes());
         }
-        if (!spec.ulimits().isEmpty()) {
-            hostConfig.withUlimits(spec.ulimits().entrySet().stream()
-                    .sorted(Map.Entry.comparingByKey())
-                    .map(entry -> new Ulimit(entry.getKey(), entry.getValue().soft(), entry.getValue().hard()))
-                    .toArray(Ulimit[]::new));
-        }
         if (linux.memorySwapBytes() != null) {
             hostConfig.withMemorySwap(linux.memorySwapBytes());
         }
@@ -1950,8 +1966,9 @@ public class ContainerLifecycleManager {
                     spec.name(), spec.networkMode(), spec.portBindings().keySet());
         }
 
-        // Native routing pins protected namespace owners before start. Other published
-        // services retain the Docker Desktop port-mapping path selected by connectsAfterStart.
+        // Network mode: set during creation unless the container connects after start (see
+        // connectsAfterStart). host, none and container:<id> publish nothing and cannot be
+        // connected after creation, so they always go on the HostConfig.
         if (spec.networkMode() != null && !spec.networkMode().isBlank() && !connectsAfterStart(spec)) {
             hostConfig.withNetworkMode(spec.networkMode());
         }
@@ -2064,15 +2081,16 @@ public class ContainerLifecycleManager {
         return resolved;
     }
 
-    /** Pins native routing namespaces while retaining Desktop port publishing elsewhere. */
+    /**
+     * Whether a container joins its network only after it starts. On Docker Desktop, naming the
+     * network at creation together with port bindings suppresses the published ports, so a
+     * container that publishes ports is created on the default bridge and connected afterwards.
+     * Any other daemon publishes them on the named network, so the container is created there and
+     * joins it alone. A daemon that cannot be asked is treated as Docker Desktop, and the answer is
+     * kept either way, so a container's create and its start always take the same path.
+     */
     private boolean connectsAfterStart(ContainerSpec spec) {
-        EmulatorConfig.NetworkConfig network = config.network();
-        boolean nativeRouting = network != null && network.vpcRouting() != null && network.vpcRouting().enabled();
-        boolean protectedNamespace = "true".equals(ContainerStorageHelper.labelValue(spec.labels(),
-                ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL)) || !spec.linuxOptions().networkSysctls().isEmpty();
-        return spec.publishesPorts()
-                && !(nativeRouting && protectedNamespace)
-                && isDockerDesktop();
+        return spec.publishesPorts() && isDockerDesktop();
     }
 
     private boolean isDockerDesktop() {

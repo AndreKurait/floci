@@ -2,6 +2,7 @@ package io.floci.aws.core.common;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.floci.aws.testing.MockQueryRequests;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -597,13 +598,18 @@ class RequestResourcesTest {
     }
 
     /**
-     * ECR's {@code registryId} selects the registry its handler acts in, so the repositories are that account's;
-     * one that is no account id names none.
+     * ECR's {@code registryId} selects the registry its handler acts in, so the repositories are that account's, and
+     * the caller's of that name too, as another account's resource is named, unless the service says it acts on that
+     * account's there, as ECR does; one that is no account id names none.
      */
     @Test
     void aRepositoryIsInTheRegistryTheRequestNames() {
-        assertEquals(List.of("arn:aws:ecr:us-east-1:111122223333:repository/web"), of("ecr:DescribeRepositories",
-                json("{\"registryId\":\"111122223333\",\"repositoryNames\":[\"web\"]}")));
+        String other = "arn:aws:ecr:us-east-1:111122223333:repository/web";
+        assertEquals(List.of(other, "arn:aws:ecr:us-east-1:000000000000:repository/web"),
+                of("ecr:DescribeRepositories",
+                        json("{\"registryId\":\"111122223333\",\"repositoryNames\":[\"web\"]}")));
+        assertEquals(List.of(other), of("ecr:DescribeRepositories",
+                json("{\"registryId\":\"111122223333\",\"repositoryNames\":[\"web\"]}"), reaching("ecr", other)));
         assertEquals(List.of("arn:aws:ecr:us-east-1:000000000000:repository/web"), of("ecr:DescribeRepositories",
                 json("{\"repositoryNames\":[\"web\"]}")));
         assertEquals(List.of(), of("ecr:DescribeRepositories",
@@ -1556,14 +1562,49 @@ class RequestResourcesTest {
                         form("Action=GetClusterCredentials&ClusterIdentifier=prod&DbUser=analyst&DbName=dev")));
     }
 
+    /**
+     * A restore's {@code OwnerAccount} puts the snapshot in that account, and the caller's of that name is named too
+     * unless Redshift says it restores that account's snapshot there.
+     */
+    /**
+     * A resource the request names by members is named as the service reads it when the service resolves the ARN to
+     * one it stores under another spelling (an AppConfig environment by its name, a PyPI package by a name CodeArtifact
+     * normalizes), and as rendered otherwise.
+     */
+    @Test
+    void aResourceIsNamedAsItsServiceReadsTheArnTheRequestsMembersGive() {
+        StoredResourceArns lowerCasing = new StoredResourceArns() {
+            @Override
+            public String namespace() {
+                return "ecr";
+            }
+
+            @Override
+            public Optional<String> find(String type, List<String> names, String region) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<String> resolveStoredArn(String arn) {
+                return arn.endsWith("/Web") ? Optional.of(arn.replace("/Web", "/web")) : Optional.empty();
+            }
+        };
+        assertEquals(List.of("arn:aws:ecr:us-east-1:000000000000:repository/web",
+                "arn:aws:ecr:us-east-1:000000000000:repository/api"), of("ecr:DescribeRepositories",
+                json("{\"repositoryNames\":[\"Web\",\"api\"]}"), lowerCasing));
+    }
+
     @Test
     void redshiftRestoreFromClusterSnapshotUsesOwnerAccountForSourceSnapshot() {
         String own = "arn:aws:redshift:us-east-1:000000000000:";
         String owner = "arn:aws:redshift:us-east-1:111122223333:";
+        String restore = "Action=RestoreFromClusterSnapshot&ClusterIdentifier=restored&SnapshotIdentifier=snap"
+                + "&SnapshotClusterIdentifier=source&OwnerAccount=111122223333";
+        assertEquals(List.of(own + "cluster:restored", owner + "snapshot:source/snap", own + "snapshot:source/snap"),
+                of("redshift:RestoreFromClusterSnapshot", form(restore)));
         assertEquals(List.of(own + "cluster:restored", owner + "snapshot:source/snap"),
-                of("redshift:RestoreFromClusterSnapshot",
-                        form("Action=RestoreFromClusterSnapshot&ClusterIdentifier=restored&SnapshotIdentifier=snap"
-                                + "&SnapshotClusterIdentifier=source&OwnerAccount=111122223333")));
+                of("redshift:RestoreFromClusterSnapshot", form(restore),
+                        reaching("redshift", owner + "snapshot:source/snap")));
         assertEquals(List.of(own + "cluster:restored", own + "snapshot:source/snap"),
                 of("redshift:RestoreFromClusterSnapshot",
                         form("Action=RestoreFromClusterSnapshot&ClusterIdentifier=restored&SnapshotIdentifier=snap"
@@ -1708,7 +1749,7 @@ class RequestResourcesTest {
     }
 
     private static ContainerRequestContext form(String body) {
-        return request("application/x-www-form-urlencoded", body);
+        return MockQueryRequests.postedToRoot(request("application/x-www-form-urlencoded", body));
     }
 
     /** The JSON body as EventBridge's JSON 1.1 handler serves it. */

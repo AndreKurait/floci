@@ -39,12 +39,6 @@ public class DockerHostResolver {
         this(config, containerDetector, null);
     }
 
-    /** Address on the selected workload network, independent of a Lambda hostname override. */
-    public Optional<String> resolveContainerIp() {
-        return containerDetector.isRunningInContainer() && currentContainerNetworkResolver != null
-                ? currentContainerNetworkResolver.resolveContainerIp() : Optional.empty();
-    }
-
     public String resolve() {
         Optional<String> override = config.services().lambda().dockerHostOverride();
         if (override.isPresent() && !override.get().isBlank()) {
@@ -53,11 +47,13 @@ public class DockerHostResolver {
         }
 
         if (containerDetector.isRunningInContainer()) {
-            Optional<String> currentNetworkIp = resolveContainerIp();
-            if (currentNetworkIp.isPresent()) {
-                LOG.infov("Running in Docker — using current network IP for Runtime API: {0}",
-                        currentNetworkIp.get());
-                return currentNetworkIp.get();
+            if (currentContainerNetworkResolver != null) {
+                Optional<String> currentNetworkIp = currentContainerNetworkResolver.resolveContainerIp();
+                if (currentNetworkIp.isPresent()) {
+                    LOG.infov("Running in Docker — using current network IP for Runtime API: {0}",
+                            currentNetworkIp.get());
+                    return currentNetworkIp.get();
+                }
             }
 
             // Use this container's own IP so Lambda containers on the same network

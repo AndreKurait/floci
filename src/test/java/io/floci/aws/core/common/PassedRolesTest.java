@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.floci.aws.core.common.PassedRoles.PassedRole;
+import io.floci.aws.testing.MockQueryRequests;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import org.junit.jupiter.api.Test;
@@ -223,6 +224,14 @@ class PassedRolesTest {
         String eks = "eks.amazonaws.com";
         assertEquals(List.of(passed("cluster", eks)), PassedRoles.of("eks:CreateCluster",
                 json("{\"name\":\"c\",\"roleArn\":\"" + ROLES + "cluster\"}"), LOOKUPS));
+        // EKS Auto Mode's node role is the one its EC2 Managed Instances run as, passed to EC2.
+        String autoMode = "{\"computeConfig\":{\"enabled\":true,\"nodePools\":[\"general-purpose\"],\"nodeRoleArn\":\""
+                + ROLES + "auto-node\"}}";
+        assertEquals(List.of(passed("auto-node", EC2), passed("cluster", eks)), PassedRoles.of("eks:CreateCluster",
+                json(autoMode.replace("{\"computeConfig\"", "{\"roleArn\":\"" + ROLES + "cluster\",\"computeConfig\"")),
+                LOOKUPS));
+        assertEquals(List.of(passed("auto-node", EC2)), PassedRoles.of("eks:UpdateClusterConfig", json(autoMode),
+                LOOKUPS));
         assertEquals(List.of(passed("node", eks)), PassedRoles.of("eks:CreateNodegroup",
                 json("{\"nodeRole\":\"" + ROLES + "node\"}"), LOOKUPS));
         assertEquals(List.of(passed("fargate", eks)), PassedRoles.of("eks:CreateFargateProfile",
@@ -232,7 +241,7 @@ class PassedRolesTest {
                  {"serviceAccount":"a","roleArn":"%1$spod-a"},{"serviceAccount":"b","roleArn":"%1$spod-b"}]}"""
                 .formatted(ROLES);
         for (String action : List.of("eks:CreateAddon", "eks:UpdateAddon")) {
-            assertEquals(List.of(passed("addon", eks), passed("pod-a", eks), passed("pod-b", eks)),
+            assertEquals(List.of(passed("pod-a", eks), passed("pod-b", eks), passed("addon", eks)),
                     PassedRoles.of(action, json(addon), LOOKUPS));
         }
         // The association's role goes to Pod Identity; its target role is assumed with it, not passed.
@@ -692,6 +701,36 @@ class PassedRolesTest {
                 json("{\"name\":\"p\",\"serviceRole\":\"app-role\"}"), LOOKUPS));
     }
 
+    @Test
+    void anXmlBodyPassesTheRolesItsModeledMembersName() {
+        // S3's PutBucketReplication, authorized as s3:PutReplicationConfiguration, passes its configuration's Role.
+        assertEquals(List.of(passed("replication", "s3.amazonaws.com")), PassedRoles.of("s3:PutBucketReplication",
+                xml("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                        + "<ReplicationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Role>" + ROLES
+                        + "replication</Role><Rule><Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::dest"
+                        + "</Bucket></Destination></Rule></ReplicationConfiguration>"), LOOKUPS));
+        // S3 Access Grants' location role, which the Service Reference passes to no named service.
+        assertEquals(List.of(new PassedRole(ROLES + "grants", null)), PassedRoles.of("s3:CreateAccessGrantsLocation",
+                xml("<CreateAccessGrantsLocationRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">"
+                        + "<LocationScope>s3://</LocationScope><IAMRoleArn>" + ROLES + "grants</IAMRoleArn>"
+                        + "</CreateAccessGrantsLocationRequest>"), LOOKUPS));
+        // A form type on a request another protocol's route takes, which is no Query request, leaves its XML read.
+        ContainerRequestContext asForm = request("application/x-www-form-urlencoded", ("<ReplicationConfiguration>"
+                + "<Role>" + ROLES + "replication</Role></ReplicationConfiguration>").getBytes(StandardCharsets.UTF_8));
+        when(asForm.getMethod()).thenReturn("PUT");
+        assertEquals(List.of(passed("replication", "s3.amazonaws.com")),
+                PassedRoles.of("s3:PutBucketReplication", asForm, LOOKUPS));
+        // A role set off by whitespace is the role, as S3 takes it.
+        assertEquals(List.of(passed("replication", "s3.amazonaws.com")), PassedRoles.of("s3:PutBucketReplication",
+                xml("<ReplicationConfiguration>\n  <Role>\n    " + ROLES + "replication\n  </Role>\n"
+                        + "</ReplicationConfiguration>"), LOOKUPS));
+        // A Role inside a rule is no member of the configuration, and a body that does not parse names none.
+        assertEquals(List.of(), PassedRoles.of("s3:PutBucketReplication", xml("<ReplicationConfiguration><Rule><Role>"
+                + ROLES + "nested</Role></Rule></ReplicationConfiguration>"), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("s3:PutBucketReplication",
+                xml("<ReplicationConfiguration><Role>" + ROLES + "replication"), LOOKUPS));
+    }
+
     private static String constraint(String type, String parameters) {
         return "{\"PortfolioId\":\"port\",\"ProductId\":\"prod\",\"Type\":\"" + type + "\",\"Parameters\":\""
                 + parameters + "\"}";
@@ -703,6 +742,10 @@ class PassedRolesTest {
 
     private static ContainerRequestContext json(String body) {
         return request("application/x-amz-json-1.1", body.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static ContainerRequestContext xml(String body) {
+        return request("application/xml", body.getBytes(StandardCharsets.UTF_8));
     }
 
     private static ContainerRequestContext cbor(String body) throws IOException {
@@ -721,7 +764,8 @@ class PassedRolesTest {
     }
 
     private static ContainerRequestContext form(String body) {
-        return request("application/x-www-form-urlencoded", body.getBytes(StandardCharsets.UTF_8));
+        return MockQueryRequests.postedToRoot(request("application/x-www-form-urlencoded",
+                body.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static ContainerRequestContext request(String mediaType, byte[] body) {

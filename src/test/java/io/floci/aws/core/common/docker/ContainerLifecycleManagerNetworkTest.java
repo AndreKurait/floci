@@ -204,38 +204,6 @@ class ContainerLifecycleManagerNetworkTest {
     }
 
     @Test
-    void protectedNamespaceWithPublishedPortsNeverUsesTheDefaultBridge() {
-        EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class);
-        EmulatorConfig.VpcRoutingConfig routing = mock(EmulatorConfig.VpcRoutingConfig.class);
-        when(config.network()).thenReturn(network);
-        when(network.vpcRouting()).thenReturn(routing);
-        when(routing.enabled()).thenReturn(true);
-        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
-        when(inspectOf("container-id").getNetworkSettings()).thenReturn(mock(NetworkSettings.class));
-
-        manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of(),
-                Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true")));
-
-        assertEquals("floci-net", createdHostConfig().getNetworkMode());
-        verify(connectCmd, never()).exec();
-        verify(dockerClient, never()).infoCmd();
-    }
-
-    @Test
-    void protectedNamespaceKeepsDesktopPortPublishingWhenNativeRoutingIsDisabled() {
-        daemonRuns("Docker Desktop");
-        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
-        when(inspectOf("container-id").getNetworkSettings()).thenReturn(mock(NetworkSettings.class));
-
-        manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of(),
-                Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true")));
-
-        assertNull(createdHostConfig().getNetworkMode());
-        verify(connectCmd).withNetworkId("floci-net");
-        verify(connectCmd).exec();
-    }
-
-    @Test
     void createAndStartStillConnectsAPublishingContainerWhenTheDaemonAnswersOnlyAfterCreate() {
         InfoCmd infoCmd = mock(InfoCmd.class);
         Info info = mock(Info.class);
@@ -679,14 +647,9 @@ class ContainerLifecycleManagerNetworkTest {
 
     private static ContainerSpec spec(String networkMode, Map<Integer, Integer> portBindings,
                                       List<Integer> exposedPorts) {
-        return spec(networkMode, portBindings, exposedPorts, Map.of());
-    }
-
-    private static ContainerSpec spec(String networkMode, Map<Integer, Integer> portBindings,
-                                      List<Integer> exposedPorts, Map<String, String> labels) {
         return new ContainerSpec(
                 "busybox:stable", "probe", List.of(), null, null, null, portBindings, List.of(),
-                exposedPorts, networkMode, List.of(), List.of(), List.of(), List.of(), labels, null,
+                exposedPorts, networkMode, List.of(), List.of(), List.of(), List.of(), Map.of(), null,
                 false, null, List.of(), null, null, List.of(), List.of(), null, null, false,
                 List.of(), Map.of(), false);
     }

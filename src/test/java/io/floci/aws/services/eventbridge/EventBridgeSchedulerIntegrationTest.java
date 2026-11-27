@@ -340,11 +340,7 @@ class EventBridgeSchedulerIntegrationTest {
             public DnsConfig dns() {
                 return new DnsConfig() {
                     @Override
-                    public Optional<String> listenAddress() { return Optional.empty(); }
-                    @Override
                     public Optional<List<String>> extraSuffixes() { return Optional.empty(); }
-                    @Override
-                    public Optional<List<String>> authoritativeSuffixes() { return Optional.empty(); }
                     @Override
                     public boolean containerFallbackEnabled() { return true; }
                     @Override
@@ -384,7 +380,6 @@ class EventBridgeSchedulerIntegrationTest {
                     @Override public Optional<String> certPath() { return Optional.empty(); }
                     @Override public Optional<String> keyPath() { return Optional.empty(); }
                     @Override public Optional<String> extraCaPath() { return Optional.empty(); }
-                    @Override public Optional<String> extraCaCerts() { return Optional.empty(); }
                     @Override public boolean selfSigned() { return true; }
                     @Override public int awsHttpsPort() { return 443; }
                 };

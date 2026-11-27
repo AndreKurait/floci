@@ -18,7 +18,6 @@ import jakarta.inject.Inject;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -236,7 +235,6 @@ public class ContainerBuilder {
         private Long memoryBytes;
         private Long nanoCpus;
         private Integer cpuShares;
-        private final Map<String, ContainerSpec.ResourceLimit> ulimits = new HashMap<>();
         private boolean readonlyRootfs;
         private boolean init;
         private final Map<Integer, Integer> portBindings = new HashMap<>();
@@ -259,7 +257,6 @@ public class ContainerBuilder {
         private final List<String> linkLocalIps = new ArrayList<>();
         private final List<DeviceRequest> deviceRequests = new ArrayList<>();
         private final List<String> capAdd = new ArrayList<>();
-        private final Map<String, String> networkSysctls = new LinkedHashMap<>();
         private final List<String> capDrop = new ArrayList<>();
         private final List<Device> devices = new ArrayList<>();
         private Long shmSizeBytes;
@@ -362,15 +359,6 @@ public class ContainerBuilder {
          */
         public Builder withMemoryBytes(long memoryBytes) {
             this.memoryBytes = memoryBytes;
-            return this;
-        }
-
-        /** Sets one process resource limit without changing the daemon's defaults for other limits. */
-        public Builder withUlimit(String name, long soft, long hard) {
-            if (name == null || !name.matches("[a-z][a-z0-9]*")) {
-                throw new IllegalArgumentException("Invalid container resource limit name: " + name);
-            }
-            ulimits.put(name, new ContainerSpec.ResourceLimit(soft, hard));
             return this;
         }
 
@@ -798,11 +786,6 @@ public class ContainerBuilder {
             return this;
         }
 
-        public Builder withNetworkSysctl(String name, String value) {
-            this.networkSysctls.put(name, value);
-            return this;
-        }
-
         /**
          * Drops a capability from the daemon's default set ({@code --cap-drop}), named without the
          * {@code CAP_} prefix, or {@code ALL}.
@@ -954,11 +937,10 @@ public class ContainerBuilder {
                     Map.copyOf(portBindingHostIps),
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
-                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, networkSysctls),
+                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness),
                     javaTrustStore,
                     dnsName,
-                    List.copyOf(joinedNetworks),
-                    Map.copyOf(ulimits)
+                    List.copyOf(joinedNetworks)
             );
         }
     }
