@@ -77,6 +77,7 @@ import io.floci.aws.services.ec2.model.PrefixList;
 import io.floci.aws.services.ec2.model.PrefixListEntry;
 import io.floci.aws.services.ec2.model.PrefixListId;
 import io.floci.aws.services.ec2.model.ReferencedSecurityGroup;
+import io.floci.aws.services.ec2.model.ReplaceRootVolumeTask;
 import io.floci.aws.services.ec2.model.Reservation;
 import io.floci.aws.services.ec2.model.Route;
 import io.floci.aws.services.ec2.model.RouteTable;
@@ -338,6 +339,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final StorageBackend<String, Instance> instances;
     private final StorageBackend<String, Volume> volumes;
     private final StorageBackend<String, VolumeModification> volumeModifications;
+    /**
+     * Not final: the StorageFactory constructor replaces this in-memory default after delegating, so the
+     * many package-private test constructors keep their signatures.
+     */
+    private StorageBackend<String, ReplaceRootVolumeTask> replaceRootVolumeTasks = new InMemoryStorage<>();
     private final StorageBackend<String, Image> registeredImages;
     private final StorageBackend<String, Snapshot> snapshots;
     private final StorageBackend<String, LaunchTemplate> launchTemplates;
@@ -921,6 +927,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 new Ec2RunInstancesReplay(storageFactory),
                 storageFactory.create("ec2", "ec2-instance-connect-endpoints.json",
                         new TypeReference<Map<String, InstanceConnectEndpoint>>() {}));
+        this.replaceRootVolumeTasks = storageFactory.create("ec2", "ec2-replace-root-volume-tasks.json",
+                new TypeReference<Map<String, ReplaceRootVolumeTask>>() {});
     }
 
     // Package-private for hermetic tests (pass in-memory or temp-dir-backed StorageBackends directly).
@@ -7461,6 +7469,294 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         () -> synchronizeRuntimeInterfaceAddresses(accountId, region, inst));
             }
         }
+    }
+
+    // ─── Root volume replacement ───────────────────────────────────────────────
+
+    private static final Set<String> REPLACE_ROOT_VOLUME_TASK_FILTERS = Set.of("instance-id");
+    private static final Set<String> ACTIVE_REPLACE_ROOT_VOLUME_STATES = Set.of("pending", "in-progress");
+
+    /**
+     * Starts a root volume replacement, answering with the task in {@code pending}. The guest is
+     * recreated from the AMI's image, or from the instance's current one when only a snapshot or the
+     * launch state is restored, keeping the instance's id, interfaces, addresses, tags and data
+     * volumes. A failed task leaves the instance running on its old root.
+     */
+    public ReplaceRootVolumeTask createReplaceRootVolumeTask(String region, String instanceId, String imageId,
+                                                             String snapshotId, boolean deleteReplacedRootVolume,
+                                                             String clientToken, List<Tag> tags, boolean dryRun) {
+        return operationAdmission.call(() -> createReplaceRootVolumeTaskAdmitted(region, instanceId, imageId,
+                snapshotId, deleteReplacedRootVolume, clientToken, tags, dryRun));
+    }
+
+    private ReplaceRootVolumeTask createReplaceRootVolumeTaskAdmitted(String region, String instanceId,
+                                                                      String imageId, String snapshotId,
+                                                                      boolean deleteReplacedRootVolume,
+                                                                      String clientToken, List<Tag> tags,
+                                                                      boolean dryRun) {
+        ensureDefaultResources(region);
+        if (instanceId == null || instanceId.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceId", 400);
+        }
+        if (imageId != null && snapshotId != null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "You can specify either a snapshot ID or an AMI ID, but not both.", 400);
+        }
+        Instance inst = requireEc2ManagedInstance(region, instanceId, "replaced");
+        if (clientToken != null && !clientToken.isBlank()) {
+            Optional<ReplaceRootVolumeTask> replay = replaceRootVolumeTasks.scan(k -> k.startsWith(region + "::"))
+                    .stream().filter(task -> clientToken.equals(task.getClientToken())).findFirst();
+            if (replay.isPresent()) {
+                if (!instanceId.equals(replay.get().getInstanceId())
+                        || !Objects.equals(imageId, replay.get().getImageId())
+                        || !Objects.equals(snapshotId, replay.get().getSnapshotId())
+                        || deleteReplacedRootVolume
+                                != Boolean.TRUE.equals(replay.get().getDeleteReplacedRootVolume())) {
+                    throw new AwsException("IdempotentParameterMismatch",
+                            "The client token was already used with different parameters.", 400);
+                }
+                return replay.get();
+            }
+        }
+        if (!"running".equals(inst.getState().getName())) {
+            throw new AwsException("IncorrectInstanceState",
+                    "The instance '" + instanceId + "' is not in the running state.", 400);
+        }
+        boolean active = replaceRootVolumeTasks.scan(k -> k.startsWith(region + "::")).stream()
+                .anyMatch(task -> instanceId.equals(task.getInstanceId())
+                        && ACTIVE_REPLACE_ROOT_VOLUME_STATES.contains(task.getTaskState()));
+        if (active) {
+            throw new AwsException("IncorrectState",
+                    "A root volume replacement task is already in progress for instance '" + instanceId + "'.", 400);
+        }
+        if (snapshotId != null) {
+            requireFound(snapshots.get(key(region, snapshotId)).isPresent(),
+                    "InvalidSnapshot.NotFound", "The snapshot '" + snapshotId + "' does not exist.");
+        }
+        // shortcut: a snapshot restore recreates the guest from the instance's current image, since
+        // a snapshot holds no container file system here; upgrade when snapshots capture one.
+        String sourceImageId = imageId != null ? imageId : inst.getImageId();
+        ResolvedAmiImage image = config.services().ec2().mock() ? null
+                : resolveReplacementImage(region, sourceImageId);
+        if (dryRun) {
+            throw dryRunOperation();
+        }
+
+        ReplaceRootVolumeTask task = new ReplaceRootVolumeTask();
+        task.setReplaceRootVolumeTaskId("replacevol-" + Ec2Ids.randomHex(17));
+        task.setInstanceId(instanceId);
+        task.setTaskState("pending");
+        task.setStartTime(clock.instant());
+        task.setImageId(imageId);
+        task.setSnapshotId(snapshotId);
+        task.setDeleteReplacedRootVolume(deleteReplacedRootVolume);
+        task.setClientToken(clientToken == null || clientToken.isBlank() ? null : clientToken);
+        task.setRegion(region);
+        task.setTags(tags == null ? new ArrayList<>() : new ArrayList<>(tags));
+        String taskKey = key(region, task.getReplaceRootVolumeTaskId());
+        replaceRootVolumeTasks.put(taskKey, task);
+        ReplaceRootVolumeTask answer = copyOf(task);
+
+        String accountId = callerAccountId();
+        Runnable inProgress = () -> RequestScopes.runAs(accountId, region,
+                () -> updateReplaceRootVolumeTask(taskKey, "in-progress", null));
+        Runnable replaced = () -> RequestScopes.runAs(accountId, region, () -> {
+            if (imageId != null) {
+                // As AWS: DescribeInstances and IMDS report the new AMI once the task succeeds.
+                inst.setImageId(imageId);
+            }
+            instances.put(key(region, instanceId), inst);
+            if (!config.services().ec2().mock()) {
+                restoreAttachedVolumesForInstance(region, inst);
+                completeContainerStart(region, inst);
+            }
+            updateReplaceRootVolumeTask(taskKey, "succeeded", null);
+        });
+        Consumer<String> failed = reason -> RequestScopes.runAs(accountId, region,
+                () -> updateReplaceRootVolumeTask(taskKey, "failed", reason));
+        if (config.services().ec2().mock()) {
+            inProgress.run();
+            replaced.run();
+        } else {
+            String publicKey = null;
+            if (inst.getKeyName() != null) {
+                KeyPair keyPair = findKeyPair(region, inst.getKeyName());
+                publicKey = keyPair == null ? null : keyPair.getPublicKey();
+            }
+            containerManager.replaceRoot(inst, image, publicKey,
+                    () -> RequestScopes.callAs(accountId, region,
+                            () -> prepareReplacementMounts(region, inst, image.volumeMounts())),
+                    inProgress, replaced, failed);
+        }
+        return answer;
+    }
+
+    /**
+     * The data-volume mounts a replacement guest takes over. The new image's mounts are picked as
+     * RunInstances picks them: one per declared device the instance has a volume at, prepared on
+     * that volume's existing Docker volume and loop device. Every other mount the old guest holds is
+     * carried over unchanged, as a real root volume swap leaves non-root EBS volumes attached.
+     */
+    private List<Ec2VolumeBlockDeviceManager.PreparedMount> prepareReplacementMounts(
+            String region, Instance instance, List<Ec2ImageCatalog.VolumeMount> mappings) {
+        List<Volume> attached = volumes.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(volume -> volume != null && !volume.getVolumeId().equals(instance.getRootVolumeId()))
+                .filter(volume -> volume.getAttachments().stream()
+                        .anyMatch(attachment -> instance.getInstanceId().equals(attachment.getInstanceId())))
+                .toList();
+        List<Ec2ImageCatalog.VolumeMount> declared = new ArrayList<>();
+        for (Ec2ImageCatalog.VolumeMount mapping : mappings) {
+            List<Volume> matches = attached.stream().filter(volume -> volume.getAttachments().stream()
+                    .anyMatch(attachment -> instance.getInstanceId().equals(attachment.getInstanceId())
+                            && isSameDevice(mapping.device(), attachment.getDevice()))).toList();
+            boolean root = isSameDevice(mapping.device(), instance.getRootDeviceName());
+            // As at launch: a declared device with no volume gets no managed mount.
+            if (matches.isEmpty() && !root) {
+                continue;
+            }
+            if (root || matches.size() != 1 || matches.getFirst().getSnapshotId() != null
+                    && !matches.getFirst().getSnapshotId().isBlank()) {
+                throw replacementMountFailure("the new image's data-volume mount at " + mapping.device()
+                        + " needs one snapshot-free non-root volume attached there");
+            }
+            declared.add(mapping);
+        }
+        boolean retains = attached.stream().anyMatch(volume -> volume.getManagedFilesystem() != null);
+        if (declared.isEmpty() && !retains) {
+            return List.of();
+        }
+        if (volumeBlockDeviceManager == null || !callerAccountId().equals(instance.getOwnerId())
+                || !region.equals(instance.getRegion())) {
+            throw replacementMountFailure("its data volumes' owner cannot be resolved");
+        }
+        List<Ec2VolumeBlockDeviceManager.PreparedMount> prepared =
+                new ArrayList<>(prepareInstanceMounts(region, instance, declared));
+        for (Volume volume : attached) {
+            if (volume.getManagedFilesystem() == null) {
+                continue;
+            }
+            for (VolumeAttachment attachment : volume.getAttachments()) {
+                if (!instance.getInstanceId().equals(attachment.getInstanceId())
+                        || declared.stream().anyMatch(mapping -> isSameDevice(mapping.device(), attachment.getDevice()))) {
+                    continue;
+                }
+                // Empty for a raw-device guest; the post-replace hook attaches those volumes again.
+                Optional<Ec2VolumeBlockDeviceManager.PreparedMount> retained = withVolumeLock(volume.getVolumeId(),
+                        () -> volumeBlockDeviceManager.retainedMount(volume, instance, attachment.getDevice()));
+                retained.ifPresent(prepared::add);
+            }
+        }
+        for (int i = 0; i < prepared.size(); i++) {
+            Path first = Path.of(prepared.get(i).target()).normalize();
+            for (int j = i + 1; j < prepared.size(); j++) {
+                Path second = Path.of(prepared.get(j).target()).normalize();
+                if (first.startsWith(second) || second.startsWith(first)) {
+                    throw replacementMountFailure("the data-volume mount of " + prepared.get(i).volumeId()
+                            + " at " + first + " overlaps the mount of " + prepared.get(j).volumeId()
+                            + " at " + second);
+                }
+            }
+        }
+        return List.copyOf(prepared);
+    }
+
+    private static AwsException replacementMountFailure(String reason) {
+        return new AwsException("InternalError", "Its data volumes cannot be kept: " + reason, 500);
+    }
+
+    /** The image a replacement guest runs, resolved as RunInstances resolves the AMI it launches. */
+    private ResolvedAmiImage resolveReplacementImage(String region, String imageId) {
+        if (imageId == null || imageId.isBlank()) {
+            throw new AwsException("InvalidAMIID.NotFound", "The instance has no image to restore.", 400);
+        }
+        synchronized (imageRegistryLock) {
+            requireNotDeregistered(region, imageId);
+            Image image = imageForCaller(region, imageId).orElseGet(() -> sharedImageForCaller(region, imageId)
+                    .orElseGet(() -> imageCatalog.findByIdOrAlias(imageId)
+                            .map(Ec2ImageCatalog.CatalogImage::toImage).orElse(null)));
+            ResolvedAmiImage resolved = amiImageResolver.resolveImage(
+                    launchableImageForCaller(region, imageId, image));
+            String captured = capturedImageFor(region, imageId);
+            if (captured != null) {
+                resolved = new ResolvedAmiImage(captured, resolved.guestRuntime(), resolved.cloudInit(),
+                        resolved.dockerPlatform(), resolved.volumeMounts());
+            }
+            return resolved;
+        }
+    }
+
+    /** Moves an active task to {@code state}; a task that already ended keeps its outcome. */
+    private void updateReplaceRootVolumeTask(String taskKey, String state, String reason) {
+        synchronized (replaceRootVolumeTasks) {
+            ReplaceRootVolumeTask task = replaceRootVolumeTasks.get(taskKey).orElse(null);
+            if (task == null || !ACTIVE_REPLACE_ROOT_VOLUME_STATES.contains(task.getTaskState())) {
+                return;
+            }
+            task.setTaskState(state);
+            if ("succeeded".equals(state) || "failed".equals(state)) {
+                task.setCompleteTime(clock.instant());
+            }
+            if (reason != null) {
+                task.setFailureReason(reason);
+                LOG.warnv("Root volume replacement {0} for instance {1} failed: {2}",
+                        task.getReplaceRootVolumeTaskId(), task.getInstanceId(), reason);
+            }
+            replaceRootVolumeTasks.put(taskKey, task);
+        }
+    }
+
+    /**
+     * The caller's tasks in this region, by id and the {@code instance-id} filter, in task ID order.
+     * An unknown id is {@code InvalidReplaceRootVolumeTaskId.NotFound}, and {@code maxResults} is
+     * the model's 1 to 50.
+     */
+    public PaginatedResult<ReplaceRootVolumeTask> describeReplaceRootVolumeTasks(
+            String region, List<String> ids, List<Map.Entry<String, List<String>>> filters,
+            Integer maxResults, String nextToken) {
+        if (filters != null) {
+            requireSupportedFilters(filters.stream().map(Map.Entry::getKey).toList(),
+                    REPLACE_ROOT_VOLUME_TASK_FILTERS);
+        }
+        if (maxResults != null && (maxResults < 1 || maxResults > 50)) {
+            throw new AwsException("InvalidMaxResults",
+                    "Value (" + maxResults + ") for parameter MaxResults is invalid. "
+                            + "Expecting a value between 1 and 50.", 400);
+        }
+        for (String id : ids) {
+            if (replaceRootVolumeTasks.get(key(region, id)).isEmpty()) {
+                throw new AwsException("InvalidReplaceRootVolumeTaskId.NotFound",
+                        "The replace root volume task ID '" + id + "' does not exist.", 400);
+            }
+        }
+        List<ReplaceRootVolumeTask> matching = replaceRootVolumeTasks.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(task -> ids.isEmpty() || ids.contains(task.getReplaceRootVolumeTaskId()))
+                .filter(task -> filters == null || filters.stream().allMatch(filter ->
+                        !"instance-id".equals(filter.getKey()) || filter.getValue().contains(task.getInstanceId())))
+                .map(Ec2Service::copyOf)
+                .sorted(Comparator.comparing(ReplaceRootVolumeTask::getReplaceRootVolumeTaskId))
+                .collect(Collectors.toList());
+        return Pagination.paginate(matching, ReplaceRootVolumeTask::getReplaceRootVolumeTaskId,
+                maxResults == null ? Integer.MAX_VALUE : maxResults, nextToken, "replacevol",
+                token -> new AwsException("InvalidParameterValue", "Invalid NextToken", 400));
+    }
+
+    /** A snapshot of the task, so a response is not rewritten by the worker while it is serialized. */
+    private static ReplaceRootVolumeTask copyOf(ReplaceRootVolumeTask task) {
+        ReplaceRootVolumeTask copy = new ReplaceRootVolumeTask();
+        copy.setReplaceRootVolumeTaskId(task.getReplaceRootVolumeTaskId());
+        copy.setInstanceId(task.getInstanceId());
+        copy.setTaskState(task.getTaskState());
+        copy.setStartTime(task.getStartTime());
+        copy.setCompleteTime(task.getCompleteTime());
+        copy.setImageId(task.getImageId());
+        copy.setSnapshotId(task.getSnapshotId());
+        copy.setDeleteReplacedRootVolume(task.getDeleteReplacedRootVolume());
+        copy.setClientToken(task.getClientToken());
+        copy.setFailureReason(task.getFailureReason());
+        copy.setRegion(task.getRegion());
+        copy.setTags(new ArrayList<>(task.getTags()));
+        return copy;
     }
 
     public void pruneTerminatedInstances() {
