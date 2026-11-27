@@ -1690,6 +1690,19 @@ class ResourceArnBuilderTest {
         assertEquals(List.of("*"), kms(backed, "RetireGrant"));
     }
 
+    @Test
+    void aKnownKmsGrantTokenNamesItsStoredKeyBeforeOtherSelectors() {
+        KmsService kms = mock(KmsService.class);
+        when(kms.findGrantKeyArn("known-token", null, "us-east-1")).thenReturn(Optional.of(KMS_KEY_ARN));
+        ResourceArnBuilder backed = backedBy(kms);
+        setJsonBody("{\"GrantToken\":\"known-token\"}");
+        assertEquals(List.of(KMS_KEY_ARN), kms(backed, "RetireGrant"));
+        setJsonBody("{\"GrantToken\":\"known-token\",\"KeyId\":\"other-key\",\"GrantId\":\"other-grant\"}");
+        assertEquals(List.of(KMS_KEY_ARN), kms(backed, "RetireGrant"));
+        setJsonBody("{\"GrantToken\":\"unknown-token\"}");
+        assertEquals(List.of("*"), kms(backed, "RetireGrant"));
+    }
+
     // ── SSM ──────────────────────────────────────────────────────────────────────
 
     @Test

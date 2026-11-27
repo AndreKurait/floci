@@ -1,8 +1,10 @@
 package io.floci.aws.services.s3;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import io.restassured.config.DecoderConfig;
 import io.restassured.config.RestAssuredConfig;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -14,6 +16,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -26,6 +29,29 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class S3IntegrationTest {
+    private static String wrappingKey;
+    private static int wrappingKeyPort;
+
+    private static String kmsFixtureKey() {
+        if (wrappingKey == null) {
+            wrappingKeyPort = RestAssured.port;
+            wrappingKey = given().contentType("application/x-amz-json-1.1")
+                    .header("X-Amz-Target", "TrentService.CreateKey").body("{}".getBytes(StandardCharsets.UTF_8))
+                    .post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        }
+        return wrappingKey;
+    }
+
+    @AfterAll
+    static void removeWrappingKey() {
+        if (wrappingKey != null) {
+            given().port(wrappingKeyPort).contentType("application/x-amz-json-1.1")
+                    .header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                    .body(("{\"KeyId\":\"" + wrappingKey + "\",\"PendingWindowInDays\":7}").getBytes(StandardCharsets.UTF_8))
+                    .post("/").then().statusCode(200);
+        }
+    }
+
     private static final String SSE_CUSTOMER_KEY = Base64.getEncoder().encodeToString("0123456789abcdef0123456789abcdef".getBytes(StandardCharsets.UTF_8));
     private static final String SSE_CUSTOMER_KEY_MD5 = customerKeyMd5(SSE_CUSTOMER_KEY);
     private static final String WRONG_SSE_CUSTOMER_KEY = Base64.getEncoder().encodeToString("abcdef0123456789abcdef0123456789".getBytes(StandardCharsets.UTF_8));
@@ -2153,7 +2179,7 @@ class S3IntegrationTest {
             .header("ETag", notNullValue())
             .header("x-amz-server-side-encryption", equalTo("AES256"));
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
             .contentType("text/plain")
             .header("x-amz-server-side-encryption", "aws:kms")
@@ -2223,7 +2249,7 @@ class S3IntegrationTest {
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
         .when()
             .get("/sse-bucket/kms-encrypted.txt")
@@ -2251,7 +2277,7 @@ class S3IntegrationTest {
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
         .when()
             .head("/sse-bucket/kms-encrypted.txt")
@@ -2302,7 +2328,7 @@ class S3IntegrationTest {
             .header("x-amz-server-side-encryption", equalTo("AES256"))
             .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
             .header("x-amz-copy-source", "/sse-bucket/encrypted.txt")
             .header("x-amz-server-side-encryption", "aws:kms")
