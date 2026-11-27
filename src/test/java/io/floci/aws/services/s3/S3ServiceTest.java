@@ -505,6 +505,29 @@ class S3ServiceTest {
     }
 
     @Test
+    void bucketStoredWithoutARegionIsInTheDefaultRegion() {
+        // A bucket persisted before buckets recorded their Region is in the default one, as
+        // ListBuckets reports it, so the region redirect still applies to it.
+        InMemoryStorage<String, Bucket> bucketStore = new InMemoryStorage<>();
+        S3Service service = new S3Service(bucketStore, new InMemoryStorage<>(), tempDir.resolve("legacy-region"),
+                false, (LambdaService) null, new RegionResolver("eu-west-2", "000000000000"));
+        Bucket unrecorded = new Bucket("legacy-null-region");
+        unrecorded.setRegion(null);
+        bucketStore.put(unrecorded.getName(), unrecorded);
+        Bucket blank = new Bucket("legacy-blank-region");
+        blank.setRegion("");
+        bucketStore.put(blank.getName(), blank);
+        Bucket recorded = new Bucket("recorded-region");
+        recorded.setRegion("ap-south-1");
+        bucketStore.put(recorded.getName(), recorded);
+
+        assertEquals(Optional.of("eu-west-2"), service.findBucketRegion("legacy-null-region"));
+        assertEquals(Optional.of("eu-west-2"), service.findBucketRegion("legacy-blank-region"));
+        assertEquals(Optional.of("ap-south-1"), service.findBucketRegion("recorded-region"));
+        assertEquals(Optional.empty(), service.findBucketRegion("no-such-bucket"));
+    }
+
+    @Test
     void listBucketsWithoutPaginationParametersReturnsMoreThanTenThousandBucketsOnOnePage() {
         InMemoryStorage<String, Bucket> bucketStore = new InMemoryStorage<>();
         S3Service service = new S3Service(bucketStore, new InMemoryStorage<>(), tempDir.resolve("many-s3"), false);
