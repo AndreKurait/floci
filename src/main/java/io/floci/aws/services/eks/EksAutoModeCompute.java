@@ -106,13 +106,8 @@ public class EksAutoModeCompute implements EksAutoModeCleanup {
 
     @Inject
     public EksAutoModeCompute(EksService eksService, EksClusterManager clusterManager, Ec2Service ec2,
-                              IamService iam, Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config) {
-        this(eksService, clusterManager, ec2, iam, instanceTypes, config, Clock.systemUTC());
-    }
-
-    /** As above; with the {@code clock} empty nodes are timed by. */
-    EksAutoModeCompute(EksService eksService, EksClusterManager clusterManager, Ec2Service ec2, IamService iam,
-                       Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config, Clock clock) {
+                              IamService iam, Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config,
+                              Clock clock) {
         this.eksService = eksService;
         this.clusterManager = clusterManager;
         this.ec2 = ec2;
