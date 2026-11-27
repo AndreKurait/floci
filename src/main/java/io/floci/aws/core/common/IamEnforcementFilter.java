@@ -26,6 +26,7 @@ import io.floci.aws.services.iam.ResourcePolicyProviders;
 import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.S3ObjectActions;
 import io.floci.aws.services.s3.S3ScratchSpace;
 import io.floci.aws.services.s3.S3Service;
@@ -629,8 +630,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 region, accountId, akid)) {
             return;
         }
-        if (abortIfRolePassDenied(ctx, caller, principal, callerArns.orElse(null), action, credentialScope,
-                region, accountId, akid)) {
+        if (abortIfRolePassDenied(ctx, caller, principal, callerArns.orElse(null), action,
+                resolvedOperation.operation(), credentialScope, region, accountId, akid)) {
             return;
         }
         if (abortIfConnectorPassDenied(ctx, caller, callerArns.orElse(null), resolvedOperation.operation(),
@@ -967,13 +968,15 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * service, when AWS's Service Reference names one, and the keys that say who is calling, which
      * {@code callerArns} writes when it is known. What a request names that holds roles, an instance
      * profile, a launch template or a task definition, is looked up in the request's account, as the
-     * service resolves it; one that does not exist passes nothing, and the operation reports it. Returns
-     * true when the request was aborted.
+     * service resolves it; one that does not exist passes nothing, and the operation reports it. The roles are
+     * read for the request's {@code operation}, which the table of passed roles is keyed by, as AWS's Service
+     * Reference lists it: S3's {@code PutBucketReplication} is authorized as {@code s3:PutReplicationConfiguration}.
+     * Returns true when the request was aborted.
      */
     private boolean abortIfRolePassDenied(ContainerRequestContext ctx, CallerContext caller, RequestPrincipal principal,
-                                          CallerArns callerArns, String action, String credentialScope,
-                                          String region, String accountId, String akid) {
-        for (PassedRoles.PassedRole passed : PassedRoles.of(action, ctx, lookupsFor(accountId, region))) {
+                                          CallerArns callerArns, String action, String operation,
+                                          String credentialScope, String region, String accountId, String akid) {
+        for (PassedRoles.PassedRole passed : PassedRoles.of(operation, ctx, lookupsFor(accountId, region))) {
             Map<String, List<String>> context = new HashMap<>();
             if (callerArns != null) {
                 callerArns.putPrincipalKeys(context);
@@ -1273,9 +1276,17 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                         taggedContext, resource, region, accountId, resourceOwnerAccountId, action);
                 ResourcePolicyDecision resourcePolicyDecision = evaluator.evaluateResourcePolicyFor(
                         effectiveResourcePolicies, principal, action, resource, effectiveContext);
+                if (resourcePolicyDecision == ResourcePolicyDecision.NEUTRAL
+                        && resourcePolicies.stream().anyMatch(ResourcePolicyProvider.ResourcePolicy::grantRequired)) {
+                    resourcePolicyDecision = ResourcePolicyDecision.EXPLICIT_DENY;
+                }
                 Decision decision = evaluator.evaluateResolvedResourcePolicy(
                         caller, resourcePolicyDecision, accountRelationship, action, resource, effectiveContext);
                 if (decision != Decision.DENY) {
+                    continue;
+                }
+                if (grantDecidesForeignKmsKey(credentialScope, action, resource, accountId)
+                        && !evaluator.deniesKmsGrant(caller, resourcePolicyDecision, action, resource, effectiveContext)) {
                     continue;
                 }
                 LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
@@ -1298,6 +1309,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
         }
         return false;
+    }
+
+    /**
+     * A KMS operation a grant can admit, on another account's key. KMS authorizes such a request
+     * through the key's grants, which need no identity policy in the caller's account: "users and
+     * roles in the external account cannot use the KMS key until you attach IAM policies that
+     * delegate those permissions, or use grants to manage access to the KMS key" (KMS Developer
+     * Guide, key-policy-modifying-external-accounts). The KMS handler checks the grant where the key
+     * lives and refuses without one; explicit denies are checked here and still win.
+     */
+    private static boolean grantDecidesForeignKmsKey(String credentialScope, String action, String resource,
+                                                     String accountId) {
+        if (!"kms".equals(credentialScope) || action == null || !action.startsWith("kms:")
+                || !KmsService.GRANT_ACTIONS.contains(action.substring("kms:".length()))
+                || resource == null || !AwsArnUtils.isArnFor(resource, "kms")) {
+            return false;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resource);
+        return arn.resource().startsWith("key/") && !arn.accountId().equals(accountId);
     }
 
     /** The same contexts with every object-tag key removed, keeping the principal and global keys. */
@@ -1350,6 +1380,21 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      */
     public void authorizeAdditionalResource(String authorizationHeader, String action, String resource) {
         authorizeAdditionalResource(authorizationHeader, action, resource, null, null);
+    }
+
+    /** Authorizes a service's delegated operation as the already authenticated request caller. */
+    public void authorizeDelegatedResource(String action, String resource,
+                                           Map<String, List<String>> conditions) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return;
+        }
+        String accessKey = requestContext.getAccessKeyId();
+        if (accessKey == null) {
+            throw new AwsException("AccessDenied", "A delegated operation requires an authenticated caller.", 403);
+        }
+        String scope = catalog.canonicalCredentialScope(action.split(":", 2)[0]);
+        authorizeResolvedAdditionalResource(accessKey, scope, requestContext.getAccountId(), action, resource,
+                null, null, null, null, conditions, null, true);
     }
 
     /**
@@ -1475,6 +1520,17 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         String credentialScope = catalog.canonicalCredentialScope(rawScope);
 
         String accountId = resolveCredentialAccountId(akid, authorizationHeader);
+        authorizeResolvedAdditionalResource(akid, credentialScope, accountId, action, resource,
+                resourcePolicyDecision, resourceOwnerAccountId, null, deniedEvent,
+                requestConditions, null, false);
+    }
+
+    private void authorizeResolvedAdditionalResource(
+            String akid, String credentialScope, String accountId, String action, String resource,
+            ResourcePolicyDecision resourcePolicyDecision, String resourceOwnerAccountId,
+            Map<String, List<String>> authenticationConditions, DeniedEvent deniedEvent,
+            Map<String, List<String>> requestConditions, List<String> providedPolicyDocuments,
+            boolean authenticatedDelegation) {
         String previousAccountId = requestContext.getAccountId();
         requestContext.setAccountId(accountId);
         try {
@@ -1485,7 +1541,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             // policies, and resolveCallerContext would delete an expired session, which would then
             // read as a key that exists nowhere. For a second resource of a request filter() has
             // authorized, the key has already passed these checks.
-            boolean accountRootKey = akid.equals(accountId);
+            boolean accountRootKey = akid.equals(accountId)
+                    || (authenticatedDelegation && "test".equals(akid));
             if (!accountRootKey && iamService.isInactiveAccessKey(akid)) {
                 throw unrecognizedClientException(credentialScope);
             }
@@ -1505,8 +1562,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             // no action maps the route. For both, S3's own request authentication refuses an
             // unknown key when S3 auth enforcement is on; with it off, the request proceeds as an
             // unsigned one would.
-            Caller caller = callerOf(akid, accountId, now);
+            Caller caller = callerOf(akid, accountId, now, authenticatedDelegation);
             if (caller == null) {
+                if (authenticatedDelegation) {
+                    throw unrecognizedClientException(credentialScope);
+                }
                 return;
             }
 
@@ -1647,12 +1707,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * a key IAM holds nothing for and has nothing else to check it against.
      */
     private Caller callerOf(String akid, String accountId, Instant now) {
+        return callerOf(akid, accountId, now, false);
+    }
+
+    private Caller callerOf(String akid, String accountId, Instant now, boolean authenticatedDelegation) {
         List<List<String>> scpLevels = scpProvider.isResolvable()
                 ? scpProvider.get().effectiveScpLevels(accountId) : null;
+        boolean accountRootKey = akid.equals(accountId)
+                || (authenticatedDelegation && "test".equals(akid));
         boolean accountRootPrincipal = false;
         CallerContext caller = iamService.resolveCallerContext(akid, now);
         if (caller == null) {
-            if (scpLevels == null || !akid.equals(accountId)) {
+            if (!accountRootKey || (scpLevels == null && !authenticatedDelegation)) {
                 return null;
             }
             caller = CallerContext.of(List.of(ROOT_ALLOW_ALL));
@@ -1682,6 +1748,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         ResourcePolicyDecision effectiveDecision = resourcePolicyDecision;
         String effectiveOwnerAccountId = resourceOwnerAccountId;
         List<String> policyDocs = null;
+        boolean resourceGrantRequired = false;
         if (effectiveDecision == null) {
             // Resource policies belong to the service that owns the resource, which is the action's
             // service, not whichever service the caller signed for. filter() picks them by the route's
@@ -1690,6 +1757,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String resourcePolicyScope = catalog.canonicalCredentialScope(action.split(":", 2)[0]);
             List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies = resolveResourcePolicies(
                     resourcePolicyScope, action, resource);
+            resourceGrantRequired = resourcePolicies.stream()
+                    .anyMatch(ResourcePolicyProvider.ResourcePolicy::grantRequired);
             effectiveOwnerAccountId = resourcePolicies.isEmpty()
                     ? null : resourcePolicies.getFirst().ownerAccountId();
             policyDocs = resourcePolicies.stream()
@@ -1709,6 +1778,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || accountId.equals(effectiveOwnerAccountId)
                 ? ResourceAccountRelationship.SAME_ACCOUNT
                 : ResourceAccountRelationship.CROSS_ACCOUNT;
+        if (resourceGrantRequired && effectiveDecision == ResourcePolicyDecision.NEUTRAL) {
+            effectiveDecision = ResourcePolicyDecision.EXPLICIT_DENY;
+        }
         Decision decision = evaluator.evaluateResolvedResourcePolicy(
                 caller.context(), effectiveDecision, accountRelationship,
                 action, resource, effectiveContext);

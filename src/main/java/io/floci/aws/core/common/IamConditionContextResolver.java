@@ -16,6 +16,7 @@ import io.floci.aws.services.iam.IamActionRegistry;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
+import io.floci.aws.services.kms.KmsGrantConditions;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
 import io.floci.aws.services.s3.S3ConditionKeys;
@@ -307,10 +308,49 @@ public class IamConditionContextResolver {
         return null;
     }
 
+    private Map<String, List<String>> kmsConditionContext(ContainerRequestContext ctx, String action) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        String account = requestContext.getAccountId();
+        if (account != null) {
+            conditions.put("kms:CallerAccount", List.of(account));
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if ("kms:RetireGrant".equals(action)) {
+            conditions.putAll(KmsGrantConditions.retirementContext(body));
+            return conditions;
+        }
+        if ("kms:CreateGrant".equals(action)) {
+            conditions.putAll(KmsGrantConditions.requestContext(body));
+            return conditions;
+        }
+        String member = switch (action) {
+            case "kms:ReEncryptFrom" -> "SourceEncryptionContext";
+            case "kms:ReEncryptTo" -> "DestinationEncryptionContext";
+            default -> "EncryptionContext";
+        };
+        if (body == null || !body.path(member).isObject()) {
+            return conditions;
+        }
+        List<String> keys = new ArrayList<>();
+        body.path(member).properties().forEach(entry -> {
+            if (entry.getValue().isTextual()) {
+                keys.add(entry.getKey());
+                conditions.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue().textValue()));
+                conditions.put(KmsGrantConditions.encryptionContextKey(entry.getKey()),
+                        List.of(entry.getValue().textValue()));
+            }
+        });
+        if (!keys.isEmpty()) {
+            conditions.put("kms:EncryptionContextKeys", keys);
+        }
+        return conditions;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
+            case "kms" -> kmsConditionContext(ctx, action);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
@@ -784,7 +824,8 @@ public class IamConditionContextResolver {
                 && s3UploadEncryptionConditionContext(ctx) == null && s3Service.isResolvable();
     }
 
-    private static String bodyText(ContainerRequestContext ctx) {
+    /** The request's body as UTF-8 text, buffered once and restored for its handler; null when it has none. */
+    static String bodyText(ContainerRequestContext ctx) {
         byte[] body = bufferEntity(ctx);
         return body == null ? null : new String(body, StandardCharsets.UTF_8);
     }
@@ -1236,8 +1277,9 @@ public class IamConditionContextResolver {
     }
 
     /**
-     * The decoded form parameters of a Query-protocol request, buffered once per request and
-     * restored for the controller that reads the form next. A repeated key keeps its first
+     * The decoded form parameters of a Query-protocol request, one the Query controller dispatches
+     * ({@link IamActionRegistry#isQueryRequest}), buffered once per request and restored for the
+     * controller that reads the form next; none for any other request. A repeated key keeps its first
      * value, which is the value the Query handlers read through {@code getFirst}, so the
      * resource this context describes is the resource the handler acts on.
      */
@@ -1255,16 +1297,17 @@ public class IamConditionContextResolver {
             });
             return parameters;
         }
+        // Only a request the Query controller dispatches carries its members as a form. Another protocol's handler
+        // reads its own body (S3's XML, a REST service's JSON) whatever Content-Type it is sent with, so a form type on
+        // it names no members here.
+        if (!IamActionRegistry.isQueryRequest(ctx)) {
+            return Map.of();
+        }
         Object cached = ctx.getProperty(BUFFERED_FORM_BODY);
         if (cached instanceof Map<?, ?> map) {
             return (Map<String, String>) map;
         }
         MediaType mediaType = ctx.getMediaType();
-        if (mediaType == null
-                || !"application".equalsIgnoreCase(mediaType.getType())
-                || !"x-www-form-urlencoded".equalsIgnoreCase(mediaType.getSubtype())) {
-            return Map.of();
-        }
         byte[] body = bufferEntity(ctx);
         if (body == null || body.length == 0) {
             return Map.of();

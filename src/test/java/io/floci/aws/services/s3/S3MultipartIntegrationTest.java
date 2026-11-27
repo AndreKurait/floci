@@ -2,9 +2,11 @@ package io.floci.aws.services.s3;
 
 import io.floci.aws.services.s3.model.S3Checksum;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import io.restassured.config.DecoderConfig;
 import io.restassured.config.RestAssuredConfig;
 import io.restassured.response.ValidatableResponse;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -14,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -21,6 +24,29 @@ import static org.hamcrest.Matchers.*;
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class S3MultipartIntegrationTest {
+    private static String wrappingKey;
+    private static int wrappingKeyPort;
+
+    private static String kmsFixtureKey() {
+        if (wrappingKey == null) {
+            wrappingKeyPort = RestAssured.port;
+            wrappingKey = given().contentType("application/x-amz-json-1.1")
+                    .header("X-Amz-Target", "TrentService.CreateKey").body("{}".getBytes(StandardCharsets.UTF_8))
+                    .post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        }
+        return wrappingKey;
+    }
+
+    @AfterAll
+    static void removeWrappingKey() {
+        if (wrappingKey != null) {
+            given().port(wrappingKeyPort).contentType("application/x-amz-json-1.1")
+                    .header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                    .body(("{\"KeyId\":\"" + wrappingKey + "\",\"PendingWindowInDays\":7}").getBytes(StandardCharsets.UTF_8))
+                    .post("/").then().statusCode(200);
+        }
+    }
+
 
     private static final String BUCKET = "multipart-test-bucket";
     private static final String KEY = "large-file.bin";
@@ -1382,7 +1408,7 @@ class S3MultipartIntegrationTest {
         .then()
             .statusCode(200);
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         String copyUploadId = given()
             .header("x-amz-server-side-encryption", "aws:kms")
             .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)
@@ -1418,7 +1444,7 @@ class S3MultipartIntegrationTest {
     @Order(37)
     void completeMultipartUploadPreservesSseKmsKeyId() {
         String key = "kms-multipart-complete.bin";
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/complete-test-key";
+        String kmsKeyId = kmsFixtureKey();
         String completeUploadId = given()
             .header("x-amz-server-side-encryption", "aws:kms")
             .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)

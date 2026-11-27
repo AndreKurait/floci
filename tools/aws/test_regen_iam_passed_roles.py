@@ -40,8 +40,9 @@ def structure(**members) -> dict:
 @pytest.fixture
 def corrections(monkeypatch):
     """No corrections at all, so a test sees the rule alone and sets what it needs."""
-    for name in ("BY_HAND", "NOT_READ", "EXCLUDED_MEMBERS", "EXTRA_MEMBERS", "MEMBER_SERVICES"):
+    for name in ("BY_HAND", "NOT_READ", "EXCLUDED_MEMBERS", "EXTRA_MEMBERS", "MEMBER_SERVICES", "ROLE_SOURCES"):
         monkeypatch.setattr(r, name, {})
+    r._role_source.cache_clear()
     monkeypatch.setattr(r, "NAMESPACES", ("svc",))
     return monkeypatch
 
@@ -149,10 +150,31 @@ def test_a_pattern_that_only_admits_an_arn_takes_no_name():
     assert r.role_members(m, "Op") == {"ExecutionRoleArn": False}
 
 
-@pytest.mark.parametrize("protocol", ["ec2", "rest-xml"])
-def test_a_model_whose_requests_are_not_read_has_no_members(protocol):
-    m = model({"Op": "In"}, {"In": structure(RoleArn="String")}, protocol=protocol)
+def test_a_model_whose_requests_are_not_read_has_no_members():
+    m = model({"Op": "In"}, {"In": structure(RoleArn="String")}, protocol="ec2")
     assert r.role_members(m, "Op") == {}
+
+
+def test_an_xml_body_is_read_below_its_payload_by_the_names_its_members_are_serialized_under():
+    # S3's PutBucketReplication: the Role of the ReplicationConfiguration its body is, not the URI's bucket.
+    m = model({"Op": "In"}, {"In": {"type": "structure", "payload": "Configuration", "members": {
+                                 "Bucket": {"shape": "String", "location": "uri", "locationName": "Bucket"},
+                                 "Configuration": {"shape": "Configuration", "locationName": "Configuration"}}},
+                             "Configuration": structure(Role="String", Targets={"shape": "Targets",
+                                                                                "locationName": "Target"}),
+                             "Targets": {"type": "list", "member": {"shape": "Target"}},
+                             "Target": structure(RoleArn="String")}, protocol="rest-xml")
+    assert r.role_members(m, "Op") == {"Role": False, "Target[].RoleArn": False}
+
+
+@pytest.mark.parametrize("nesting", [{"type": "list", "member": {"shape": "Target"}, "flattened": True},
+                                     {"type": "map", "key": {"shape": "String"}, "value": {"shape": "Target"}}])
+def test_an_xml_role_member_reached_through_a_map_or_a_flattened_list_fails(nesting):
+    shapes = {"In": structure(Targets="Targets"), "Targets": nesting, "Target": structure(RoleArn="String")}
+    with pytest.raises(ValueError, match="map or a flattened list"):
+        r.role_members(model({"Op": "In"}, shapes, protocol="rest-xml"), "Op")
+    # A JSON body nests them as the paths do.
+    assert len(r.role_members(model({"Op": "In"}, shapes), "Op")) == 1
 
 
 def test_a_member_path_with_a_map_key_exists_only_for_a_key_the_enum_lists():
@@ -180,6 +202,52 @@ def test_each_member_goes_to_the_one_service_the_reference_names(corrections):
 
 def test_a_role_passed_to_no_named_service_carries_none(corrections):
     assert r.entry_for("svc:CreateThing", [], SIMPLE)["roles"][0] == {"member": "RoleArn"}
+
+
+CLUSTER = {"svc": model({"CreateCluster": "In"}, {"In": structure(roleArn="String", computeConfig="Compute"),
+                                                  "Compute": structure(nodeRoleArn="String")})}
+
+
+def role_source(corrections, tmp_path, members):
+    path = tmp_path / "svc-roles.json"
+    path.write_text(json.dumps({"members": members}), encoding="utf-8")
+    corrections.setattr(r, "ROLE_SOURCES", {"svc": path})
+    r._role_source.cache_clear()
+
+
+def test_a_vendored_role_source_gives_each_member_the_service_its_role_is_for(corrections, tmp_path):
+    # The request's own member by its operation, a member of a type it holds by that type, wherever it sits.
+    role_source(corrections, tmp_path, [
+        {"operation": "CreateCluster", "member": "roleArn", "rolePage": "cluster", "trustedBy": ["svc.amazonaws.com"]},
+        {"type": "Compute", "member": "nodeRoleArn", "rolePage": "node", "trustedBy": ["other.amazonaws.com"]}])
+    assert r.entry_for("svc:CreateCluster", ["other", "svc"], CLUSTER)["roles"] == [
+        {"member": "computeConfig.nodeRoleArn", "passedTo": "other"}, {"member": "roleArn", "passedTo": "svc"}]
+
+
+def test_a_vendored_role_for_a_service_the_reference_does_not_name_fails(corrections, tmp_path):
+    role_source(corrections, tmp_path, [
+        {"operation": "CreateCluster", "member": "roleArn", "rolePage": "cluster", "trustedBy": ["lambda.amazonaws.com"]},
+        {"type": "Compute", "member": "nodeRoleArn", "rolePage": "node", "trustedBy": ["other.amazonaws.com"]}])
+    with pytest.raises(ValueError, match="not one of"):
+        r.entry_for("svc:CreateCluster", ["other", "svc"], CLUSTER)
+    # A member it does not give still needs saying which.
+    role_source(corrections, tmp_path, [
+        {"type": "Compute", "member": "nodeRoleArn", "rolePage": "node", "trustedBy": ["other.amazonaws.com"]}])
+    with pytest.raises(ValueError, match="ROLE_SOURCES"):
+        r.entry_for("svc:CreateCluster", ["other", "svc"], CLUSTER)
+
+
+def test_a_vendored_role_no_operation_reads_is_reported(corrections, tmp_path):
+    corrections.setattr(r, "load_models", lambda data, clients: CLUSTER)
+    covered = {"svc:CreateCluster": {"passedTo": ["other", "svc"], "clients": ["svc"]}}
+    role_source(corrections, tmp_path, [
+        {"operation": "CreateCluster", "member": "roleArn", "rolePage": "cluster", "trustedBy": ["svc.amazonaws.com"]},
+        {"type": "Compute", "member": "nodeRoleArn", "rolePage": "node", "trustedBy": ["other.amazonaws.com"]}])
+    assert r._unmatched_corrections(covered, {"svc": ["svc"]}, tmp_path) == []
+    role_source(corrections, tmp_path, [
+        {"type": "Compute", "member": "goneRoleArn", "rolePage": "node", "trustedBy": ["other.amazonaws.com"]}])
+    assert r._unmatched_corrections(covered, {"svc": ["svc"]}, tmp_path) == [
+        "ROLE_SOURCES gives svc's Compute.goneRoleArn, which no operation there reads a role from"]
 
 
 def test_several_services_need_a_member_service(corrections):
