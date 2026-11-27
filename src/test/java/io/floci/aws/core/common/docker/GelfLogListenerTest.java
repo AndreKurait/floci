@@ -133,7 +133,7 @@ class GelfLogListenerTest {
     @Test
     void aRestartedListenerTakesTheSamePortAndClaimsOnlyContainersDialingIt() throws IOException {
         int port;
-        try (ServerSocket free = new ServerSocket(0)) {
+        try (ServerSocket free = new ServerSocket(0, 50, InetAddress.getLoopbackAddress())) {
             port = free.getLocalPort();
         }
         GelfLogListener before = new GelfLogListener(mock(DockerClient.class), true, "127.0.0.1", port, 8);
