@@ -2,8 +2,10 @@ package io.floci.aws.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
+import com.github.dockerjava.api.model.HostConfig;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerExec;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.testing.DockerAvailability;
@@ -265,6 +267,71 @@ class Ec2PublicPeerPacketIntegrationTest {
         assertEquals(publicSource, fetch(caller, destination).stdout().strip());
         sdk.revokeSecurityGroupIngress(request -> request.groupId(serverGroup).ipPermissions(natSource));
         assertDropped(caller, destination);
+    }
+
+    @Test
+    void externalCallerRequiresSecurityGroupAndInternetReturnRoute() {
+        Ec2Client sdk = Ec2Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .httpClientBuilder(UrlConnectionHttpClient.builder())
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .build();
+        cleanup.addFirst(sdk::close);
+        String vpc = routedVpc(sdk, "10.90.0.0/16");
+        String subnet = subnet(sdk, vpc, "10.90.1.0/24");
+        String group = packetGroup(sdk, vpc, "external");
+        String target = launch(sdk, subnet, group, "10.90.1.10",
+                Base64.getEncoder().encodeToString("""
+                        #!/bin/sh
+                        set -eu
+                        mkdir -p /www/cgi-bin
+                        cat > /www/cgi-bin/identity <<'CGI'
+                        #!/bin/sh
+                        printf 'Content-Type: text/plain\\r\\n\\r\\n%s' "$REMOTE_ADDR"
+                        CGI
+                        chmod 755 /www/cgi-bin/identity
+                        httpd -p 10.90.1.10:8080 -h /www
+                        """.getBytes(StandardCharsets.UTF_8)));
+        String address = instance(sdk, target).publicIpAddress();
+        assertNotNull(address);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertEquals(0, fetch(target, "10.90.1.10").exitCode()));
+        String caller = docker.createContainerCmd(TestImages.BUSYBOX)
+                .withHostConfig(HostConfig.newHostConfig()
+                        .withNetworkMode(config.services().dockerNetwork().orElseThrow()))
+                .withEntrypoint("sleep").withCmd("300").withLabels(Map.of(
+                        ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)))
+                .exec().getId();
+        cleanup.addFirst(() -> docker.removeContainerCmd(caller).withForce(true).exec());
+        docker.startContainerCmd(caller).exec();
+        String source = docker.inspectContainerCmd(caller).exec().getNetworkSettings().getNetworks()
+                .values().iterator().next().getIpAddress();
+        IpPermission ingress = addressPermission(source);
+        assertNotEquals(0, externalFetch(caller, address).exitCode());
+        sdk.authorizeSecurityGroupIngress(request -> request.groupId(group).ipPermissions(ingress));
+        ContainerExec.Result response = externalFetch(caller, address);
+        assertEquals(0, response.exitCode(), response.summary());
+        assertEquals(source, response.stdout().strip(), "The native server must see the external caller");
+
+        String table = sdk.describeRouteTables(request -> request.filters(
+                filter -> filter.name("vpc-id").values(vpc),
+                filter -> filter.name("association.main").values("true"))).routeTables().getFirst().routeTableId();
+        String gateway = sdk.describeRouteTables(request -> request.routeTableIds(table)).routeTables().getFirst()
+                .routes().stream().filter(route -> "0.0.0.0/0".equals(route.destinationCidrBlock()))
+                .findFirst().orElseThrow().gatewayId();
+        sdk.deleteRoute(request -> request.routeTableId(table).destinationCidrBlock("0.0.0.0/0"));
+        assertNotEquals(0, externalFetch(caller, address).exitCode());
+        sdk.createRoute(request -> request.routeTableId(table).destinationCidrBlock("0.0.0.0/0").gatewayId(gateway));
+        assertEquals(source, externalFetch(caller, address).stdout().strip());
+        sdk.revokeSecurityGroupIngress(request -> request.groupId(group).ipPermissions(ingress));
+        assertNotEquals(0, externalFetch(caller, address).exitCode());
+        sdk.authorizeSecurityGroupIngress(request -> request.groupId(group).ipPermissions(ingress));
+        assertEquals(source, externalFetch(caller, address).stdout().strip());
+    }
+
+    private ContainerExec.Result externalFetch(String caller, String address) {
+        return ContainerExec.run(docker, caller,
+                new String[]{"wget", "-T", "2", "-qO-", "http://" + address + ":8080/cgi-bin/identity"},
+                5).throwIfTimedOut(caller);
     }
 
     private String routedVpc(Ec2Client sdk, String cidr) {

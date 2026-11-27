@@ -51,6 +51,14 @@ final class VpcRoutingCommands {
     static String endpoint(String privateAddress, String privateDevice, List<LocalRoute> localRoutes, List<Hop> hops,
                            List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
                            boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources) {
+        return endpoint(privateAddress, privateDevice, localRoutes, hops, deniedDestinations, resolvers, controls,
+                instanceMetadataAllowed, publicDevice, inboundPublicSources, null);
+    }
+
+    static String endpoint(String privateAddress, String privateDevice, List<LocalRoute> localRoutes, List<Hop> hops,
+                           List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
+                           boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources,
+                           VpcPublicInstanceIngress instanceIngress) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
         for (Hop hop : hops) {
@@ -67,6 +75,9 @@ final class VpcRoutingCommands {
         StringBuilder rules = new StringBuilder("flush chain inet floci_vpc_routes ingress\n")
                 .append("flush chain inet floci_vpc_routes egress\n")
                 .append("add rule inet floci_vpc_routes egress oifname lo counter accept\n");
+        if (instanceIngress != null) {
+            instanceIngress.append(rules);
+        }
         if (publicDevice != null) {
             String device = device(publicDevice);
             for (String address : inboundPublicSources) {
@@ -150,6 +161,12 @@ final class VpcRoutingCommands {
 
     static String publicInstanceSourceRoutes(String privateAddress, String publicAddress, String publicDevice,
                                              List<Hop> routes) {
+        return publicInstanceSourceInterfaces(privateAddress, publicAddress,
+                publicAddress == null ? List.of() : List.of(publicDevice), routes);
+    }
+
+    static String publicInstanceSourceInterfaces(String privateAddress, String publicAddress,
+                                                 List<String> incomingDevices, List<Hop> routes) {
         String rules = """
                 add table ip floci_instance_api
                 add chain ip floci_instance_api incoming { type nat hook prerouting priority dstnat; }
@@ -158,9 +175,11 @@ final class VpcRoutingCommands {
                 flush chain ip floci_instance_api outgoing
                 """;
         if (publicAddress != null) {
-            rules += "add rule ip floci_instance_api incoming iifname \"" + device(publicDevice)
-                    + "\" ip daddr " + VpcRouteSelection.ipv4(publicAddress)
-                    + " dnat to " + VpcRouteSelection.ipv4(privateAddress) + "\n";
+            for (String incomingDevice : incomingDevices.stream().distinct().sorted().toList()) {
+                rules += "add rule ip floci_instance_api incoming iifname \"" + device(incomingDevice)
+                        + "\" ip daddr " + VpcRouteSelection.ipv4(publicAddress)
+                        + " dnat to " + VpcRouteSelection.ipv4(privateAddress) + "\n";
+            }
             for (Hop route : routes.stream().filter(hop -> !hop.replyOnly()).distinct()
                     .sorted(Comparator.comparing(Hop::destination).thenComparing(Hop::device)).toList()) {
                 rules += "add rule ip floci_instance_api outgoing oifname \"" + route.device()

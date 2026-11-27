@@ -495,13 +495,16 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         List<VpcRoutingCommands.LocalRoute> local = routes.stream().map(route -> new VpcRoutingCommands.LocalRoute(
                 route.destination(), VpcRouteSelection.local(route.route()) && vpcCidr.contains(route.destination())))
                 .toList();
+        VpcPublicInstanceIngress instanceIngress = nativeAddress == null ? null : new VpcPublicInstanceIngress(
+                nativeAddress.address(), identity.logicalAddress(), nativeAddress.addressDevice(),
+                VpcFrontendIngress.decisions(vpc, routes, topology.gateways));
         String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), endpoint.privateDevice,
                 local, hops, denied, endpoint.resolvers, identity.controlConnections(),
-                identity.instanceMetadataAllowed(), returnDevice, inbound);
+                identity.instanceMetadataAllowed(), returnDevice, inbound, instanceIngress);
         if (endpoint.publicAddress != null) {
             NativePublicAddress address = endpoint.publicAddress;
-            script += VpcRoutingCommands.publicInstanceSourceRoutes(identity.logicalAddress(), address.address(),
-                    address.device(), hops);
+            script += VpcRoutingCommands.publicInstanceSourceInterfaces(identity.logicalAddress(), address.address(),
+                    List.of(address.device(), address.addressDevice()), hops);
         }
         if (!script.equals(endpoint.applied)) {
             run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
