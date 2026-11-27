@@ -5,6 +5,9 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.ConflictException;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Network;
@@ -35,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -204,6 +208,142 @@ class VpcPublicPeerRoutingTest {
                 "Failure quarantine must not reuse the temporary update guard");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedPolicyExecWithdrawsAHelperStoppedDuringTheCommand(boolean absent) {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        InspectContainerResponse inspection = docker.inspectContainerCmd("second").exec();
+        AtomicBoolean commandFailed = new AtomicBoolean();
+        when(inspection.getState().getRunning()).thenAnswer(invocation -> !commandFailed.get());
+        when(docker.inspectContainerCmd("second").exec()).thenAnswer(invocation -> {
+            if (absent && commandFailed.get()) {
+                throw new NotFoundException("namespace removed during exec");
+            }
+            return inspection;
+        });
+        when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenAnswer(invocation -> {
+            commandFailed.set(true);
+            return 137L;
+        });
+        gateway.setAttachments(List.of());
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertTrue(commandFailed.get(), "The helper must stop after its routing command starts");
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+        assertTrue(latest("first").contains("accept"), "The healthy helper must retain its local route policy");
+        assertFalse(latest("first").contains("via 240.0.0.3"));
+        verify(docker, never()).stopContainerCmd("first");
+        verify(docker, never()).startContainerCmd("second");
+        verify(docker, never()).removeContainerCmd("second");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedPolicyExecStillFailsForRunningOrIndeterminateHelpers(boolean indeterminate) {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        when(docker.inspectContainerCmd("second").exec().getState().getRunning())
+                .thenReturn(indeterminate ? null : true);
+        when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenReturn(137L);
+        gateway.setAttachments(List.of());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, manager::reconcile);
+
+        assertTrue(failure.getMessage().startsWith("Cannot reconcile native VPC routing:"));
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+        assertFalse(latest("first").contains("accept"), "An unconfirmed exec failure must retain quarantine");
+        assertFalse(latest("second").contains("accept"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void runningCallerWithoutItsPublicInterfaceStillFailsEvenWhenAnotherCallerRetires(boolean retiredPeer) {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        if (retiredPeer) {
+            admit("third", 4, true);
+            stopped("third");
+        }
+        when(docker.inspectContainerCmd("second").exec().getNetworkSettings().getNetworks()).thenReturn(Map.of());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, manager::reconcile);
+
+        assertEquals("Native public API caller lost its unique public interface", failure.getMessage());
+        assertFalse(latest("first").contains("accept"));
+        assertFalse(latest("second").contains("accept"));
+        assertTrue(manager.publicInstanceAddresses().containsAll(Set.of("172.18.0.2", "172.18.0.3")));
+    }
+
+    @Test
+    void repeatedInspectionFailurePreservesTheOriginalErrorAndQuarantinesSurvivors() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        ConflictException failure = new ConflictException("Docker inspection unavailable");
+        when(docker.inspectContainerCmd("second").exec()).thenThrow(failure);
+
+        assertSame(failure, assertThrows(ConflictException.class, manager::reconcile));
+
+        assertFalse(latest("first").contains("accept"));
+        assertFalse(latest("second").contains("accept"));
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+    }
+
+    @Test
+    void stoppedPublicCallerRetainsOwnerCleanupWhileSurvivorsKeepTheirRoutes() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        stopped("second");
+        when(docker.inspectContainerCmd("second").exec().getNetworkSettings().getNetworks()).thenReturn(Map.of());
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+        assertTrue(latest("first").contains("egress ip daddr 172.18.0.3 counter drop"));
+        assertFalse(latest("first").contains("via 240.0.0.3"));
+        assertThrows(ConflictException.class, () -> manager.unregister(ACCOUNT, REGION, "second"),
+                "A stopped caller still belongs to its owner until namespace users are retired");
+        verify(docker, never()).startContainerCmd("second");
+        verify(docker, never()).removeContainerCmd("second");
+        verify(docker, never()).stopContainerCmd("first");
+    }
+
+    private void stopped(String helper) {
+        when(docker.inspectContainerCmd(helper).exec().getState().getRunning()).thenReturn(false);
+        when(docker.execCreateCmd(helper)).thenThrow(new ConflictException("container is not running"));
+    }
+
+    @Test
+    void stoppedNamespaceWithIntactInterfacesStopsAdvertisingItsPublicAddress() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        stopped("second");
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+        assertTrue(latest("first").contains("egress ip daddr 172.18.0.3 counter drop"));
+        assertFalse(latest("first").contains("via 240.0.0.3"));
+        verify(docker, never()).startContainerCmd("second");
+        verify(docker, never()).removeContainerCmd("second");
+    }
+
+    @Test
+    void quarantineFailuresDoNotReplaceTheOriginalException() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        ConflictException failure = new ConflictException("Docker unavailable during quarantine");
+        when(docker.inspectContainerCmd("second").exec()).thenThrow(failure);
+        when(docker.execCreateCmd("second")).thenThrow(failure);
+        when(docker.stopContainerCmd("second")).thenThrow(failure);
+        gateway.setAttachments(List.of());
+
+        assertSame(failure, assertThrows(ConflictException.class, manager::reconcile));
+
+        assertFalse(latest("first").contains("accept"));
+    }
+
     private void admit(String helper, int host, boolean internal) {
         prepareNamespace(helper, host, internal);
         SecurityGroupNftCompiler.Endpoint identity = identity(helper, host);
@@ -224,6 +364,7 @@ class VpcPublicPeerRoutingTest {
                 "vpc", attachment("vpc-network", privateIp),
                 "public", attachment("public-network", "240.0.0." + host));
         when(docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks()).thenReturn(attachments);
+        when(docker.inspectContainerCmd(helper).exec().getState().getRunning()).thenReturn(true);
         Network control = mock(Network.class);
         when(control.getInternal()).thenReturn(internal);
         when(docker.inspectNetworkCmd().withNetworkId("control-network").exec()).thenReturn(control);

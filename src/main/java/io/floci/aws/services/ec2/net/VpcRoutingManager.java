@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Network;
@@ -36,6 +37,7 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -62,6 +64,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private final Map<String, Endpoint> endpoints = new LinkedHashMap<>();
     private final Map<String, PublicAddress> publicAddresses = new LinkedHashMap<>();
     private final Map<String, NatRuntime> nats = new LinkedHashMap<>();
+    private final Set<String> unavailableNamespaces = new HashSet<>();
     private String publicNetwork;
     private boolean draining;
 
@@ -89,7 +92,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (!enabled() || draining) {
             return Set.of();
         }
-        return endpoints.values().stream().map(endpoint -> endpoint.publicAddress)
+        return activeEndpoints().stream().map(endpoint -> endpoint.publicAddress)
                 .filter(address -> address != null && address.transport() != null)
                 .map(NativePublicAddress::address).collect(Collectors.toUnmodifiableSet());
     }
@@ -151,6 +154,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         }
         endpoints.remove(key, endpoint);
         publicAddresses.remove(key, address);
+        forgetUnownedNamespaces();
         reconcile();
         removeEmptyPublicNetwork();
     }
@@ -347,6 +351,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
 
     public synchronized void natDeleted(String account, String region, String id) {
         nats.remove(key(account, region, id));
+        forgetUnownedNamespaces();
         reconcile();
         removeEmptyPublicNetwork();
     }
@@ -357,40 +362,124 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             return;
         }
         try {
-            for (Endpoint endpoint : List.copyOf(endpoints.values())) {
-                RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(), () -> {
-                    Topology topology = topology(endpoint.identity.region());
-                    for (NatGateway gateway : topology.nats) {
-                        if ("available".equals(gateway.getState()) && "public".equals(gateway.getConnectivityType())
-                                && endpoint.identity.vpcId().equals(gateway.getVpcId())) {
-                            createNat(endpoint.identity.accountId(), endpoint.identity.region(), gateway);
+            while (true) {
+                try {
+                    reconcilePresentNamespaces();
+                    return;
+                } catch (NotFoundException | ConflictException | InvalidPublicInterfaceException
+                        | RoutingCommandException | UnavailableNamespaceException unavailable) {
+                    boolean retired;
+                    try {
+                        retired = withdrawUnavailableNamespaces();
+                    } catch (RuntimeException inspectionFailure) {
+                        if (inspectionFailure != unavailable) {
+                            unavailable.addSuppressed(inspectionFailure);
                         }
+                        throw unavailable;
                     }
-                });
-            }
-            configureAwsApi();
-            for (NatRuntime nat : List.copyOf(nats.values())) {
-                if (!nat.retiring && nat.namespace != null) {
-                    RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
+                    if (!retired) {
+                        throw unavailable;
+                    }
                 }
             }
-            for (Endpoint endpoint : List.copyOf(endpoints.values())) {
-                RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(),
-                        () -> configureEndpoint(endpoint, topology(endpoint.identity.region())));
-            }
         } catch (RuntimeException failure) {
-            for (Endpoint endpoint : endpoints.values()) {
+            for (Endpoint endpoint : activeEndpoints()) {
                 endpoint.applied = null;
                 quarantine(endpoint.helper, false, failure);
             }
             for (NatRuntime nat : nats.values()) {
                 nat.applied = null;
-                if (nat.namespace != null) {
+                if (nat.namespace != null && !unavailableNamespaces.contains(nat.namespace.id())) {
                     quarantine(nat.namespace.id(), true, failure);
                 }
             }
             throw failure;
         }
+    }
+
+    private void reconcilePresentNamespaces() {
+        for (Endpoint endpoint : activeEndpoints()) {
+            validateNativePublicInterface(endpoint);
+        }
+        for (Endpoint endpoint : activeEndpoints()) {
+            RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(), () -> {
+                Topology topology = topology(endpoint.identity.region());
+                for (NatGateway gateway : topology.nats) {
+                    if ("available".equals(gateway.getState()) && "public".equals(gateway.getConnectivityType())
+                            && endpoint.identity.vpcId().equals(gateway.getVpcId())) {
+                        createNat(endpoint.identity.accountId(), endpoint.identity.region(), gateway);
+                    }
+                }
+            });
+        }
+        configureAwsApi();
+        for (NatRuntime nat : activeNats()) {
+            RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
+        }
+        for (Endpoint endpoint : activeEndpoints()) {
+            RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(),
+                    () -> configureEndpoint(endpoint, topology(endpoint.identity.region())));
+        }
+    }
+
+    private void validateNativePublicInterface(Endpoint endpoint) {
+        NativePublicAddress address = endpoint.publicAddress;
+        if (address == null) {
+            return;
+        }
+        InspectContainerResponse inspection = docker.inspectContainerCmd(endpoint.helper).exec();
+        if (inspection.getState() != null && Boolean.FALSE.equals(inspection.getState().getRunning())) {
+            throw new UnavailableNamespaceException();
+        }
+        long matches = inspection.getNetworkSettings().getNetworks().values().stream()
+                .filter(network -> address.address().equals(network.getIpAddress())
+                        && address.addressNetwork().equals(network.getNetworkID())).count();
+        if (matches != 1) {
+            throw new InvalidPublicInterfaceException();
+        }
+    }
+
+    private boolean withdrawUnavailableNamespaces() {
+        Set<String> helpers = new HashSet<>();
+        endpoints.values().forEach(endpoint -> helpers.add(endpoint.helper));
+        publicAddresses.values().forEach(address -> helpers.add(address.namespace.id()));
+        nats.values().stream().filter(nat -> nat.namespace != null)
+                .forEach(nat -> helpers.add(nat.namespace.id()));
+        boolean changed = false;
+        for (String helper : helpers) {
+            if (!unavailableNamespaces.contains(helper) && namespaceUnavailable(helper)) {
+                unavailableNamespaces.add(helper);
+                changed = true;
+                LOG.debugv("Withdrawing VPC routes for unavailable namespace {0}; retaining owner cleanup", helper);
+            }
+        }
+        return changed;
+    }
+
+    private boolean namespaceUnavailable(String helper) {
+        try {
+            InspectContainerResponse inspection = docker.inspectContainerCmd(helper).exec();
+            return inspection.getState() != null && Boolean.FALSE.equals(inspection.getState().getRunning());
+        } catch (NotFoundException absent) {
+            return true;
+        }
+    }
+
+    private void forgetUnownedNamespaces() {
+        unavailableNamespaces.removeIf(helper -> endpoints.values().stream()
+                .noneMatch(value -> helper.equals(value.helper))
+                && publicAddresses.values().stream().noneMatch(value -> helper.equals(value.namespace.id()))
+                && nats.values().stream().noneMatch(value ->
+                        value.namespace != null && helper.equals(value.namespace.id())));
+    }
+
+    private List<Endpoint> activeEndpoints() {
+        return endpoints.values().stream().filter(endpoint -> !unavailableNamespaces.contains(endpoint.helper)).toList();
+    }
+
+    private List<NatRuntime> activeNats() {
+        return nats.values().stream().filter(nat -> !nat.retiring && nat.namespace != null
+                && !unavailableNamespaces.contains(nat.namespace.id())).toList();
     }
 
     private void configureNat(NatRuntime nat, Topology topology) {
@@ -401,12 +490,13 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             destinations.add(new VpcRoutingCommands.Hop(apiAddress, awsApi.transport(), nat.publicDevice, false));
         }
         for (PublicAddress address : publicAddresses.values()) {
-            if (address.transport != null && internet(address.address, routes, nat.vpc, topology)) {
+            if (!unavailableNamespaces.contains(address.namespace.id())
+                    && address.transport != null && internet(address.address, routes, nat.vpc, topology)) {
                 destinations.add(new VpcRoutingCommands.Hop(address.address, address.transport,
                         nat.publicDevice, false));
             }
         }
-        for (Endpoint endpoint : endpoints.values()) {
+        for (Endpoint endpoint : activeEndpoints()) {
             NativePublicAddress address = endpoint.publicAddress;
             if (address != null && address.transport() != null && publicNetwork.equals(address.network())
                     && internet(address.address(), routes, nat.vpc, topology)) {
@@ -434,6 +524,10 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         List<VpcRoutingCommands.Hop> hops = new ArrayList<>();
         List<String> denied = new ArrayList<>();
         for (PublicAddress destination : publicAddresses.values()) {
+            if (unavailableNamespaces.contains(destination.namespace.id())) {
+                denied.add(destination.address);
+                continue;
+            }
             if (destination.transport == null || destination == own) {
                 continue;
             }
@@ -447,6 +541,10 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         for (Endpoint peer : endpoints.values()) {
             NativePublicAddress destination = peer.publicAddress;
             if (peer == endpoint || destination == null) {
+                continue;
+            }
+            if (unavailableNamespaces.contains(peer.helper)) {
+                denied.add(destination.address());
                 continue;
             }
             int previous = hops.size();
@@ -484,8 +582,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (returnDevice != null) {
             hops.stream().filter(hop -> returnDevice.equals(hop.device()))
                     .map(VpcRoutingCommands.Hop::destination).forEach(inbound::add);
-            for (NatRuntime nat : nats.values()) {
-                if (!nat.retiring && nat.transport != null && internet(nat.publicIp, routes, vpc, topology)) {
+            for (NatRuntime nat : activeNats()) {
+                if (nat.transport != null && internet(nat.publicIp, routes, vpc, topology)) {
                     hops.add(new VpcRoutingCommands.Hop(nat.publicIp, nat.transport, returnDevice, true));
                     inbound.add(nat.publicIp);
                 }
@@ -523,6 +621,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         NatRuntime nat = gateway.map(value -> nats.get(key(identity.accountId(), identity.region(),
                 value.getNatGatewayId()))).orElse(null);
         if (nat != null && !nat.retiring && nat.namespace != null
+                && !unavailableNamespaces.contains(nat.namespace.id())
                 && internet(address, routes(nat.region, nat.vpc, nat.subnet, topology), nat.vpc, topology)) {
             hops.add(new VpcRoutingCommands.Hop(address, nat.privateIp, endpoint.privateDevice, false));
         } else if (own != null && VpcRouteSelection.internet(route, identity.vpcId(), topology.gateways)) {
@@ -534,14 +633,14 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (!awsApi.enabled()) {
             return;
         }
-        if (nats.isEmpty() && !hasPublicInstances()) {
+        if (nats.isEmpty() && activeEndpoints().stream().noneMatch(endpoint -> endpoint.publicAddress != null)) {
             awsApi.retire();
             return;
         }
         awsApi.ensure(publicNetwork());
         List<VpcRoutingCommands.Hop> callers = new ArrayList<>();
-        for (NatRuntime nat : nats.values()) {
-            if (!nat.retiring && nat.transport != null) {
+        for (NatRuntime nat : activeNats()) {
+            if (nat.transport != null) {
                 RequestScopes.runAs(nat.account, nat.region, () -> {
                     Topology topology = topology(nat.region);
                     if (internet(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS,
@@ -551,7 +650,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 });
             }
         }
-        for (Endpoint endpoint : endpoints.values()) {
+        for (Endpoint endpoint : activeEndpoints()) {
             NativePublicAddress address = endpoint.publicAddress;
             if (address != null) {
                 if (address.transport() == null) {
@@ -707,11 +806,15 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         try {
             run(helper, nat ? VpcRoutingCommands.natGuard() : VpcRoutingCommands.endpointGuard());
         } catch (RuntimeException guardFailure) {
-            failure.addSuppressed(guardFailure);
+            if (guardFailure != failure) {
+                failure.addSuppressed(guardFailure);
+            }
             try {
                 docker.stopContainerCmd(helper).withTimeout(0).exec();
             } catch (RuntimeException stopFailure) {
-                failure.addSuppressed(stopFailure);
+                if (stopFailure != failure) {
+                    failure.addSuppressed(stopFailure);
+                }
                 LOG.errorv(stopFailure, "Could not quarantine VPC namespace {0}", helper);
             }
         }
@@ -721,7 +824,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"sh", "-c", script}, 20)
                 .throwIfTimedOut(helper);
         if (result.exitCode() != 0) {
-            throw new IllegalStateException("Cannot reconcile native VPC routing: " + result.summary());
+            throw new RoutingCommandException(result.summary());
         }
     }
 
@@ -782,6 +885,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (!endpoints.isEmpty() || !nats.isEmpty() || !publicAddresses.isEmpty() || publicNetwork != null) {
             throw new IllegalStateException("VPC packet resources have not finished retirement");
         }
+        unavailableNamespaces.clear();
     }
 
     @Override
@@ -801,6 +905,24 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
 
     private String key(String account, String region, String id) {
         return account + "/" + region + "/" + id;
+    }
+
+    private static final class InvalidPublicInterfaceException extends IllegalStateException {
+        private InvalidPublicInterfaceException() {
+            super("Native public API caller lost its unique public interface");
+        }
+    }
+
+    private static final class RoutingCommandException extends IllegalStateException {
+        private RoutingCommandException(String summary) {
+            super("Cannot reconcile native VPC routing: " + summary);
+        }
+    }
+
+    private static final class UnavailableNamespaceException extends IllegalStateException {
+        private UnavailableNamespaceException() {
+            super("Native public namespace is stopped");
+        }
     }
 
     private record Topology(List<RouteTable> tables, List<NatGateway> nats, List<InternetGateway> gateways) {}

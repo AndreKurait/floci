@@ -8,6 +8,7 @@ import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.DockerHostResolver;
+import io.floci.aws.services.ec2.net.VpcRoutingManager;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.TestImages;
 import io.quarkus.test.InjectMock;
@@ -76,6 +77,7 @@ class Ec2PublicPeerPacketIntegrationTest {
 
     @Inject EmulatorConfig config;
     @Inject Ec2Service service;
+    @Inject VpcRoutingManager routing;
     @Inject DockerClient docker;
     @Inject CurrentContainerNetworkResolver currentContainer;
     @InjectSpy DockerHostResolver dockerHostResolver;
@@ -332,6 +334,55 @@ class Ec2PublicPeerPacketIntegrationTest {
         return ContainerExec.run(docker, caller,
                 new String[]{"wget", "-T", "2", "-qO-", "http://" + address + ":8080/cgi-bin/identity"},
                 5).throwIfTimedOut(caller);
+    }
+
+    @Test
+    void stoppedNamespaceWithdrawsItsPublicRouteWithoutQuarantiningSurvivors() {
+        Ec2Client sdk = Ec2Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .httpClientBuilder(UrlConnectionHttpClient.builder())
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .build();
+        cleanup.addFirst(sdk::close);
+        String vpc = routedVpc(sdk, "10.91.0.0/16");
+        String subnet = subnet(sdk, vpc, "10.91.1.0/24");
+        String group = packetGroup(sdk, vpc, "retirement");
+        sdk.authorizeSecurityGroupIngress(request -> request.groupId(group).ipPermissions(
+                IpPermission.builder().ipProtocol("tcp").fromPort(8080).toPort(8080)
+                        .userIdGroupPairs(pair -> pair.groupId(group)).build()));
+        String target = launch(sdk, subnet, group, "10.91.1.10",
+                Base64.getEncoder().encodeToString("""
+                        #!/bin/sh
+                        set -eu
+                        mkdir -p /www/cgi-bin
+                        cat > /www/cgi-bin/identity <<'CGI'
+                        #!/bin/sh
+                        printf 'Content-Type: text/plain\\r\\n\\r\\n%s' "$REMOTE_ADDR"
+                        CGI
+                        chmod 755 /www/cgi-bin/identity
+                        httpd -p 10.91.1.10:8080 -h /www
+                        """.getBytes(StandardCharsets.UTF_8)));
+        String retiring = launch(sdk, subnet, group, "10.91.1.11", null);
+        String survivor = launch(sdk, subnet, group, "10.91.1.12", null);
+        String destination = instance(sdk, target).publicIpAddress();
+        String retiringAddress = instance(sdk, retiring).publicIpAddress();
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertEquals(0, fetch(target, "10.91.1.10").exitCode()));
+        assertPublicSource(sdk, survivor, destination);
+        assertTrue(routing.publicInstanceAddresses().contains(retiringAddress));
+
+        String guest = service.describeInstances("us-east-1", List.of(retiring), Map.of())
+                .getFirst().getInstances().getFirst().getDockerContainerId();
+        String networkMode = docker.inspectContainerCmd(guest).exec().getHostConfig().getNetworkMode();
+        assertTrue(networkMode.startsWith("container:"), "The guest must use its protected namespace");
+        String namespace = networkMode.substring("container:".length());
+        docker.stopContainerCmd(namespace).withTimeout(0).exec();
+
+        assertDoesNotThrow(routing::reconcile);
+
+        assertFalse(routing.publicInstanceAddresses().contains(retiringAddress));
+        assertPublicSource(sdk, survivor, destination);
+        assertFalse(docker.inspectContainerCmd(namespace).exec().getState().getRunning(),
+                "Routing must leave restarting the stopped namespace to its owner");
     }
 
     private String routedVpc(Ec2Client sdk, String cidr) {
