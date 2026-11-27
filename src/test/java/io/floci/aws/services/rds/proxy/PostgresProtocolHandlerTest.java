@@ -27,10 +27,12 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -49,6 +51,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -299,8 +302,8 @@ class PostgresProtocolHandlerTest {
     void forwardsClientDatabaseToBackendStartup() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -390,8 +393,8 @@ class PostgresProtocolHandlerTest {
     void doesNotSendAuthenticationOkWhenBackendStartupFails() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -446,7 +449,7 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void forceSslRefusesPlaintextStartupBeforeContactingTheBackend() throws Exception {
-        try (ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -471,7 +474,7 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void forceSslAcceptsStartupOverTls() throws Exception {
-        try (ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -508,8 +511,8 @@ class PostgresProtocolHandlerTest {
     void acceptsPostgresSslRequestAndContinuesStartup() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -575,7 +578,7 @@ class PostgresProtocolHandlerTest {
             "host.docker.internal, true, true", "never-registered.example.com, false, true"})
     void hostnameVerificationRequiresRegisteredAdvertisedHost(String advertisedHost, boolean registered,
                                                               boolean legacyCa) throws Exception {
-        try (ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -648,8 +651,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void cancelRequestInsideTlsIsForwardedToTheBackend() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -698,8 +701,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void closesClientWhenBackendClosesDuringBridge() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             Thread backendThread = Thread.ofVirtual().start(() -> {
                 try {
@@ -755,8 +758,8 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -805,8 +808,8 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -898,8 +901,8 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> settingsQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -966,8 +969,8 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> privilegeQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1039,8 +1042,8 @@ class PostgresProtocolHandlerTest {
             throws Exception {
         List<String> relayed = new CopyOnWriteArrayList<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1110,20 +1113,26 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void iamSessionIsRefusedWhenPostgresRefusesAStartupParameterForTheTokenRole() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
+            AtomicReference<Throwable> backendFailure = new AtomicReference<>();
             FutureTask<Void> backendTask = new FutureTask<>(() -> {
-                mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
-                        "approle", true, (in, out) -> {
-                            readSimpleQuery(in);
-                            // What PostgreSQL answers when a role that is not a member of
-                            // the master asks to act as it.
-                            writeErrorAndReadyForQuery(out, "ERROR", "42501",
-                                    "permission denied to set role \"dbadmin\"");
-                        });
-                return null;
+                try {
+                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
+                            "approle", true, (in, out) -> {
+                                readSimpleQuery(in);
+                                // What PostgreSQL answers when a role that is not a member of
+                                // the master asks to act as it.
+                                writeErrorAndReadyForQuery(out, "ERROR", "42501",
+                                        "permission denied to set role \"dbadmin\"");
+                            });
+                    return null;
+                } catch (IOException | RuntimeException | AssertionError failure) {
+                    backendFailure.set(failure);
+                    throw failure;
+                }
             });
             Thread backendThread = Thread.ofVirtual().start(backendTask);
 
@@ -1157,6 +1166,62 @@ class PostgresProtocolHandlerTest {
                 backendThread.join(5_000);
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
                 assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+                assertNull(backendFailure.get(), () -> "backend fixture failed: " + backendFailure.get());
+            }
+        }
+    }
+
+    @Test
+    void startupRefusalFramesSurviveAnImmediatePeerDisconnect() throws Exception {
+        CountDownLatch peerClosed = new CountDownLatch(1);
+        AtomicReference<Throwable> peerFailure = new AtomicReference<>();
+        try (ServerSocket server = loopbackServerSocket();
+             Socket peer = connectTestSocket("localhost", server.getLocalPort());
+             Socket backend = acceptTestSocket(server)) {
+            peer.setSoTimeout(5_000);
+            peer.setSoLinger(true, 0);
+            Thread reader = Thread.ofVirtual().start(() -> {
+                try {
+                    Map<Character, String> error = readErrorResponse(new DataInputStream(peer.getInputStream()));
+                    assertEquals("ERROR", error.get('S'));
+                    assertEquals("42501", error.get('C'));
+                    assertEquals("permission denied", error.get('M'));
+                } catch (Throwable failure) {
+                    peerFailure.set(failure);
+                } finally {
+                    try {
+                        peer.close();
+                    } catch (IOException failure) {
+                        peerFailure.compareAndSet(null, failure);
+                    }
+                    peerClosed.countDown();
+                }
+            });
+            DataOutputStream output = new DataOutputStream(new FilterOutputStream(backend.getOutputStream()) {
+                @Override
+                public void write(byte[] data, int offset, int length) throws IOException {
+                    out.write(data, offset, length);
+                }
+
+                @Override
+                public void flush() throws IOException {
+                    super.flush();
+                    try {
+                        if (!peerClosed.await(5, TimeUnit.SECONDS)) {
+                            throw new IOException("peer did not close after the error response");
+                        }
+                    } catch (InterruptedException failure) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(failure);
+                    }
+                }
+            });
+            try {
+                writeErrorAndReadyForQuery(output, "ERROR", "42501", "permission denied");
+            } finally {
+                reader.join(5_000);
+                assertFalse(reader.isAlive(), "peer reader did not finish");
+                assertNull(peerFailure.get(), () -> "peer fixture failed: " + peerFailure.get());
             }
         }
     }
@@ -1165,8 +1230,8 @@ class PostgresProtocolHandlerTest {
     void iamSessionIsRefusedBeforeAnyParameterIsAppliedWhenOneWouldRestoreTheMaster() throws Exception {
         AtomicReference<Integer> afterHandover = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1214,8 +1279,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void iamSessionIsRefusedWhenPostgresReportsAnotherSessionRoleAfterTheParameters() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1272,9 +1337,9 @@ class PostgresProtocolHandlerTest {
         AtomicReference<String> handover = new AtomicReference<>();
         List<String> afterHandover = new ArrayList<>();
 
-        try (ServerSocket lookupServer = new ServerSocket(0);
-             ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket lookupServer = loopbackServerSocket();
+             ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             Thread lookupThread = Thread.ofVirtual().start(() -> {
                 try {
@@ -1364,8 +1429,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void iamSessionFailsWhenARoleDefaultHitsAnErrorOtherThanARefusal() throws Exception {
-        try (ServerSocket lookupServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket lookupServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             Thread lookupThread = Thread.ofVirtual().start(() -> {
                 try {
@@ -1633,8 +1698,8 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1703,8 +1768,8 @@ class PostgresProtocolHandlerTest {
     void iamSessionForTheMasterUserKeepsTheMasterSession() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1749,8 +1814,8 @@ class PostgresProtocolHandlerTest {
     void iamSessionIsTerminatedWhenPostgresReportsAnotherSessionRole() throws Exception {
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1808,8 +1873,8 @@ class PostgresProtocolHandlerTest {
         byte[] wideRow = new byte[40_000];
         Arrays.fill(wideRow, (byte) 'x');
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1869,8 +1934,8 @@ class PostgresProtocolHandlerTest {
     void iamSessionIsTerminatedWhenAnotherSessionRoleFollowsABurstOfRows() throws Exception {
         int rows = 2_000;
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1942,8 +2007,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void nonIamSessionRelaysSessionAuthorizationChanges() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -1998,8 +2063,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void backendThatAcceptsButNeverAnswersFailsWithinTheHandshakeTimeout() throws Exception {
-        try (ServerSocket silentBackend = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket silentBackend = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             PostgresProtocolHandler.BackendConnector connector =
                     () -> connectTestSocket("localhost", silentBackend.getLocalPort());
@@ -2106,8 +2171,7 @@ class PostgresProtocolHandlerTest {
         List<LogRecord> records = LogCapture.capture(PostgresProtocolHandler.class, () ->
                 assertDoesNotThrow(() -> runAdmissionRefused(true, false, user, (in, out) -> {
                     assertEquals(PostgresProtocolHandler.databaseRoleQuery(user, true, false, false), readSimpleQuery(in));
-                    writeErrorResponse(out, "ERROR", "XX000", "SECRET_SQL X-Amz-Credential=SECRET_TOKEN");
-                    writeReadyForQuery(out);
+                    writeErrorAndReadyForQuery(out, "ERROR", "XX000", "SECRET_SQL X-Amz-Credential=SECRET_TOKEN");
                     assertEquals(-1, in.read());
                 })));
         List<String> logs = records.stream().map(LogCapture::formatted).toList();
@@ -2135,8 +2199,8 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Throwable> backendFailure = new AtomicReference<>();
         AtomicReference<Throwable> authFailure = new AtomicReference<>();
         AtomicReference<PostgresProtocolHandler.AuthenticatedSession> result = new AtomicReference<>();
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
             Thread backendThread = Thread.ofVirtual().start(() -> {
                 try {
                     mockBackendMasterSession(backendServer, script);
@@ -2232,8 +2296,8 @@ class PostgresProtocolHandlerTest {
                                                   boolean forwardStartupParameters) throws Exception {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
             Thread backendThread = Thread.ofVirtual().start(() -> {
@@ -2350,8 +2414,7 @@ class PostgresProtocolHandlerTest {
             backendQuery.set(query);
 
             if (!roleExists) {
-                writeErrorResponse(out, "ERROR", "42704", "role \"" + role + "\" does not exist");
-                writeReadyForQuery(out);
+                writeErrorAndReadyForQuery(out, "ERROR", "42704", "role \"" + role + "\" does not exist");
                 return;
             }
 
@@ -2614,6 +2677,10 @@ class PostgresProtocolHandlerTest {
         out.flush();
     }
 
+    private static ServerSocket loopbackServerSocket() throws IOException {
+        return new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+    }
+
     /** Collects ParameterStatus values the client is handed, stopping at ReadyForQuery. */
     private static Map<String, String> readParametersUntilReadyForQuery(DataInputStream in)
             throws IOException {
@@ -2772,7 +2839,7 @@ class PostgresProtocolHandlerTest {
     /** Authenticates {@code client} with the proxy against {@code backend}, and fails on the backend's failure. */
     private PostgresProtocolHandler.AuthenticatedSession authenticateAgainst(MemorySocket client,
                                                                           MockBackend backend) throws Exception {
-        try (ServerSocket server = new ServerSocket(0)) {
+        try (ServerSocket server = loopbackServerSocket()) {
             AtomicReference<Throwable> backendFailure = new AtomicReference<>();
             Thread backendThread = Thread.ofVirtual().start(() -> {
                 try {
