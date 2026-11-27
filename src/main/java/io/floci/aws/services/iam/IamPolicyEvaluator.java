@@ -363,6 +363,15 @@ public class IamPolicyEvaluator {
         return new DecisionRecord(Outcome.ALLOW, granting.layer(), granting);
     }
 
+    /** Whether a foreign KMS grant is barred by an explicit deny or an SCP ceiling. */
+    public boolean deniesKmsGrant(CallerContext caller, ResourcePolicyDecision resourcePolicyDecision,
+                                  String action, String resource, Map<String, List<String>> conditionCtx) {
+        DecisionRecord decision = explain(caller, resourcePolicyDecision,
+                ResourceAccountRelationship.SAME_ACCOUNT, action, resource, conditionCtx);
+        return decision.outcome() == Outcome.EXPLICIT_DENY
+                || decision.layer() == PolicyLayer.SERVICE_CONTROL;
+    }
+
     private static DecisionRecord implicitDeny(PolicyLayer layer) {
         return new DecisionRecord(Outcome.IMPLICIT_DENY, layer, null);
     }
