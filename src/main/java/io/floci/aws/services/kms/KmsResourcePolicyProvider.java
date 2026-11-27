@@ -47,8 +47,12 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
         }
         Optional<KmsService.KeyPolicyMaterial> material = service.findKeyPolicyMaterial(resource);
         List<ResourcePolicy> policies = new ArrayList<>();
+        // A key that does not exist has no key policy to grant anything. Its owner account is kept,
+        // so a call on another account's missing key is still judged cross-account and refused, but
+        // a call on the caller's own missing key is left to the caller's policies. The handler then
+        // answers NotFoundException, as KMS does, instead of AccessDeniedException.
         policies.add(new ResourcePolicy(material.map(KmsService.KeyPolicyMaterial::policy).filter(policy -> !policy.isBlank()).orElse(null),
-                arn.accountId(), true));
+                arn.accountId(), material.isPresent()));
         material.ifPresent(key -> key.grants().forEach(grant -> policies.add(
                 new ResourcePolicy(grantPolicy(grant, resource, key.symmetric()), arn.accountId(), true))));
         return List.copyOf(policies);

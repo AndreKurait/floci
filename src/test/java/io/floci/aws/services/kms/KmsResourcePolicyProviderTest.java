@@ -127,8 +127,8 @@ class KmsResourcePolicyProviderTest {
         storeKey();
         grants.put(REGION + "::grant", grant("grant", Map.of()));
         String foreign = ARN.replace(OWNER, CALLER);
-        assertEquals(List.of(new ResourcePolicy(null, CALLER, true)), provider.getResourcePolicies("kms", foreign));
-        assertEquals(List.of(new ResourcePolicy(null, OWNER, true)),
+        assertEquals(List.of(new ResourcePolicy(null, CALLER, false)), provider.getResourcePolicies("kms", foreign));
+        assertEquals(List.of(new ResourcePolicy(null, OWNER, false)),
                 provider.getResourcePolicies("kms", ARN.replace("arn:aws:", "arn:aws-cn:")));
         assertTrue(provider.getResourcePolicies("kms", ARN.replace("key/" + KEY_ID, "alias/test")).isEmpty());
         verifyNoInteractions(request);
