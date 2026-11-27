@@ -33,6 +33,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.nio.charset.StandardCharsets;
@@ -45,10 +46,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -99,6 +102,7 @@ class IamEnforcementFilterTest {
         evaluator = mock(IamPolicyEvaluator.class);
         actionRegistry = mock(IamActionRegistry.class);
         when(actionRegistry.operationForRoute(any(), any(), any())).thenAnswer(inv -> inv.getArgument(1));
+        when(actionRegistry.routedScope(any())).thenAnswer(inv -> inv.getArgument(0));
         arnBuilder = mock(ResourceArnBuilder.class);
         requestContext = new RequestContext();
         conditionContextResolver = mock(IamConditionContextResolver.class);
@@ -2659,8 +2663,11 @@ class IamEnforcementFilterTest {
 
     /** Builds a filter whose only resource-policy provider reports the given bucket owner. */
     private IamEnforcementFilter filterWithBucketOwner(String ownerAccountId) {
-        ResourcePolicyProvider provider = (scope, arn) ->
-                List.of(new ResourcePolicyProvider.ResourcePolicy(null, ownerAccountId));
+        return filterWithResourcePolicy(new ResourcePolicyProvider.ResourcePolicy(null, ownerAccountId));
+    }
+
+    private IamEnforcementFilter filterWithResourcePolicy(ResourcePolicyProvider.ResourcePolicy policy) {
+        ResourcePolicyProvider provider = (scope, arn) -> List.of(policy);
         @SuppressWarnings("unchecked")
         Instance<ResourcePolicyProvider> providers =
                 mock(Instance.class);
@@ -2676,5 +2683,78 @@ class IamEnforcementFilterTest {
                 mock(CloudTrailService.class),
                 mock(CurrentVertxRequest.class),
                 catalog, scpProvider, sessionAccountLookup, providers);
+    }
+
+    @Test
+    void delegatedUnknownCallerIsRejectedBeforeResourcePolicyLookup() {
+        requestContext.setAccessKeyId("AKIAUNKNOWN");
+        requestContext.setAccountId("111122223333");
+        AwsException failure = assertThrows(AwsException.class, () -> newFilter().authorizeDelegatedResource(
+                "kms:GenerateDataKey", "arn:aws:kms:us-east-1:111122223333:key/example", Map.of()));
+        assertEquals("UnrecognizedClientException", failure.getErrorCode());
+        assertEquals("111122223333", requestContext.getAccountId());
+        verifyNoInteractions(evaluator);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"111122223333", "test"})
+    void delegatedRootStillRequiresAKeyGrantWithoutScps(String accessKey) {
+        evaluator = new IamPolicyEvaluator(new ObjectMapper());
+        requestContext.setAccessKeyId(accessKey);
+        requestContext.setAccountId("111122223333");
+        IamEnforcementFilter filter = filterWithResourcePolicy(
+                new ResourcePolicyProvider.ResourcePolicy(null, "111122223333", true));
+        AwsException failure = assertThrows(AwsException.class, () -> filter.authorizeDelegatedResource(
+                "kms:GenerateDataKey", "arn:aws:kms:us-east-1:111122223333:key/example", Map.of()));
+        assertEquals("AccessDenied", failure.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"111122223333", "test"})
+    void delegatedRootUsesKeyGrantConditionsWithoutScps(String accessKey) {
+        evaluator = new IamPolicyEvaluator(new ObjectMapper());
+        requestContext.setAccessKeyId(accessKey);
+        requestContext.setAccountId("111122223333");
+        String policy = """
+                {"Version":"2012-10-17","Statement":[{
+                  "Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111122223333:root"},
+                  "Action":"kms:GenerateDataKey","Resource":"*",
+                  "Condition":{"StringEquals":{"kms:ViaService":"s3.us-east-1.amazonaws.com"}}}]}
+                """;
+        IamEnforcementFilter filter = filterWithResourcePolicy(
+                new ResourcePolicyProvider.ResourcePolicy(policy, "111122223333", true));
+        String resource = "arn:aws:kms:us-east-1:111122223333:key/example";
+        assertThrows(AwsException.class,
+                () -> filter.authorizeDelegatedResource("kms:GenerateDataKey", resource, Map.of()));
+        assertDoesNotThrow(() -> filter.authorizeDelegatedResource("kms:GenerateDataKey", resource,
+                Map.of("kms:ViaService", List.of("s3.us-east-1.amazonaws.com"))));
+    }
+
+    @Test
+    void delegatedIdentityAllowDoesNotReplaceTheRequiredKeyGrant() {
+        evaluator = new IamPolicyEvaluator(new ObjectMapper());
+        requestContext.setAccessKeyId("AKIAISSUED");
+        requestContext.setAccountId("111122223333");
+        when(iamService.resolveCallerContext(eq("AKIAISSUED"), any()))
+                .thenReturn(CallerContext.of(List.of(FULL_AWS_ACCESS)));
+        IamEnforcementFilter filter = filterWithResourcePolicy(
+                new ResourcePolicyProvider.ResourcePolicy(null, "111122223333", true));
+        assertThrows(AwsException.class, () -> filter.authorizeDelegatedResource(
+                "kms:GenerateDataKey", "arn:aws:kms:us-east-1:111122223333:key/example", Map.of()));
+    }
+
+    @Test
+    void delegatedRootRemainsBoundedByScps() {
+        requestContext.setAccessKeyId("111122223333");
+        requestContext.setAccountId("111122223333");
+        ScpProvider scp = mock(ScpProvider.class);
+        when(scp.effectiveScpLevels("111122223333")).thenReturn(List.of(List.of(
+                FULL_AWS_ACCESS, """
+                {"Version":"2012-10-17","Statement":[{
+                  "Effect":"Deny","Action":"kms:GenerateDataKey","Resource":"*"}]}
+                """)));
+        IamEnforcementFilter filter = newFilterWithScp(scp);
+        assertThrows(AwsException.class, () -> filter.authorizeDelegatedResource(
+                "kms:GenerateDataKey", "arn:aws:kms:us-east-1:111122223333:key/example", Map.of()));
     }
 }

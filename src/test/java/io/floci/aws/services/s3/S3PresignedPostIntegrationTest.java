@@ -2,6 +2,7 @@ package io.floci.aws.services.s3;
 
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -15,7 +16,9 @@ import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -24,6 +27,26 @@ import static org.hamcrest.Matchers.*;
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class S3PresignedPostIntegrationTest {
+
+    private final List<String> createdKmsKeys = new ArrayList<>();
+
+    private String createKmsKey() {
+        String key = given().contentType("application/x-amz-json-1.1")
+                .header("X-Amz-Target", "TrentService.CreateKey").body("{}".getBytes(StandardCharsets.UTF_8))
+                .post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        createdKmsKeys.add(key);
+        return key;
+    }
+
+    @AfterEach
+    void retireCreatedKmsKeys() {
+        for (String key : createdKmsKeys) {
+            given().contentType("application/x-amz-json-1.1")
+                    .header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                    .body(("{\"KeyId\":\"" + key + "\",\"PendingWindowInDays\":7}").getBytes(StandardCharsets.UTF_8))
+                    .post("/").then().statusCode(200);
+        }
+    }
 
     private static final String BUCKET = "presigned-post-bucket";
     private static final String VERSIONED_BUCKET = "presigned-post-versioned-bucket";
@@ -840,6 +863,11 @@ class S3PresignedPostIntegrationTest {
                 "arn:aws:kms:us-east-1:000000000000:key/11111111-1111-1111-1111-111111111111",
                 "arn:aws:kms:us-east-1:000000000000:key/22222222-2222-2222-2222-222222222222"
         };
+        if ("aws:kms".equals(encryption)) {
+            for (int index = 0; index < kmsKeys.length; index++) {
+                kmsKeys[index] = createKmsKey();
+            }
+        }
         String[] versionIds = new String[kmsKeys.length];
 
         given().put("/" + bucket).then().statusCode(200);

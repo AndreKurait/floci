@@ -315,10 +315,7 @@ public class S3Controller {
             rejectUnservedSubresource("HEAD", uriInfo);
             s3Service.authorizeBucketRead(bucket, "s3:ListBucket", authorization);
             s3Service.headBucket(bucket);
-            String bucketRegion = s3Service.getBucketRegion(bucket);
-            if (bucketRegion == null || bucketRegion.isBlank()) {
-                bucketRegion = regionResolver.getDefaultRegion();
-            }
+            String bucketRegion = s3Service.findBucketRegion(bucket).orElse(regionResolver.getDefaultRegion());
             return Response.ok()
                     .header("x-amz-bucket-region", bucketRegion)
                     .build();
@@ -4215,13 +4212,29 @@ public class S3Controller {
             }
         }
 
-        S3Object obj = s3Service.postObject(bucket, key, fileData, objectContentType,
-            metadata.isEmpty() ? null : metadata, new PutObjectOptions()
-                .withServerSideEncryption(encryption)
-                .withSseKmsKeyId(kmsKeyId)
-                .withSseCustomerAlgorithm(lcFields.get("x-amz-server-side-encryption-customer-algorithm"))
-                .withSseCustomerKey(lcFields.get("x-amz-server-side-encryption-customer-key"))
-                .withSseCustomerKeyMd5(lcFields.get("x-amz-server-side-encryption-customer-key-md5")));
+        String previousAccessKey = requestContext.getAccessKeyId();
+        String previousSessionToken = requestContext.getSessionToken();
+        S3Object obj;
+        try {
+            if (credential != null && !credential.isEmpty()) {
+                String accessKey = accountResolver.extractAccessKeyId(
+                    AccountResolver.SIGV4_SCHEME + " Credential=" + credential);
+                if (accessKey != null) {
+                    requestContext.setAccessKeyId(accessKey);
+                    requestContext.setSessionToken(lcFields.get("x-amz-security-token"));
+                }
+            }
+            obj = s3Service.postObject(bucket, key, fileData, objectContentType,
+                metadata.isEmpty() ? null : metadata, new PutObjectOptions()
+                    .withServerSideEncryption(encryption)
+                    .withSseKmsKeyId(kmsKeyId)
+                    .withSseCustomerAlgorithm(lcFields.get("x-amz-server-side-encryption-customer-algorithm"))
+                    .withSseCustomerKey(lcFields.get("x-amz-server-side-encryption-customer-key"))
+                    .withSseCustomerKeyMd5(lcFields.get("x-amz-server-side-encryption-customer-key-md5")));
+        } finally {
+            requestContext.setAccessKeyId(previousAccessKey);
+            requestContext.setSessionToken(previousSessionToken);
+        }
         LOG.infov("Presigned POST upload: {0}/{1} ({2} bytes)", bucket, key, fileData.length);
 
         String xml = new XmlBuilder()

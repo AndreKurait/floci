@@ -3,11 +3,16 @@ package io.floci.aws.services.s3;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.IamEnforcementFilter;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.HybridStorage;
 import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.LambdaFunction;
@@ -22,12 +27,16 @@ import io.floci.aws.services.s3.model.ObjectAttributeName;
 import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import io.floci.aws.services.s3.model.WebsiteConfiguration;
+import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -42,11 +51,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -59,9 +70,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class S3ServiceTest {
 
     @TempDir
@@ -396,8 +409,20 @@ class S3ServiceTest {
 
     @Test
     void putObjectWithKmsKeepsTheKeyId() {
+        InMemoryStorageFactory factory = new InMemoryStorageFactory("000000000000");
+        RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
+        KmsService kms = new KmsService(factory, regions);
+        String kmsKeyId = kms.createKey("object key", "us-east-1").getArn();
+        S3KmsEncryption encryption = new S3KmsEncryption(kms, mock(IamEnforcementFilter.class),
+                new RequestContext(), regions, mock(IamService.class));
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage().persistentPath()).thenReturn(tempDir.toString());
+        when(config.storage().mode()).thenReturn("persistent");
+        when(config.storage().services().s3().mode()).thenReturn(Optional.of("persistent"));
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        s3Service = new S3Service(factory, config, null, null, null, null, null,
+                regions, new ObjectMapper(), null, Clock.systemUTC(), encryption);
         s3Service.createBucket("test-bucket", "us-east-1");
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
 
         S3Object put = s3Service.putObject(
                 "test-bucket",
@@ -412,6 +437,8 @@ class S3ServiceTest {
 
         assertEquals("aws:kms", put.getServerSideEncryption());
         assertEquals(kmsKeyId, put.getSseKmsKeyId());
+        assertArrayEquals("data".getBytes(StandardCharsets.UTF_8),
+                s3Service.getObject("test-bucket", "kms-with-key-id.txt").getData());
     }
 
     @Test
@@ -475,6 +502,29 @@ class S3ServiceTest {
         AwsException ex = assertThrows(AwsException.class,
                 () -> s3Service.createBucket(bucketName, "us-east-1"), bucketName);
         assertEquals("InvalidBucketName", ex.getErrorCode());
+    }
+
+    @Test
+    void bucketStoredWithoutARegionIsInTheDefaultRegion() {
+        // A bucket persisted before buckets recorded their Region is in the default one, as
+        // ListBuckets reports it, so the region redirect still applies to it.
+        InMemoryStorage<String, Bucket> bucketStore = new InMemoryStorage<>();
+        S3Service service = new S3Service(bucketStore, new InMemoryStorage<>(), tempDir.resolve("legacy-region"),
+                false, (LambdaService) null, new RegionResolver("eu-west-2", "000000000000"));
+        Bucket unrecorded = new Bucket("legacy-null-region");
+        unrecorded.setRegion(null);
+        bucketStore.put(unrecorded.getName(), unrecorded);
+        Bucket blank = new Bucket("legacy-blank-region");
+        blank.setRegion("");
+        bucketStore.put(blank.getName(), blank);
+        Bucket recorded = new Bucket("recorded-region");
+        recorded.setRegion("ap-south-1");
+        bucketStore.put(recorded.getName(), recorded);
+
+        assertEquals(Optional.of("eu-west-2"), service.findBucketRegion("legacy-null-region"));
+        assertEquals(Optional.of("eu-west-2"), service.findBucketRegion("legacy-blank-region"));
+        assertEquals(Optional.of("ap-south-1"), service.findBucketRegion("recorded-region"));
+        assertEquals(Optional.empty(), service.findBucketRegion("no-such-bucket"));
     }
 
     @Test

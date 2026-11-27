@@ -92,6 +92,16 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("kms:RetireGrant".equals(operation)) {
+            JsonNode body = readJsonBody(ctx);
+            StoredResourceArns stored = storedResourceArns("kms");
+            if (body != null && body.path("GrantToken").isTextual() && stored != null) {
+                List<String> keys = stored.through("GrantToken", body.path("GrantToken").textValue(), region);
+                if (!keys.isEmpty()) {
+                    return keys;
+                }
+            }
+        }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
 
