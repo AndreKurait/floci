@@ -14,9 +14,12 @@ import io.floci.aws.services.s3.model.MultipartUpload;
 import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -44,6 +47,7 @@ import static org.mockito.Mockito.when;
  * the configured {@code ApplyServerSideEncryptionByDefault}, or SSE-S3 ({@code AES256}) for a bucket
  * with none. An explicit header and an SSE-C key keep taking precedence.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class S3DefaultEncryptionServiceTest {
 
     private static final String BUCKET = "default-encryption-bucket";
