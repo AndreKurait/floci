@@ -1724,7 +1724,7 @@ public class Ec2ContainerManager {
             if ("running".equals(state)) {
                 return false;
             }
-            instance.markTerminated(System.currentTimeMillis());
+            instance.markTerminated(clock.millis());
         }
         failLaunch(instance);
         return true;

@@ -724,7 +724,23 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         if (props == null || !props.has("Policy") || props.get("Policy").isNull()) {
             return JsonNodeFactory.instance.nullNode();
         }
-        return ctx.engine().resolveNode(props.get("Policy"));
+        JsonNode policy = ctx.engine().resolveNode(props.get("Policy"));
+        if (policy == null || policy.isNull()) {
+            return JsonNodeFactory.instance.nullNode();
+        }
+        if (policy.isTextual()) {
+            try {
+                policy = MAPPER.readTree(policy.textValue());
+            } catch (JsonProcessingException failure) {
+                throw new AwsException("ValidationError",
+                        "AWS::Events::EventBus Policy must contain valid JSON.", 400);
+            }
+        }
+        if (policy == null || !policy.isObject()) {
+            throw new AwsException("ValidationError",
+                    "AWS::Events::EventBus Policy must resolve to a JSON object.", 400);
+        }
+        return policy;
     }
 
     private JsonNode parseEventBusPolicy(String policy, String source) {

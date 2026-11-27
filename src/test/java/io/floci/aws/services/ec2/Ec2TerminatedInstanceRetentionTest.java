@@ -17,6 +17,7 @@ import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.ec2.model.Volume;
 import io.floci.aws.services.ec2.model.VolumeAttachment;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
+import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.StorageFactories;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -24,8 +25,10 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -194,6 +197,25 @@ class Ec2TerminatedInstanceRetentionTest {
     }
 
     @Test
+    void scheduledRetentionUsesTheInstanceLifecycleClock() throws Exception {
+        EmulatorConfig config = config(dir, true, true);
+        ManualClock clock = new ManualClock(NOW);
+        seed(config, ACCOUNT, terminated("i-clock-owned", NOW));
+        Ec2TerminatedInstanceScheduler scheduler =
+                new Ec2TerminatedInstanceScheduler(service(config, clock), config);
+        Instant workerTime = NOW.plus(Duration.ofDays(365));
+
+        scheduler.tick(workerTime);
+        assertNotNull(persisted("i-clock-owned"), "a different worker clock must not expire a fresh instance");
+        clock.advance(Duration.ofHours(1));
+        scheduler.tick(workerTime);
+        assertNotNull(persisted("i-clock-owned"), "the exact one-hour boundary remains retained");
+        clock.advance(Duration.ofMillis(1));
+        scheduler.tick(workerTime);
+        assertNull(persisted("i-clock-owned"), "the lifecycle clock releases the record after one hour");
+    }
+
+    @Test
     void theSchedulerHasNoBackgroundSweepWhileEc2IsDisabled() {
         EmulatorConfig config = config(dir, true, false);
 
@@ -223,6 +245,20 @@ class Ec2TerminatedInstanceRetentionTest {
         assertEquals(List.of(launching), written, "the terminal state must be handed to the store");
         assertEquals("terminated", written.getFirst().getState().getName());
         assertTrue(written.getFirst().getTerminatedAt() > 0);
+    }
+
+    @Test
+    void aCancelledNativeLaunchUsesTheSameLifecycleClock() {
+        Ec2ContainerManager manager = manager(config(dir, true, false), mock(DockerClient.class),
+                mock(ContainerLifecycleManager.class), mock(Ec2PortForwardManager.class),
+                Clock.fixed(NOW, ZoneOffset.UTC));
+        Instance launching = instance("i-clock-cancelled", InstanceState.pending(), null);
+        try {
+            assertTrue(manager.cancelLaunch(launching));
+            assertEquals(NOW.toEpochMilli(), launching.getTerminatedAt());
+        } finally {
+            manager.stop();
+        }
     }
 
     @Test
@@ -302,9 +338,13 @@ class Ec2TerminatedInstanceRetentionTest {
     }
 
     private Ec2Service service(EmulatorConfig config) {
+        return service(config, Clock.fixed(NOW, ZoneOffset.UTC));
+    }
+
+    private Ec2Service service(EmulatorConfig config, Clock clock) {
         return new Ec2Service(config, mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
-                StorageFactories.open(config, "persistent"));
+                StorageFactories.open(config, "persistent"), clock);
     }
 
     private void seedVolume(String volumeId, String instanceId) {
