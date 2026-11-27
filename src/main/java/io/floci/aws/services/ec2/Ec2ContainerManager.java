@@ -3483,15 +3483,10 @@ public class Ec2ContainerManager {
                 return;
             }
             inProgress.run();
-            String reason = recreateGuest(instance, oldId, image, publicKey, accountId, prepareMounts);
+            String reason = recreateGuest(instance, oldId, image, publicKey, accountId, prepareMounts, replaced);
             if (reason != null) {
                 failed.accept(reason);
                 return;
-            }
-            try {
-                replaced.run();
-            } catch (RuntimeException e) {
-                LOG.warnv("Error in post-replace hook for instance {0}: {1}", instance.getInstanceId(), e.getMessage());
             }
         }), callbackCompleted).whenComplete((ignored, failure) -> {
             apiReboots.computeIfPresent(oldId, (id, count) -> count > 1 ? count - 1 : null);
@@ -3503,9 +3498,10 @@ public class Ec2ContainerManager {
 
     /** Swaps the workload container; returns null on success, or the reason the old guest was kept. */
     private String recreateGuest(Instance instance, String oldId, ResolvedAmiImage image, String publicKey,
-                                 String accountId, Supplier<List<PreparedMount>> prepareMounts) {
+                                 String accountId, Supplier<List<PreparedMount>> prepareMounts, Runnable replaced) {
         String instanceId = instance.getInstanceId();
         String region = instance.getRegion();
+        String oldImageId = instance.getImageId();
         InspectContainerResponse old;
         try {
             old = dockerClient.inspectContainerCmd(oldId).exec();
@@ -3573,13 +3569,20 @@ public class Ec2ContainerManager {
             }
             refreshStartedContainerAddresses(instance, newId, protectedNamespace(instance));
             persist(instance);
+            try {
+                bootstrapReplacedGuest(instance, newId, image, publicKey);
+            } catch (RuntimeException e) {
+                // The new root already runs; a bootstrap step that fails is the guest's, as at launch.
+                LOG.warnv("Could not bootstrap the replaced guest of EC2 instance {0}: {1}", instanceId, e.getMessage());
+            }
+            replaced.run();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            restoreOldGuest(instance, oldId, newId, name, parked, oldStopped, swapped);
+            restoreOldGuest(instance, oldId, newId, name, parked, oldStopped, swapped, oldImageId);
             return "The root volume replacement was interrupted.";
         } catch (Exception e) {
             LOG.warnv("Could not replace the root volume of EC2 instance {0}: {1}", instanceId, e.getMessage());
-            restoreOldGuest(instance, oldId, newId, name, parked, oldStopped, swapped);
+            restoreOldGuest(instance, oldId, newId, name, parked, oldStopped, swapped, oldImageId);
             return "The root volume could not be replaced: " + e.getMessage();
         } finally {
             if (newId != null) {
@@ -3591,12 +3594,6 @@ public class Ec2ContainerManager {
         } catch (RuntimeException e) {
             LOG.warnv("Could not remove the replaced guest {0} of EC2 instance {1}: {2}",
                     oldId, instanceId, e.getMessage());
-        }
-        try {
-            bootstrapReplacedGuest(instance, newId, image, publicKey);
-        } catch (RuntimeException e) {
-            // The new root already runs; a bootstrap step that fails is the guest's, as at launch.
-            LOG.warnv("Could not bootstrap the replaced guest of EC2 instance {0}: {1}", instanceId, e.getMessage());
         }
         LOG.infov("Replaced the root volume of EC2 instance {0}: container {1} runs {2}",
                 instanceId, newId, image.dockerImage());
@@ -3626,11 +3623,12 @@ public class Ec2ContainerManager {
 
     /** Undoes a partial swap so the instance keeps running on its old root, as AWS leaves it after a failed task. */
     private void restoreOldGuest(Instance instance, String oldId, String newId, String name,
-                                 boolean parked, boolean oldStopped, boolean swapped) {
+                                 boolean parked, boolean oldStopped, boolean swapped, String oldImageId) {
         if (swapped) {
             synchronized (instance) {
                 if (Objects.equals(newId, instance.getDockerContainerId())) {
                     instance.setDockerContainerId(oldId);
+                    instance.setImageId(oldImageId);
                 }
             }
         }

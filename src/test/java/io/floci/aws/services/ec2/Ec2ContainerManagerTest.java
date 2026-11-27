@@ -4016,6 +4016,39 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void replaceRootPostReplaceFailureRestoresTheOldGuestAndReportsFailure() {
+        List<Runnable> tasks = new ArrayList<>();
+        ExecutorService executor = mock(ExecutorService.class);
+        doAnswer(call -> { tasks.add(call.getArgument(0)); return null; }).when(executor).execute(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        stubReplaceableGuest(harness, "i-replace-hook-fails", null);
+        StartContainerCmd startOld = mock(StartContainerCmd.class);
+        when(harness.dockerClient.startContainerCmd(REPLACED_CONTAINER_ID)).thenReturn(startOld);
+        Instance guest = replaceableInstance("i-replace-hook-fails");
+        guest.setImageId("ami-original");
+        AtomicReference<String> failed = new AtomicReference<>();
+        try {
+            harness.manager.replaceRoot(guest, ResolvedAmiImage.minimal("ubuntu:26.04"), null,
+                    () -> { }, () -> {
+                        guest.setImageId("ami-replacement");
+                        throw new IllegalStateException("data-volume reattachment refused");
+                    }, failed::set);
+            tasks.removeFirst().run();
+
+            assertTrue(failed.get() != null && failed.get().contains("data-volume reattachment refused"),
+                    "A failed post-replace hook must finish the task as failed: " + failed.get());
+            assertEquals(REPLACED_CONTAINER_ID, guest.getDockerContainerId());
+            assertEquals("ami-original", guest.getImageId());
+            assertEquals("running", guest.getState().getName());
+            verify(harness.lifecycleManager).removeIfExists(TEST_CONTAINER_ID);
+            verify(harness.lifecycleManager, never()).removeIfExists(REPLACED_CONTAINER_ID);
+            verify(startOld).exec();
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
     void replaceRootThatFailsToStartTheNewGuestKeepsTheOldOneRunning() {
         List<Runnable> tasks = new ArrayList<>();
         ExecutorService executor = mock(ExecutorService.class);

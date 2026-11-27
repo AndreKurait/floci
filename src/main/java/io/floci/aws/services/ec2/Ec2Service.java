@@ -7502,11 +7502,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             throw new AwsException("InvalidParameterCombination",
                     "You can specify either a snapshot ID or an AMI ID, but not both.", 400);
         }
-        if (deleteReplacedRootVolume && imageId == null && snapshotId == null) {
-            // As AWS: the original volume is only deleted when a new source replaces it.
-            throw new AwsException("InvalidParameterCombination",
-                    "DeleteReplacedRootVolume requires a snapshot ID or an AMI ID.", 400);
-        }
         Instance inst = requireEc2ManagedInstance(region, instanceId, "replaced");
         if (clientToken != null && !clientToken.isBlank()) {
             Optional<ReplaceRootVolumeTask> replay = replaceRootVolumeTasks.scan(k -> k.startsWith(region + "::"))
@@ -7514,7 +7509,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (replay.isPresent()) {
                 if (!instanceId.equals(replay.get().getInstanceId())
                         || !Objects.equals(imageId, replay.get().getImageId())
-                        || !Objects.equals(snapshotId, replay.get().getSnapshotId())) {
+                        || !Objects.equals(snapshotId, replay.get().getSnapshotId())
+                        || deleteReplacedRootVolume
+                                != Boolean.TRUE.equals(replay.get().getDeleteReplacedRootVolume())) {
                     throw new AwsException("IdempotentParameterMismatch",
                             "The client token was already used with different parameters.", 400);
                 }
