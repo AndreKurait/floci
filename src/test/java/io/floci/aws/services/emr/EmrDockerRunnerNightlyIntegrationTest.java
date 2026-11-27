@@ -176,7 +176,13 @@ class EmrDockerRunnerNightlyIntegrationTest {
         String container = ContainerStorageHelper.dockerName(config, "emr-" + stepId);
         await("step " + stepId + "'s command to sleep").atMost(Duration.ofMinutes(5))
                 .pollInterval(Duration.ofSeconds(1))
-                .until(() -> sleeping(container));
+                .until(() -> {
+                    Response step = emr("DescribeStep",
+                            "{\"ClusterId\":\"" + clusterId + "\",\"StepId\":\"" + stepId + "\"}")
+                            .then().statusCode(200).extract().response();
+                    EmrRequests.requireUnfinishedStep(step);
+                    return sleeping(container);
+                });
     }
 
     private boolean sleeping(String container) {
