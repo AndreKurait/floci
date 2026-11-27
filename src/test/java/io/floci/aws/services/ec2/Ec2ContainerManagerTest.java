@@ -7283,7 +7283,15 @@ class Ec2ContainerManagerTest {
 
     @Test
     void concurrentTerminationRetriesClaimTheSamePhysicalCleanup() throws Exception {
-        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch firstTaskCompleted = new CountDownLatch(1);
+        ExecutorService executor = new ThreadPoolExecutor(2, 2, 0, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(2)) {
+            @Override
+            protected void afterExecute(Runnable task, Throwable failure) {
+                super.afterExecute(task, failure);
+                firstTaskCompleted.countDown();
+            }
+        };
         LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         Instance instance = instance("i-singleflight-termination");
         instance.setDockerContainerId(TEST_CONTAINER_ID);
@@ -7316,6 +7324,7 @@ class Ec2ContainerManagerTest {
             });
             assertTrue(terminalSaved.await(5, TimeUnit.SECONDS));
             assertEquals("terminated", instance.getState().getName());
+            assertTrue(firstTaskCompleted.await(5, TimeUnit.SECONDS));
             refuse.set(false);
             harness.manager.terminate(instance, callbacks::incrementAndGet);
             assertTrue(retryEntered.await(5, TimeUnit.SECONDS));
