@@ -24,6 +24,7 @@ import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.testing.IotWebSocketSigV4;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import io.floci.aws.testing.ThreadStates;
 import io.floci.aws.testutil.FreePorts;
 import io.netty.handler.codec.mqtt.MqttProperties;
@@ -62,6 +63,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.AdditionalAnswers;
 import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
@@ -110,11 +113,11 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -181,7 +184,7 @@ class IotMqttBrokerServiceTest {
     private final IotCustomAuthorizer customAuthorizer = mock(IotCustomAuthorizer.class);
     private final IotPublishEventRecorder recorder = new IotPublishEventRecorder();
     /** The broker's clock, which a keep-alive test moves forward instead of sleeping. */
-    private final AtomicLong nanoTime = new AtomicLong();
+    private final TestTime time = TestTime.create();
     private int plainPort;
     private int tlsPort;
     private IotMqttBrokerService broker;
@@ -213,7 +216,7 @@ class IotMqttBrokerServiceTest {
         when(config.tls().enabled()).thenReturn(true);
         when(registry.getDefault()).thenReturn(Optional.of(tls));
         when(tls.getKeyStoreOptions()).thenReturn(pem(bootLeaf));
-        broker = new IotMqttBrokerService(config, vertx, iotService, customAuthorizer, registry, nanoTime::get);
+        broker = new IotMqttBrokerService(config, vertx, iotService, customAuthorizer, registry, time::nanoTime);
     }
 
     @AfterEach
@@ -1407,7 +1410,7 @@ class IotMqttBrokerServiceTest {
         MqttEndpoint subscribing = keepAliveEndpoint("subscribing");
         MqttEndpoint unsubscribing = keepAliveEndpoint("unsubscribing");
         MqttEndpoint acknowledging = keepAliveEndpoint("acknowledging");
-        nanoTime.addAndGet(Duration.ofSeconds(2).toNanos());
+        time.advance(Duration.ofSeconds(2));
 
         ArgumentCaptor<Handler<MqttPublishMessage>> publish = handlerCaptor();
         verify(publishing).publishHandler(publish.capture());
@@ -1450,13 +1453,39 @@ class IotMqttBrokerServiceTest {
     void anAbruptCloseBeforeTheKeepAliveTimeoutIsDueIsAConnectionLoss() throws Exception {
         startBrokerRecordingPublishes();
         MqttEndpoint dropped = keepAliveEndpoint("dropped");
-        nanoTime.addAndGet(Duration.ofMillis(1_500).toNanos());
+        time.advance(Duration.ofMillis(1_500));
 
         ArgumentCaptor<Handler<Void>> close = handlerCaptor();
         verify(dropped).closeHandler(close.capture());
         close.getValue().handle(null);
 
         assertEquals("CONNECTION_LOST", awaitPresence("disconnected", "dropped", 1).get(0).get("disconnectReason").asText());
+    }
+
+    /**
+     * The limit is 1.5 times the keep-alive, rounded up to a second, less the 250 ms of slack: a close
+     * one nanosecond short of it is a connection loss, a close at it is a keep-alive timeout.
+     */
+    @ParameterizedTest
+    @CsvSource({"1, 1750", "30, 44750", "1200, 1799750"})
+    void aCloseIsAKeepAliveTimeoutFromTheInstantTheSilenceReachesTheLimit(int keepAliveSeconds, long limitMillis)
+            throws Exception {
+        startBrokerRecordingPublishes();
+        Duration limit = Duration.ofMillis(limitMillis);
+        MqttEndpoint early = keepAliveEndpoint("early", keepAliveSeconds);
+        time.advance(limit.minusNanos(1));
+        ArgumentCaptor<Handler<Void>> earlyClose = handlerCaptor();
+        verify(early).closeHandler(earlyClose.capture());
+        earlyClose.getValue().handle(null);
+        MqttEndpoint due = keepAliveEndpoint("due", keepAliveSeconds);
+        time.advance(limit);
+        ArgumentCaptor<Handler<Void>> dueClose = handlerCaptor();
+        verify(due).closeHandler(dueClose.capture());
+        dueClose.getValue().handle(null);
+
+        assertEquals("CONNECTION_LOST", awaitPresence("disconnected", "early", 1).get(0).get("disconnectReason").asText());
+        assertEquals("MQTT_KEEP_ALIVE_TIMEOUT",
+                awaitPresence("disconnected", "due", 1).get(0).get("disconnectReason").asText());
     }
 
     /**
@@ -1467,7 +1496,7 @@ class IotMqttBrokerServiceTest {
     void aSilentClientTimesOutFromItsConnectNotFromItsCustomAuthorizersDecision() throws Exception {
         startBrokerRecordingPublishes();
         when(customAuthorizer.connectPolicies(eq("slow-auth"), eq("slow"), any(), any(), any())).thenAnswer(invocation -> {
-            nanoTime.addAndGet(Duration.ofMillis(1_500).toNanos());
+            time.advance(Duration.ofMillis(1_500));
             return List.of("""
                     {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}""");
         });
@@ -1476,7 +1505,7 @@ class IotMqttBrokerServiceTest {
 
         broker.handleEndpoint(endpoint, false);
         awaitPresence("connected", "slow", 1);
-        nanoTime.addAndGet(Duration.ofMillis(600).toNanos());
+        time.advance(Duration.ofMillis(600));
         ArgumentCaptor<Handler<Void>> close = handlerCaptor();
         verify(endpoint, times(2)).closeHandler(close.capture());
         close.getValue().handle(null);
@@ -1772,7 +1801,7 @@ class IotMqttBrokerServiceTest {
         int queued = IotMqttBrokerService.MAX_PENDING_RULE_EVALUATIONS - 1;
         CountDownLatch firstStarted = new CountDownLatch(1);
         CountDownLatch releaseFirst = new CountDownLatch(1);
-        AtomicInteger queuedRan = new AtomicInteger();
+        CountDownLatch queuedRan = new CountDownLatch(queued);
         AtomicBoolean beyondBoundRan = new AtomicBoolean();
         CountDownLatch afterDrainRan = new CountDownLatch(1);
 
@@ -1788,20 +1817,15 @@ class IotMqttBrokerServiceTest {
         try {
             assertTrue(firstStarted.await(10, TimeUnit.SECONDS), "the first evaluation started");
             for (int i = 0; i < queued; i++) {
-                broker.evaluateRulesOnWorker(topic, queuedRan::incrementAndGet);
+                broker.evaluateRulesOnWorker(topic, queuedRan::countDown);
             }
             broker.evaluateRulesOnWorker(topic, () -> beyondBoundRan.set(true));
         } finally {
             releaseFirst.countDown();
         }
 
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (queuedRan.get() < queued) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("only " + queuedRan.get() + " of " + queued + " queued evaluations ran");
-            }
-            Thread.sleep(10);
-        }
+        assertTrue(queuedRan.await(10, TimeUnit.SECONDS),
+                () -> "only " + (queued - queuedRan.getCount()) + " of " + queued + " queued evaluations ran");
         assertFalse(beyondBoundRan.get(), "the evaluation beyond the bound was skipped");
 
         broker.evaluateRulesOnWorker(topic, afterDrainRan::countDown);
@@ -1876,7 +1900,7 @@ class IotMqttBrokerServiceTest {
         when(rejectedWorker.executeBlocking(ArgumentMatchers.<Callable<Void>>any(), eq(false)))
                 .thenThrow(new IllegalStateException("dispatch unavailable"));
         IotMqttBrokerService rejectedBroker = new IotMqttBrokerService(
-                config, rejectedVertx, iotService, customAuthorizer, registry, nanoTime::get);
+                config, rejectedVertx, iotService, customAuthorizer, registry, time::nanoTime);
         for (int i = 0; i <= IotMqttBrokerService.MAX_PENDING_RULE_EVALUATIONS; i++) {
             assertThrows(IllegalStateException.class,
                     () -> rejectedBroker.evaluateRulesOnWorker("devices/d1/metrics", () -> {}));
@@ -2109,7 +2133,7 @@ class IotMqttBrokerServiceTest {
             timers.add(new ExpiryTimer(delay, id, handler));
             return id;
         }).when(timerVertx).setTimer(anyLong(), any());
-        broker = new IotMqttBrokerService(config, timerVertx, iotService, customAuthorizer, registry, nanoTime::get);
+        broker = new IotMqttBrokerService(config, timerVertx, iotService, customAuthorizer, registry, time::nanoTime);
         serveIotWithRuleWriting(mock(DynamoDbItemAccess.class));
         return timers;
     }
@@ -2142,16 +2166,9 @@ class IotMqttBrokerServiceTest {
     }
 
     private List<JsonNode> awaitPresence(String eventType, String clientId, int count) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 10_000;
-        List<JsonNode> events = presence(eventType, clientId);
-        while (events.size() < count) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("expected " + count + " " + eventType + " events for " + clientId + ", got " + events);
-            }
-            Thread.sleep(10);
-            events = presence(eventType, clientId);
-        }
-        return events;
+        return await(count + " " + eventType + " events for " + clientId).atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> presence(eventType, clientId), events -> events.size() >= count);
     }
 
     /**
@@ -2166,13 +2183,9 @@ class IotMqttBrokerServiceTest {
     }
 
     private static void awaitDisconnected(MqttClient client) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (client.isConnected()) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("client " + client.getClientId() + " is still connected");
-            }
-            Thread.sleep(10);
-        }
+        await("client " + client.getClientId() + " to be disconnected").atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> !client.isConnected());
     }
 
     private static MqttSubscribeMessage subscribeMessage(String topicFilter) {
@@ -2200,9 +2213,13 @@ class IotMqttBrokerServiceTest {
 
     /** A connected client with a one-second keep-alive. */
     private MqttEndpoint keepAliveEndpoint(String clientId) {
+        return keepAliveEndpoint(clientId, 1);
+    }
+
+    private MqttEndpoint keepAliveEndpoint(String clientId, int keepAliveSeconds) {
         MqttEndpoint endpoint = mock(MqttEndpoint.class);
         when(endpoint.clientIdentifier()).thenReturn(clientId);
-        when(endpoint.keepAliveTimeSeconds()).thenReturn(1);
+        when(endpoint.keepAliveTimeSeconds()).thenReturn(keepAliveSeconds);
         broker.handleEndpoint(endpoint, false);
         return endpoint;
     }
@@ -2457,18 +2474,9 @@ class IotMqttBrokerServiceTest {
 
     /** Vert.x resolves close() a moment before the OS releases the port; poll like the lazy-start test. */
     private static void awaitClosed(int port) {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (accepts(port)) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("port " + port + " still accepts connections");
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted while waiting for port " + port + " to close", e);
-            }
-        }
+        await("port " + port + " to stop accepting connections").atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(50))
+                .until(() -> !accepts(port));
     }
 
     /** A client key manager with no certificate that records whether the server asked for one. */
