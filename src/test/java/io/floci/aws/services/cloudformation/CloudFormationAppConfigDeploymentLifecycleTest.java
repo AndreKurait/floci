@@ -12,6 +12,8 @@ import io.floci.aws.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -158,6 +160,51 @@ class CloudFormationAppConfigDeploymentLifecycleTest {
                 .contains("previous hosted configuration version"));
         assertEquals("2", appconfig.getActiveVersion(environment, profile));
         assertEquals("COMPLETE", currentDeployment().getState());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Ref", "Fn::Sub"})
+    void hostedVersionReferenceFlowsThroughCreateReplacementAndDelete(String reference) throws Exception {
+        deploy("CREATE", hostedTemplate("four", reference));
+        assertEquals("CREATE_COMPLETE", stack().getStatus(), stack().getStatusReason());
+        assertEquals("4", appconfig.getActiveVersion(environment, profile));
+        assertEquals(app + "|" + profile + "|4", stack().getResources().get("Config").getPhysicalId());
+
+        deploy("UPDATE", hostedTemplate("five", reference));
+        assertEquals("UPDATE_COMPLETE", stack().getStatus(), stack().getStatusReason());
+        assertEquals("5", appconfig.getActiveVersion(environment, profile));
+        assertEquals(app + "|" + profile + "|5", stack().getResources().get("Config").getPhysicalId());
+
+        cfn.deleteStack("deployment", REGION, ACCOUNT).get(30, TimeUnit.SECONDS);
+
+        assertEquals("4", appconfig.getActiveVersion(environment, profile));
+    }
+
+    @Test
+    void hostedVersionReferenceRollbackRestoresPriorDeployment() throws Exception {
+        deploy("CREATE", hostedTemplate("four", "Ref"));
+        assertEquals("CREATE_COMPLETE", stack().getStatus(), stack().getStatusReason());
+        String original = stack().getResources().get("Deployment").getPhysicalId();
+        ObjectNode update = hostedTemplate("five", "Ref");
+        addInvalidResource(update);
+
+        deploy("UPDATE", update);
+
+        assertEquals("UPDATE_ROLLBACK_COMPLETE", stack().getStatus(), stack().getStatusReason());
+        assertEquals(original, stack().getResources().get("Deployment").getPhysicalId());
+        assertEquals("4", appconfig.getActiveVersion(environment, profile));
+    }
+
+    private ObjectNode hostedTemplate(String content, String reference) {
+        ObjectNode result = template("unused");
+        ((ObjectNode) result.path("Resources")).set("Config", JSON.valueToTree(Map.of(
+                "Type", "AWS::AppConfig::HostedConfigurationVersion", "DeletionPolicy", "Retain",
+                "UpdateReplacePolicy", "Retain", "Properties", Map.of("ApplicationId", app,
+                        "ConfigurationProfileId", profile, "Content", content, "ContentType", "text/plain"))));
+        ((ObjectNode) result.path("Resources").path("Deployment").path("Properties"))
+                .set("ConfigurationVersion", JSON.valueToTree(Map.of(reference,
+                        "Ref".equals(reference) ? "Config" : "${Config}")));
+        return result;
     }
 
     private Deployment currentDeployment() {
