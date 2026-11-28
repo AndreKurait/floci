@@ -38,6 +38,7 @@ import java.util.TimeZone;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
+import static io.floci.aws.services.apigateway.RestResourcePolicyTestSupport.disabledCaller;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -63,7 +64,8 @@ class ApiGatewayExecuteControllerTest {
         return new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, objectMapper, null,
-                null, null, null, null, routeContext, null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, routeContext, null, null, null, null, null, null, new HttpProxyInvoker(),
+                null, disabledCaller());
     }
 
     @ParameterizedTest
@@ -494,7 +496,8 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker(),
+                null, disabledCaller());
 
         Response response = controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -526,7 +529,8 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null, null, new HttpProxyInvoker(),
+                null, disabledCaller());
 
         controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -561,7 +565,8 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker(),
+                null, disabledCaller());
 
         controller.dispatch("GET", "restapi1", "prod", "hello", headers, null, null);
 

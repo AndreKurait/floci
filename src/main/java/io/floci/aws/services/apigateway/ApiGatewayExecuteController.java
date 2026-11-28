@@ -23,6 +23,7 @@ import io.floci.aws.core.common.AwsErrorResponse;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsPartition;
 import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.CookieHeaders;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
@@ -58,6 +59,7 @@ import io.floci.aws.services.elbv2.ElbV2Service;
 import io.floci.aws.services.elbv2.model.Listener;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
 import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
+import io.floci.aws.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
@@ -175,7 +177,30 @@ public class ApiGatewayExecuteController {
         this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver, objectMapper,
                 vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service, sqsQueryHandler, routeContext,
                 jwtSignatureVerifier, requestContext, sigV4Authorizer, restLambdaAuthorizer,
-                authorizerPolicyEvaluator, cloudMapInstanceResolver, httpProxyInvoker, null);
+                authorizerPolicyEvaluator, cloudMapInstanceResolver, httpProxyInvoker, null, null);
+    }
+    private final CallerCallAuthorizer callerCallAuthorizer;
+
+    public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, CognitoUserPoolAuthorizer cognitoAuthorizer,
+                                       ApiGatewayV2Service apiGatewayV2Service,
+                                       LambdaService lambdaService, RegionResolver regionResolver,
+                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
+                                       AwsServiceRouter serviceRouter,
+                                       WebSocketConnectionManager webSocketConnectionManager,
+                                       ElbV2Service elbV2Service,
+                                       SqsQueryHandler sqsQueryHandler,
+                                       ApiGatewayExecuteRouteContext routeContext,
+                                       JwtSignatureVerifier jwtSignatureVerifier,
+                                       RequestContext requestContext,
+                                       ExecuteApiSigV4Authorizer sigV4Authorizer, RestLambdaAuthorizer restLambdaAuthorizer,
+                                       AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                       CloudMapInstanceResolver cloudMapInstanceResolver,
+                                       HttpProxyInvoker httpProxyInvoker,
+                                       ServiceCallAuthorizer serviceCallAuthorizer) {
+        this(apiGatewayService, cognitoAuthorizer, apiGatewayV2Service, lambdaService, regionResolver, objectMapper,
+                vtlEngine, serviceRouter, webSocketConnectionManager, elbV2Service, sqsQueryHandler, routeContext,
+                jwtSignatureVerifier, requestContext, sigV4Authorizer, restLambdaAuthorizer,
+                authorizerPolicyEvaluator, cloudMapInstanceResolver, httpProxyInvoker, serviceCallAuthorizer, null);
     }
 
     @Inject
@@ -194,7 +219,8 @@ public class ApiGatewayExecuteController {
                                        AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
                                        CloudMapInstanceResolver cloudMapInstanceResolver,
                                        HttpProxyInvoker httpProxyInvoker,
-                                       ServiceCallAuthorizer serviceCallAuthorizer) {
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer) {
         this.apiGatewayService = apiGatewayService;
         this.cognitoAuthorizer = cognitoAuthorizer;
         this.apiGatewayV2Service = apiGatewayV2Service;
@@ -220,6 +246,7 @@ public class ApiGatewayExecuteController {
         this.cloudMapInstanceResolver = cloudMapInstanceResolver;
         this.httpProxyInvoker = httpProxyInvoker;
         this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.callerCallAuthorizer = callerCallAuthorizer;
     }
 
     /** Matches an ELBv2 listener ARN (ALB {@code app/} or NLB {@code net/}); group 1 = region. */
@@ -534,6 +561,25 @@ public class ApiGatewayExecuteController {
                 return restIamRejection(scope, iamResult);
             }
             iamIdentity = iamResult.identity();
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath()));
+            if (callerCallAuthorizer.authorizeRequest(iamIdentity == null ? null : iamIdentity.accessKey(),
+                    iamIdentity == null ? null : iamIdentity.accountId(),
+                    iamIdentity == null ? null : iamIdentity.userArn(), "execute-api:Invoke", invokeArn,
+                    AwsArnUtils.parse(invokeArn).partition(), routeContext.sourceIp(),
+                    isSecureTransport(uriInfo)) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
+        }
+
+        if ("CUSTOM".equals(method.getAuthorizationType())
+                && callerCallAuthorizer.evaluateAnonymousResourcePolicy("execute-api:Invoke",
+                        buildMethodArn(region, apiId, stageName, httpMethod,
+                                preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath())), routeContext.sourceIp(),
+                        isSecureTransport(uriInfo)) == ResourcePolicyDecision.EXPLICIT_DENY) {
+            return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                    "User is not authorized to access this resource");
         }
 
         scope = scope.withIdentity(resolvedApiKey, iamIdentity);
@@ -542,6 +588,18 @@ public class ApiGatewayExecuteController {
         if (keyFromAuthorizer) {
             resolvedApiKey = resolveApiKey(region, apiId, stageName, authorizerResult.usageIdentifierKey());
             scope = scope.withIdentity(resolvedApiKey, iamIdentity);
+        }
+
+        String authorizationType = method.getAuthorizationType();
+        if (authorizationType == null || "NONE".equalsIgnoreCase(authorizationType)
+                || "COGNITO_USER_POOLS".equalsIgnoreCase(authorizationType)) {
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath()));
+            if (callerCallAuthorizer.authorizeAnonymousResource("execute-api:Invoke", invokeArn,
+                    routeContext.sourceIp(), isSecureTransport(uriInfo)) != Decision.ALLOW) {
+                return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
+                        "User is not authorized to access this resource");
+            }
         }
 
         // API Gateway checks the API key requirement after authorization but before request
@@ -1201,10 +1259,14 @@ public class ApiGatewayExecuteController {
                     pending.cache(verified);
                 }
             }
-            String methodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
+            String methodArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(requestPath, uriInfo.getRequestUri().getRawPath()));
             Map<String, List<String>> conditions = AuthorizerPolicyEvaluator.requestConditions(
                     routeContext.sourceIp(), isSecureTransport(uriInfo));
-            if (!restLambdaAuthorizer.permits(verified, methodArn, conditions)) {
+            ResourcePolicyDecision resourceDecision = callerCallAuthorizer.evaluateAnonymousResourcePolicy(
+                    "execute-api:Invoke", methodArn, routeContext.sourceIp(), isSecureTransport(uriInfo));
+            String authorizerMethodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
+            if (!restLambdaAuthorizer.permits(verified, authorizerMethodArn, conditions, resourceDecision)) {
                 return authorizerError(scope, GatewayResponseType.ACCESS_DENIED, 403);
             }
             return new AuthorizerResult(null, verified.principalId(), verified.context(),
