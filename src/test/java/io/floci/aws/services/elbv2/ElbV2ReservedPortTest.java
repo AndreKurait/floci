@@ -22,6 +22,7 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.net.SSLOptions;
+import io.vertx.core.net.SocketAddress;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
@@ -193,7 +194,8 @@ class ElbV2ReservedPortTest {
         listener.setDefaultCertificate(certificateArn);
         LoadBalancer loadBalancer = new LoadBalancer();
         loadBalancer.setDnsName("tls.example.test");
-        when(dataPlane.elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn())).thenReturn(loadBalancer);
+        when(dataPlane.elbV2Service.getLoadBalancerForListener(
+                        region, listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
         CertificateGenerator generator = new CertificateGenerator();
         CertificateGenerator.GeneratedCertificate old = generator.generateSelfSignedCertificate(
                 "tls.example.test", List.of(), KeyAlgorithm.RSA_2048);
@@ -259,7 +261,8 @@ class ElbV2ReservedPortTest {
             listener.setDefaultCertificate(certificateArn);
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
             CertificateGenerator.GeneratedCertificate certificate = generator.generateSelfSignedCertificate(
                     name + ".example.test", List.of(), KeyAlgorithm.RSA_2048);
@@ -325,7 +328,8 @@ class ElbV2ReservedPortTest {
             listener.setProtocol("HTTP");
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
         }
         try {
@@ -379,12 +383,13 @@ class ElbV2ReservedPortTest {
             listener.setProtocol("HTTP");
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
         }
         try {
             publishRuntime(dataPlane, old, "us-west-2", old.getPort(), List.of(fixedRule("old")));
-            assertFixedResponse(oldServer, "old.example.test", "old");
+            assertFixedResponse(oldServer, old.getPort(), "old.example.test", "old");
             removeRuntime(dataPlane, old.getListenerArn(), old.getPort());
             verify(oldServer).close();
             publishRuntime(dataPlane, moved, "us-west-2", moved.getPort(), List.of(fixedRule("pending")));
@@ -395,10 +400,10 @@ class ElbV2ReservedPortTest {
             oldClose.complete();
             verify(reusedServer, never()).listen();
             verify(movedServer, never()).close();
-            assertFixedResponse(movedServer, "moved.example.test", "moved");
+            assertFixedResponse(movedServer, moved.getPort(), "moved.example.test", "moved");
             publishRuntime(dataPlane, reused, "us-west-2", reused.getPort(), List.of(fixedRule("reused")));
             verify(reusedServer).listen();
-            assertFixedResponse(reusedServer, "reused.example.test", "reused");
+            assertFixedResponse(reusedServer, reused.getPort(), "reused.example.test", "reused");
             removeRuntime(dataPlane, reused.getListenerArn(), reused.getPort());
             verify(reusedServer).close();
             verify(movedServer, never()).close();
@@ -445,7 +450,8 @@ class ElbV2ReservedPortTest {
         listener.setProtocol("HTTP");
         LoadBalancer loadBalancer = new LoadBalancer();
         loadBalancer.setDnsName("retry.example.test");
-        when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+        when(dataPlane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                 .thenReturn(loadBalancer);
         try {
             if ("failed-future".equals(stage)) {
@@ -466,7 +472,7 @@ class ElbV2ReservedPortTest {
                 retry.getValue().handle(0L);
             }
             verify(replacement).listen();
-            assertFixedResponse(replacement, "retry.example.test", "recovered");
+            assertFixedResponse(replacement, listener.getPort(), "retry.example.test", "recovered");
             removeRuntime(dataPlane, listener.getListenerArn(), listener.getPort());
             verify(replacement).close();
             verify(dataPlane.vertx, times(2)).createHttpServer(any(HttpServerOptions.class));
@@ -507,7 +513,8 @@ class ElbV2ReservedPortTest {
             listener.setProtocol("HTTP");
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
         }
         try {
@@ -523,7 +530,7 @@ class ElbV2ReservedPortTest {
             verify(replacement).listen();
             oldListen.fail(new IllegalStateException("obsolete listen failure"));
             verify(replacement, never()).close();
-            assertFixedResponse(replacement, "replacement.example.test", "replacement");
+            assertFixedResponse(replacement, second.getPort(), "replacement.example.test", "replacement");
             publishRuntime(dataPlane, second, "us-west-2", second.getPort(), List.of(fixedRule("replacement")));
             verify(dataPlane.vertx, times(2)).createHttpServer(any(HttpServerOptions.class));
             removeRuntime(dataPlane, second.getListenerArn(), second.getPort());
@@ -546,12 +553,13 @@ class ElbV2ReservedPortTest {
         return rule;
     }
 
-    private static void assertFixedResponse(HttpServer server, String host, String body) {
+    private static void assertFixedResponse(HttpServer server, int port, String host, String body) {
         ArgumentCaptor<Handler<HttpServerRequest>> handler = ArgumentCaptor.captor();
         verify(server).requestHandler(handler.capture());
         HttpServerRequest request = mock(HttpServerRequest.class);
         HttpServerResponse response = mock(HttpServerResponse.class);
         when(request.host()).thenReturn(host);
+        when(request.localAddress()).thenReturn(SocketAddress.inetSocketAddress(port, "127.0.0.1"));
         when(request.response()).thenReturn(response);
         when(response.setStatusCode(anyInt())).thenReturn(response);
         handler.getValue().handle(request);
