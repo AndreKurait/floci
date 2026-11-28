@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudfront;
 
 import io.floci.aws.core.common.RequestHost;
 import io.floci.aws.core.common.RequestUriRewrite;
+import io.floci.aws.services.cloudfront.CloudFrontService.ViewerHostMatch;
 import io.floci.aws.services.cloudfront.model.Distribution;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.inject.Instance;
@@ -61,7 +62,12 @@ public class CloudFrontDistributionFilter implements ContainerRequestFilter {
             return;
         }
 
-        Distribution dist = cloudFront.findByHost(host);
+        ViewerHostMatch match = cloudFront.matchViewerHost(host);
+        if (match.ambiguous()) {
+            requestContext.abortWith(Response.status(404).build());
+            return;
+        }
+        Distribution dist = match.distribution();
         if (dist == null) {
             return;
         }
