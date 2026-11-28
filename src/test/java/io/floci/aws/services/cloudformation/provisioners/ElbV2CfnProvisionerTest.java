@@ -69,11 +69,13 @@ class ElbV2CfnProvisionerTest {
             "arn:aws:elasticloadbalancing:us-east-1:000000000000:listener/app/web/50dc6c495c0c9188/f2f7dc8efc522ab2";
     private static final String RULE_ARN = LISTENER_ARN.replace(":listener/", ":listener-rule/") + "/9683b2d02a6cabee";
 
+    private static final String HEALTH_SNAPSHOT = "__FlociTargetGroupHealthUpdateSnapshot";
+
     private static final List<String> TWO_SUBNETS = List.of("subnet-1", "subnet-2");
     private static final String DECLARED_TARGETS = "__FlociTargetGroupTargets";
     private static final String DECLARED_TARGETS_PRIOR = "__FlociTargetGroupTargetsPrior";
     private static final String TARGETS_SNAPSHOT = CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR;
-    private static final String HEALTH_SNAPSHOT = ElbV2CfnProvisioner.HEALTH_UPDATE_SNAPSHOT_ATTR;
+    
 
     private final ElbV2Service elb = mock(ElbV2Service.class);
     private final ElbV2CfnProvisioner provisioner = new ElbV2CfnProvisioner(elb);
@@ -84,6 +86,9 @@ class ElbV2CfnProvisionerTest {
     private final StackResource tgResource = resource("AWS::ElasticLoadBalancingV2::TargetGroup", "Tg");
     /** The previous resource the engine restores when a target group update fails. */
     private final StackResource restored = new StackResource();
+
+    private final TargetGroup healthGroup = targetGroup("web-tg");
+    private final StackResource healthResource = resource("AWS::ElasticLoadBalancingV2::TargetGroup", "Group");
 
     @BeforeEach
     void defaultListenerLoadBalancer() {
@@ -151,6 +156,7 @@ class ElbV2CfnProvisionerTest {
             return node == null || node.isMissingNode() || node.isNull() ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(engine.omitNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         // resolveStringList delegates to the real engine method; for the literal arrays these
         // tests use it just walks the array and calls resolve(...) per element, stubbed above.
@@ -1723,4 +1729,89 @@ class ElbV2CfnProvisionerTest {
         StackResource r = resource("AWS::ElasticLoadBalancingV2::TrustStore", "Ts");
         assertThrows(IllegalStateException.class, () -> provisioner.provision(r, mapper.createObjectNode(), ctx()));
     }
+
+    private ObjectNode changedHealth() {
+        ObjectNode props = mapper.createObjectNode().put("Name", "web-tg")
+                .put("HealthCheckProtocol", "HTTP").put("HealthCheckPort", "8888")
+                .put("HealthCheckEnabled", false).put("HealthCheckPath", "/ready")
+                .put("HealthCheckIntervalSeconds", 15).put("HealthCheckTimeoutSeconds", 4)
+                .put("HealthyThresholdCount", 4).put("UnhealthyThresholdCount", 5);
+        props.putObject("Matcher").put("HttpCode", "200-299");
+        return props;
+    }
+
+    private void priorHealth(boolean duplicate) {
+        healthGroup.setHealthCheckProtocol("TCP");
+        healthGroup.setHealthCheckPort("traffic-port");
+        healthGroup.setHealthCheckEnabled(true);
+        healthGroup.setHealthCheckPath("/");
+        healthGroup.setHealthCheckIntervalSeconds(30);
+        healthGroup.setHealthCheckTimeoutSeconds(5);
+        healthGroup.setHealthyThresholdCount(5);
+        healthGroup.setUnhealthyThresholdCount(2);
+        healthGroup.setMatcher("200");
+        when(elb.describeTargetGroups(REGION, null, List.of(TG_ARN), null)).thenReturn(List.of(healthGroup));
+        Mockito.doAnswer(call -> {
+            List<TargetDescription> rows = call.getArgument(2);
+            healthGroup.getTargets().addAll(rows);
+            return null;
+        }).when(elb).registerTargets(eq(REGION), eq(TG_ARN), anyList());
+        if (duplicate) {
+            when(elb.createTargetGroup(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),
+                    any(), any(), any(), any(), any(), any(), any(), any()))
+                    .thenThrow(new AwsException("DuplicateTargetGroupName", "exists", 400));
+            when(elb.describeTargetGroups(REGION, null, null, List.of("web-tg")))
+                    .thenReturn(List.of(healthGroup));
+        } else {
+            when(elb.createTargetGroup(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),
+                    any(), any(), any(), any(), any(), any(), any(), any())).thenReturn(healthGroup);
+        }
+    }
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    @Test
+    void failedAttributeUndoStillRestoresHealthAndRetainsAttributeRetry() {
+        priorHealth(true);
+        ObjectNode props = changedHealth();
+        props.putArray("TargetGroupAttributes").addObject().put("Key", "deregistration_delay.timeout_seconds")
+                .put("Value", "10");
+        when(elb.describeTargetGroupAttributes(REGION, TG_ARN))
+                .thenReturn(Map.of("deregistration_delay.timeout_seconds", "300"));
+        provisioner.provision(healthResource, props, ctx(TG_ARN));
+        doThrow(new AwsException("InternalFailure", "restore failed", 500)).doNothing()
+                .when(elb).restoreTargetGroupAttributes(eq(REGION), eq(TG_ARN), any());
+        assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(healthResource));
+        verifyHealthRestored(1);
+        assertFalse(healthResource.getAttributes().containsKey(HEALTH_SNAPSHOT));
+        assertTrue(healthResource.getAttributes().containsKey(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR));
+        assertTrue(provisioner.rollbackUpdate(healthResource));
+        verifyHealthRestored(1);
+    }
+
+    
+
+
+    
+
+    @Test
+    void updateWithoutHealthFieldsLeavesHealthUnchanged() {
+        priorHealth(true);
+        provisioner.provision(healthResource, mapper.createObjectNode().put("Name", "web-tg"), ctx(TG_ARN));
+        verify(elb, never()).modifyTargetGroup(any(), any(), any(), any(), any(),
+                any(), any(), any(), any(), any(), any());
+        assertFalse(healthResource.getAttributes().containsKey(HEALTH_SNAPSHOT));
+    }
+
+
 }

@@ -346,7 +346,9 @@ class Ec2KeyPairCfnProvisionerTest {
         assertEquals("ParameterNotFound", assertThrows(AwsException.class,
                 () -> realSsm.getParameter("/ec2/keypair/key-2", REGION)).getErrorCode());
         assertEquals("private-key-1", realSsm.getParameter("/ec2/keypair/key-1", REGION).getValue());
-        verify(ec2, never()).deleteKeyPair(anyString(), any(), any());
+        verify(ec2).deleteKeyPair(REGION, null, "key-2");
+        verify(ec2, never()).deleteKeyPair(REGION, null, "key-1");
+        verify(ec2, never()).describeKeyPairs(anyString(), anyList(), anyList());
     }
 
     @Test
@@ -574,7 +576,7 @@ class Ec2KeyPairCfnProvisionerTest {
         verify(ec2, never()).deleteKeyPair(REGION, null, "key-1");
     }
 
-    /** The cleanup goes by name, yet a displaced key deleted outside the stack still takes its parameter. */
+    /** A displaced key deleted outside the stack still takes its parameter. */
     @Test
     void theCommittedRenameRemovesTheParameterOfADisplacedKeyDeletedOutsideTheStack() throws Exception {
         StackResource r = renamed();
@@ -586,7 +588,7 @@ class Ec2KeyPairCfnProvisionerTest {
 
         verify(ssm).deleteParameter("/ec2/keypair/key-1", REGION);
         verify(ssm, never()).deleteParameter("/ec2/keypair/key-2", REGION);
-        verify(ec2, never()).deleteKeyPair(anyString(), any(), any());
+        verify(ec2).deleteKeyPair(REGION, null, "key-1");
         assertFalse(r.getAttributes().containsKey("__FlociKeyPairCreatedKeys"));
     }
 
@@ -601,7 +603,7 @@ class Ec2KeyPairCfnProvisionerTest {
         assertEquals("first", r.getPhysicalId());
         verify(ssm).deleteParameter("/ec2/keypair/key-2", REGION);
         verify(ssm, never()).deleteParameter("/ec2/keypair/key-1", REGION);
-        verify(ec2, never()).deleteKeyPair(anyString(), any(), any());
+        verify(ec2).deleteKeyPair(REGION, null, "key-2");
         assertFalse(r.getAttributes().containsKey("__FlociKeyPairCreatedKeys"));
     }
 
@@ -613,7 +615,8 @@ class Ec2KeyPairCfnProvisionerTest {
                 .thenReturn(List.of(created("next", "key-2")))
                 .thenThrow(new AwsException("InvalidKeyPair.NotFound", "The key pair 'next' does not exist", 400));
         when(ec2.deleteKeyPair(REGION, null, "key-2"))
-                .thenThrow(new AwsException("InternalServerError", "simulated delete failure", 500));
+                .thenThrow(new AwsException("InternalServerError", "simulated delete failure", 500))
+                .thenReturn(null);
 
         assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
         assertTrue(provisioner.rollbackUpdate(r));
@@ -622,6 +625,82 @@ class Ec2KeyPairCfnProvisionerTest {
         verify(ssm, never()).deleteParameter("/ec2/keypair/key-1", REGION);
         assertFalse(provisioner.hasReplacementUpdate(r));
         assertFalse(r.getAttributes().containsKey("__FlociKeyPairCreatedKeys"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "false,false,false", "false,false,true", "false,true,false", "false,true,true",
+            "true,false,false", "true,false,true", "true,true,false", "true,true,true"
+    })
+    void replacementCleanupKeepsOwnershipAfterReload(boolean importedKeys, boolean rollback, boolean retry)
+            throws Exception {
+        StackResource r = renamed(importedKeys);
+        String name = rollback ? "next" : "first";
+        String keyId = rollback ? "key-2" : "key-1";
+        when(ec2.describeKeyPairs(REGION, List.of(name), List.of()))
+                .thenReturn(List.of(created(name, "external-key")));
+        if (retry) {
+            when(ec2.deleteKeyPair(REGION, null, keyId))
+                    .thenThrow(new AwsException("InternalServerError", "transient delete failure", 500))
+                    .thenReturn(null);
+            if (rollback) {
+                assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
+            } else {
+                assertFalse(provisioner.completeUpdate(r).complete());
+            }
+        }
+
+        StackResource reloaded = mapper.readValue(mapper.writeValueAsBytes(r), StackResource.class);
+        if (rollback) {
+            assertTrue(provisioner.rollbackUpdate(reloaded));
+        } else {
+            assertTrue(provisioner.completeUpdate(reloaded).complete());
+        }
+        provisioner.clearUpdate(reloaded);
+
+        assertEquals(rollback ? "first" : "next", reloaded.getPhysicalId());
+        assertEquals(rollback ? "key-1" : "key-2", reloaded.getAttributes().get("KeyPairId"));
+        verify(ec2, times(retry ? 2 : 1)).deleteKeyPair(REGION, null, keyId);
+        verify(ec2, never()).deleteKeyPair(REGION, null, "external-key");
+        verify(ec2, never()).describeKeyPairs(anyString(), anyList(), anyList());
+        if (importedKeys) {
+            verify(ssm, never()).deleteParameter(anyString(), anyString());
+        } else {
+            verify(ssm, times(retry ? 2 : 1)).deleteParameter("/ec2/keypair/" + keyId, REGION);
+        }
+        verify(ssm, never()).deleteParameter("/ec2/keypair/external-key", REGION);
+        assertFalse(reloaded.getAttributes().containsKey("__FlociKeyPairCreatedKeys"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void endingExhaustedCleanupPreservesIdentityForAnotherPendingKey(boolean importedKeys) throws Exception {
+        StackResource r = renamed(importedKeys);
+        when(ec2.deleteKeyPair(REGION, null, "key-2"))
+                .thenThrow(new AwsException("InternalServerError", "persistent delete failure", 500));
+        assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(r));
+        assertFalse(provisioner.completeUpdate(r).complete());
+        assertFalse(provisioner.completeUpdate(r).complete());
+
+        when(ec2.createKeyPair(REGION, "third", null, null)).thenReturn(created("third", "key-3"));
+        provisioner.provision(r, props("{\"KeyName\": \"third\"}"), ctx("first"));
+        when(ec2.deleteKeyPair(REGION, null, "key-1"))
+                .thenThrow(new AwsException("InternalServerError", "transient delete failure", 500))
+                .thenReturn(null);
+        assertFalse(provisioner.completeUpdate(r).complete());
+        provisioner.clearUpdate(r);
+
+        when(ec2.describeKeyPairs(REGION, List.of("first"), List.of()))
+                .thenReturn(List.of(created("first", "external-key")));
+        StackResource reloaded = mapper.readValue(mapper.writeValueAsBytes(r), StackResource.class);
+        assertTrue(provisioner.completeUpdate(reloaded).complete());
+        provisioner.clearUpdate(reloaded);
+
+        verify(ec2, times(2)).deleteKeyPair(REGION, null, "key-1");
+        verify(ec2, never()).deleteKeyPair(REGION, null, "external-key");
+        verify(ssm, times(importedKeys ? 0 : 2)).deleteParameter("/ec2/keypair/key-1", REGION);
+        verify(ssm, never()).deleteParameter("/ec2/keypair/external-key", REGION);
+        assertFalse(provisioner.hasReplacementUpdate(reloaded));
     }
 
     @Test
@@ -649,25 +728,22 @@ class Ec2KeyPairCfnProvisionerTest {
         provisioner.delete(created, REGION);
 
         verify(ssm).deleteParameter("/ec2/keypair/key-1", REGION);
-        verify(ec2, never()).deleteKeyPair(anyString(), any(), any());
+        verify(ec2).deleteKeyPair(REGION, null, "key-1");
     }
 
     /**
-     * The delete follows the name, as Cloud Control's DeleteResource names the key by it alone: a key
-     * made under the name outside the stack is the one deleted, with its parameter, and the parameter
-     * the stack's own key left is deleted too.
+     * Stack cleanup uses its recorded identity so a key created later under the same name remains owned
+     * by its creator. Name-only Cloud Control deletion retains its separate behavior.
      */
     @Test
-    void stackDeleteFollowsTheNameAndStillRemovesTheRecordedKeysParameter() throws Exception {
+    void stackDeleteUsesRecordedIdentityWhenTheNameIsReused() throws Exception {
         StackResource created = provisioned("{\"KeyName\": \"deploy\"}");
-        when(ec2.describeKeyPairs(REGION, List.of("deploy"), List.of()))
-                .thenReturn(List.of(created("deploy", "key-9")));
 
         provisioner.delete(created, REGION);
 
-        verify(ssm).deleteParameter("/ec2/keypair/key-9", REGION);
-        verify(ec2).deleteKeyPair(REGION, null, "key-9");
         verify(ssm).deleteParameter("/ec2/keypair/key-1", REGION);
+        verify(ec2).deleteKeyPair(REGION, null, "key-1");
+        verify(ec2, never()).describeKeyPairs(anyString(), anyList(), anyList());
     }
 
     /** An imported key has no parameter, whether or not it is still there. */
@@ -684,7 +760,7 @@ class Ec2KeyPairCfnProvisionerTest {
         provisioner.delete(imported, REGION);
         provisioner.delete(imported, REGION);
 
-        verify(ec2, times(1)).deleteKeyPair(REGION, null, "key-2");
+        verify(ec2, times(2)).deleteKeyPair(REGION, null, "key-2");
         verifyNoInteractions(ssm);
     }
 
@@ -792,11 +868,21 @@ class Ec2KeyPairCfnProvisionerTest {
 
     /** A stack whose key {@code first} was renamed to {@code next} by an update that has not ended. */
     private StackResource renamed() throws Exception {
-        when(ec2.createKeyPair(REGION, "first", null, null)).thenReturn(created("first", "key-1"));
-        when(ec2.createKeyPair(REGION, "next", null, null)).thenReturn(created("next", "key-2"));
+        return renamed(false);
+    }
+
+    private StackResource renamed(boolean importedKeys) throws Exception {
+        String material = importedKeys ? ", \"PublicKeyMaterial\": \"ssh-ed25519 AAAA\"" : "";
+        if (importedKeys) {
+            when(ec2.importKeyPair(REGION, "first", "ssh-ed25519 AAAA")).thenReturn(imported("first", "key-1"));
+            when(ec2.importKeyPair(REGION, "next", "ssh-ed25519 AAAA")).thenReturn(imported("next", "key-2"));
+        } else {
+            when(ec2.createKeyPair(REGION, "first", null, null)).thenReturn(created("first", "key-1"));
+            when(ec2.createKeyPair(REGION, "next", null, null)).thenReturn(created("next", "key-2"));
+        }
         StackResource r = resource();
-        provisioner.provision(r, props("{\"KeyName\": \"first\"}"), ctx(null));
-        provisioner.provision(r, props("{\"KeyName\": \"next\"}"), ctx("first"));
+        provisioner.provision(r, props("{\"KeyName\": \"first\"" + material + "}"), ctx(null));
+        provisioner.provision(r, props("{\"KeyName\": \"next\"" + material + "}"), ctx("first"));
         return r;
     }
 

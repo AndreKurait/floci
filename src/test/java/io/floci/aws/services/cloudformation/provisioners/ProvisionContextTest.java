@@ -73,7 +73,7 @@ class ProvisionContextTest {
                 props("{\"A\":1}"), props("{\"A\":2}"));
         ProvisionContext original = new ProvisionContext(engine, "eu-west-1", "123456789012", "stack",
                 "old-id", event -> {}, props("{\"A\":1}"), changes, "boundary-arn",
-                mock(CloudFormationTemplateEngine.class));
+                mock(CloudFormationTemplateEngine.class), props("{\"current\":true}"), props("{\"prior\":true}"));
 
         for (String replacement : new String[] {"new-id", null}) {
             ProvisionContext copy = original.withPriorPhysicalId(replacement);
@@ -85,6 +85,21 @@ class ProvisionContextTest {
             }
         }
         assertEquals("old-id", original.priorPhysicalId());
+    }
+
+    @Test
+    void updatePolicyConstructorRetainsBothPoliciesAndDefaultsThePreviousEngine() {
+        JsonNode current = props("{\"AutoScalingRollingUpdate\":{\"MaxBatchSize\":2}}");
+        JsonNode prior = props("{\"AutoScalingRollingUpdate\":{\"MaxBatchSize\":1}}");
+        ProvisionContext context = new ProvisionContext(engine, "us-east-1", "000000000000", "stack",
+                "old-id", event -> {}, props("{}"), current, prior);
+        assertSame(current, context.updatePolicy());
+        assertSame(prior, context.priorUpdatePolicy());
+        assertSame(engine, context.priorEngine());
+        assertNull(context.changes());
+        assertNull(context.delegatedRoleBoundaryArn());
+        assertSame(current, context.withPriorPhysicalId("new-id").updatePolicy());
+        assertSame(prior, context.withPriorPhysicalId("new-id").priorUpdatePolicy());
     }
 
     @Test
