@@ -4,12 +4,13 @@ import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.inject.spi.ObserverMethod;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import java.lang.reflect.Method;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 
 class Ec2StartupServiceTest {
 
@@ -23,11 +24,14 @@ class Ec2StartupServiceTest {
     }
 
     @Test
-    void startupSeedsThroughTheSameEntryPointAsReset() {
+    void startupRestoresPersistedInstancesBeforeSeedingTheDefaultRegion() {
         Ec2Service service = mock(Ec2Service.class);
 
         new Ec2Startup(service).onStart(new StartupEvent());
 
-        verify(service).seedDefaultRegionIfEnabled();
+        InOrder order = inOrder(service);
+        order.verify(service).restoreMetadataRegistrations();
+        order.verify(service).seedDefaultRegionIfEnabled();
+        order.verifyNoMoreInteractions();
     }
 }

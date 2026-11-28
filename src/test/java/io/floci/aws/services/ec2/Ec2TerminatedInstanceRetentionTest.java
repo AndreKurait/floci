@@ -3,6 +3,8 @@ package io.floci.aws.services.ec2;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import io.floci.aws.config.EmulatorConfig;
@@ -49,6 +51,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Answers.RETURNS_SELF;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -278,6 +281,12 @@ class Ec2TerminatedInstanceRetentionTest {
     @Test
     void anOlderSnapshotIsNeverTheLastStateWritten() throws Exception {
         DockerClient docker = mock(DockerClient.class);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspection = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(docker.inspectContainerCmd("container-race")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(inspection);
+        when(inspection.getHostConfig().getNetworkMode()).thenReturn("bridge");
+        when(inspection.getConfig().getLabels()).thenReturn(Map.of());
         when(docker.stopContainerCmd(anyString())).thenReturn(mock(StopContainerCmd.class, RETURNS_SELF));
         when(docker.removeContainerCmd(anyString())).thenReturn(mock(RemoveContainerCmd.class, RETURNS_SELF));
         Ec2ContainerManager manager = manager(config(dir, true, false), docker,
