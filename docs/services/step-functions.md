@@ -1174,6 +1174,13 @@ fails the task with the given `Error` and `Cause`, which flow through `Retry` an
 mocked and real service calls can be combined in one execution. The file is re-read
 when it changes, so it can be edited without restarting Floci.
 
+With IAM enforcement enabled, `StartExecution` and `StartSyncExecution` requests
+naming a Local `#<test case>` suffix are checked against the underlying state
+machine ARN. A grant on that ARN reaches the request, and a deny on it prevents
+the request. Execution ARN resource checks use the same machine identity. Other
+operations retain the supplied selector. This authorization rule does not change
+the `StartSyncExecution` suffix restrictions below.
+
 Behavior was verified against Step Functions Local 2.0.0. As there, `StartSyncExecution`
 rejects a test case suffix with `UnsupportedOperation` and does not strip a bare trailing
 `#`, a bare trailing `#` on `StartExecution` runs the execution unmocked, and a retry
