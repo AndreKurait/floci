@@ -3090,6 +3090,37 @@ role each passes:
   entry with type EC2_LINUX or EC2_WINDOWS, the IAM principal creating the access entry must have
   the iam:PassRole permission." `CreateCapability`, `UpdateCapability` and `RegisterCluster`, which
   Floci does not serve, are checked from the table below.
+- **EMR:** `RunJobFlow` passes `ServiceRole` to `elasticmapreduce.amazonaws.com`, `AutoScalingRole`
+  to `application-autoscaling.amazonaws.com`, each by its name or its ARN, and the roles of the
+  instance profile `JobFlowRole` names, by its name or its ARN, to `ec2.amazonaws.com`, all read from
+  the table below. The Service Reference passes its roles to the three services without saying which
+  member's goes where, so a vendored source, `tools/aws/sources/emr-roles.json`, written by
+  `tools/aws/fetch_emr_roles.py` from the EMR API reference, management guide and the AWS CLI
+  reference, gives each member's role: the guide's page of each role names its default role ("The
+  default role name is EMR_EC2_DefaultRole"), the full access policy it gives users passes each
+  default role to one service (`"iam:PassedToService": "ec2.amazonaws.com*"`), the API reference
+  calls `JobFlowRole` an instance profile ("Also called instance profile and Amazon EC2 role"), and
+  the CLI reference's examples give the roles by name (`--service-role EMR_DefaultRole`). The steps'
+  runtime role, `StepExecutionRoleArn`, is not passed: "You can control access to the runtime role
+  with the condition key elasticmapreduce:ExecutionRoleArn."
+- **API Gateway:** authorized by HTTP method, its roles are checked for the operation its route
+  resolves to, each passed to `apigateway.amazonaws.com`, all read from the table below: an
+  integration's `credentials` and an authorizer's `authorizerCredentials`, REST APIs' and HTTP APIs'
+  (`credentialsArn`, `authorizerCredentialsArn`) alike, and over the JSON 1.1 endpoint Floci also
+  serves HTTP APIs at by botocore's names (`CredentialsArn`, `Body`); the value of a REST API update's patch
+  operation whose path names one of those, or the account's `/cloudwatchRoleArn`; and, in an import's
+  OpenAPI definition, JSON or YAML, each Operation object's (the ANY method's included)
+  `x-amazon-apigateway-integration` `credentials` and each security scheme's
+  `x-amazon-apigateway-authorizer` `authorizerCredentials`, the definition read as API Gateway takes
+  and reads it: a REST API's whole body, its `${AWS::Region}`, `${AWS::AccountId}` and
+  `${AWS::Partition}` resolved, and an HTTP API's from its body's `body` or `Body`, or else the whole
+  body, as the REST route also takes one. No
+  member's name says it takes a role, so a vendored source, `tools/aws/sources/apigateway-roles.json`,
+  written by `tools/aws/fetch_apigateway_roles.py` from the API references and developer guide,
+  gives each: "To specify an IAM role for API Gateway to assume, use the role's Amazon Resource Name
+  (ARN)"; "the path for this property is /name"; "only OpenAPI definition JSON/YAML files are
+  supported"; and each extension, what it extends and its property "in the form of an ARN of an IAM
+  execution role".
 - **CloudFormation:** `CreateStack`, `UpdateStack`, `DeleteStack`, `CreateChangeSet` and
   `ContinueUpdateRollback` pass `RoleARN` to `cloudformation.amazonaws.com` when the request names
   one. `CreateStackSet` and `UpdateStackSet` pass `AdministrationRoleARN`, or, for a self-managed
@@ -3157,7 +3188,9 @@ botocore's models, `src/main/resources/aws/iam-passed-roles.json`. A request mem
 when its name ends in `Role`, `RoleArn` or `RoleName` (or a plural, or one of those followed by
 `Update` or `Override`) and it holds a string, or a list or map of them; it is read from a JSON or
 CBOR body, from Query form parameters, in either list form, or from a REST-XML body by the elements
-botocore names, and its role is passed to the service the Service Reference names. Form parameters
+botocore names, and its role is passed to the service the Service Reference names. A JSON number or
+Boolean in such a member is read as the text a handler reads it as, so `"JobFlowRole":123456` names
+the instance profile `123456`, as EMR takes it. Form parameters
 are read only from a request the Query protocol dispatches, a form posted to the root path, so a
 request to another protocol's route is read as its handler reads it whatever `Content-Type` it is
 sent with: an S3 replication configuration sent as a form is still read as its XML. The table is keyed
@@ -3200,14 +3233,13 @@ when the caller may not pass the role.
 - Not read: an operation whose request names no role (SSM `CreateDocument` and CloudWatch Logs
   `StartQuery`, for two); one whose role is a parameter of the runbook it runs (SSM
   `StartAutomationExecution`, Config `PutRemediationConfigurations`); one the Service Reference
-  passes roles from to several services without saying which member goes where (EMR `RunJobFlow`,
-  whose `JobFlowRole` also names an instance profile, CloudWatch Logs `CreateImportTask`); and one
-  the botocore
+  passes roles from to several services without saying which member goes where (CloudWatch Logs
+  `CreateImportTask`); and one the botocore
   models Floci is pinned to do not have yet (SSM `RegisterDefaultHostManagementConfiguration`,
   Kinesis Analytics `ImportSnapshot`, Secrets Manager `AssociateCrossAccountReplica`), whose role
   the generator reads as soon as a release that has it is pinned. EC2's `RequestSpotFleet` names
   its roles in EC2's own protocol, one of them as an instance profile. The REST services whose
-  routes no rule maps yet, and API Gateway, which is authorized by HTTP method, are not read either.
+  routes no rule maps yet are not read either.
 
 A request that names a Lambda network connector also needs `lambda:PassNetworkConnector` on it. The
 Lambda developer guide has "The caller must have `lambda:PassNetworkConnector` on the referenced

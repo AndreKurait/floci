@@ -281,6 +281,11 @@ public class ApiGatewayController {
         return Pagination.parseMaxResults(limit, "limit", "BadRequestException");
     }
 
+    /** An empty query value binds as null, so an explicitly empty {@code position} is read from the URI. */
+    private static String requestedPosition(String position, UriInfo uriInfo) {
+        return position == null && uriInfo.getQueryParameters().containsKey("position") ? "" : position;
+    }
+
     private <T> Response pageResponse(PaginatedResult<T> page, Function<T, JsonNode> toNode) {
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("item");
@@ -294,10 +299,12 @@ public class ApiGatewayController {
     @GET
     @Path("/restapis/{apiId}/authorizers")
     public Response getAuthorizers(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
-                                   @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                   @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                   @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
         // Authorizer clashes with the imported API Gateway v2 model
-        PaginatedResult<io.floci.aws.services.apigateway.model.Authorizer> page = service.getAuthorizerPage(region, apiId, pageLimit(limit), position);
+        PaginatedResult<io.floci.aws.services.apigateway.model.Authorizer> page =
+                service.getAuthorizerPage(region, apiId, pageLimit(limit), requestedPosition(position, uriInfo));
         return pageResponse(page, this::toAuthorizerNode);
     }
 
@@ -435,13 +442,11 @@ public class ApiGatewayController {
 
     @GET
     @Path("/restapis")
-    public Response getRestApis(@Context HttpHeaders headers) {
+    public Response getRestApis(@Context HttpHeaders headers, @Context UriInfo uriInfo,
+                                @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        List<RestApi> apis = service.getRestApis(region);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        apis.forEach(a -> items.add(toApiNode(region, a)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        return pageResponse(service.getRestApiPage(region, pageLimit(limit), requestedPosition(position, uriInfo)),
+                api -> toApiNode(region, api));
     }
 
     @GET
@@ -474,10 +479,11 @@ public class ApiGatewayController {
     @Path("/restapis/{apiId}/resources")
     public Response getResources(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
                                  @QueryParam("embed") List<String> embed,
-                                 @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                 @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                 @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
         boolean embedMethods = embed != null && embed.contains("methods");
-        return pageResponse(service.getResourcePage(region, apiId, pageLimit(limit), position),
+        return pageResponse(service.getResourcePage(region, apiId, pageLimit(limit), requestedPosition(position, uriInfo)),
                 resource -> toResourceNode(resource, embedMethods));
     }
 
@@ -660,9 +666,10 @@ public class ApiGatewayController {
     @GET
     @Path("/restapis/{apiId}/deployments")
     public Response getDeployments(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
-                                   @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                   @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                   @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
-        return pageResponse(service.getDeploymentsPage(region, apiId, limit, position), this::toDeploymentNode);
+        return pageResponse(service.getDeploymentsPage(region, apiId, limit, requestedPosition(position, uriInfo)), this::toDeploymentNode);
     }
 
     @GET
@@ -907,9 +914,10 @@ public class ApiGatewayController {
     @GET
     @Path("/usageplans")
     public Response getUsagePlans(@Context HttpHeaders headers, @QueryParam("keyId") String keyId,
-                                  @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                  @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                  @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
-        PaginatedResult<UsagePlan> page = service.getUsagePlanPage(region, keyId, pageLimit(limit), position);
+        PaginatedResult<UsagePlan> page = service.getUsagePlanPage(region, keyId, pageLimit(limit), requestedPosition(position, uriInfo));
         return pageResponse(page, p -> toUsagePlanNode(p, false));
     }
 
@@ -1027,13 +1035,13 @@ public class ApiGatewayController {
 
     @GET
     @Path("/usageplans/{usagePlanId}/keys")
-    public Response getUsagePlanKeys(@Context HttpHeaders headers, @PathParam("usagePlanId") String usagePlanId) {
+    public Response getUsagePlanKeys(@Context HttpHeaders headers, @PathParam("usagePlanId") String usagePlanId,
+                                     @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                     @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
-        List<UsagePlanKey> keys = service.getUsagePlanKeys(region, usagePlanId);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        keys.forEach(k -> items.add(toUsagePlanKeyNode(k)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        PaginatedResult<UsagePlanKey> page =
+                service.getUsagePlanKeyPage(region, usagePlanId, pageLimit(limit), requestedPosition(position, uriInfo));
+        return pageResponse(page, this::toUsagePlanKeyNode);
     }
 
     @GET
@@ -1135,9 +1143,11 @@ public class ApiGatewayController {
     @GET
     @Path("/restapis/{apiId}/requestvalidators")
     public Response getRequestValidators(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
-                                         @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                         @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                         @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
-        PaginatedResult<RequestValidator> page = service.getRequestValidatorPage(region, apiId, pageLimit(limit), position);
+        PaginatedResult<RequestValidator> page = service.getRequestValidatorPage(region, apiId, pageLimit(limit),
+                requestedPosition(position, uriInfo));
         return pageResponse(page, this::toRequestValidatorNode);
     }
 
@@ -1191,11 +1201,12 @@ public class ApiGatewayController {
     @GET
     @Path("/restapis/{apiId}/models")
     public Response getModels(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
-                              @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                              @QueryParam("limit") String limit, @QueryParam("position") String position,
+                              @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
         // Model clashes with the imported API Gateway v2 model
         PaginatedResult<io.floci.aws.services.apigateway.model.Model> page =
-                service.getModelPage(region, apiId, pageLimit(limit), position);
+                service.getModelPage(region, apiId, pageLimit(limit), requestedPosition(position, uriInfo));
         return pageResponse(page, this::toModelNode);
     }
 
@@ -1261,10 +1272,11 @@ public class ApiGatewayController {
                                           @QueryParam("type") String type, @QueryParam("name") String name,
                                           @QueryParam("path") String path,
                                           @QueryParam("locationStatus") String locationStatus,
-                                          @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                          @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                          @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
         PaginatedResult<DocumentationPart> page = service.getDocumentationParts(region, apiId, type, name,
-                path, locationStatus, pageLimit(limit), position);
+                path, locationStatus, pageLimit(limit), requestedPosition(position, uriInfo));
         return pageResponse(page, part -> objectMapper.valueToTree(part));
     }
 
@@ -1373,9 +1385,11 @@ public class ApiGatewayController {
     @GET
     @Path("/domainnames/{domainName}/basepathmappings")
     public Response getBasePathMappings(@Context HttpHeaders headers, @PathParam("domainName") String domainName,
-                                        @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                        @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                        @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
-        PaginatedResult<BasePathMapping> page = service.getBasePathMappingsPage(region, domainName, limit, position);
+        PaginatedResult<BasePathMapping> page = service.getBasePathMappingsPage(region, domainName, limit,
+                requestedPosition(position, uriInfo));
         return pageResponse(page, this::toMappingNode);
     }
 
@@ -1510,15 +1524,7 @@ public class ApiGatewayController {
         if (payload == null || payload.isBlank()) {
             throw new AwsException("BadRequestException", "Body is required for OpenAPI import", 400);
         }
-        try {
-            JsonNode root = objectMapper.readTree(payload);
-            if (root.isObject() && root.hasNonNull("body") && root.get("body").isTextual()) {
-                return root.get("body").asText();
-            }
-        } catch (IOException e) {
-            // Not JSON at all — a raw YAML/JSON OpenAPI document.
-        }
-        return payload;
+        return ApiGatewayV2OpenApiImporter.restDefinition(objectMapper, payload);
     }
 
     @POST
@@ -1658,11 +1664,12 @@ public class ApiGatewayController {
     @GET
     @Path("/vpclinks")
     public Response getV1VpcLinks(@Context HttpHeaders headers,
-                                  @QueryParam("limit") String limit, @QueryParam("position") String position) {
+                                  @QueryParam("limit") String limit, @QueryParam("position") String position,
+                                  @Context UriInfo uriInfo) {
         String region = regionResolver.resolveRegion(headers);
         // VpcLink clashes with the imported API Gateway v2 model
         PaginatedResult<io.floci.aws.services.apigateway.model.VpcLink> page =
-                service.getVpcLinkPage(region, pageLimit(limit), position);
+                service.getVpcLinkPage(region, pageLimit(limit), requestedPosition(position, uriInfo));
         return pageResponse(page, this::toV1VpcLinkNode);
     }
 
@@ -2375,6 +2382,10 @@ public class ApiGatewayController {
         }
 
         node.put("apiKeySource", api.getApiKeySource());
+        // Absent while compression is off, as on AWS.
+        if (api.getMinimumCompressionSize() != null) {
+            node.put("minimumCompressionSize", api.getMinimumCompressionSize());
+        }
         // Not settable on a REST API here, so the emulated value is always the AWS default.
         // Report it rather than omitting it, because a client that reads an absent member back
         // as null sees it as a difference from the configuration it just sent and never converges.
@@ -2727,13 +2738,18 @@ public class ApiGatewayController {
         node.putObject("endpointConfiguration").putArray("types").add(d.getEndpointConfigurationType());
         if (d.getCertificateName() != null) node.put("certificateName", d.getCertificateName());
         if (d.getCertificateArn() != null) node.put("certificateArn", d.getCertificateArn());
-        node.put("regionalDomainName", d.getRegionalDomainName());
-        node.put("regionalHostedZoneId", d.getRegionalHostedZoneId());
-        if (d.getRegionalCertificateName() != null) {
-            node.put("regionalCertificateName", d.getRegionalCertificateName());
-        }
-        if (d.getRegionalCertificateArn() != null) {
-            node.put("regionalCertificateArn", d.getRegionalCertificateArn());
+        // An edge-optimized domain reports only its distribution (aws-cli
+        // examples/apigateway/create-domain-name.rst, Example 1). The regional name stays stored,
+        // since the custom domain filter still routes on it.
+        if (!"EDGE".equals(d.getEndpointConfigurationType())) {
+            node.put("regionalDomainName", d.getRegionalDomainName());
+            node.put("regionalHostedZoneId", d.getRegionalHostedZoneId());
+            if (d.getRegionalCertificateName() != null) {
+                node.put("regionalCertificateName", d.getRegionalCertificateName());
+            }
+            if (d.getRegionalCertificateArn() != null) {
+                node.put("regionalCertificateArn", d.getRegionalCertificateArn());
+            }
         }
         if (d.getDistributionDomainName() != null) {
             node.put("distributionDomainName", d.getDistributionDomainName());

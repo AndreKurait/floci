@@ -237,14 +237,15 @@ class IamRestRouteEnforcementIntegrationTest {
 
     @Test
     void postTagsIsCheckedAgainstTheArnItsBodyNames() {
-        // POST /tags tags the ARN its body names: one named in the query does not move the check.
+        // POST /tags tags the ARN its body names: one named in the query does not move the check. FIS's generated
+        // routes give the bare path the shared tags controller also serves it on.
         String user = user("route-tags-body");
-        String allowed = "arn:aws:pipes:us-east-1:" + ACCOUNT + ":pipe/route-allowed-" + suffix();
-        String other = "arn:aws:pipes:us-east-1:" + ACCOUNT + ":pipe/route-other-" + suffix();
+        String allowed = "arn:aws:fis:us-east-1:" + ACCOUNT + ":experiment-template/EXTallowed" + suffix();
+        String other = "arn:aws:fis:us-east-1:" + ACCOUNT + ":experiment-template/EXTother" + suffix();
 
-        policy(user, allow("pipes:TagResource", allowed));
-        refused(as(user, "pipes").queryParam("resourceArn", allowed).body(tagBody(other)).post("/tags").then(),
-                "pipes:TagResource");
+        policy(user, allow("fis:TagResource", allowed));
+        refused(as(user, "fis").queryParam("resourceArn", allowed).body(tagBody(other)).post("/tags").then(),
+                "fis:TagResource");
     }
 
     /**
@@ -281,12 +282,15 @@ class IamRestRouteEnforcementIntegrationTest {
         String user = user("route-tags-scope");
         String group = scheduleGroup("route-group-" + suffix());
         String queue = "arn:aws:batch:us-east-1:" + ACCOUNT + ":job-queue/route-queue-" + suffix();
+        String tags = "{\"Tags\":[{\"Key\":\"team\",\"Value\":\"a\"}]}";
 
         // Nor is an ARN of a service with no tagging rule checked as the signing scope's action.
         as(user, "pipes").body(tagBody(queue)).post("/tags").then().body(not(containsString("pipes:TagResource")));
         policy(user, allow("pipes:TagResource", "*"));
-        refused(as(user, "pipes").body(tagBody(group)).post("/tags").then(), "scheduler:TagResource");
-        refused(as(user, "sqs").body(tagBody(group)).post("/tags").then(), "scheduler:TagResource");
+        refused(as(user, "pipes").urlEncodingEnabled(false).body(tags).post("/tags/" + encoded(group)).then(),
+                "scheduler:TagResource");
+        refused(as(user, "sqs").urlEncodingEnabled(false).body(tags).post("/tags/" + encoded(group)).then(),
+                "scheduler:TagResource");
     }
 
     @Test
@@ -451,7 +455,8 @@ class IamRestRouteEnforcementIntegrationTest {
     void anEksAccessEntrysPolicyRoutesAreCheckedAsTheirOwnActionsOnTheEntry() {
         // Associating, listing and disassociating an entry's access policies act on the cluster's entries, the parts
         // of an entry's ARN the request does not give open, so a grant on another cluster's entries does not cover
-        // them, and one on this cluster's does.
+        // them, and one on this cluster's does. So does describing the entry with its principal sent unencoded, which
+        // EKS takes whole.
         String user = user("route-eks-entry");
         String name = "route-entry-" + suffix();
         String base = "/clusters/" + name + "/access-entries";
@@ -470,7 +475,7 @@ class IamRestRouteEnforcementIntegrationTest {
         String admin = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy";
         String associate = "{\"policyArn\":\"" + admin + "\",\"accessScope\":{\"type\":\"cluster\"}}";
         String actions = "[\"eks:AssociateAccessPolicy\",\"eks:ListAssociatedAccessPolicies\","
-                + "\"eks:DisassociateAccessPolicy\"]";
+                + "\"eks:DisassociateAccessPolicy\",\"eks:DescribeAccessEntry\"]";
 
         policy(user, "{\"Effect\":\"Allow\",\"Action\":" + actions + ",\"Resource\":\"" + other + "\"}");
         refused(as(user, "eks").urlEncodingEnabled(false).body(associate).post(policies).then(),
@@ -478,12 +483,15 @@ class IamRestRouteEnforcementIntegrationTest {
         refused(as(user, "eks").urlEncodingEnabled(false).get(policies).then(), "eks:ListAssociatedAccessPolicies");
         refused(as(user, "eks").urlEncodingEnabled(false).delete(policies + "/" + encoded(admin)).then(),
                 "eks:DisassociateAccessPolicy");
+        refused(as(user, "eks").urlEncodingEnabled(false).get(base + "/" + role).then(), "eks:DescribeAccessEntry");
 
         policy(user, "{\"Effect\":\"Allow\",\"Action\":" + actions + ",\"Resource\":\"" + entries + "\"}");
         as(user, "eks").urlEncodingEnabled(false).body(associate).post(policies).then().statusCode(200);
         as(user, "eks").urlEncodingEnabled(false).get(policies).then().statusCode(200)
                 .body("associatedAccessPolicies[0].policyArn", equalTo(admin));
         as(user, "eks").urlEncodingEnabled(false).delete(policies + "/" + encoded(admin)).then().statusCode(200);
+        as(user, "eks").urlEncodingEnabled(false).get(base + "/" + role).then().statusCode(200)
+                .body("accessEntry.principalArn", equalTo(role));
         // A principal whose IAM path holds access-policies is an entry, so deleting it is DeleteAccessEntry.
         refused(as(user, "eks").urlEncodingEnabled(false)
                 .delete(base + "/arn:aws:iam::" + ACCOUNT + ":role/ci/access-policies/runner").then(),
