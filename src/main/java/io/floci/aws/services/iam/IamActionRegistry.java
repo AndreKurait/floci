@@ -7,9 +7,28 @@ import io.floci.aws.core.common.ProtocolClaim;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
+import io.floci.aws.core.common.V1TagsController;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.account.AccountController;
+import io.floci.aws.services.account.AccountRegionActions;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationController;
+import io.floci.aws.services.apigateway.ApiGatewayController;
+import io.floci.aws.services.appconfig.AppConfigDataController;
+import io.floci.aws.services.backup.BackupFrameworkController;
+import io.floci.aws.services.backup.BackupFrameworkResources;
+import io.floci.aws.services.batch.BatchController;
+import io.floci.aws.services.batch.BatchSchedulingPolicyTarget;
+import io.floci.aws.services.cloudfront.CloudFrontController;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestController;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestRoute;
+import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
+import io.floci.aws.services.eks.EksController;
+import io.floci.aws.services.iot.IotController;
+import io.floci.aws.services.lambda.LambdaRuntimeManagementController;
+import io.floci.aws.services.route53.Route53Controller;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
+import io.floci.aws.services.s3tables.S3TablesController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -41,6 +60,35 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class IamActionRegistry {
 
+    private static final Map<String, String> BATCH_POLICY_ACTIONS = Map.of(
+            "createSchedulingPolicy", "batch:CreateSchedulingPolicy",
+            "deleteSchedulingPolicy", "batch:DeleteSchedulingPolicy",
+            "describeSchedulingPolicies", "batch:DescribeSchedulingPolicies",
+            "listSchedulingPolicies", "batch:ListSchedulingPolicies",
+            "updateSchedulingPolicy", "batch:UpdateSchedulingPolicy");
+
+
+    private static final Map<String, String> MQ_CONFIGURATION_ACTIONS = Map.of(
+            "createConfiguration", "mq:CreateConfiguration",
+            "describeConfiguration", "mq:DescribeConfiguration",
+            "updateConfiguration", "mq:UpdateConfiguration",
+            "deleteConfiguration", "mq:DeleteConfiguration",
+            "describeConfigurationRevision", "mq:DescribeConfigurationRevision",
+            "listConfigurationRevisions", "mq:ListConfigurationRevisions",
+            "listConfigurations", "mq:ListConfigurations");
+
+    private static final Map<String, String> ROUTE53_ACTIONS = Map.of(
+            "testDnsAnswer", "route53:TestDNSAnswer",
+            "createReusableDelegationSet", "route53:CreateReusableDelegationSet",
+            "getReusableDelegationSet", "route53:GetReusableDelegationSet",
+            "listReusableDelegationSets", "route53:ListReusableDelegationSets",
+            "deleteReusableDelegationSet", "route53:DeleteReusableDelegationSet");
+
+    private static final Map<String, String> S3TABLES_METRICS_ACTIONS = Map.of(
+            "putTableBucketMetricsConfiguration", "s3tables:PutTableBucketMetricsConfiguration",
+            "getTableBucketMetricsConfiguration", "s3tables:GetTableBucketMetricsConfiguration",
+            "deleteTableBucketMetricsConfiguration", "s3tables:DeleteTableBucketMetricsConfiguration");
+
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
 
     private final IamRestRoutes restRoutes;
@@ -70,6 +118,13 @@ public class IamActionRegistry {
 
     /** The routes the registry checks as an action of its own, each a rule of the scope it serves. */
     private static final List<ActionRule> RULES = List.of(
+        rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
+
+        rule("batch", "POST", "^/v1/createschedulingpolicy$", "batch:CreateSchedulingPolicy"),
+        rule("batch", "POST", "^/v1/deleteschedulingpolicy$", "batch:DeleteSchedulingPolicy"),
+        rule("batch", "POST", "^/v1/describeschedulingpolicies$", "batch:DescribeSchedulingPolicies"),
+        rule("batch", "POST", "^/v1/listschedulingpolicies$", "batch:ListSchedulingPolicies"),
+        rule("batch", "POST", "^/v1/updateschedulingpolicy$", "batch:UpdateSchedulingPolicy"),
         // ── Lambda ──────────────────────────────────────────────────────────────
         // Code signing configs first: a config's function list ends in /functions, as ListFunctions does.
         rule("lambda", "GET",    "^/2020-04-22/code-signing-configs/[^/]+/functions$",
@@ -245,6 +300,7 @@ public class IamActionRegistry {
         rule("resource-groups", "POST", "^/_rg/delete-group/?$", "resource-groups:DeleteGroup"),
         rule("resource-groups", "POST", "^/_rg/group-resources/?$", "resource-groups:GroupResources"),
         rule("resource-groups", "POST", "^/_rg/list-group-resources/?$", "resource-groups:ListGroupResources"),
+        rule("resource-groups", "POST", "^/_rg/groups-list/?$", "resource-groups:ListGroups"),
 
         // ── Kinesis ────────────────────────────────────────────────────────────
         rule("kinesis", "POST", ".*", "kinesis:*")
@@ -319,13 +375,134 @@ public class IamActionRegistry {
      * PartiQL statement by its verb) is checked as the actions the request-resources table gives those parts.
      */
     public String resolveOperation(String credentialScope, String operationName, ContainerRequestContext ctx) {
-        return IamAuthorizedActions.actionFor(credentialScope, operationName);
+        // Resource Groups Tagging signs as tagging, but its permission namespace is tag.
+        String namespace = "tagging".equals(credentialScope) ? "tag" : credentialScope;
+        return IamAuthorizedActions.actionFor(namespace, operationName);
     }
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
+    public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo,
+                                       ContainerRequestContext request) {
+        if ("batch".equals(credentialScope) && resourceInfo != null
+                && resourceInfo.getResourceClass() != null && resourceInfo.getResourceMethod() != null) {
+            if (BatchController.class.isAssignableFrom(resourceInfo.getResourceClass())) {
+                return BATCH_POLICY_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+            }
+            if (V1TagsController.class.isAssignableFrom(resourceInfo.getResourceClass())
+                    && BatchSchedulingPolicyTarget.isPolicySelector(BatchSchedulingPolicyTarget.taggedArn(request))) {
+                return switch (resourceInfo.getResourceMethod().getName()) {
+                    case "listTags" -> "batch:ListTagsForResource";
+                    case "tagResourcePost" -> "batch:TagResource";
+                    case "untagResource" -> "batch:UntagResource";
+                    default -> null;
+                };
+            }
+        }
+        return resolveMatchedRoute(credentialScope, resourceInfo);
+    }
+
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
+        }
+        if ("mq".equals(credentialScope) && resourceInfo != null
+                && AmazonMqConfigurationController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return MQ_CONFIGURATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "importDocumentationParts".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:PUT";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "testInvokeMethod".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:POST";
+        }
+        if ("iot".equals(credentialScope) && resourceInfo != null
+                && IotController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
+            return "iot:DeleteJob";
+        }
+        if ("eks".equals(credentialScope) && resourceInfo != null
+                && EksController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "listAccessPolicies".equals(resourceInfo.getResourceMethod().getName())) {
+            return "eks:ListAccessPolicies";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && ("getModelTemplate".equals(resourceInfo.getResourceMethod().getName())
+                || "getV2ModelTemplate".equals(resourceInfo.getResourceMethod().getName()))) {
+            return "apigateway:GET";
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            String action = switch (resourceInfo.getResourceMethod().getName()) {
+                case "getFieldLevelEncryption" -> "cloudfront:GetFieldLevelEncryption";
+                case "getFieldLevelEncryptionConfig" -> "cloudfront:GetFieldLevelEncryptionConfig";
+                case "getFieldLevelEncryptionProfile" -> "cloudfront:GetFieldLevelEncryptionProfile";
+                case "getFieldLevelEncryptionProfileConfig" -> "cloudfront:GetFieldLevelEncryptionProfileConfig";
+                default -> null;
+            };
+            if (action != null) {
+                return action;
+            }
+        }
+        if ("backup".equals(credentialScope) && resourceInfo != null
+                && BackupFrameworkController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return BackupFrameworkController.iamAction(resourceInfo.getResourceMethod().getName());
+        }
+        if ("s3tables".equals(credentialScope) && resourceInfo != null
+                && S3TablesController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return S3TABLES_METRICS_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("lambda".equals(credentialScope) && resourceInfo != null
+                && LambdaRuntimeManagementController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "getRuntimeManagementConfig" -> "lambda:GetRuntimeManagementConfig";
+                case "putRuntimeManagementConfig" -> "lambda:PutRuntimeManagementConfig";
+                default -> null;
+            };
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontFunctionTestController.class.equals(resourceInfo.getResourceClass())) {
+            return "cloudfront:TestFunction";
+        }
+        if ("account".equals(credentialScope) && resourceInfo != null
+                && AccountController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return AccountRegionActions.forMethod(resourceInfo.getResourceMethod().getName());
+        }
+        if ("appconfig".equals(credentialScope) && resourceInfo != null
+                && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            // GetLatestConfiguration uses an internal route to avoid an S3 bucket-name collision.
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "startConfigurationSession" -> "appconfig:StartConfigurationSession";
+                case "getLatestConfiguration" -> "appconfig:GetLatestConfiguration";
+                default -> null;
+            };
+        }
+        if ("route53".equals(credentialScope) && resourceInfo != null
+                && Route53Controller.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return ROUTE53_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "updateOriginAccessControl".equals(resourceInfo.getResourceMethod().getName())) {
+            return "cloudfront:UpdateOriginAccessControl";
         }
         IamOperation iamOperation = resourceInfo.getResourceClass().getAnnotation(IamOperation.class);
         if (iamOperation == null || !credentialScope.equals(iamOperation.namespace())) {
@@ -363,11 +540,28 @@ public class IamActionRegistry {
     }
 
     public String resolveRoute(String credentialScope, ContainerRequestContext ctx) {
+        if ("cloudfront".equals(credentialScope) && CloudFrontFunctionTestRoute.matches(ctx)) {
+            return "cloudfront:TestFunction";
+        }
         String method = ctx.getMethod().toUpperCase();
         // Matched on the path the router dispatched on, as every scope is: S3 too, whose key of slashes alone
         // S3SlashOnlyKeyFilter rewrites escaped (PUT /bucket// writes the key "/"), and whose own reading of a key,
         // which keeps the slashes it was sent with, names the object (RequestPathLabels).
         String path = routedPath(ctx);
+        if ("backup".equals(credentialScope)) {
+            String frameworkAction = BackupFrameworkResources.routeAction(method, decodedPath(ctx));
+            if (frameworkAction != null) {
+                return frameworkAction;
+            }
+        }
+
+
+        if ("s3".equals(credentialScope) && !isS3ControlRequest(credentialScope, ctx)) {
+            String dispatched = resolveS3SubResourceAction(method, ctx);
+            if (dispatched != null) {
+                return dispatched;
+            }
+        }
 
         for (ActionRule rule : RULES) {
             if (rule.matches(credentialScope, method, path, ctx)) {
@@ -556,7 +750,7 @@ public class IamActionRegistry {
      * so a rule ending at the route's last segment has to match it too, or the request would pass as an
      * unknown action.
      */
-    static String routedPath(ContainerRequestContext ctx) {
+    public static String routedPath(ContainerRequestContext ctx) {
         return withoutTrailingSlash(rawPath(ctx));
     }
 
@@ -641,4 +835,194 @@ public class IamActionRegistry {
                 && "application".equalsIgnoreCase(mediaType.getType())
                 && "x-www-form-urlencoded".equalsIgnoreCase(mediaType.getSubtype());
     }
+
+    private record SubResourceAction(String queryParameter, String action) {}
+
+    private static SubResourceAction sub(String queryParameter, String action) {
+        return new SubResourceAction(queryParameter, action);
+    }
+
+    private static final List<SubResourceAction> GET_BUCKET_SUBRESOURCES = List.of(
+            sub("uploads",           "s3:ListBucketMultipartUploads"),
+            sub("notification",      "s3:GetBucketNotification"),
+            sub("versioning",        "s3:GetBucketVersioning"),
+            sub("versions",          "s3:ListBucketVersions"),
+            sub("location",          "s3:GetBucketLocation"),
+            sub("tagging",           "s3:GetBucketTagging"),
+            sub("object-lock",       "s3:GetBucketObjectLockConfiguration"),
+            sub("website",           "s3:GetBucketWebsite"),
+            sub("logging",           "s3:GetBucketLogging"),
+            sub("policyStatus",      "s3:GetBucketPolicyStatus"),
+            sub("policy",            "s3:GetBucketPolicy"),
+            sub("cors",              "s3:GetBucketCORS"),
+            sub("lifecycle",         "s3:GetLifecycleConfiguration"),
+            sub("acl",               "s3:GetBucketAcl"),
+            sub("encryption",        "s3:GetEncryptionConfiguration"),
+            sub("publicAccessBlock", "s3:GetBucketPublicAccessBlock"),
+            sub("ownershipControls", "s3:GetBucketOwnershipControls"),
+            sub("requestPayment",    "s3:GetBucketRequestPayment"),
+            sub("accelerate",        "s3:GetAccelerateConfiguration"),
+            sub("replication",       "s3:GetReplicationConfiguration"),
+            sub("metrics",           "s3:GetMetricsConfiguration"),
+            sub("intelligent-tiering", "s3:GetIntelligentTieringConfiguration"),
+            sub("analytics",         "s3:GetAnalyticsConfiguration"),
+            sub("inventory",         "s3:GetInventoryConfiguration"));
+
+    private static final List<SubResourceAction> PUT_BUCKET_SUBRESOURCES = List.of(
+            sub("notification",      "s3:PutBucketNotification"),
+            sub("versioning",        "s3:PutBucketVersioning"),
+            sub("tagging",           "s3:PutBucketTagging"),
+            sub("object-lock",       "s3:PutBucketObjectLockConfiguration"),
+            sub("website",           "s3:PutBucketWebsite"),
+            sub("logging",           "s3:PutBucketLogging"),
+            sub("policy",            "s3:PutBucketPolicy"),
+            sub("cors",              "s3:PutBucketCORS"),
+            sub("lifecycle",         "s3:PutLifecycleConfiguration"),
+            sub("acl",               "s3:PutBucketAcl"),
+            sub("encryption",        "s3:PutEncryptionConfiguration"),
+            sub("publicAccessBlock", "s3:PutBucketPublicAccessBlock"),
+            sub("ownershipControls", "s3:PutBucketOwnershipControls"),
+            sub("requestPayment",    "s3:PutBucketRequestPayment"),
+            sub("accelerate",        "s3:PutAccelerateConfiguration"),
+            sub("replication",       "s3:PutReplicationConfiguration"),
+            sub("metrics",           "s3:PutMetricsConfiguration"),
+            sub("intelligent-tiering", "s3:PutIntelligentTieringConfiguration"),
+            sub("analytics",         "s3:PutAnalyticsConfiguration"),
+            sub("inventory",         "s3:PutInventoryConfiguration"));
+
+    // AWS gives only DeleteBucketPolicy and DeleteBucketWebsite their own action; removing any other
+    // sub-resource is authorised by the same Put* action that sets it. ?accelerate is absent because
+    // S3Controller rejects DELETE on it with 405, so no mapping should claim the request.
+    private static final List<SubResourceAction> DELETE_BUCKET_SUBRESOURCES = List.of(
+            sub("tagging",           "s3:PutBucketTagging"),
+            sub("website",           "s3:DeleteBucketWebsite"),
+            sub("policy",            "s3:DeleteBucketPolicy"),
+            sub("cors",              "s3:PutBucketCORS"),
+            sub("lifecycle",         "s3:PutLifecycleConfiguration"),
+            sub("encryption",        "s3:PutEncryptionConfiguration"),
+            sub("publicAccessBlock", "s3:PutBucketPublicAccessBlock"),
+            sub("ownershipControls", "s3:PutBucketOwnershipControls"),
+            sub("replication",       "s3:PutReplicationConfiguration"),
+            sub("metrics",           "s3:PutMetricsConfiguration"),
+            sub("intelligent-tiering", "s3:PutIntelligentTieringConfiguration"),
+            sub("analytics",         "s3:PutAnalyticsConfiguration"),
+            sub("inventory",         "s3:PutInventoryConfiguration"));
+
+    private static String resolveS3SubResourceAction(String method, ContainerRequestContext ctx) {
+        MultivaluedMap<String, String> params = ctx.getUriInfo().getQueryParameters();
+        // /{bucket}?acl -> bucket-level; /{bucket}/{key}?acl -> object-level.
+        // A trailing slash is a valid key character, so /bucket/folder/?acl is an object request -
+        // we cannot use endsWith("/") to infer bucket-level.
+        String path = routedPath(ctx);
+        String stripped = path.startsWith("/") ? path.substring(1) : path;
+        int firstSlash = stripped.indexOf('/');
+        boolean isBucketLevel = firstSlash < 0 || firstSlash == stripped.length() - 1;
+        if (!isBucketLevel) {
+            return objectSubResourceAction(method, params);
+        }
+        List<SubResourceAction> chain = switch (method) {
+            case "GET" -> GET_BUCKET_SUBRESOURCES;
+            case "PUT" -> PUT_BUCKET_SUBRESOURCES;
+            case "DELETE" -> DELETE_BUCKET_SUBRESOURCES;
+            default -> List.of();
+        };
+        for (SubResourceAction entry : chain) {
+            if (params.containsKey(entry.queryParameter())) {
+                return entry.action();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The operation an object sub-resource selects, checked in the order S3Controller dispatches
+     * them: a request naming several runs the first, so it is checked as that one. A
+     * {@code versionId} selects the version action AWS checks in place of an action that has one
+     * (see {@link S3ObjectActions#forVersion}). Null where the controller falls through to the plain
+     * object operation on the current version, which the rules check.
+     */
+    private static String objectSubResourceAction(String method, MultivaluedMap<String, String> params) {
+        String versionId = params.getFirst("versionId");
+        return switch (method) {
+            case "GET" -> {
+                if (params.containsKey("uploadId")) {
+                    yield "s3:ListMultipartUploadParts";
+                }
+                if (params.containsKey("tagging")) {
+                    yield S3ObjectActions.forVersion("s3:GetObjectTagging", versionId);
+                }
+                if (params.containsKey("annotation")) {
+                    yield S3ObjectActions.forVersion(annotationReadAction(params), versionId);
+                }
+                if (params.containsKey("retention")) {
+                    yield "s3:GetObjectRetention";
+                }
+                if (params.containsKey("legal-hold")) {
+                    yield "s3:GetObjectLegalHold";
+                }
+                if (params.containsKey("acl")) {
+                    yield S3ObjectActions.forVersion("s3:GetObjectAcl", versionId);
+                }
+                yield versionId != null ? "s3:GetObjectVersion" : null;
+            }
+            case "HEAD" -> {
+                if (params.containsKey("annotation")) {
+                    yield S3ObjectActions.forVersion(annotationReadAction(params), versionId);
+                }
+                yield versionId != null ? "s3:GetObjectVersion" : null;
+            }
+            case "PUT" -> {
+                if (params.containsKey("tagging")) {
+                    yield S3ObjectActions.forVersion("s3:PutObjectTagging", versionId);
+                }
+                if (params.containsKey("retention")) {
+                    yield "s3:PutObjectRetention";
+                }
+                if (params.containsKey("legal-hold")) {
+                    yield "s3:PutObjectLegalHold";
+                }
+                if (params.containsKey("acl")) {
+                    yield S3ObjectActions.forVersion("s3:PutObjectAcl", versionId);
+                }
+                // A PUT naming an uploadId and a partNumber is UploadPart, which the rules check as
+                // s3:PutObject, as they do PutObject and CopyObject.
+                yield params.containsKey("annotation")
+                        ? S3ObjectActions.forVersion("s3:PutObjectAnnotation", versionId)
+                        : null;
+            }
+            case "DELETE" -> {
+                if (params.containsKey("tagging")) {
+                    yield S3ObjectActions.forVersion("s3:DeleteObjectTagging", versionId);
+                }
+                if (params.containsKey("annotation")) {
+                    yield S3ObjectActions.forVersion("s3:DeleteObjectAnnotation", versionId);
+                }
+                if (params.containsKey("uploadId")) {
+                    yield "s3:AbortMultipartUpload";
+                }
+                yield versionId != null ? "s3:DeleteObjectVersion" : null;
+            }
+            case "POST" -> {
+                if (params.containsKey("uploads")) {
+                    yield "s3:PutObject";
+                }
+                if (params.containsKey("restore")) {
+                    yield "s3:RestoreObject";
+                }
+                if (params.containsKey("select")) {
+                    // SelectObjectContent reads the current object; its modeled input names no version.
+                    yield "s3:GetObject";
+                }
+                yield params.containsKey("uploadId") ? "s3:PutObject" : null;
+            }
+            default -> null;
+        };
+    }
+
+    /** A named annotation is GetObjectAnnotation; an empty or absent name lists them, as S3Controller does. */
+    private static String annotationReadAction(MultivaluedMap<String, String> params) {
+        String name = params.getFirst("annotationName");
+        return name != null && !name.isEmpty() ? "s3:GetObjectAnnotation" : "s3:ListObjectAnnotations";
+    }
+
 }
