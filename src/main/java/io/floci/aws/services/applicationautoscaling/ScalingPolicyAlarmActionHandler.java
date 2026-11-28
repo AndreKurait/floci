@@ -1,5 +1,6 @@
 package io.floci.aws.services.applicationautoscaling;
 
+import io.floci.aws.core.common.EpochSeconds;
 import io.floci.aws.services.applicationautoscaling.model.ScalableTarget;
 import io.floci.aws.services.applicationautoscaling.model.ScalingPolicy;
 import io.floci.aws.services.applicationautoscaling.model.StepAdjustment;
@@ -13,7 +14,7 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.time.Instant;
+import java.time.Clock;
 
 /**
  * Invokes a target-tracking or step-scaling policy when the CloudWatch alarm behind it fires.
@@ -45,8 +46,7 @@ import java.time.Instant;
  * moves" rationale no longer applies, and a persistent breach must not stay stuck below where
  * it belongs for a full cooldown window just because of an unrelated capacity change. Cooldown
  * defaults to 300s when unset, matching
- * AWS's documented default for ECS services (the only scalable dimension this handler drives
- * today) rather than inventing a different value.</p>
+ * AWS's documented default for ECS services. Lambda uses its documented zero default.</p>
  *
  * <p>{@link AlarmEvaluator} dispatches on every tick a breach persists, not only the first
  * transition into {@code ALARM}, so a cooldown-deferred action gets retried on a later tick
@@ -58,20 +58,26 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
     private static final Logger LOG = Logger.getLogger(ScalingPolicyAlarmActionHandler.class);
 
     /**
-     * AWS's documented per-service default when a cooldown isn't explicitly configured. ECS is
-     * the only scalable dimension this handler drives today, so its default (also shared by
-     * most other scalable-target types) is the one that applies here.
+     * Default for ECS and most scalable targets. Lambda overrides it with zero below.
      */
     private static final int DEFAULT_COOLDOWN_SECONDS = 300;
 
     private final ApplicationAutoScalingService service;
     private final Instance<CapacityAdjuster> adjusters;
+    private final Clock clock;
 
     @Inject
     public ScalingPolicyAlarmActionHandler(ApplicationAutoScalingService service,
                                            @Any Instance<CapacityAdjuster> adjusters) {
+        this(service, adjusters, Clock.systemUTC());
+    }
+
+    /** Reads the cooldowns' time from {@code clock}: the system clock outside tests. */
+    ScalingPolicyAlarmActionHandler(ApplicationAutoScalingService service, Instance<CapacityAdjuster> adjusters,
+                                    Clock clock) {
         this.service = service;
         this.adjusters = adjusters;
+        this.clock = clock;
     }
 
     @Override
@@ -101,6 +107,11 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
                 policy.getResourceId(), policy.getScalableDimension()).orElse(null);
         if (target == null) {
             LOG.debugv("No scalable target for policy {0}", policy.getPolicyName());
+            return;
+        }
+
+        if (DynamoDbTargetTracking.supports(policy)) {
+            service.executeDynamoDbPolicy(policy, target, alarm, metricValue, region);
             return;
         }
 
@@ -249,27 +260,29 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
         };
     }
 
-    private static boolean withinCooldown(ScalingPolicy policy, boolean scaleOut) {
+    private boolean withinCooldown(ScalingPolicy policy, boolean scaleOut) {
         int cooldownSeconds = cooldownSeconds(policy, scaleOut);
         double last = scaleOut ? policy.getLastScaleOutTime() : policy.getLastScaleInTime();
-        return last > 0 && (Instant.now().getEpochSecond() - last) < cooldownSeconds;
+        // Whole milliseconds on both sides: in whole seconds a cooldown stamped late in a second ended early.
+        return last > 0 && clock.millis() - Math.round(last * 1000.0) < cooldownSeconds * 1000L;
     }
 
     private static int cooldownSeconds(ScalingPolicy policy, boolean scaleOut) {
+        int defaultCooldown = "lambda".equals(policy.getServiceNamespace()) ? 0 : DEFAULT_COOLDOWN_SECONDS;
         if ("StepScaling".equals(policy.getPolicyType())) {
             StepScalingConfiguration config = policy.getStepScalingConfiguration();
-            return config != null && config.getCooldown() != null ? config.getCooldown() : DEFAULT_COOLDOWN_SECONDS;
+            return config != null && config.getCooldown() != null ? config.getCooldown() : defaultCooldown;
         }
         TargetTrackingConfiguration config = policy.getTargetTrackingConfiguration();
         if (config == null) {
-            return DEFAULT_COOLDOWN_SECONDS;
+            return defaultCooldown;
         }
         Integer cooldown = scaleOut ? config.getScaleOutCooldown() : config.getScaleInCooldown();
-        return cooldown != null ? cooldown : DEFAULT_COOLDOWN_SECONDS;
+        return cooldown != null ? cooldown : defaultCooldown;
     }
 
-    private static void stampCooldown(ScalingPolicy policy, boolean scaleOut) {
-        double now = Instant.now().getEpochSecond();
+    private void stampCooldown(ScalingPolicy policy, boolean scaleOut) {
+        double now = EpochSeconds.fromMillis(clock.millis());
         if (scaleOut) {
             policy.setLastScaleOutTime(now);
         } else {
