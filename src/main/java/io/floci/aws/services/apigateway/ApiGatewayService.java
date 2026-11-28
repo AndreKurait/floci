@@ -29,6 +29,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.core.storage.WriteProfile;
+import io.floci.aws.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.floci.aws.services.apigateway.model.Account;
 import io.floci.aws.services.apigateway.model.ApiGatewayResource;
 import io.floci.aws.services.apigateway.model.ApiKey;
@@ -5434,5 +5435,30 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
 
     private static String shortId(int length) {
         return UUID.randomUUID().toString().replace("-", "").substring(0, length);
+    }
+
+    /** Reads live certificate references without acquiring this service's mutation lock. */
+    public List<CertificateReference> acmCertificateReferences() {
+        List<CertificateReference> references = new ArrayList<>();
+        for (String key : domainStore.keys()) {
+            int separator = key.indexOf("::");
+            if (separator <= 0) {
+                continue;
+            }
+            String region = key.substring(0, separator);
+            domainStore.get(key).ifPresent(domain -> {
+                String domainArn = domainNameArn(region, domain.getDomainName());
+                addCertificateReference(references, domain.getCertificateArn(), domainArn);
+                addCertificateReference(references, domain.getRegionalCertificateArn(), domainArn);
+            });
+        }
+        return references;
+    }
+
+    private static void addCertificateReference(List<CertificateReference> references, String certificateArn,
+                                                String resourceArn) {
+        if (certificateArn != null && !certificateArn.isBlank()) {
+            references.add(new CertificateReference(certificateArn, resourceArn));
+        }
     }
 }
