@@ -24,6 +24,8 @@ import io.floci.aws.services.ssm.model.SsmDocument;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -111,6 +113,22 @@ class SsmServiceTest {
                 new InMemoryStorage<>(),
                 5
         );
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"mi-0123456789abcdef0", "ecs:cluster_container_runtime", "i-*",
+            "i-0123456789abcdef0/suffix", "arn:aws:ec2:us-east-1:111122223333:instance/i-0123456789abcdef0"})
+    void resolvesNoSessionResourceForAnUnsupportedTarget(String target) {
+        assertEquals(List.of(), ssmService.through("Target", target, "us-east-1"));
+    }
+
+    @Test
+    void updateAssociationWithoutANameDoesNotSelectTheSessionDocument() throws Exception {
+        String id = "d50f951e-8dff-4640-9a67-143a0e039b30";
+        assertEquals(List.of("arn:aws:ssm:us-east-1:000000000000:association/" + id),
+                RequestResources.ofBody("ssm:UpdateAssociation",
+                        MAPPER.readTree("{\"AssociationId\":\"" + id + "\"}"),
+                        "aws", "us-east-1", "000000000000", ssmService));
     }
 
     @Test
@@ -1264,13 +1282,14 @@ class SsmServiceTest {
         ssmService.createDocument("Doc3", "{}", "Command", "us-west-2");
 
         List<SsmDocument> eastDocs = ssmService.listDocuments("us-east-1", null);
-        assertEquals(2, eastDocs.size());
+        assertEquals(5, eastDocs.size());
         assertTrue(eastDocs.stream().anyMatch(d -> "Doc1".equals(d.getName())));
         assertTrue(eastDocs.stream().anyMatch(d -> "Doc2".equals(d.getName())));
 
         List<SsmDocument> westDocs = ssmService.listDocuments("us-west-2", Map.of());
-        assertEquals(1, westDocs.size());
-        assertEquals("Doc3", westDocs.get(0).getName());
+        assertEquals(4, westDocs.size());
+        assertTrue(westDocs.stream().anyMatch(d -> "Doc3".equals(d.getName())));
+        assertFalse(westDocs.stream().anyMatch(d -> "Doc1".equals(d.getName()) || "Doc2".equals(d.getName())));
 
         // Filter by DocumentType
         List<SsmDocument> commandDocs = ssmService.listDocuments("us-east-1", Map.of("DocumentType", List.of("Command")));
@@ -1286,21 +1305,34 @@ class SsmServiceTest {
         List<SsmDocument> blankNameDocs = ssmService.listDocuments("us-east-1", Map.of("Name", List.of("")));
         assertTrue(blankNameDocs.isEmpty());
 
-        // Owner=Self/All/the caller's account id match every visible document (all are self-owned)
+        // Self excludes AWS-owned documents; All includes them.
         List<SsmDocument> selfDocs = ssmService.listDocuments("us-east-1", Map.of("Owner", List.of("Self")));
         assertEquals(2, selfDocs.size());
         List<SsmDocument> allDocs = ssmService.listDocuments("us-east-1", Map.of("Owner", List.of("All")));
-        assertEquals(2, allDocs.size());
+        assertEquals(5, allDocs.size());
 
-        // Owner=Amazon/Public/another account id match none: no AWS-owned or cross-account documents
+        // Amazon selects the built-in documents.
         List<SsmDocument> amazonDocs = ssmService.listDocuments("us-east-1", Map.of("Owner", List.of("Amazon")));
-        assertTrue(amazonDocs.isEmpty());
+        assertEquals(3, amazonDocs.size());
+        assertTrue(amazonDocs.stream().allMatch(d -> "Amazon".equals(d.getOwner())));
 
         // Filter by PlatformTypes (all documents default to Windows/Linux/MacOS)
         List<SsmDocument> windowsDocs = ssmService.listDocuments("us-east-1", Map.of("PlatformTypes", List.of("Windows")));
-        assertEquals(2, windowsDocs.size());
+        assertEquals(5, windowsDocs.size());
         List<SsmDocument> aixDocs = ssmService.listDocuments("us-east-1", Map.of("PlatformTypes", List.of("AIX")));
         assertTrue(aixDocs.isEmpty());
+    }
+
+    @Test
+    void unfilteredListIncludesBuiltinDocumentsAndRegionalAccountDocuments() {
+        ssmService.createDocument("EastDoc", "{}", "Command", "us-east-1");
+        ssmService.createDocument("WestDoc", "{}", "Command", "us-west-2");
+
+        List<SsmDocument> documents = ssmService.listDocuments("us-west-2", null);
+
+        assertEquals(List.of("AWS-StartPortForwardingSession", "AWS-StartPortForwardingSessionToRemoteHost",
+                        "AWS-StartSSHSession", "WestDoc"),
+                documents.stream().map(SsmDocument::getName).sorted().toList());
     }
 
     @Test
@@ -1323,8 +1355,9 @@ class SsmServiceTest {
         assertEquals("123456789012", accountDocs.get(0).getOwner());
 
         List<SsmDocument> unfilteredDocs = service.listDocuments("us-east-1", null);
-        assertEquals(1, unfilteredDocs.size());
-        assertEquals("123456789012", unfilteredDocs.get(0).getOwner());
+        assertEquals(4, unfilteredDocs.size());
+        assertEquals("123456789012", unfilteredDocs.stream()
+                .filter(d -> "LegacyDoc".equals(d.getName())).findFirst().orElseThrow().getOwner());
 
         assertTrue(service.listDocuments("us-east-1", Map.of("Owner", List.of("999999999999"))).isEmpty());
     }
