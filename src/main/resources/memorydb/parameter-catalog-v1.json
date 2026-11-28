@@ -1,0 +1,1824 @@
+{
+  "version": "floci-memorydb-parameters-v1",
+  "families": [
+    "memorydb_redis6",
+    "memorydb_redis7",
+    "memorydb_valkey7"
+  ],
+  "defaultGroups": [
+    {
+      "name": "default.memorydb-redis6",
+      "family": "memorydb_redis6",
+      "overrides": {}
+    },
+    {
+      "name": "default.memorydb-redis7",
+      "family": "memorydb_redis7",
+      "overrides": {}
+    },
+    {
+      "name": "default.memorydb-valkey7",
+      "family": "memorydb_valkey7",
+      "overrides": {}
+    },
+    {
+      "name": "default.memorydb-redis7.search",
+      "family": "memorydb_redis7",
+      "overrides": {
+        "search-enabled": "yes"
+      }
+    },
+    {
+      "name": "default.memorydb-valkey7.search",
+      "family": "memorydb_valkey7",
+      "overrides": {
+        "search-enabled": "yes"
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "acllog-max-len",
+      "defaultValue": "128",
+      "description": "The maximum length of the ACL Log",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "10000"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "active-defrag-cycle-max",
+      "defaultValue": "75",
+      "description": "Maximal effort for defrag in CPU percentage",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "75"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "active-defrag-cycle-min",
+      "defaultValue": "5",
+      "description": "Minimal effort for defrag in CPU percentage",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "75"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "active-defrag-ignore-bytes",
+      "defaultValue": "104857600",
+      "description": "Minimum amount of fragmentation waste to start active defrag",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1048576",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "active-defrag-max-scan-fields",
+      "defaultValue": "1000",
+      "description": "Maximum number of set/hash/zset/list fields that will be processed from the main dictionary scan",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "1000000"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "active-defrag-threshold-lower",
+      "defaultValue": "10",
+      "description": "Minimum percentage of fragmentation to start active defrag",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "100"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "active-defrag-threshold-upper",
+      "defaultValue": "100",
+      "description": "Maximum percentage of fragmentation at which we use maximum effort",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "100"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "active-expire-effort",
+      "defaultValue": "1",
+      "description": "The amount of effort that redis uses to expire items in the active expiration job",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "10"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "activedefrag",
+      "defaultValue": "no",
+      "description": "Enabled active memory defragmentation",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "activerehashing",
+      "defaultValue": "yes",
+      "description": "Apply rehashing or not",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis6"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "current-engine-guide-hidden-in-Redis7-and-Valkey7",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "busy-reply-threshold",
+      "defaultValue": "5000",
+      "description": "The milliseconds a script may run before the engine starts answering BUSY to other clients",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "client-output-buffer-limit-normal-hard-limit",
+      "defaultValue": "0",
+      "description": "Normal client output buffer hard limit in bytes",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "client-output-buffer-limit-normal-soft-limit",
+      "defaultValue": "0",
+      "description": "Normal client output buffer soft limit in bytes",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "client-output-buffer-limit-normal-soft-seconds",
+      "defaultValue": "0",
+      "description": "Normal client output buffer soft limit in seconds",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "client-output-buffer-limit-pubsub-hard-limit",
+      "defaultValue": "33554432",
+      "description": "Pubsub client output buffer hard limit in bytes",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "client-output-buffer-limit-pubsub-soft-limit",
+      "defaultValue": "8388608",
+      "description": "Pubsub client output buffer soft limit in bytes",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "client-output-buffer-limit-pubsub-soft-seconds",
+      "defaultValue": "60",
+      "description": "Pubsub client output buffer soft limit in seconds",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "client-query-buffer-limit",
+      "defaultValue": "1073741824",
+      "description": "Max size of a single client query buffer. Change takes place immediately.",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1048576",
+            "1073741824"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "current-engine-guide",
+        "description": "current-engine-guide",
+        "domain": "current-engine-guide",
+        "families": "current-engine-guide",
+        "modifiable": "current-engine-guide",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "hash-max-listpack-entries",
+      "defaultValue": "512",
+      "description": "The maximum number of hash entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "hash-max-listpack-value",
+      "defaultValue": "64",
+      "description": "The threshold of biggest hash entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "hash-max-ziplist-entries",
+      "defaultValue": "512",
+      "description": "The maximum number of hash entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "hash-max-ziplist-value",
+      "defaultValue": "64",
+      "description": "The threshold of biggest hash entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "hll-sparse-max-bytes",
+      "defaultValue": "3000",
+      "description": "HyperLogLog sparse representation bytes limit",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "16000"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "latency-tracking",
+      "defaultValue": "no",
+      "description": "Track the per command latencies and enable exporting the percentile distribution via the INFO latencystats command and cumulative latency distributions (histograms) via the LATENCY command.",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "lazyfree-lazy-eviction",
+      "defaultValue": "no",
+      "description": "Perform an asynchronous delete on evictions",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "lazyfree-lazy-expire",
+      "defaultValue": "no",
+      "description": "Perform an asynchronous delete on expired keys",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "lazyfree-lazy-server-del",
+      "defaultValue": "no",
+      "description": "Perform an asynchronous delete on key updates",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "lazyfree-lazy-user-del",
+      "defaultValue": "no",
+      "description": "Specifies whether the default behavior of DEL command acts the same as UNLINK",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "lfu-decay-time",
+      "defaultValue": "1",
+      "description": "The amount of time in minutes to decrement the key counter for LFU eviction policyd",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "lfu-log-factor",
+      "defaultValue": "10",
+      "description": "The log factor for incrementing key counter for LFU eviction policy",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "list-compress-depth",
+      "defaultValue": "0",
+      "description": "Number of quicklist ziplist nodes from each side of the list to exclude from compression. The head and tail of the list are always uncompressed for fast push/pop operations",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "list-max-listpack-size",
+      "defaultValue": "128",
+      "description": "The maximum number of list entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "list-max-ziplist-size",
+      "defaultValue": "128",
+      "description": "The maximum number of list entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "lua-time-limit",
+      "defaultValue": "5000",
+      "description": "Max execution time of a Lua script in milliseconds",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "maxclients",
+      "defaultValue": "65000",
+      "description": "The maximum number of clients that can be connected at one time. Non modifiable.",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "65000",
+            "65000"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": false,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "current-engine-guide",
+        "description": "current-engine-guide",
+        "domain": "current-engine-guide",
+        "families": "current-engine-guide",
+        "modifiable": "current-engine-guide",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "maxmemory-clients",
+      "defaultValue": "0",
+      "description": "The memory all client connection buffers together may use, as a size or a percentage of the node's memory; 0 removes the limit",
+      "domain": {
+        "kind": "text"
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "maxmemory-policy",
+      "defaultValue": "noeviction",
+      "description": "Max memory policy",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "volatile-lru",
+          "allkeys-lru",
+          "volatile-lfu",
+          "allkeys-lfu",
+          "volatile-random",
+          "allkeys-random",
+          "volatile-ttl",
+          "noeviction"
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "maxmemory-samples",
+      "defaultValue": "3",
+      "description": "Max memory samples",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "notify-keyspace-events",
+      "defaultValue": "",
+      "description": "The keyspace events for Redis to notify Pub/Sub clients about. By default all notifications are disabled",
+      "domain": {
+        "kind": "text"
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "proto-max-bulk-len",
+      "defaultValue": "536870912",
+      "description": "The largest single request or bulk reply, in bytes",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1048576",
+            "536870912"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "search-enabled",
+      "defaultValue": "no",
+      "description": "When set to yes, it enables search capabilities.",
+      "domain": {
+        "kind": "tokens",
+        "values": [
+          "yes",
+          "no"
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.1",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "recorded-catalog-20261102T084325Z",
+        "domain": "native32b",
+        "families": "current-engine-guide-and-redis7-search-workflow",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "Redis7-current-guide7.1;Valkey-native-family-compatibility7.2.6"
+      }
+    },
+    {
+      "name": "search-query-timeout-ms",
+      "defaultValue": "10000",
+      "description": "The maximum amount of time in milliseconds that a search query is allowed to run.",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "60000"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.1",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "recorded-catalog-20261102T084325Z",
+        "domain": "recorded-catalog-20261102T084325Z-and-current-engine-guide",
+        "families": "current-engine-guide-and-redis7-search-workflow",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "Redis7-current-guide7.1;Valkey-native-family-compatibility7.2.6"
+      }
+    },
+    {
+      "name": "set-max-intset-entries",
+      "defaultValue": "512",
+      "description": "The limit in the size of the set in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "set-max-listpack-entries",
+      "defaultValue": "128",
+      "description": "The maximum number of set entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "set-max-listpack-value",
+      "defaultValue": "64",
+      "description": "The threshold of biggest set entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "slowlog-log-slower-than",
+      "defaultValue": "10000",
+      "description": "The execution time, in microseconds, to exceed in order for the command to get logged. Note that a negative number disables the slow log, while a value of zero forces the logging of every command",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            null,
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "recorded-catalog-20261102T084325Z",
+        "domain": "recorded-catalog-20261102T084325Z;negative-permission-in-current-guide",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "slowlog-max-len",
+      "defaultValue": "128",
+      "description": "The length of the slow log. There is no limit to this length. Just be aware that it will consume memory. You can reclaim memory used by the slow log with SLOWLOG RESET.",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "recorded-catalog-20261102T084325Z",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "stream-node-max-bytes",
+      "defaultValue": "4096",
+      "description": "The maximum size of a single node in a stream in bytes",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "stream-node-max-entries",
+      "defaultValue": "100",
+      "description": "The maximum number of items a single node in a stream can contain",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "tcp-keepalive",
+      "defaultValue": "300",
+      "description": "If non-zero, send ACKs every given number of seconds",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "timeout",
+      "defaultValue": "0",
+      "description": "Close connection if client is idle for a given number of seconds, or never if 0",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            "0"
+          ],
+          [
+            "20",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "tracking-table-max-keys",
+      "defaultValue": "1000000",
+      "description": "The maximum number of keys allowed for the tracking table for client side caching",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "1",
+            "100000000"
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6",
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6",
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "recorded-catalog-20261102T084325Z",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "zset-max-listpack-entries",
+      "defaultValue": "128",
+      "description": "The maximum number of sorted set entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "zset-max-listpack-value",
+      "defaultValue": "64",
+      "description": "The threshold of biggest sorted set entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis7",
+        "memorydb_valkey7"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis7": "7.0.7",
+        "memorydb_valkey7": "7.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "zset-max-ziplist-entries",
+      "defaultValue": "128",
+      "description": "The maximum number of sorted set entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    },
+    {
+      "name": "zset-max-ziplist-value",
+      "defaultValue": "64",
+      "description": "The threshold of biggest sorted set entries in order for the dataset to be compressed",
+      "domain": {
+        "kind": "integer",
+        "ranges": [
+          [
+            "0",
+            null
+          ]
+        ]
+      },
+      "families": [
+        "memorydb_redis6"
+      ],
+      "modifiable": true,
+      "minimumEngineVersions": {
+        "memorydb_redis6": "6.2.6"
+      },
+      "provenance": {
+        "defaultValue": "native32b",
+        "description": "native32b-unqualified-description",
+        "domain": "native32b",
+        "families": "native32b",
+        "modifiable": "native32b-standalone-metadata",
+        "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+      }
+    }
+  ],
+  "limits": [
+    "Standalone metadata only; no engine/cluster application or attachment claims.",
+    "Native32b descriptions, extra entries and family minimum versions remain compatibility inputs, not AWS oracles.",
+    "No node-specific maxmemory, preview family aliases, arbitrary engine versions or full catalog parity.",
+    "Recorded descriptions override different guide prose; published DataType is derived from the domain.",
+    "Only six modeled Parameter members are emitted; no Source or IsModifiable wire member is invented."
+  ]
+}

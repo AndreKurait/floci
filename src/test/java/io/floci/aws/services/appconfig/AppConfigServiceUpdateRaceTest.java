@@ -23,6 +23,7 @@ import static io.floci.aws.testing.ThreadStates.awaitBlockedOrDone;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 /**
  * The update methods CloudFormation uses read an entity, change it and write it back. A delete the
@@ -75,7 +76,7 @@ class AppConfigServiceUpdateRaceTest {
                 Map.of("Name", "settings", "LocationUri", "hosted"));
 
         deleteWaitsForTheWrite(store,
-                () -> service.updateConfigurationProfile(app.getId(), profile.getId(), "renamed", null),
+                () -> service.updateConfigurationProfile(app.getId(), profile.getId(), Map.of("Name", "renamed")),
                 () -> service.deleteConfigurationProfile(app.getId(), profile.getId()));
 
         assertTrue(service.findConfigurationProfile(profile.getId()).isEmpty(), "the entity outlived its delete");
@@ -93,6 +94,29 @@ class AppConfigServiceUpdateRaceTest {
                 () -> service.deleteEnvironment(app.getId(), env.getId()));
 
         assertTrue(service.findEnvironment(env.getId()).isEmpty(), "the entity outlived its delete");
+    }
+
+    @Test
+    void aNativeEnvironmentPatchCannotResurrectADeletedEnvironment() throws Exception {
+        ParkingStore<Environment> store = new ParkingStore<>();
+        AppConfigService service = serviceWithStore(ENVIRONMENTS, store);
+        String app = service.createApplication(Map.of("Name", "app")).getId();
+        Environment env = service.createEnvironment(app, Map.of("Name", "environment"));
+        deleteWaitsForTheWrite(store,
+                () -> service.updateEnvironment(app, env.getId(), Map.of("Description", "patched")),
+                () -> service.deleteEnvironment(app, env.getId()));
+        assertTrue(service.findEnvironment(env.getId()).isEmpty());
+    }
+
+    @Test
+    void aNativeStrategyPatchCannotResurrectADeletedStrategy() throws Exception {
+        ParkingStore<DeploymentStrategy> store = new ParkingStore<>();
+        AppConfigService service = serviceWithStore(STRATEGIES, store);
+        DeploymentStrategy strategy = service.createDeploymentStrategy(Map.of("Name", "strategy", "GrowthFactor", 20));
+        deleteWaitsForTheWrite(store,
+                () -> service.updateDeploymentStrategy(strategy.getId(), Map.of("Description", "patched")),
+                () -> service.deleteDeploymentStrategy(strategy.getId()));
+        assertTrue(service.listDeploymentStrategies().stream().noneMatch(value -> value.getId().equals(strategy.getId())));
     }
 
     /**
@@ -131,6 +155,7 @@ class AppConfigServiceUpdateRaceTest {
     /** An AppConfig service whose {@code fileName} store is {@code store} and every other store in memory. */
     private static AppConfigService serviceWithStore(String fileName, StorageBackend<String, ?> store) {
         return new AppConfigService(new InMemoryStorageFactory(ACCOUNT).withStore(fileName, store),
-                new RegionResolver("us-east-1", ACCOUNT));
+                new RegionResolver("us-east-1", ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class));
     }
 }

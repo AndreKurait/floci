@@ -104,14 +104,16 @@ class RedshiftMaxErrorIntegrationTest {
             stmt.execute("CREATE TABLE t_maxerror_default (id int, name text)");
 
             // MAXERROR 0 fails at the first error
-            assertThrows(SQLException.class, () -> stmt.execute(
+            SQLException error0 = assertThrows(SQLException.class, () -> stmt.execute(
                     "COPY t_maxerror_default (id, name) FROM 's3://" + BUCKET + "/one-error-default.txt' "
                             + "DELIMITER '|' MAXERROR 0"));
+            assertEquals("22P02", error0.getSQLState());
 
             // MAXERROR 1 also fails at the first error
-            assertThrows(SQLException.class, () -> stmt.execute(
+            SQLException error1 = assertThrows(SQLException.class, () -> stmt.execute(
                     "COPY t_maxerror_default (id, name) FROM 's3://" + BUCKET + "/one-error-default.txt' "
                             + "DELIMITER '|' MAXERROR 1"));
+            assertEquals("22P02", error1.getSQLState());
 
             try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM t_maxerror_default")) {
                 assertTrue(rs.next());

@@ -29,7 +29,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -371,17 +373,9 @@ class CloudWatchLogsMetricFilterTest {
         boolean present = expected != null && expected.has("Sum");
         List<String> recorded = present ? MetricFilterQueryAssertions.recorded(expected) : List.of();
         List<Statistic> statistics = MetricFilterQueryAssertions.STATISTICS.stream().map(Statistic::fromValue).toList();
-        AtomicReference<List<Datapoint>> lastRead = new AtomicReference<>(List.of());
-        if (present) {
-            TestFixtures.await(() -> {
-                lastRead.set(statistics(metric, minute, dimensions, statistics));
-                return matchesSeries(lastRead.get(), expected, recorded);
-            }, metric + " at " + minute + " " + dimensions, "all recorded statistics " + expected,
-                    Duration.ofSeconds(10).toNanos(), 50, () -> "; last read: " + lastRead.get());
-        } else {
-            lastRead.set(statistics(metric, minute, dimensions, statistics));
-        }
-        List<Datapoint> points = lastRead.get();
+        List<Datapoint> points = awaitSeries(
+                () -> statistics(metric, minute, dimensions, statistics), expected, Duration.ofSeconds(10),
+                metric + " at " + minute + " " + dimensions);
         assertThat(points).as(metric + " at " + minute + " " + dimensions).hasSize(present ? 1 : 0);
         if (present) {
             Datapoint point = points.get(0);
@@ -412,6 +406,31 @@ class CloudWatchLogsMetricFilterTest {
             }
         }
         MetricFilterQueryAssertions.assertSeries(namespace, metric, minute, dimensions, expected);
+    }
+
+    static List<Datapoint> awaitSeries(Supplier<List<Datapoint>> read, JsonNode expected, Duration timeout)
+            throws InterruptedException {
+        return awaitSeries(read, expected, timeout, "metric series");
+    }
+
+    private static List<Datapoint> awaitSeries(Supplier<List<Datapoint>> read, JsonNode expected,
+                                              Duration timeout, String resourceName) throws InterruptedException {
+        boolean present = expected != null && expected.has("Sum");
+        List<String> recorded = present ? MetricFilterQueryAssertions.recorded(expected) : List.of();
+        long deadline = System.nanoTime() + timeout.toNanos();
+        AtomicReference<List<Datapoint>> lastRead = new AtomicReference<>(read.get());
+        if (present && !matchesSeries(lastRead.get(), expected, recorded)) {
+            // The initial sample counts even with a zero budget; further reads retain the poll interval.
+            AtomicBoolean initialSample = new AtomicBoolean(true);
+            TestFixtures.await(() -> {
+                if (!initialSample.getAndSet(false)) {
+                    lastRead.set(read.get());
+                }
+                return matchesSeries(lastRead.get(), expected, recorded);
+            }, resourceName, "all recorded statistics " + expected,
+                    Math.max(0, deadline - System.nanoTime()), 50, () -> "; last read: " + lastRead.get());
+        }
+        return lastRead.get();
     }
 
     private static boolean matchesSeries(List<Datapoint> points, JsonNode expected, List<String> recorded) {

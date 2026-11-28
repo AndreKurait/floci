@@ -15,6 +15,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -24,9 +25,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -81,6 +84,11 @@ class ContainerLifecycleManagerLinuxOptionsTest {
                 .withTmpfs("/scratch", "noexec,size=64m")
                 .withMemorySwapBytes(1536 * MIB)
                 .withMemorySwappiness(10)
+                .withPidMode("host")
+                .withApparmorProfile("floci-native")
+                .withStopSignal("SIGRTMIN+3")
+                .withNetworkSysctl("net.ipv6.conf.all.disable_ipv6", "0")
+                .withNetworkSysctl("net.ipv4.ip_forward", "1")
                 .build();
 
         manager().create(spec);
@@ -95,6 +103,11 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertEquals(512 * MIB, hostConfig.getMemory());
         assertEquals(1536 * MIB, hostConfig.getMemorySwap());
         assertEquals(10L, hostConfig.getMemorySwappiness());
+        assertEquals(Map.of("net.ipv6.conf.all.disable_ipv6", "0", "net.ipv4.ip_forward", "1"),
+                hostConfig.getSysctls());
+        assertEquals("host", hostConfig.getPidMode());
+        assertEquals(List.of("apparmor=floci-native"), hostConfig.getSecurityOpts());
+        verify(createCmd).withStopSignal("SIGRTMIN+3");
     }
 
     @Test
@@ -112,6 +125,35 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertNull(hostConfig.getTmpFs());
         assertNull(hostConfig.getMemorySwap());
         assertNull(hostConfig.getMemorySwappiness());
+        assertNull(hostConfig.getSysctls());
+        assertNull(hostConfig.getPidMode());
+        assertNull(hostConfig.getSecurityOpts());
+        verify(createCmd, never()).withStopSignal(anyString());
+    }
+
+    @Test
+    void networkSysctlsCannotChangeAnotherNamespacesSettings() {
+        for (String mode : List.of("host", "container:protected-helper")) {
+            assertThrows(IllegalArgumentException.class, () -> builder().withNetworkMode(mode)
+                    .withNetworkSysctl("net.ipv4.ip_forward", "1").build());
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> builder().withNetworkSysctl("kernel.hostname", "changed").build());
+        assertThrows(IllegalArgumentException.class,
+                () -> builder().withNetworkSysctl("net.ipv4.ip_forward", " ").build());
+    }
+
+    @Test
+    void networkSysctlsAreAnImmutableSnapshotAndNoneKeepsItsOwnNamespace() {
+        ContainerBuilder.Builder mutable = builder().withNetworkMode("none")
+                .withNetworkSysctl("net.ipv6.conf.default.disable_ipv6", "0");
+        ContainerSpec spec = mutable.build();
+        mutable.withNetworkSysctl("net.ipv4.ip_forward", "1");
+        assertEquals(Map.of("net.ipv6.conf.default.disable_ipv6", "0"), spec.linuxOptions().networkSysctls());
+        assertThrows(UnsupportedOperationException.class,
+                () -> spec.linuxOptions().networkSysctls().put("net.ipv4.ip_forward", "1"));
+        assertTrue(new LinuxOptions(List.of(), List.of(), List.of(), null, Map.of(), null, null)
+                .networkSysctls().isEmpty());
     }
 
     @Test
@@ -142,6 +184,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
                 .withCapAdd("SYS_PTRACE")
                 .withCapAdd("NET_RAW")
                 .withCapDrop("MKNOD")
+                .withApparmorProfile("unconfined")
                 .build();
 
         manager().create(spec);
@@ -150,6 +193,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertArrayEquals(new Capability[] {Capability.SYS_PTRACE}, hostConfig.getCapAdd());
         assertArrayEquals(new Capability[] {Capability.NET_ADMIN, Capability.NET_RAW, Capability.MKNOD},
                 hostConfig.getCapDrop());
+        assertEquals(List.of("apparmor=unconfined"), hostConfig.getSecurityOpts());
     }
 
     /**

@@ -71,7 +71,8 @@ class KmsKeyOfAccountTest {
 
     /**
      * A key's policy is its resource policy, owned by the account in its ARN even when that account holds no such key,
-     * so another account's key is judged as cross-account; an alias or a key left open has none.
+     * so another account's key is judged as cross-account; a missing key has no policy to require a grant from; an alias
+     * or a key left open has none.
      */
     @Test
     void theProviderGivesAKeysPolicyAndOwnerAndNothingForAnAliasOrAnOpenKey() {
@@ -79,9 +80,10 @@ class KmsKeyOfAccountTest {
         List<ResourcePolicy> policies = provider.getResourcePolicies("redshift-serverless", key.getArn());
         assertEquals(1, policies.size());
         assertEquals(OWNER, policies.getFirst().ownerAccountId());
+        assertTrue(policies.getFirst().grantRequired());
         assertThat(policies.getFirst().policyDocument(), containsString("kms:*"));
         String missing = "arn:aws:kms:" + REGION + ":777788889999:key/" + key.getKeyId();
-        assertEquals(List.of(new ResourcePolicy(null, "777788889999")), provider.getResourcePolicies("kms", missing));
+        assertEquals(List.of(new ResourcePolicy(null, "777788889999", false)), provider.getResourcePolicies("kms", missing));
         assertTrue(provider.getResourcePolicies("kms", "arn:aws:kms:" + REGION + ":" + OWNER + ":alias/snapshots")
                 .isEmpty());
         assertTrue(provider.getResourcePolicies("kms", "arn:aws:kms:" + REGION + ":" + OWNER + ":key/*").isEmpty());

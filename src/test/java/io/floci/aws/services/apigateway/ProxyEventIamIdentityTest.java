@@ -2,7 +2,10 @@ package io.floci.aws.services.apigateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigatewayv2.proxy.HttpProxyInvoker;
 import io.floci.aws.testing.ParallelLocks;
 import jakarta.ws.rs.core.HttpHeaders;
@@ -68,7 +71,7 @@ class ProxyEventIamIdentityTest {
         controller = new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, MAPPER, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class), null);
     }
 
     @Test

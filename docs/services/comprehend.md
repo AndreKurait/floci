@@ -1,6 +1,7 @@
 # Comprehend
 
 **Protocol:** JSON 1.1 (`X-Amz-Target: Comprehend_20171127.*`)
+**Smithy RPC v2 CBOR:** `POST /service/Comprehend_20171127/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Endpoint:** `POST http://localhost:4566/`
 
 ## Supported Actions

@@ -3,7 +3,9 @@ package io.floci.aws.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.QueryConstraintCheck;
+import io.floci.aws.services.cloudformation.CloudFormationExecutionScope;
 import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
+import io.floci.aws.services.cloudformation.GetStackOutputRoleAuthorizer.ExecutionIdentity;
 import io.floci.aws.services.cloudformation.model.StackEvent;
 
 import java.math.BigInteger;
@@ -11,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -27,17 +30,39 @@ import java.util.function.Consumer;
  * then. A dynamic reference, an export or another stack's output still reads its current value. A
  * context built without one uses {@code engine} there, which reads such a value as this update
  * resolves it.
+ *
+ * <p>{@code updatePolicy} belongs to this operation; {@code priorUpdatePolicy} was resolved against
+ * the previous deployment before the update began. Both travel with a copied context.
  */
 public record ProvisionContext(CloudFormationTemplateEngine engine, String region,
                                String accountId, String stackName, String priorPhysicalId,
                                Consumer<StackEvent> progress, JsonNode priorProperties,
                                PropertyChanges changes, String delegatedRoleBoundaryArn,
-                               CloudFormationTemplateEngine priorEngine) {
+                               CloudFormationTemplateEngine priorEngine, JsonNode updatePolicy, JsonNode priorUpdatePolicy) {
 
     public ProvisionContext {
         if (priorEngine == null) {
             priorEngine = engine;
         }
+    }
+
+    /** The context without update policies, as used by existing provisioners. */
+    public ProvisionContext(CloudFormationTemplateEngine engine, String region,
+                            String accountId, String stackName, String priorPhysicalId,
+                            Consumer<StackEvent> progress, JsonNode priorProperties,
+                            PropertyChanges changes, String delegatedRoleBoundaryArn,
+                            CloudFormationTemplateEngine priorEngine) {
+        this(engine, region, accountId, stackName, priorPhysicalId, progress, priorProperties, changes,
+                delegatedRoleBoundaryArn, priorEngine, null, null);
+    }
+
+    /** Update policies without an explicit change list or previous deployment engine. */
+    public ProvisionContext(CloudFormationTemplateEngine engine, String region,
+                            String accountId, String stackName, String priorPhysicalId,
+                            Consumer<StackEvent> progress, JsonNode priorProperties,
+                            JsonNode updatePolicy, JsonNode priorUpdatePolicy) {
+        this(engine, region, accountId, stackName, priorPhysicalId, progress, priorProperties, null,
+                null, null, updatePolicy, priorUpdatePolicy);
     }
 
     /** The context without the previous deployment's engine; see the record's description. */
@@ -46,7 +71,7 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
                             Consumer<StackEvent> progress, JsonNode priorProperties,
                             PropertyChanges changes, String delegatedRoleBoundaryArn) {
         this(engine, region, accountId, stackName, priorPhysicalId, progress, priorProperties, changes,
-                delegatedRoleBoundaryArn, null);
+                delegatedRoleBoundaryArn, null, null, null);
     }
 
     /**
@@ -58,6 +83,11 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
                             Consumer<StackEvent> progress, JsonNode priorProperties,
                             PropertyChanges changes) {
         this(engine, region, accountId, stackName, priorPhysicalId, progress, priorProperties, changes, null);
+    }
+
+    /** Authenticated caller or validated execution role, available only during this operation. */
+    public Optional<ExecutionIdentity> executionIdentity() {
+        return CloudFormationExecutionScope.current();
     }
 
     public ProvisionContext(CloudFormationTemplateEngine engine, String region,
@@ -79,7 +109,7 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
      */
     public ProvisionContext withPriorPhysicalId(String priorPhysicalId) {
         return new ProvisionContext(engine, region, accountId, stackName, priorPhysicalId, progress,
-                priorProperties, changes, delegatedRoleBoundaryArn, priorEngine);
+                priorProperties, changes, delegatedRoleBoundaryArn, priorEngine, updatePolicy, priorUpdatePolicy);
     }
 
     /** Intermediate resource events retain the stack pipeline's event IDs and metadata. */

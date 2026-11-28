@@ -67,6 +67,9 @@ public class LambdaAliasStore {
 
     public void save(String region, LambdaAlias alias) {
         get(region, alias.getFunctionName(), alias.getName()).ifPresent(this::deindexAlias);
+        // The backend may hand out the stored instance itself, already changed by the caller, so the
+        // lookup above cannot tell which URL the alias used to have.
+        urlIdIndex.values().removeIf(indexed -> indexed == alias);
         backend.put(key(region, alias.getFunctionName(), alias.getName()), alias);
         indexAlias(alias);
     }
@@ -90,6 +93,21 @@ public class LambdaAliasStore {
     public Optional<LambdaAlias> readForAccount(
             String accountId, String region, String functionName, String aliasName) {
         return AccountAwareStorageBackend.readInAccount(backend, accountId, key(region, functionName, aliasName));
+    }
+
+    public Optional<LambdaAlias> getReadOnlyForAccount(
+            String accountId, String region, String functionName, String aliasName) {
+        String key = key(region, functionName, aliasName);
+        Optional<LambdaAlias> result;
+        if (backend instanceof AccountAwareStorageBackend<LambdaAlias> aware) {
+            result = aware.getForAccount(accountId, key).or(() -> aware.getLegacyForAccount(accountId, key));
+        } else {
+            result = backend.get(key);
+        }
+        return result.filter(alias -> functionName.equals(alias.getFunctionName()) && aliasName.equals(alias.getName()))
+                .filter(alias -> accountId.equals(AwsArnUtils.accountOrDefault(alias.getAliasArn(), "")))
+                .filter(alias -> AwsArnUtils.Arn.of("lambda", region, accountId,
+                        "function:" + functionName + ":" + aliasName).toString().equals(alias.getAliasArn()));
     }
 
     public Optional<LambdaAlias> getByUrlId(String urlId) {

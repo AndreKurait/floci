@@ -43,6 +43,11 @@ public class Ec2StoredResourceArns implements StoredResourceArns {
         }
         String account = arn.accountId().isEmpty() ? regionResolver.getAccountId() : arn.accountId();
         String region = arn.region().isEmpty() ? regionResolver.getRegion() : arn.region();
+        if ("instance".equals(parts[0]) || parts[1].startsWith("i-")) {
+            AwsArnUtils.Arn resolved = AwsArnUtils.Arn.of("ec2", region, account, arn.resource());
+            return arn.partition().equals(resolved.partition())
+                    ? ec2.storedInstanceTags(resolved.toString()) : Map.of();
+        }
         Map<String, String> tags = new LinkedHashMap<>();
         for (Tag tag : ec2.resourceTags(account, region, parts[1])) {
             tags.put(tag.getKey(), tag.getValue() == null ? "" : tag.getValue());

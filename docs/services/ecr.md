@@ -38,11 +38,17 @@
 | `BatchGetRepositoryScanningConfiguration` | Report each repository's `scanOnPush` setting with a derived `scanFrequency` (`SCAN_ON_PUSH` or `MANUAL`); a missing repository fails the whole batch instead of appearing in `failures` |
 | `TagResource` / `UntagResource` / `ListTagsForResource` | Resource tagging |
 | `PutLifecyclePolicy` / `GetLifecyclePolicy` / `DeleteLifecyclePolicy` | Lifecycle policies, applied by a background sweep (see [Lifecycle policies](#lifecycle-policies)) |
+| `StartLifecyclePolicyPreview` / `GetLifecyclePolicyPreview` | Evaluate and page a stored image-expiry preview without deleting images |
 | `SetRepositoryPolicy` / `GetRepositoryPolicy` / `DeleteRepositoryPolicy` | Repository policy round-trip (stored, not enforced) |
 | `PutRegistryPolicy` / `GetRegistryPolicy` / `DeleteRegistryPolicy` | Registry policy round-trip (stored, not enforced) |
 | `PutReplicationConfiguration` / `DescribeRegistry` | Store the registry's replication rules and return them with the registry ID (stored, not acted on) |
 | `PutRegistryScanningConfiguration` / `GetRegistryScanningConfiguration` | Store the registry's scan type and scanning rules (stored, not acted on) |
 | `GetAccountSetting` / `PutAccountSetting` | Read and store account settings for the registry (stored, not acted on) |
+
+`PutLifecyclePolicy` checks that the document is one JSON object with a nonempty
+`rules` array and unique positive integer priorities. Rejected documents return
+`InvalidParameterException` without replacing the prior policy. Storage validates the policy; the background lifecycle sweep applies it separately.
+Preview evaluation is described below.
 
 `GetAccountSetting` and `PutAccountSetting` keep values per account and Region.
 Supported names are `BASIC_SCAN_TYPE_VERSION` (`AWS_NATIVE`), `REGISTRY_POLICY_SCOPE`
@@ -78,9 +84,11 @@ is refused with the model's message, as AWS does. `imageStatus` and `DescribeIma
 
 - **Real OCI registry backing.** A single shared `registry:2` container per Floci instance stores all repositories. Floci proxies Docker Distribution traffic to it and starts it lazily on the first ECR API call. The container is reused across Floci restarts (`keep-running-on-shutdown: true` by default), so pushed image bytes survive restarts.
 - **TLS registry data plane.** Real AWS ECR is HTTPS-only. When TLS is enabled (`FLOCI_TLS_ENABLED=true`), Floci serves the registry data plane over TLS at `<account>.dkr.ecr.<region>.localhost.floci.io:<port>/<repo>`. The server certificate automatically includes regional wildcards `*.dkr.ecr.<region>.localhost.floci.io` for every advertised AWS region as Subject Alternative Names (SANs). Container runtimes and tools (Docker, containerd, nerdctl, podman) connect over HTTPS after trusting Floci's root CA certificate (`GET /_floci/ca.pem` or system trust store). The plain HTTP loopback path (`<account>.dkr.ecr.<region>.localhost:<port>`) remains fully supported without changes.
-- **Advertise TLS addresses.** Set `FLOCI_SERVICES_ECR_TLS_URI=true` together with `FLOCI_TLS_ENABLED=true` to return the TLS hostname in `repositoryUri` and an HTTPS `proxyEndpoint` from `GetAuthorizationToken`. This opt-in defaults to `false`. With `uri-style: path`, the URI becomes `localhost.floci.io:<port>/<account>/<region>/<repo>` and the login endpoint is `https://localhost.floci.io:<port>`. Existing repository records acquire the current URI when described or returned by deletion. If global TLS is disabled, the option has no effect. Clients must trust the Floci CA, or the configured certificate must cover the advertised names.
+- **Advertise TLS addresses.** Set `FLOCI_SERVICES_ECR_TLS_URI=true` together with `FLOCI_TLS_ENABLED=true` to return the TLS hostname in `repositoryUri` and an HTTPS `proxyEndpoint` from `GetAuthorizationToken`. This opt-in defaults to `false`. With `uri-style: path`, the URI becomes `localhost.floci.io:<port>/<account>/<region>/<repo>` and the login endpoint is `https://localhost.floci.io:<port>`. Its regionless `GET /v2/` login probe validates an issued password without a Region in the URL; subsequent repository requests still require the password's issuing Region. Existing repository records acquire the current URI when described or returned by deletion. If global TLS is disabled, the option has no effect. Clients must trust the Floci CA, or the configured certificate must cover the advertised names.
 - **Storage cleanup.** `DeleteRepository --force` removes repository manifests, including untagged manifests. When it deletes the final repository, or when a non-retained runtime stops, Floci removes the named registry volume only in `memory` mode or when `prune-volumes-on-delete: true`.
 - **Loopback URI scheme.** Repository URIs follow `<account>.dkr.ecr.<region>.localhost:<flociPort>/<repoName>`. RFC 6761 reserves `*.localhost` to resolve to the loopback address, and a Docker daemon with the classic image store auto-trusts loopback as an insecure registry, so `docker push` and `docker pull` work without daemon configuration. A Linux daemon with the containerd image store, the default from Docker Engine 29, reaches only `localhost` and `127.0.0.1` over plain HTTP and takes `*.localhost` for an HTTPS registry: use the `path` URI style (`localhost:<flociPort>/<account>/<region>/<repo>`, `floci.services.ecr.uri-style: path`) there, as well as where `*.localhost` resolution misbehaves.
+
+- **Native registry hostnames.** The data plane also recognizes `<account>.dkr.ecr.<region>.<partition DNS suffix>` in the request host or a registry mirror's `ns` query parameter. The region's partition must match the suffix. These requests retain the same account/Region storage isolation, upload continuation paths and immutable-tag enforcement as local hostnames. Clients using native names must route them to Floci and trust its TLS certificate; advertised repository URIs and login endpoints retain their configured local form.
 - **Image tag mutability.** `IMMUTABLE` repositories allow the first manifest write for a tag and reject every replacement, including a replacement with the same manifest. The proxy forwards blob uploads and digest-addressed manifests unchanged. `PutImage` follows the same rule and answers `ImageTagAlreadyExistsException`; a `docker push` and a `PutImage` of the same tag cannot both succeed.
 - **Pushing through the API.** `PutImage` and the layer API write to the same `registry:2` container as `docker push`, so an image written through the API is the one `docker pull` and `BatchGetImage` return. Retagging without Docker works as on AWS: read the manifest with `batch-get-image`, then write it with `put-image --image-tag <new>`.
   - `PutImage` takes the media type from `imageManifestMediaType`, else from the manifest's own `mediaType`; a manifest with neither is `InvalidParameterException`, as on AWS. A tag outside ECR's rule (`[a-zA-Z0-9-_.]+`, at most 300 characters) is `InvalidParameterException` with ECR's message. The backing registry follows the OCI tag grammar, so Floci also refuses two kinds of tag ECR takes, with a message naming the limit: one starting with `.` or `-`, and one longer than 128 characters. A manifest whose layers the repository does not hold answers `LayersNotFoundException`; writing the manifest a tag already points at answers `ImageAlreadyExistsException`.
@@ -89,7 +97,7 @@ is refused with the model's message, as AWS does. `imageStatus` and `DescribeIma
   - `GetDownloadUrlForLayer` returns `<scheme>://<repository URI host>/v2/<repo>/blobs/<digest>`, served by Floci's registry endpoint without credentials, in place of AWS's pre-signed S3 URL.
   - `BatchCheckLayerAvailability` lists held layers as `AVAILABLE`, and a layer the repository does not hold under `failures` as `MissingLayerDigest`.
 - **Image deletion.** `BatchDeleteImage` follows the AWS rules. Deleting by `imageTag` removes only that tag: when other tags reference the same manifest they keep serving the shared digest, so `docker pull`, `batch-get-image` and `describe-images` by a surviving tag still find the image. The manifest is deleted once the last tag referencing it goes. Deleting by `imageDigest` removes the image together with all of its tags, and the response reports one `imageIds` entry per removed tag, as the API reference's example does. Unknown tags come back per entry under `failures` as `ImageNotFound`. A manifest write to the repository, a `docker push`, a `crane delete` or a `PutImage`, is coordinated with the delete that rewrites a shared manifest under its surviving tags, so a push that arrives during the delete is never overwritten by the restore; it waits and lands after it.
-- **Authorization.** `GetAuthorizationToken` returns `Base64("AWS:floci")` plus a proxy endpoint. The backing `registry:2` runs without auth, so any `aws ecr get-login-password | docker login` succeeds.
+- **Authorization.** `GetAuthorizationToken` returns an opaque login password plus a proxy endpoint. With IAM enforcement enabled, the Floci registry proxy authenticates that password and checks repository permissions before forwarding requests to the backing `registry:2`.
 - **Pull through cache rule configuration.** Pull-through cache rule actions persist AWS-compatible rule metadata with account and Region isolation. `UpdatePullThroughCacheRule` preserves fields omitted by the request and refreshes `updatedAt`. `ValidatePullThroughCacheRule` checks that the rule exists and reports it as valid; Floci does not contact the upstream registry or validate credentials. Rules do not proxy or cache images from the configured upstream registry.
 - **Registry settings.** The registry policy, replication configuration and scanning configuration are kept per account and Region and returned as written. Floci does not replicate or scan images, or evaluate the registry policy.
   - Each request is checked against the constraints of the ECR service model, vendored in `src/main/resources/aws/ecr-request-shapes.json` by `tools/aws/regen_ecr_shapes.py`: member types, required members, lengths and counts, patterns and enum values. A request outside them is `InvalidParameterException` in ECR's form, `Invalid parameter at '<member>' failed to satisfy constraint: '<rule>'`.
@@ -102,6 +110,8 @@ is refused with the model's message, as AWS does. `imageStatus` and `DescribeIma
 - **Cross-account / cross-region isolation.** Internally the registry namespaces repositories as `<account>/<region>/<repoName>`, so the same repository name in different accounts or regions cannot collide. The data plane reads a repository in the account its registry host names, so a repository any account created takes pushes and pulls at `<account>.dkr.ecr.<region>...` with its own settings, `IMMUTABLE` tags included.
 - **Unknown repositories.** A push or pull for a repository nobody created answers `404 NAME_UNKNOWN` (`The repository with name '<name>' does not exist in the registry with id '<account>'`) before any byte reaches the registry, as ECR does, rather than storing the image.
 - **Reconcile on first start.** When the registry container starts, or is recovered after it stopped or disappeared, Floci queries `GET /v2/_catalog` and recreates `Repository` metadata entries for any namespaces present in the registry but missing from local storage, in the account each namespace belongs to. This means image bytes are never orphaned across restarts. Until the catalog has been read, a name without metadata answers `503 UNAVAILABLE` rather than `NAME_UNKNOWN`, since its images may be in the registry; a read that failed is retried on the next push or pull, at most every 30 seconds.
+
+- **Registry startup readiness.** Starting or adopting a backing container waits for its `GET /v2/` endpoint before reporting it ready, even when repository metadata reconciliation is not registered. HTTP probes share a ten-second startup deadline. A timeout or interruption leaves startup unsuccessful; a later request can retry the same container, and normal shutdown still retires it when retention is disabled.
 - **Upgrade from direct registry access.** Floci recreates an older backing container with the same volume and a loopback-only port binding. Repositories written through the former direct endpoint retain their physical paths and map to the default account and Region; their returned URI moves to port `4566`.
 - **Lambda, ECS and EMR Serverless integration.** Image-backed Lambda functions (`PackageType=Image`), ECS task containers and the custom images of EMR Serverless applications (in its `docker` runner mode) reference the same loopback `repositoryUri`. Floci rewrites real-AWS-shaped `<account>.dkr.ecr.<region>.amazonaws.com/...` URIs to the loopback registry at pull time, path style on `localhost` (`localhost:<flociPort>/<account>/<region>/<repo>`) in either URI style and with or without TLS, an address a Linux Docker daemon pulls from over plain HTTP. On Docker Desktop the rewrite is `<account>.dkr.ecr.<region>.localhost:<flociPort>/<repo>` instead: Desktop's daemon runs in a VM and dials `localhost` there, where a host port Docker chose for Floci is not bound, while it sends `*.localhost` through its host proxy to the port Floci publishes. Floci asks the daemon once whether it is Docker Desktop. CDK's `DockerImageFunction` (which generates AWS-shaped URIs in CloudFormation templates) works without any user-side rewriting. With `FLOCI_DOCKER_IMAGE_REGISTRY_BASE` set, the rewritten reference, and a loopback `repositoryUri` named directly, are still pulled from Floci's registry: the base goes in front of the images a mirror holds, never of one on `localhost`.
 - **Locally built images win.** An AWS-shaped URI that names an image already present on the Docker daemon is used as-is instead of being rewritten (`FLOCI_SERVICES_ECR_PREFER_LOCAL_IMAGES`, default `true`). Build the image under the exact URI your function or task definition declares (`docker build -t <account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag> .`) and it runs without a push to the emulated registry, and without the registry container being started. The check uses the reference Floci would launch, so with `FLOCI_DOCKER_IMAGE_REGISTRY_BASE` set the image must be present as `<base>/<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>`.
@@ -163,6 +173,61 @@ a duplicate is `ExclusionAlreadyExistsException`, and removing an unknown ARN is
 and returns a scoped `nextToken` when more results remain. Registry settings and
 exclusions survive storage reloads together. Floci records this metadata without
 changing image pull-time tracking.
+
+## Lifecycle policy previews
+
+`StartLifecyclePolicyPreview` evaluates an explicit policy, or the repository's stored
+policy when omitted, against one captured inventory. It supports `expire` with
+`imageCountMoreThan` and `sinceImagePushed`, tagged prefix or pattern selections,
+untagged images, and a final `any` rule. Filters in a rule all have to match the
+image's tags. Earlier tagging matches protect images from later rules even when the
+earlier rule retains them. Count rules keep the newest images; age rules select
+images strictly older than the requested number of days.
+
+**Digest-only direct-Docker orphan manifests cannot be enumerated.** The registry
+inventory combines all live tags with digests recorded by native `PutImage` calls.
+Native digest-only images participate. Every known image must have a verified native
+first-push timestamp in the current repository lifetime. Legacy timestamps and
+pre-existing Docker images are refused because their first push time is unknown.
+Adding a native tag to an existing Docker digest does not establish that time.
+
+Preview reads verify manifest body digests and referenced blob presence and sizes;
+they do not validate image-config or layer contents or execute images. Registry
+errors, malformed or incomplete pages, changed namespaces, and known missing images
+fail the preview. Pagination bounds fail explicitly instead of truncating results.
+Manifest lists, indexes, reference artifacts, archive/transition actions, pull-age
+rules, and wildcard prefix entries are unsupported and refused. Ordinary prefixes
+and patterns with up to four `*` characters are supported.
+
+Successful starts return `COMPLETE` synchronously and preserve exact policy bytes in
+an immutable repository snapshot. They do not change the stored lifecycle policy or
+delete images. While a start is running, a concurrent Get for the same repository
+lifetime returns a transient `IN_PROGRESS` view; this is Floci's local concurrency
+policy. A failed start preserves the previous completed snapshot. Restart discards
+transient progress and retains completed snapshots according to the configured
+storage mode. Hybrid mode retains its asynchronous durability.
+
+`GetLifecyclePolicyPreview` reads the stored snapshot without contacting or starting
+the registry. It supports image selectors, tag-status filters, and pages of 1-100
+results. Its expiry count describes the whole snapshot before filtering. Local
+result ordering uses push time followed by digest; tokens bind the snapshot, caller,
+Region, repository, and filter. A new preview invalidates previous tokens.
+
+Both actions use the caller's repository ARN and current `aws:ResourceTag/` and
+`ecr:ResourceTag/` values during IAM evaluation. Preauthorization reads do not migrate
+legacy data, initialize generations, or refresh URIs. Foreign `registryId` values are
+explicitly unsupported for previews; repository policies do not grant cross-account
+preview access. IAM evaluation and a later mutation are not one atomic transaction
+against concurrent tag changes.
+
+Repository generations, detached atomic parent replacements, and shared physical
+manifest locks prevent queued native writers from attaching old metadata or previews
+to recreated repositories. Creation shares a gate with final-registry pruning. A
+successful authorized legacy migration is a separate write before preview publication.
+Image metadata cleanup and parent deletion are separate commits: a refused parent
+deletion can leave the old repository and preview after metadata cleanup. The proxy
+retains its existing namespace capture before acquiring the physical lock, so these
+controls do not promise that all queued proxy bytes are rejected after recreation.
 
 ## Configuration
 
@@ -328,7 +393,7 @@ Repository repo = ecr.createRepository(req -> req.repositoryName("floci-it/app")
 GetAuthorizationTokenResponse auth = ecr.getAuthorizationToken();
 AuthorizationData data = auth.authorizationData().get(0);
 String decoded = new String(Base64.getDecoder().decode(data.authorizationToken()));
-// decoded = "AWS:floci" → pipe to `docker login --username AWS --password-stdin <proxyEndpoint>`
+// decoded = "AWS:<issued-password>" → pipe the password to `docker login --username AWS --password-stdin <proxyEndpoint>`
 
 // List images after a docker push
 ListImagesResponse images = ecr.listImages(req -> req.repositoryName("floci-it/app"));
@@ -383,3 +448,35 @@ See [Docker's bridge network documentation](https://docs.docker.com/engine/netwo
 **Disk not reclaimed after deleting images.** Deleting the last tag of an image, deleting by digest, or a lifecycle policy expiring an image removes its manifest, but blobs remain on disk until garbage collection runs. Trigger it with `curl -X POST http://localhost:4566/_floci/ecr/gc`. The endpoint runs `registry garbage-collect` inside the backing container and returns the reclaimed blob list. The operation is serialized: ECR API calls block for its duration (typically a few seconds).
 
 **`*.localhost` does not resolve to loopback on this platform.** Set `floci.services.ecr.uri-style: path` to fall back to `localhost:<port>/<account>/<region>/<repo>` URIs. On Docker Desktop the rewrite of AWS-shaped Lambda, ECS and EMR Serverless images keeps `<account>.dkr.ecr.<region>.localhost`; there, build the image under the AWS-shaped URI the function or task definition names, and Floci uses it as-is (`FLOCI_SERVICES_ECR_PREFER_LOCAL_IMAGES`).
+
+### Native registry addresses
+
+Set `FLOCI_SERVICES_ECR_NATIVE_URI=true` to return partition-aware AWS registry
+hostnames for repository URIs and authorization proxy endpoints. The endpoint uses
+HTTPS on port 443, matching native container-image references. This option changes
+advertised addresses only: supply private DNS and a trusted TLS route from every
+Docker client/daemon to Floci. It does not publish ports, install certificates,
+change public DNS, or disable TLS verification. The default remains the existing
+localhost registry addresses; native addresses take precedence over URI style.
+`GetAuthorizationToken` returns an endpoint for each requested `registryIds` account
+in the request region; omitting the list selects the caller's registry.
+
+### Registry authentication and IAM enforcement
+
+For authenticated operation, set both `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and `FLOCI_AUTH_VALIDATE_SIGNATURES=true` (configuration keys `floci.services.iam.enforcement-enabled` and `floci.auth.validate-signatures`). Token issuance refuses an unverified caller even when global signature verification is disabled.
+
+With IAM enforcement enabled, every Distribution request requires a native ECR password obtained by a verified IAM caller through `GetAuthorizationToken`. Passwords are opaque, stored only as digests, expire within twelve hours and no later than the verified issuing session, and retain their issuing principal and Region. A password works only in its issuing Region. Stored credentials from versions that did not record a Region require a new login. Repository operations evaluate current identity policies, session policies, permissions boundaries, organization policies, and repository grants. Requesting another `registryId` does not grant access to that account. Client passwords are never forwarded to the backing registry.
+
+Explicitly disabling IAM enforcement retains the existing unauthenticated emulator mode. Tokens issued in that mode are not accepted after enforcement is enabled. Internal image consumers in enforced mode must supply native issued credentials too; loopback addressing is not an authentication exemption.
+
+Internal Lambda, ECS, EMR Serverless and Lambda Web image retrieval uses short-lived, repository-scoped credentials that are revoked when retrieval finishes. Role-backed retrieval uses the workload's validated retrieval role; EMR Serverless uses its service repository grant and application source ARN. These credentials are not stored as Docker registry configuration or issued to management clients.
+
+Scoped internal retrieval contacts the registry even when Docker already has the image layers. The registry checks the complete retrieval permissions before serving the manifest, so a cached layer cannot skip a permission denial. Transport and source-IP conditions use the observed registry request, rather than an invented network context at credential issuance. A denied scoped pull cannot fall back to a cached image. With enforcement enabled, AWS-shaped references are rewritten to the emulator registry even when `prefer-local-images` is on; this prevents an authorization refresh from reaching the real AWS registry. IAM-off operation and pulls using the ordinary configured registry credentials retain their existing cache behavior.
+
+Upload-status queries and cancellation (`GET`, `HEAD`, or `DELETE` on `/blobs/uploads/`) are explicitly unsupported in enforced mode; ordinary layer upload `POST`, `PATCH`, and `PUT` are supported.
+
+The underlying-session expiry cap is a conservative emulator constraint; it has not been validated against AWS in a differential test.
+
+## Cross-account repository reads
+
+With IAM enforcement enabled, repository API requests use the account selected by `registryId`. Cross-account image pulls require both the caller identity permission and a repository policy granting that caller access to the target repository. An explicit deny in either policy takes precedence. Repository URI refreshes retain the owning account namespace. `GetAuthorizationToken` still requires its separate identity permission.

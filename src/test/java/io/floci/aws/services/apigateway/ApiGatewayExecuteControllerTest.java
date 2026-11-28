@@ -4,8 +4,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.apigatewayv2.model.Api;
 import io.floci.aws.services.apigatewayv2.proxy.HttpProxyInvoker;
@@ -63,7 +66,7 @@ class ApiGatewayExecuteControllerTest {
         return new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, objectMapper, null,
-                null, null, null, null, routeContext, null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, routeContext, null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class), null);
     }
 
     @ParameterizedTest
@@ -494,7 +497,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class), null);
 
         Response response = controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -526,7 +529,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, requestContext, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class), null);
 
         controller.dispatch("GET", "abc123", "prod", "hello", headers, null, null);
 
@@ -561,7 +564,7 @@ class ApiGatewayExecuteControllerTest {
         ApiGatewayExecuteController controller = new ApiGatewayExecuteController(
                 apiGatewayService, null, apiGatewayV2Service, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class), null);
 
         controller.dispatch("GET", "restapi1", "prod", "hello", headers, null, null);
 

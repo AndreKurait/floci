@@ -2,6 +2,7 @@
 
 **Protocol:** JSON 1.1
 **Header:** `X-Amz-Target: Textract.<Action>`
+**Smithy RPC v2 CBOR:** `POST /service/Textract/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 
 Floci emulates the AWS Textract API with a dummy response stub. The response shape matches the real AWS Textract contracts so AWS SDK and CLI clients accept the reply without error. No real OCR or document analysis is performed: every call returns a fixed set of `Block` objects with synthetic metadata.
 

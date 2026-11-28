@@ -97,8 +97,9 @@ public final class AccessDeniedMessages {
                         held == null ? null : held.permissionsBoundaryArn());
             }
         }
-        if (caller.sessionPolicyDocument() != null) {
-            SimulationDecision session = simulate(evaluator, List.of(caller.sessionPolicyDocument()), action,
+        List<String> sessionPolicies = caller.sessionPolicyDocuments();
+        if (!sessionPolicies.isEmpty()) {
+            SimulationDecision session = simulate(evaluator, sessionPolicies, action,
                     resource, context);
             if (session != SimulationDecision.ALLOWED) {
                 return PolicyType.SESSION_POLICY.refusal(session, action, null);

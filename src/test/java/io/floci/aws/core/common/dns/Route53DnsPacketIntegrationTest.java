@@ -1,6 +1,7 @@
 package io.floci.aws.core.common.dns;
 
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.TlsConfigSource;
 import io.floci.aws.services.ec2.Ec2MetadataServer;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.route53.Route53DnsRecordSource;
@@ -64,13 +65,18 @@ class Route53DnsPacketIntegrationTest {
     void conflictingRuntimeOriginsRefusePrivateRecordsAcrossTheWire() throws Exception {
         String zone = uniqueName() + ".example";
         String id;
+        String publicId;
         try (Route53Client client = AwsTestClients.create(Route53Client.builder(), "test", Region.US_EAST_1)) {
             id = client.createHostedZone(request -> request.name(zone).callerReference(UUID.randomUUID().toString())
                     .vpc(vpc -> vpc.vpcId("vpc-conflict").vpcRegion("us-east-1"))).hostedZone().id();
             zoneIds.add(id);
+            publicId = client.createHostedZone(request -> request.name(zone)
+                    .callerReference(UUID.randomUUID().toString())).hostedZone().id();
+            zoneIds.add(publicId);
         }
         String name = "service." + zone;
         change(id, "CREATE", record(name, "A", 17, "192.0.2.17"));
+        change(publicId, "CREATE", record(name, "A", 31, "203.0.113.17"));
         DnsClientVpcSource known = address -> Optional.of(new DnsClientVpcSource.ClientVpc(
                 config.defaultAccountId(), "us-east-1", "vpc-conflict"));
         byte[] request = DnsTestQuery.query(name, 1, 0x1234);
@@ -86,7 +92,7 @@ class Route53DnsPacketIntegrationTest {
             }
         }
         assertRuntimeAddress(queryWithOrigins(request, List.of(known, known)), "192.0.2.17");
-        assertRuntimeAddress(queryWithOrigins(request, List.of()), "192.0.2.17");
+        assertRuntimeAddress(queryWithOrigins(request, List.of()), "203.0.113.17");
     }
 
     @Test
@@ -114,7 +120,7 @@ class Route53DnsPacketIntegrationTest {
         List<DnsClientVpcSource> runtimeOrigins = origins.stream().toList();
         byte[] request = DnsTestQuery.query(name, 1, 0x1234);
         try {
-            assertRuntimeAddress(queryWithOrigins(request, runtimeOrigins), "192.0.2.17");
+            assertRuntimeAddress(queryWithOrigins(request, runtimeOrigins), "203.0.113.17");
             metadata.registerContainer("127.0.0.1", instance.getInstanceId(), instance);
             byte[] allowed = queryWithOrigins(request, runtimeOrigins);
             assertPrivateHeader(allowed, 0, 1);
@@ -122,7 +128,7 @@ class Route53DnsPacketIntegrationTest {
             assertArrayEquals(new DnsRecord.Address(1, "192.0.2.17").data(),
                     Arrays.copyOfRange(allowed, allowed.length - 4, allowed.length));
             metadata.reconcileContainerAddresses(Set.of("192.0.2.99"), instance);
-            assertRuntimeAddress(queryWithOrigins(request, runtimeOrigins), "192.0.2.17");
+            assertRuntimeAddress(queryWithOrigins(request, runtimeOrigins), "203.0.113.17");
             metadata.reconcileContainerAddresses(Set.of("127.0.0.1"), instance);
             assertPrivateHeader(queryWithOrigins(request, runtimeOrigins), 0, 1);
             instance.setRegion("us-west-2");
@@ -135,7 +141,7 @@ class Route53DnsPacketIntegrationTest {
             assertRuntimeAddress(queryWithOrigins(request, runtimeOrigins), "203.0.113.17");
             instance.setVpcId("vpc-ec2-dns");
             metadata.unregisterInstance(instance);
-            assertRuntimeAddress(queryWithOrigins(request, runtimeOrigins), "192.0.2.17");
+            assertRuntimeAddress(queryWithOrigins(request, runtimeOrigins), "203.0.113.17");
         } finally {
             metadata.unregisterInstance(instance);
         }
@@ -151,8 +157,10 @@ class Route53DnsPacketIntegrationTest {
         change(id, "CREATE", record(name, "SRV", 17,
                 "20 0 8080 first." + zone + ".", "10 100 65535 second." + zone));
 
+        DnsClientVpcSource.ClientVpc origin = new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "vpc-srv");
         byte[] request = DnsTestQuery.query(name, 33, 0x1234);
-        byte[] response = query(request, "vpc-srv");
+        byte[] response = query(request, origin);
         assertPrivateHeader(response, 0, 2);
         ByteBuffer packet = ByteBuffer.wrap(response);
         packet.position(request.length);
@@ -173,9 +181,9 @@ class Route53DnsPacketIntegrationTest {
         assertEquals(List.of("10 100 65535 second." + zone, "20 0 8080 first." + zone),
                 values.stream().sorted().toList());
 
-        assertPrivateHeader(query(DnsTestQuery.query(name, 1, 0x1234), "vpc-srv"), 0, 0);
-        assertPrivateHeader(query(DnsTestQuery.query("_tcp." + zone, 33, 0x1234), "vpc-srv"), 0, 0);
-        assertPrivateHeader(query(DnsTestQuery.query("absent." + zone, 33, 0x1234), "vpc-srv"), 3, 0);
+        assertPrivateHeader(query(DnsTestQuery.query(name, 1, 0x1234), origin), 0, 0);
+        assertPrivateHeader(query(DnsTestQuery.query("_tcp." + zone, 33, 0x1234), origin), 0, 0);
+        assertPrivateHeader(query(DnsTestQuery.query("absent." + zone, 33, 0x1234), origin), 3, 0);
     }
 
     @ParameterizedTest
@@ -185,29 +193,31 @@ class Route53DnsPacketIntegrationTest {
         String id = route53.createHostedZone(name, UUID.randomUUID().toString(), null,
                 new VpcAssociation("vpc-cname-negative", "us-east-1")).zone().getId();
         zoneIds.add(id);
+        DnsClientVpcSource.ClientVpc origin = new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "vpc-cname-negative");
         String missing = "missing." + name;
         for (int hop = 0; hop < depth; hop++) {
             String target = hop + 1 == depth ? missing : "alias" + (hop + 1) + "." + name;
             change(id, "CREATE", record("alias" + hop + "." + name, "CNAME", 30, target + "."));
         }
 
-        assertEquals(3, ByteBuffer.wrap(query(DnsTestQuery.query(missing, type, 0x1234), "vpc-cname-negative")).getShort(2) & 15);
-        byte[] response = query(DnsTestQuery.query("alias0." + name, type, 0x1234), "vpc-cname-negative");
+        assertEquals(3, ByteBuffer.wrap(query(request(missing, type), origin)).getShort(2) & 15);
+        byte[] response = query(request("alias0." + name, type), origin);
         assertEquals(3, ByteBuffer.wrap(response).getShort(2) & 15,
                 "A private CNAME must preserve its target's NXDOMAIN response");
         assertEquals(0, ByteBuffer.wrap(response).getShort(6));
 
         ResourceRecordSet text = record(missing, "TXT", 60, "\"present\"");
         change(id, "CREATE", text);
-        byte[] noData = query(DnsTestQuery.query("alias0." + name, type, 0x1234), "vpc-cname-negative");
+        byte[] noData = query(request("alias0." + name, type), origin);
         assertEquals(0, ByteBuffer.wrap(noData).getShort(2) & 15);
         assertEquals(0, ByteBuffer.wrap(noData).getShort(6));
         change(id, "DELETE", text);
-        assertEquals(3, ByteBuffer.wrap(query(DnsTestQuery.query("alias0." + name, type, 0x1234), "vpc-cname-negative")).getShort(2) & 15);
+        assertEquals(3, ByteBuffer.wrap(query(request("alias0." + name, type), origin)).getShort(2) & 15);
 
         change(id, "CREATE", record(missing, "A", 600, "192.0.2.17"));
-        byte[] request = DnsTestQuery.query("alias0." + name, 1, 0x1234);
-        byte[] restored = query(request, "vpc-cname-negative");
+        byte[] request = request("alias0." + name, 1);
+        byte[] restored = query(request, origin);
         assertEquals(0, ByteBuffer.wrap(restored).getShort(2) & 15);
         assertEquals(1, ByteBuffer.wrap(restored).getShort(6));
         assertEquals(30, ByteBuffer.wrap(restored).getInt(request.length + 6));
@@ -230,30 +240,34 @@ class Route53DnsPacketIntegrationTest {
         }
     }
 
-    @Test
-    void apiChangesAndDeletesReachAuthoritativeTxtDespiteAwsEndpointSpoofing() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"TXT,16,\"first\",\"second\"", "A,1,192.0.2.10,192.0.2.11", "AAAA,28,2001:db8::10,2001:db8::11"})
+    void apiChangesAndDeletesReachAuthoritativeRecordsDespiteAwsEndpointSpoofing(
+            String recordType, int type, String first, String second) throws Exception {
         String name = uniqueName() + ".amazonaws.com";
         String id = createZone(name);
         String endpoint = "version." + name;
-        for (String value : List.of("first", "second")) {
+        for (String value : List.of(first, second)) {
             given().contentType("application/xml").body("""
                     <ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
                       <ChangeBatch><Changes><Change><Action>UPSERT</Action><ResourceRecordSet>
-                        <Name>%s</Name><Type>TXT</Type><TTL>17</TTL>
-                        <ResourceRecords><ResourceRecord><Value>"%s"</Value></ResourceRecord></ResourceRecords>
+                        <Name>%s</Name><Type>%s</Type><TTL>17</TTL>
+                        <ResourceRecords><ResourceRecord><Value>%s</Value></ResourceRecord></ResourceRecords>
                       </ResourceRecordSet></Change></Changes></ChangeBatch>
                     </ChangeResourceRecordSetsRequest>
-                    """.formatted(endpoint, value))
+                    """.formatted(endpoint, recordType, value))
                     .post("/2013-04-01/hostedzone/" + id + "/rrset").then().statusCode(200);
-            byte[] request = DnsTestQuery.query(endpoint, 16, 0x1234);
+            byte[] request = request(endpoint, type);
             byte[] response = query(request);
             assertHeader(response, 0, true, 1, 0);
             assertEquals(17, ByteBuffer.wrap(response).getInt(request.length + 6));
-            assertArrayEquals(new DnsRecord.Txt("\"" + value + "\"").data(),
+            DnsRecord expected = type == 16 ? new DnsRecord.Txt(value) : new DnsRecord.Address(type, value);
+            assertArrayEquals(expected.data(),
                     Arrays.copyOfRange(response, request.length + 12, response.length));
         }
-        change(id, "DELETE", record(endpoint, "TXT", 17, "\"second\""));
-        assertNegative(query(DnsTestQuery.query(endpoint, 16, 0x1234)), name, 3, 900);
+        assertNegative(query(request(endpoint, type == 1 ? 28 : 1)), name, 0, 900);
+        change(id, "DELETE", record(endpoint, recordType, 17, second));
+        assertNegative(query(request(endpoint, type)), name, 3, 900);
     }
 
     @ParameterizedTest
@@ -343,6 +357,68 @@ class Route53DnsPacketIntegrationTest {
     }
 
     @Test
+    void publicCnameAnswersWithItsTargetsAddressUnderTheZoneAuthority() throws Exception {
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        change(id, "CREATE", record("endpoint." + name, "CNAME", 30, "ip-10-0-5-88.ec2.internal."));
+        byte[] request = request("endpoint." + name, 1);
+        byte[] response = query(request);
+        assertHeader(response, 0, true, 1, 0);
+        assertEquals(1, ByteBuffer.wrap(response).getShort(request.length + 2));
+        assertEquals(30, ByteBuffer.wrap(response).getInt(request.length + 6));
+        assertArrayEquals(new DnsRecord.Address(1, "10.0.5.88").data(),
+                Arrays.copyOfRange(response, request.length + 12, response.length));
+        assertNegative(query(request("endpoint." + name, 28)), name, 0, 900);
+    }
+
+    @Test
+    void publicCnameToAnOwnedLoadBalancerNameAnswersItsAddressRatherThanTheSpoofedRoute() {
+        String balancer = "internal-app-" + uniqueName() + ".us-east-1.elb.amazonaws.com";
+        DnsRecordSource frontend = new DnsRecordSource() {
+            @Override
+            public Optional<DnsAnswer> resolveIpv4(String name) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolveAuthoritative(String name, int type,
+                                                            DnsClientVpcSource.ClientVpc origin) {
+                return balancer.equals(name)
+                        ? Optional.of(DnsAnswer.records(List.of("198.51.100.7"), 60)) : Optional.empty();
+            }
+        };
+        List<DnsRecordSource> sources = new ArrayList<>();
+        DnsClientVpcSource.ClientVpc vpc = new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "vpc-cname-balancer");
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.copyOf(TlsConfigSource.awsEndpointSuffixes()), sources,
+                List.of(), List.of(address -> "10.87.1.10".equals(address) ? Optional.of(vpc) : Optional.empty()),
+                true, List.of());
+        sources.add(new Route53DnsRecordSource(route53, config, new DnsLookupHelper(config), dns));
+        sources.add(frontend);
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        change(id, "CREATE", record("endpoint." + name, "CNAME", 30, balancer + "."));
+
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                dns.planQuery("ec2.us-east-1.amazonaws.com", "10.87.1.10", "127.0.0.1", 1)
+                        .answer().orElseThrow().addresses(), "spoofing routes a VPC client's AWS names");
+        DnsAnswer answer = dns.planQuery("endpoint." + name, "10.87.1.10", "127.0.0.1", 1).answer().orElseThrow();
+        assertEquals(List.of("198.51.100.7"), answer.addresses());
+        assertEquals(30, answer.ttlSeconds());
+    }
+
+    @Test
+    void publicCnameCycleAcrossZonesEndsWithoutAnswers() {
+        String first = uniqueName() + ".example";
+        String second = uniqueName() + ".example";
+        change(createZone(first), "CREATE", record("loop." + first, "CNAME", 30, "loop." + second + "."));
+        change(createZone(second), "CREATE", record("loop." + second, "CNAME", 30, "loop." + first + "."));
+        DnsAnswer answer = source.resolveAuthoritative("loop." + first, 1).orElseThrow();
+        assertEquals(0, answer.responseCode());
+        assertTrue(answer.isEmpty());
+    }
+
+    @Test
     void negativeAnswersDistinguishNamesEmptyNonterminalsAndWildcardMatches() throws Exception {
         String name = uniqueName() + ".example";
         String id = createZone(name);
@@ -378,6 +454,9 @@ class Route53DnsPacketIntegrationTest {
         weighted.setSetIdentifier("one");
         weighted.setWeight(1L);
         change(id, "CREATE", weighted);
+        assertHeader(query(request("weighted." + name, 16)), 0, true, 1, 0);
+        weighted.setHealthCheckId("requires-health-evaluation");
+        change(id, "UPSERT", weighted);
         change(id, "CREATE", record("alias." + name, "CNAME", 60, "target.example."));
         change(id, "CREATE", record("delegated." + name, "NS", 60, "other.example."));
         for (int type : List.of(15, 5)) {
@@ -387,9 +466,10 @@ class Route53DnsPacketIntegrationTest {
         createZone(awsName);
         byte[] address = query(DnsTestQuery.query(awsName, 1, 0x1234));
         assertNegative(address, awsName, 0, 900);
-        for (String label : List.of("weighted", "alias", "leaf.delegated")) {
+        for (String label : List.of("weighted", "leaf.delegated")) {
             assertHeader(query(DnsTestQuery.query(label + "." + name, 16, 0x1234)), 5, false, 0, 0);
         }
+        assertNegative(query(request("alias." + name, 16)), name, 0, 900);
     }
 
     @ParameterizedTest
@@ -408,6 +488,8 @@ class Route53DnsPacketIntegrationTest {
         alias.setAliasTarget(cloudFront);
         change(id, "CREATE", alias);
 
+        assertEquals(5, source.resolveAuthoritative(name, type, "127.0.0.1")
+                .orElseThrow().responseCode(), "unsupported target should reach the refusal fallback");
         byte[] response = query(DnsTestQuery.query(name, type, 0x1234));
         assertPrivateHeader(response, 0, answers);
         if (type == 1) {
@@ -560,15 +642,13 @@ class Route53DnsPacketIntegrationTest {
         return query(request, null);
     }
 
-    private byte[] query(byte[] request, String vpcId) throws Exception {
-        List<DnsClientVpcSource> origins = vpcId == null ? List.of()
-                : List.of(address -> Optional.of(new DnsClientVpcSource.ClientVpc(
-                        config.defaultAccountId(), "us-east-1", vpcId)));
-        return queryWithOrigins(request, origins);
+    private byte[] query(byte[] request, DnsClientVpcSource.ClientVpc origin) throws Exception {
+        return queryWithOrigins(request, List.of(address -> Optional.ofNullable(origin)));
     }
 
     private byte[] queryWithOrigins(byte[] request, List<DnsClientVpcSource> runtimeOrigins) throws Exception {
-        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of("amazonaws.com"), List.of(source), List.of(), runtimeOrigins);
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of("amazonaws.com"), List.of(source),
+                List.of(), runtimeOrigins);
         DatagramSocket server = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
         DatagramSocket client = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
         try {
@@ -586,4 +666,8 @@ class Route53DnsPacketIntegrationTest {
             client.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         }
     }
+    private static byte[] request(String name, int type) {
+        return DnsTestQuery.query(name, type, 0x1234);
+    }
+
 }

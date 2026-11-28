@@ -135,6 +135,25 @@ public class RdsDataService implements Resettable {
                    RdsBackendEndpointResolver backendEndpointResolver,
                    boolean databaseResumingExceptionEnabled,
                    Clock clock) {
+        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl,
+                backendGate, backendEndpointResolver, databaseResumingExceptionEnabled, clock,
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread thread = new Thread(r, "rds-data-transaction-cleanup");
+                    thread.setDaemon(true);
+                    return thread;
+                }));
+    }
+
+    RdsDataService(RdsDataResourceResolver resourceResolver,
+                   SecretsManagerService secretsManagerService,
+                   ObjectMapper objectMapper,
+                   RdsDataConnectionFactory connectionFactory,
+                   Duration transactionTtl,
+                   RdsBackendGate backendGate,
+                   RdsBackendEndpointResolver backendEndpointResolver,
+                   boolean databaseResumingExceptionEnabled,
+                   Clock clock,
+                   ScheduledExecutorService transactionCleanupExecutor) {
         this.resourceResolver = resourceResolver;
         this.secretsManagerService = secretsManagerService;
         this.objectMapper = objectMapper;
@@ -144,11 +163,7 @@ public class RdsDataService implements Resettable {
         this.backendGate = backendGate;
         this.backendEndpointResolver = backendEndpointResolver;
         this.databaseResumingExceptionEnabled = databaseResumingExceptionEnabled;
-        this.transactionCleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread thread = new Thread(r, "rds-data-transaction-cleanup");
-            thread.setDaemon(true);
-            return thread;
-        });
+        this.transactionCleanupExecutor = transactionCleanupExecutor;
     }
 
     @PostConstruct

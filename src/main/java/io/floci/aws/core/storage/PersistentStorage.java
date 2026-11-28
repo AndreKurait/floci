@@ -40,10 +40,20 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public synchronized boolean persistIfCurrent(K key, V value) {
+        if (value == null || store.get(key) != value) {
+            return false;
+        }
+        persistToDisk();
+        return true;
+    }
+
+    @Override
     public synchronized void put(K key, V value) {
         store.put(key, value);
         persistToDisk();
     }
+
 
     @Override
     public synchronized void putAll(Map<K, V> entries) {
@@ -71,6 +81,11 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public void putAllDurably(Map<K, V> entries) {
+        putAllAtomically(entries);
+    }
+
+    @Override
     public Optional<V> get(K key) {
         return Optional.ofNullable(store.get(key));
     }
@@ -92,6 +107,24 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
             StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), candidate));
         } catch (IOException exception) {
             throw new UncheckedIOException("Failed to commit atomic deletions to " + filePath, exception);
+        }
+        store = candidate;
+    }
+
+    @Override
+    public synchronized void applyAtomically(Map<K, V> entries, Set<K> keys) {
+        Map<K, V> replacements = Map.copyOf(entries);
+        Set<K> deletions = Set.copyOf(keys);
+        if (replacements.isEmpty() && deletions.isEmpty()) {
+            return;
+        }
+        ConcurrentHashMap<K, V> candidate = new ConcurrentHashMap<>(store);
+        candidate.putAll(replacements);
+        candidate.keySet().removeAll(deletions);
+        try {
+            StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), candidate));
+        } catch (IOException exception) {
+            throw new UncheckedIOException("Failed to commit mixed atomic batch to " + filePath, exception);
         }
         store = candidate;
     }
@@ -143,6 +176,15 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     public synchronized void clear() {
         store.clear();
         persistToDisk();
+    }
+
+    @Override
+    public synchronized void flushOrThrow() {
+        try {
+            StorageFiles.writeAtomically(filePath, tempFile -> objectMapper.writeValue(tempFile.toFile(), store));
+        } catch (IOException exception) {
+            throw new UncheckedIOException("Failed to persist data to " + filePath, exception);
+        }
     }
 
     private synchronized void persistToDisk() {

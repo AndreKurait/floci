@@ -68,7 +68,7 @@ class SsmTaggingIamEnforcementIntegrationTest {
                                     + allowed + "\",\"Tags\":[{\"Key\":\"team\",\"Value\":\"x\"}],"
                                     + "\"TagKeys\":[\"team\"]}")
                     .when().post("/")
-                    .then().statusCode(400).body(containsString("AccessDeniedException"));
+                    .then().statusCode(403).body(containsString("AccessDeniedException"));
                 }
 
                 given()
@@ -112,7 +112,7 @@ class SsmTaggingIamEnforcementIntegrationTest {
                                 + ACCOUNT + ":parameter" + denied
                                 + "\",\"Tags\":[{\"Key\":\"team\",\"Value\":\"x\"}]}")
                 .when().post("/")
-                .then().statusCode(400).body(containsString("AccessDeniedException"));
+                .then().statusCode(403).body(containsString("AccessDeniedException"));
 
                 assertTrue(root.listTagsForResource(r -> r.resourceType(ResourceTypeForTagging.PARAMETER)
                         .resourceId(denied)).tagList().isEmpty());
@@ -179,7 +179,7 @@ class SsmTaggingIamEnforcementIntegrationTest {
                                 + ACCOUNT + ":parameter" + denied
                                 + "\",\"Tags\":[{\"Key\":\"team\",\"Value\":\"x\"}]}")
                 .when().post("/")
-                .then().statusCode(400).body(containsString("AccessDeniedException"));
+                .then().statusCode(403).body(containsString("AccessDeniedException"));
 
                 assertTrue(root.listTagsForResource(r -> r.resourceType(ResourceTypeForTagging.PARAMETER)
                         .resourceId(denied)).tagList().isEmpty());

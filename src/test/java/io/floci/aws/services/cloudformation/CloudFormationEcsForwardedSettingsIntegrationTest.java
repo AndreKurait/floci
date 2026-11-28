@@ -437,6 +437,9 @@ class CloudFormationEcsForwardedSettingsIntegrationTest {
 
     private static String serviceTemplate(String stackName, int desiredCount, String... settings) {
         String declared = List.of(settings).stream().map(setting -> ", " + setting).collect(Collectors.joining());
+        if (List.of(settings).stream().noneMatch(setting -> setting.contains("\"CapacityProviderStrategy\""))) {
+            declared += ", \"LaunchType\": \"FARGATE\"";
+        }
         return SERVICE_TEMPLATE.formatted(stackName, Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"), desiredCount, declared);
     }
 

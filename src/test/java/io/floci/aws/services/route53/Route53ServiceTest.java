@@ -4,6 +4,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.dns.DnsAnswer;
+import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.floci.aws.core.common.dns.DnsRecord;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -42,6 +43,97 @@ class Route53ServiceTest {
     private static final String ACCOUNT = "000000000000";
 
     private final Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
+
+    @Test
+    void testDnsAnswerRejectsPrivateAndMissingZones() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("private.example", "answer-private", null,
+                new VpcAssociation("vpc-123", "us-east-1")).zone().getId();
+        AwsException privateError = assertThrows(AwsException.class, () ->
+                service.testDnsAnswer(zoneId, "private.example", "NS", null, null, null));
+        assertEquals("InvalidInput", privateError.getErrorCode());
+        AwsException missingError = assertThrows(AwsException.class, () ->
+                service.testDnsAnswer("ZMissing", "private.example", "NS", null, null, null));
+        assertEquals("NoSuchHostedZone", missingError.getErrorCode());
+    }
+
+    @Test
+    void testDnsAnswerUsesDelegationMetadataAndAcceptsZonePrefix() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com", "answer-public", null, null).zone().getId();
+        Route53Service.TestDnsAnswerResult answer = service.testDnsAnswer("/hostedzone/" + zoneId,
+                "EXAMPLE.com", "NS", null, "2001:db8::1", null);
+        assertEquals("EXAMPLE.com", answer.recordName());
+        assertEquals(service.getAssignedNameServers(zoneId).getFirst(), answer.nameserver());
+        assertEquals(service.getAssignedNameServers(zoneId).stream().map(ns -> ns + ".").toList(), answer.recordData());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "\t"})
+    void testDnsAnswerAcceptsStoredSimpleRecordsWithBlankIdentifiers(String identifier) {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "answer-stored", null, null).zone().getId();
+        ResourceRecordSet legacy = aRecord("www.example.com.", 60, "192.0.2.81");
+        legacy.setSetIdentifier(identifier);
+        @SuppressWarnings("unchecked")
+        AccountAwareStorageBackend<List<ResourceRecordSet>> recordStore =
+                (AccountAwareStorageBackend<List<ResourceRecordSet>>) stores.get("route53-records.json");
+        List<ResourceRecordSet> seeded = new ArrayList<>(recordStore.get(zoneId).orElseThrow());
+        seeded.add(legacy);
+        recordStore.put(zoneId, seeded);
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, legacy.getName(), "A", null, null, null);
+        assertEquals("NOERROR", answer.responseCode());
+        assertEquals(List.of("192.0.2.81"), answer.recordData());
+        assertEquals(identifier, typeARecords(service, zoneId).getFirst().getSetIdentifier());
+    }
+
+    @Test
+    void testDnsAnswerStillRefusesNonblankSimpleRoutingIdentifiers() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "answer-identifier", null, null).zone().getId();
+        ResourceRecordSet record = aRecord("www.example.com.", 60, "192.0.2.82");
+        record.setSetIdentifier("unsupported");
+        service.changeResourceRecordSets(zoneId, List.of(change("CREATE", record)), null);
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, record.getName(), "A", null, null, null);
+        assertEquals("REFUSED", answer.responseCode());
+        assertEquals(List.of(), answer.recordData());
+    }
+
+    @Test
+    void testDnsAnswerServesRecordsAndSameZoneAliasesBeneathAnExistingRootZone() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone(".", "answer-root", null, null).zone().getId();
+        ResourceRecordSet record = aRecord("www.example.", 60, "192.0.2.83");
+        ResourceRecordSet alias = aliasRecord("alias.example.", record.getName(), false);
+        alias.getAliasTarget().setHostedZoneId(zoneId);
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", record), change("CREATE", alias)), null);
+
+        for (String name : List.of(record.getName(), alias.getName())) {
+            Route53Service.TestDnsAnswerResult answer =
+                    service.testDnsAnswer(zoneId, name, "A", null, null, null);
+            assertEquals("NOERROR", answer.responseCode());
+            assertEquals(List.of("192.0.2.83"), answer.recordData());
+        }
+    }
+
+    @Test
+    void testDnsAnswerStillRefusesAliasCyclesInARootZone() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone(".", "answer-root-cycle", null, null).zone().getId();
+        ResourceRecordSet alias = aliasRecord("loop.example.", "loop.example.", false);
+        alias.getAliasTarget().setHostedZoneId(zoneId);
+        service.changeResourceRecordSets(zoneId, List.of(change("CREATE", alias)), null);
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, alias.getName(), "A", null, null, null);
+        assertEquals("REFUSED", answer.responseCode());
+        assertEquals(List.of(), answer.recordData());
+    }
 
     private Route53Service newService() {
         return newService(".");
@@ -667,34 +759,37 @@ class Route53ServiceTest {
     @Test
     void clear_resetsPrivateZoneNameCounts() {
         Route53Service service = newService();
+        ClientVpc origin = new ClientVpc(ACCOUNT, "us-east-1", "vpc-123");
         String zoneId = service.createHostedZone("corp.internal.", "ref-clear", null,
                 new VpcAssociation("vpc-123", "us-east-1")).zone().getId();
 
         service.changeResourceRecordSets(zoneId,
                 List.of(change("CREATE", aRecord("app.corp.internal.", 300, "10.0.0.1"))), null);
 
-        List<ResourceRecordSet> beforeClear = service.findPrivateRecordsForName("app.corp.internal.", null);
+        List<ResourceRecordSet> beforeClear = service.findPrivateRecordsForName("app.corp.internal.", origin);
         assertThat(beforeClear, hasSize(1));
 
         service.clear();
 
-        List<ResourceRecordSet> afterClear = service.findPrivateRecordsForName("app.corp.internal.", null);
+        List<ResourceRecordSet> afterClear = service.findPrivateRecordsForName("app.corp.internal.", origin);
         assertThat(afterClear, empty());
     }
 
     @Test
     void isCoveredByPrivateZone_matchesPrivateZoneDomainsOnly() {
         Route53Service service = newService();
+        ClientVpc origin = new ClientVpc(ACCOUNT, "us-east-1", "vpc-123");
         service.createHostedZone("corp.internal.", "ref-private", null,
                 new VpcAssociation("vpc-123", "us-east-1"));
         service.createHostedZone("public.com.", "ref-public", null, null);
 
-        assertTrue(service.isCoveredByPrivateZone("corp.internal", null));
-        assertTrue(service.isCoveredByPrivateZone("app.corp.internal.", null));
-        assertTrue(service.isCoveredByPrivateZone("sub.service.corp.internal", null));
-        assertFalse(service.isCoveredByPrivateZone("public.com", null));
-        assertFalse(service.isCoveredByPrivateZone("othercorp.internal", null));
-        assertFalse(service.isCoveredByPrivateZone("example.org", null));
+        assertTrue(service.isCoveredByPrivateZone("corp.internal", origin));
+        assertTrue(service.isCoveredByPrivateZone("app.corp.internal.", origin));
+        assertTrue(service.isCoveredByPrivateZone("sub.service.corp.internal", origin));
+        assertFalse(service.isCoveredByPrivateZone("corp.internal", null));
+        assertFalse(service.isCoveredByPrivateZone("public.com", origin));
+        assertFalse(service.isCoveredByPrivateZone("othercorp.internal", origin));
+        assertFalse(service.isCoveredByPrivateZone("example.org", origin));
     }
 
     private static HealthCheckConfig httpsCheck(String path) {

@@ -1,5 +1,6 @@
 package io.floci.aws.core.common;
 
+import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.PartitionMatrix;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
@@ -9,10 +10,25 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.mq.MqClient;
+import software.amazon.awssdk.services.mq.model.CreateConfigurationResponse;
+import software.amazon.awssdk.services.mq.model.MqException;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Verifies that REST calls for unimplemented operations signed for a service sharing a path
@@ -61,11 +77,6 @@ class RestCrossServiceRouteCollisionIntegrationTest {
             "servicecatalog, GET, /applications",
             "servicecatalog, GET, /applications/app-123",
             "servicecatalog, DELETE, /applications/app-123",
-            "mq, POST, /v1/configurations",
-            "mq, GET, /v1/configurations",
-            "mq, GET, /v1/configurations/c-123",
-            "mq, PUT, /v1/configurations/c-123",
-            "mq, DELETE, /v1/configurations/c-123",
             "securityhub, GET, /associations",
             "securityhub, POST, /associations",
             "macie2, GET, /jobs/job-123",
@@ -92,6 +103,61 @@ class RestCrossServiceRouteCollisionIntegrationTest {
             .header("x-amzn-query-error", "UnknownOperationException;Sender")
             .body("__type", equalTo("UnknownOperationException"))
             .body("message", equalTo("Unknown operation: " + method + " " + path));
+    }
+
+    @Test
+    void mqAndKafkaConfigurationLifecyclesStayWithinTheirSigningScope() {
+        String account = Long.toString(ThreadLocalRandom.current().nextLong(740000000000L, 749999999999L));
+        String name = "collision-" + UUID.randomUUID();
+        try (MqClient mq = AwsTestClients.create(MqClient.builder(), account, Region.US_EAST_1)) {
+            String kafkaArn = kafkaRequest(account).body(Map.of("name", name, "serverProperties",
+                    Base64.getEncoder().encodeToString("auto.create.topics.enable=false\n".getBytes(StandardCharsets.UTF_8))))
+                    .post("/v1/configurations").then().statusCode(200).extract().path("arn");
+            try {
+                CreateConfigurationResponse created = mq.createConfiguration(r -> r.name(name)
+                        .engineType("RABBITMQ").engineVersion("3.13").authenticationStrategy("SIMPLE"));
+                try {
+                    assertNotNull(created.id(), "The MQ route must return its own configuration identity");
+                    assertTrue(created.arn().contains(":mq:"), created.arn());
+                    assertEquals(List.of(created.arn()), mq.listConfigurations().configurations().stream()
+                            .map(configuration -> configuration.arn()).toList());
+                    kafkaRequest(account).get("/v1/configurations").then().statusCode(200)
+                            .body("configurations.arn", equalTo(List.of(kafkaArn)));
+                    assertEquals(created.id(), mq.describeConfiguration(r -> r.configurationId(created.id())).id());
+                    kafkaRequest(account).get("/v1/configurations/{arn}", kafkaArn).then().statusCode(200)
+                            .body("latestRevision.revision", equalTo(1));
+                    String data = Base64.getEncoder().encodeToString("heartbeat = 120\n".getBytes(StandardCharsets.UTF_8));
+                    assertEquals(2, mq.updateConfiguration(r -> r.configurationId(created.id())
+                            .data(data).description("MQ revision")).latestRevision().revision());
+                    assertEquals("MQ revision", mq.describeConfiguration(r -> r.configurationId(created.id()))
+                            .description());
+                    kafkaRequest(account).get("/v1/configurations/{arn}", kafkaArn).then().statusCode(200)
+                            .body("latestRevision.revision", equalTo(1));
+                } finally {
+                    if (created.id() != null) {
+                        mq.deleteConfiguration(r -> r.configurationId(created.id()));
+                    } else if (created.arn() != null && created.arn().contains(":kafka:")) {
+                        // If routing regresses, remove only the returned Kafka resource with our reserved name.
+                        kafkaRequest(account).get("/v1/configurations/{arn}", created.arn()).then().statusCode(200)
+                                .body("name", equalTo(name));
+                        kafkaRequest(account).delete("/v1/configurations/{arn}", created.arn()).then().statusCode(200);
+                    }
+                }
+                assertEquals(404, assertThrows(MqException.class,
+                        () -> mq.describeConfiguration(r -> r.configurationId(created.id()))).statusCode());
+                assertEquals(List.of(), mq.listConfigurations().configurations());
+                kafkaRequest(account).get("/v1/configurations").then().statusCode(200)
+                        .body("configurations.arn", equalTo(List.of(kafkaArn)));
+            } finally {
+                kafkaRequest(account).delete("/v1/configurations/{arn}", kafkaArn).then().statusCode(200);
+            }
+        }
+    }
+
+    private static RequestSpecification kafkaRequest(String account) {
+        return given().header("Authorization", "AWS4-HMAC-SHA256 Credential=" + account
+                + "/20261125/us-east-1/kafka/aws4_request, SignedHeaders=host, Signature=00")
+                .contentType("application/json");
     }
 
     @Test

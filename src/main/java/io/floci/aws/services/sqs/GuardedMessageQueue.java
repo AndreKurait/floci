@@ -1,17 +1,22 @@
 package io.floci.aws.services.sqs;
 
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.concurrent.VersionedSignal;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.sqs.model.Message;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -23,12 +28,17 @@ import java.util.stream.Collectors;
 class GuardedMessageQueue {
 
     private final ReentrantLock lock = new ReentrantLock();
+    private final VersionedSignal changes = new VersionedSignal();
     private MessageList messages;
     private final StorageBackend<String, List<Message>> messageStore;
     private final String storageKey;
     private final String receiptHandleSecret;
+    private final Object persistenceLock;
+    private final BooleanSupplier currentGeneration;
     private final boolean detachedSnapshots;
-    private final SqsQueueActivity activity = new SqsQueueActivity();
+    private final SqsQueueActivity activity;
+    /** Reads the time a visibility deadline is set from and checked against. */
+    private final Clock clock;
     private volatile boolean closed;
 
     @FunctionalInterface
@@ -52,6 +62,22 @@ class GuardedMessageQueue {
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
                         String receiptHandleSecret) {
+        this(initial, messageStore, storageKey, receiptHandleSecret, new Object(), () -> true);
+    }
+
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration) {
+        this(initial, messageStore, storageKey, receiptHandleSecret, persistenceLock, currentGeneration,
+                Clock.systemUTC());
+    }
+
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret, Object persistenceLock, BooleanSupplier currentGeneration,
+                        Clock clock) {
+        this.clock = clock;
+        this.activity = new SqsQueueActivity(clock);
+        this.persistenceLock = persistenceLock;
+        this.currentGeneration = currentGeneration;
         this.detachedSnapshots = messageStore != null
                 && !(messageStore instanceof InMemoryStorage<?, ?>
                 || messageStore instanceof AccountAwareStorageBackend<?> aware && aware.isInMemory());
@@ -66,13 +92,22 @@ class GuardedMessageQueue {
 
     void addMessage(Message message) {
         try (Guard _ = hold()) {
+            requireOpen();
             commit(messages.plus(message));
         }
     }
 
     void addAll(List<Message> toAdd) {
         try (Guard _ = hold()) {
+            requireOpen();
             commit(messages.plusAll(toAdd));
+        }
+    }
+
+    private void requireOpen() {
+        if (closed) {
+            throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                    "The specified queue does not exist.", 400);
         }
     }
 
@@ -80,20 +115,24 @@ class GuardedMessageQueue {
                                      boolean fifo, int maxReceiveCount,
                                      String deadLetterTargetArn) {
         try (Guard _ = hold()) {
+            if (closed) {
+                return new ClaimResult(List.of(), List.of());
+            }
             List<Message> claimed = new ArrayList<>();
             List<Message> dlqCandidates = new ArrayList<>();
 
             List<DeliveryState> previous = new ArrayList<>();
+            Instant now = clock.instant();
             try {
                 if (fifo) {
-                    claimFifo(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
+                    claimFifo(now, maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
                             claimed, dlqCandidates, previous);
                 } else {
-                    claimStandard(maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
+                    claimStandard(now, maxMessages, effectiveTimeout, maxReceiveCount, deadLetterTargetArn,
                             claimed, dlqCandidates, previous);
                 }
                 if (!dlqCandidates.isEmpty()) {
-                    commit(messages.withoutAll(dlqCandidates::contains));
+                    commit(messages.withoutAll(dlqCandidates::contains), false);
                 } else if (!claimed.isEmpty()) {
                     persist(messages);
                 }
@@ -120,13 +159,13 @@ class GuardedMessageQueue {
         }
     }
 
-    private boolean tryClaim(Message msg, int effectiveTimeout, int maxReceiveCount,
+    private boolean tryClaim(Instant now, Message msg, int effectiveTimeout, int maxReceiveCount,
                              String deadLetterTargetArn, List<Message> claimed,
                              List<Message> dlqCandidates, List<DeliveryState> previous) {
         previous.add(new DeliveryState(msg));
         msg.setReceiveCount(msg.getReceiveCount() + 1);
         if (msg.getFirstReceiveTimestamp() == null) {
-            msg.setFirstReceiveTimestamp(Instant.now());
+            msg.setFirstReceiveTimestamp(now);
         }
 
         if (maxReceiveCount > 0 && deadLetterTargetArn != null
@@ -136,22 +175,22 @@ class GuardedMessageQueue {
         }
 
         msg.setReceiptHandle(ReceiptHandle.issue(storageKey, msg.getMessageId(), receiptHandleSecret).encode());
-        msg.setVisibleAt(Instant.now().plusSeconds(effectiveTimeout));
+        msg.setVisibleAt(now.plusSeconds(effectiveTimeout));
         claimed.add(msg);
         return true;
     }
 
-    private void claimStandard(int maxMessages, int effectiveTimeout,
+    private void claimStandard(Instant now, int maxMessages, int effectiveTimeout,
                                int maxReceiveCount, String deadLetterTargetArn,
                                List<Message> claimed, List<Message> dlqCandidates, List<DeliveryState> previous) {
         for (Message msg : messages) {
             if (claimed.size() >= maxMessages) break;
-            if (!msg.isVisible()) continue;
-            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
+            if (!msg.isVisible(now)) continue;
+            tryClaim(now, msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
         }
     }
 
-    private void claimFifo(int maxMessages, int effectiveTimeout,
+    private void claimFifo(Instant now, int maxMessages, int effectiveTimeout,
                            int maxReceiveCount, String deadLetterTargetArn,
                            List<Message> claimed, List<Message> dlqCandidates, List<DeliveryState> previous) {
         // Cross-call group locking: a group that already has an in-flight
@@ -163,18 +202,18 @@ class GuardedMessageQueue {
         // DelaySeconds and must not lock its group.
         Set<String> groupsWithInFlight =
                 messages.stream()
-                        .filter(msg -> !msg.isVisible() && msg.getReceiptHandle() != null
+                        .filter(msg -> !msg.isVisible(now) && msg.getReceiptHandle() != null
                                 && msg.getMessageGroupId() != null)
                         .map(Message::getMessageGroupId).collect(Collectors.toSet());
 
         for (Message msg : messages) {
             if (claimed.size() >= maxMessages) break;
-            if (!msg.isVisible()) continue;
+            if (!msg.isVisible(now)) continue;
 
             String groupId = msg.getMessageGroupId();
             if (groupId != null && groupsWithInFlight.contains(groupId)) continue;
 
-            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
+            tryClaim(now, msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates, previous);
         }
     }
 
@@ -218,9 +257,10 @@ class GuardedMessageQueue {
             HandleResult result = checkHandle(msg, handle, fifo);
             if (result == HandleResult.APPLIED) {
                 Instant previous = msg.getVisibleAt();
-                msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
+                msg.setVisibleAt(clock.instant().plusSeconds(visibilityTimeout));
                 try {
                     persist(messages);
+                    changes.signal();
                 } catch (RuntimeException exception) {
                     msg.setVisibleAt(previous);
                     throw exception;
@@ -243,11 +283,11 @@ class GuardedMessageQueue {
      * On a standard queue an older handle of the message still works. On a FIFO queue only the
      * handle of the receive still in flight does.
      */
-    private static HandleResult checkHandle(Message msg, ReceiptHandle handle, boolean fifo) {
+    private HandleResult checkHandle(Message msg, ReceiptHandle handle, boolean fifo) {
         if (msg == null) {
             return HandleResult.MESSAGE_GONE;
         }
-        if (fifo && (!handle.encode().equals(msg.getReceiptHandle()) || msg.isVisible())) {
+        if (fifo && (!handle.encode().equals(msg.getReceiptHandle()) || msg.isVisible(clock.instant()))) {
             return HandleResult.HANDLE_EXPIRED;
         }
         return HandleResult.APPLIED;
@@ -298,6 +338,19 @@ class GuardedMessageQueue {
         }
     }
 
+    /** Restore a rejected automatic redrive in its original order without reviving a deleted queue. */
+    void restoreFirst(List<Message> rejected) {
+        try (Guard _ = hold()) {
+            requireOpen();
+            List<Message> restored = new ArrayList<>(rejected);
+            restored.addAll(messages);
+            // Retain recovered messages in memory if the storage retry also fails.
+            messages = MessageList.copyOf(restored);
+            persist(messages);
+            changes.signal();
+        }
+    }
+
     record MessageCounts(long visible, long inFlight, long delayed) {
     }
 
@@ -314,8 +367,9 @@ class GuardedMessageQueue {
             long visible = 0;
             long inFlight = 0;
             long delayed = 0;
+            Instant now = clock.instant();
             for (Message m : messages) {
-                if (m.isVisible()) {
+                if (m.isVisible(now)) {
                     visible++;
                 } else if (m.getReceiptHandle() == null) {
                     delayed++;
@@ -342,8 +396,9 @@ class GuardedMessageQueue {
         try (Guard _ = hold()) {
             Instant oldest = null;
             Set<String> groupsInFlight = new HashSet<>();
+            Instant visibleBy = clock.instant();
             for (Message m : messages) {
-                if (!m.isVisible() && m.getReceiptHandle() != null && m.getMessageGroupId() != null) {
+                if (!m.isVisible(visibleBy) && m.getReceiptHandle() != null && m.getMessageGroupId() != null) {
                     groupsInFlight.add(m.getMessageGroupId());
                 }
                 // ponytail: AWS also leaves out a standard-queue message received 3+ times in this queue;
@@ -390,12 +445,47 @@ class GuardedMessageQueue {
     }
 
     void close() {
-        closed = true;
+        try (Guard _ = hold()) {
+            closed = true;
+            changes.signal();
+        }
+    }
+
+    boolean isClosed() {
+        return closed;
+    }
+
+    void signalChange() {
+        changes.signal();
+    }
+
+    long changeVersion() {
+        return changes.version();
+    }
+
+    void awaitChange(long observed, long timeoutNanos) throws InterruptedException {
+        changes.awaitChange(observed, pollPause(timeoutNanos));
+    }
+
+    /** How long a receiver with {@code timeoutNanos} left waits for a change before it scans again. */
+    long pollPause(long timeoutNanos) {
+        try (Guard _ = hold()) {
+            // Empty queues need no clock-driven scans. Nonempty queues retain recovery for
+            // visibility/retention expiry and failed redrive attempts, which may enable work.
+            return messages.isEmpty() ? timeoutNanos : Math.min(timeoutNanos, TimeUnit.SECONDS.toNanos(1));
+        }
     }
 
     private void commit(MessageList candidate) {
+        commit(candidate, true);
+    }
+
+    private void commit(MessageList candidate, boolean notifyReceivers) {
         persist(candidate);
         messages = candidate;
+        if (notifyReceivers) {
+            changes.signal();
+        }
     }
 
     private List<Message> snapshot(List<Message> source) {
@@ -406,18 +496,25 @@ class GuardedMessageQueue {
     }
 
     private void persist(List<Message> candidate) {
-        if (closed || messageStore == null || storageKey == null) {
-            return;
-        }
-        List<Message> snapshot = snapshot(candidate);
-        if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
-            String accountId = extractAccountFromStorageKey(storageKey);
-            if (accountId != null) {
-                aware.putForAccount(accountId, storageKey, snapshot);
+        // Old and new generations serialize writes on the same storage-key stripe.
+        synchronized (persistenceLock) {
+            if (closed || !currentGeneration.getAsBoolean() || messageStore == null || storageKey == null) {
                 return;
             }
+            List<Message> snapshot = snapshot(candidate);
+            String accountId = extractAccountFromStorageKey(storageKey);
+            if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware && accountId != null) {
+                aware.putForAccount(accountId, storageKey, snapshot);
+                if (!currentGeneration.getAsBoolean()) {
+                    aware.deleteForAccount(accountId, storageKey);
+                }
+            } else {
+                messageStore.put(storageKey, snapshot);
+                if (!currentGeneration.getAsBoolean()) {
+                    messageStore.delete(storageKey);
+                }
+            }
         }
-        messageStore.put(storageKey, snapshot);
     }
 
     /**

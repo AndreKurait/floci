@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.eventbridge.model.Archive;
@@ -50,7 +52,9 @@ class EventBridgeSchedulerIntegrationTest {
         StorageBackend<String, List<Target>> targetStore = new InMemoryStorage<>();
 
         EventBridgeInvoker invoker = new EventBridgeInvoker(null, null, null, new ObjectMapper(), createConfig());
-        TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, "http://localhost:4566", Clock.systemUTC(), null);
+        TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class),
+                "http://localhost:4566", Clock.systemUTC(), null);
         scheduler = new RuleScheduler(vertx, createConfig(), new ObjectMapper(), dispatcher);
 
         ReplayDispatcher replayDispatcher = new ReplayDispatcher(vertx);
@@ -340,7 +344,11 @@ class EventBridgeSchedulerIntegrationTest {
             public DnsConfig dns() {
                 return new DnsConfig() {
                     @Override
+                    public Optional<String> listenAddress() { return Optional.empty(); }
+                    @Override
                     public Optional<List<String>> extraSuffixes() { return Optional.empty(); }
+                    @Override
+                    public Optional<List<String>> authoritativeSuffixes() { return Optional.empty(); }
                     @Override
                     public boolean containerFallbackEnabled() { return true; }
                     @Override
@@ -380,8 +388,13 @@ class EventBridgeSchedulerIntegrationTest {
                     @Override public Optional<String> certPath() { return Optional.empty(); }
                     @Override public Optional<String> keyPath() { return Optional.empty(); }
                     @Override public Optional<String> extraCaPath() { return Optional.empty(); }
+                    @Override public Optional<String> extraCaCerts() { return Optional.empty(); }
                     @Override public boolean selfSigned() { return true; }
                     @Override public int awsHttpsPort() { return 443; }
+                    @Override public int awsHttpsFallbackPort() { return 0; }
+                    @Override public Optional<String> awsHttpsFallbackHost() { return Optional.empty(); }
+                    @Override public boolean awsHttpsFallbackProxyProtocol() { return false; }
+                    @Override public Optional<List<String>> awsHttpsFallbackHosts() { return Optional.empty(); }
                 };
             }
         };

@@ -18,7 +18,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Pre-matching filter that rewrites SQS requests sent to a queue URL path to POST / so they are handled
+ * Pre-matching filter that rewrites SQS requests sent to a queue URL path to / so they are handled
  * by the correct controller. The path is /{accountId}/{queueName}, optionally behind a /queue/{region}/
  * prefix, with an optional trailing slash.
  * <p>
@@ -33,7 +33,9 @@ import java.util.regex.Pattern;
  * for SQS on the prefixed path is rejected with 404 InvalidAddress, as AWS rejects it, by
  * {@link SqsInvalidAddressFilter} once its signature has been verified.
  * <p>
- * S3 object POSTs, which always carry uploads, uploadId, restore or select, are never rewritten.
+ * Signed Query GET requests, including Boto 2 calls, follow the same path-based queue lookup.
+ * Their original URI remains available to signature verification. S3 object GETs and S3 object
+ * POSTs carrying uploads, uploadId, restore or select are never rewritten.
  */
 @Provider
 @PreMatching
@@ -65,7 +67,8 @@ public class SqsQueueUrlRouterFilter implements ContainerRequestFilter {
     @Override
     public void filter(ContainerRequestContext ctx) {
 
-        if (!"POST".equals(ctx.getMethod())) {
+        boolean get = "GET".equals(ctx.getMethod());
+        if (!get && !"POST".equals(ctx.getMethod())) {
             return;
         }
 
@@ -75,6 +78,11 @@ public class SqsQueueUrlRouterFilter implements ContainerRequestFilter {
             return;
         }
         boolean hasRegionPrefix = matcher.group(1) != null;
+
+        if (get) {
+            routeQueryGet(ctx, path, hasRegionPrefix);
+            return;
+        }
 
         MultivaluedMap<String, String> queryParams = ctx.getUriInfo().getQueryParameters();
         for (String param : S3_OBJECT_POST_PARAMS) {
@@ -135,6 +143,25 @@ public class SqsQueueUrlRouterFilter implements ContainerRequestFilter {
 
         // Rewrite the path to / so AwsQueryController / AwsJsonController handles the request.
         rewriteToRoot(ctx);
+    }
+
+    private void routeQueryGet(ContainerRequestContext ctx, String path, boolean hasRegionPrefix) {
+        // The action alone cannot distinguish an SQS call from an S3 object GET with query parameters.
+        if (SignedServiceRoute.signingService(ctx).filter("sqs"::equals).isEmpty()) {
+            return;
+        }
+        if (hasRegionPrefix) {
+            ctx.setProperty(INVALID_ADDRESS_PROPERTY, Boolean.TRUE);
+            rewriteToRoot(ctx);
+            return;
+        }
+        URI requestUri = ctx.getUriInfo().getRequestUri();
+        String queuePath = path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
+        String queueUrl = requestUri.getScheme() + "://" + requestUri.getAuthority() + queuePath;
+        // The path names the queue. IAM and the handler must see that same queue, even when the caller
+        // supplied another QueueUrl. Signature verification still reads the untouched Vert.x wire URI.
+        ctx.setRequestUri(ctx.getUriInfo().getRequestUriBuilder()
+                .replacePath("/").replaceQueryParam("QueueUrl", queueUrl).build());
     }
 
     private void rewriteToRoot(ContainerRequestContext ctx) {

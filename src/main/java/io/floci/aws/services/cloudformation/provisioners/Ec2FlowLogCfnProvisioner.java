@@ -93,6 +93,7 @@ public class Ec2FlowLogCfnProvisioner implements CfnResourceProvisioner {
                 ctx.resolveOptional(props, "TrafficType"),
                 ctx.resolveOptional(props, "LogDestinationType"),
                 ctx.resolveOptional(props, "LogDestination"),
+                ctx.resolveOptional(props, "LogGroupName"),
                 ctx.resolveOptional(props, "DeliverLogsPermissionArn"),
                 ctx.resolveOptional(props, "LogFormat"),
                 props != null && props.hasNonNull("MaxAggregationInterval")
@@ -184,7 +185,7 @@ public class Ec2FlowLogCfnProvisioner implements CfnResourceProvisioner {
         // TrafficType and LogDestinationType when the template omits them, so a re-apply of an
         // unchanged template reads null here against a stored default. Defaulting the requested
         // side the same way keeps a no-op update a no-op, while a genuine add, drop or change
-        // still differs. The other three have no create-time default and stay null on both sides.
+        // still differs. Other properties without a create-time default stay null on both sides.
         rejectIfChanged("ResourceId", existing.getResourceId(),
                 ctx.resolveOptional(props, "ResourceId"));
         rejectIfChanged("ResourceType", existing.getResourceType(),
@@ -193,9 +194,12 @@ public class Ec2FlowLogCfnProvisioner implements CfnResourceProvisioner {
                 orDefault(ctx.resolveOptional(props, "TrafficType"), DEFAULT_TRAFFIC_TYPE));
         rejectIfChanged("LogDestinationType", existing.getLogDestinationType(),
                 FlowLogService.effectiveLogDestinationType(ctx.resolveOptional(props, "LogDestinationType"),
-                        ctx.resolveOptional(props, "LogDestination"), null));
+                        ctx.resolveOptional(props, "LogDestination"), ctx.resolveOptional(props, "LogGroupName")));
         rejectIfChanged("LogDestination", existing.getLogDestination(),
                 ctx.resolveOptional(props, "LogDestination"));
+        rejectIfChanged("LogGroupName", existing.getLogGroupName(),
+                FlowLogService.effectiveLogGroupName(ctx.resolveOptional(props, "LogDestination"),
+                        ctx.resolveOptional(props, "LogGroupName")));
         rejectIfChanged("DeliverLogsPermissionArn", existing.getDeliverLogsPermissionArn(),
                 ctx.resolveOptional(props, "DeliverLogsPermissionArn"));
         rejectIfChanged("LogFormat", existing.getLogFormat(), ctx.resolveOptional(props, "LogFormat"));

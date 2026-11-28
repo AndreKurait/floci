@@ -36,8 +36,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
@@ -138,7 +138,8 @@ class EcsGracefulStopConcurrencyServiceTest {
             service.updateService(CLUSTER, "fast", null, null, null, null, true, REGION);
             tick(service);
             tick(service);
-            await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, fastOld)));
+            service.awaitPendingStop(fastOld.getTaskArn());
+            assertEquals("STOPPED", lastStatus(service, fastOld));
             assertNotEquals(fastOld.getTaskArn(), onlyRunningTask(service, "fast").getTaskArn());
 
             assertEquals("STOPPING", lastStatus(service, slowOld), "the slow task is still in its grace period");
@@ -146,7 +147,8 @@ class EcsGracefulStopConcurrencyServiceTest {
         } finally {
             releaseSlowStop.countDown();
         }
-        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, slowOld)));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, slowOld));
     }
 
     @Test
@@ -173,7 +175,8 @@ class EcsGracefulStopConcurrencyServiceTest {
         } finally {
             releaseSlowStop.countDown();
         }
-        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, old)));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, old));
         tick(service);
         tick(service);
 
@@ -200,15 +203,74 @@ class EcsGracefulStopConcurrencyServiceTest {
 
         service.updateService(CLUSTER, "flaky", null, 0, null, REGION);
         tick(service);
-        await().atMost(TICK_BUDGET).untilAsserted(() ->
-                verify(containerManager).stopTaskAndCollectExitCodes(handleOf(task)));
+        service.awaitPendingStops();
+        verify(containerManager).stopTaskAndCollectExitCodes(handleOf(task));
         assertEquals("STOPPING", lastStatus(service, task), "a stop that failed leaves the task STOPPING");
 
-        await().atMost(TICK_BUDGET).until(() -> {
-            tick(service);
-            return "STOPPED".equals(lastStatus(service, task));
-        });
+        // The very next tick retries it.
+        tick(service);
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, task));
         verify(containerManager, times(2)).stopTaskAndCollectExitCodes(handleOf(task));
+    }
+
+    @Test
+    void teardownPreparationPausesReconciliationUntilReset() throws Exception {
+        EcsService service = newService();
+        createService(service, "draining", 1);
+        tick(service);
+        EcsTask original = onlyRunningTask(service, "draining");
+
+        service.beginTeardown();
+        assertTrue(service.isReconcilerShutdown(), "preparation stops the scheduler before other owners drain");
+        service.updateService(CLUSTER, "draining", null, 2, null, REGION);
+        tick(service);
+        service.reconcileServices();
+        verify(containerManager, times(1)).startTask(any(), any(), any(), anyString());
+
+        service.stopManagedContainers();
+        verify(containerManager).stopTask(handleOf(original));
+        service.clear();
+        service.afterReset();
+        tick(service);
+        assertEquals(2, runningTasks(service, "draining").size(), "reset resumes the desired service count");
+    }
+
+    @Test
+    void teardownPreparationWaitsForTaskLaunchBeforeStoppingContainers() throws Exception {
+        EcsService service = newService();
+        createService(service, "launching", 1);
+        CountDownLatch launchEntered = new CountDownLatch(1);
+        CountDownLatch releaseLaunch = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            EcsTask task = invocation.getArgument(0);
+            launchEntered.countDown();
+            assertTrue(releaseLaunch.await(30, TimeUnit.SECONDS), "test must release the in-flight launch");
+            Container container = new Container();
+            container.setName("app");
+            container.setRuntimeId("launching-container");
+            task.setContainers(List.of(container));
+            return new EcsTaskHandle(task.getTaskArn(), Map.of("app", container.getRuntimeId()), Map.of());
+        }).when(containerManager).startTask(any(), any(), any(), anyString());
+        FutureTask<Void> launch = startTick(service);
+        FutureTask<Void> preparation = new FutureTask<>(service::beginTeardown, null);
+        Thread preparationThread = new Thread(preparation, "test-ecs-teardown-preparation");
+        preparationThread.setDaemon(true);
+        try {
+            assertTrue(launchEntered.await(5, TimeUnit.SECONDS), "the task launch must be in flight");
+            preparationThread.start();
+            Thread.State state = ThreadStates.awaitState(preparationThread,
+                    EnumSet.of(Thread.State.TIMED_WAITING, Thread.State.TERMINATED), TICK_BUDGET,
+                    "teardown preparation");
+            assertEquals(Thread.State.TIMED_WAITING, state, "preparation must wait for the admitted task launch");
+        } finally {
+            releaseLaunch.countDown();
+        }
+        launch.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        preparation.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        EcsTask launched = onlyRunningTask(service, "launching");
+        service.stopManagedContainers();
+        verify(containerManager).stopTask(handleOf(launched));
     }
 
     @Test
@@ -233,8 +295,9 @@ class EcsGracefulStopConcurrencyServiceTest {
             Thread teardownThread = new Thread(teardown, "test-ecs-teardown");
             teardownThread.setDaemon(true);
             teardownThread.start();
-            assertThrows(TimeoutException.class, () -> teardown.get(500, TimeUnit.MILLISECONDS),
-                    "the teardown waits for the stop already running");
+            // With the stop still held open, a teardown that has parked is waiting for that stop.
+            ThreadStates.awaitParkedOrDone(teardownThread);
+            assertFalse(teardown.isDone(), "the teardown waits for the stop already running");
         } finally {
             releaseSlowStop.countDown();
         }
@@ -260,11 +323,12 @@ class EcsGracefulStopConcurrencyServiceTest {
         service.updateService(CLUSTER, "after-reset", null, 0, null, REGION);
         tick(service);
 
-        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, task)));
+        service.awaitPendingStops();
+        assertEquals("STOPPED", lastStatus(service, task));
     }
 
     @Test
-    void stopTaskWaitsForTheStopTheSchedulerAlreadyStarted() throws Exception {
+    void stopTaskAnswersStoppingWhileTheStopTheSchedulerStartedLandsIt() throws Exception {
         EcsService service = newService();
         createService(service, "slow", 1);
         tick(service);
@@ -273,26 +337,27 @@ class EcsGracefulStopConcurrencyServiceTest {
         service.updateService(CLUSTER, "slow", null, 0, null, REGION);
 
         FutureTask<Void> scaleIn = startTick(service);
-        CompletableFuture<EcsTask> userStop;
         try {
             assertTrue(slowStopEntered.await(5, TimeUnit.SECONDS), "the scale-in stop never started");
-            userStop = CompletableFuture.supplyAsync(() ->
-                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION));
-            assertThrows(TimeoutException.class, () -> userStop.get(500, TimeUnit.MILLISECONDS),
-                    "StopTask answers once the stop already running has landed");
+            // StopTask answers at once, as ECS does; the stop already running is the one that lands it.
+            EcsTask answer = CompletableFuture.supplyAsync(() ->
+                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION))
+                    .get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+            assertEquals("STOPPING", answer.getLastStatus());
         } finally {
             releaseSlowStop.countDown();
         }
 
-        EcsTask stopped = userStop.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
         scaleIn.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        service.awaitPendingStops();
+        EcsTask stopped = describe(service, task);
         assertEquals("STOPPED", stopped.getLastStatus());
         assertEquals(EcsService.STOP_CODE_SERVICE_SCHEDULER_INITIATED, stopped.getStopCode());
         verify(containerManager, times(1)).stopTaskAndCollectExitCodes(handleOf(task));
     }
 
     @Test
-    void stopTaskWaitsForATickRetryOfAStopThatFailedWhileItWaited() throws Exception {
+    void stopTaskDuringAStopThatFailsLeavesTheRetryToTheTick() throws Exception {
         EcsService service = newService();
         createService(service, "flaky", 1);
         tick(service);
@@ -317,30 +382,29 @@ class EcsGracefulStopConcurrencyServiceTest {
         service.updateService(CLUSTER, "flaky", null, 0, null, REGION);
 
         tick(service);
-        CompletableFuture<EcsTask> userStop;
         try {
             assertTrue(firstStopEntered.await(5, TimeUnit.SECONDS), "the scale-in stop never started");
-            userStop = CompletableFuture.supplyAsync(() ->
-                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION));
-            assertThrows(TimeoutException.class, () -> userStop.get(500, TimeUnit.MILLISECONDS),
-                    "StopTask waits for the stop already running");
+            // StopTask answers at once and starts no second Docker stop next to the running one.
+            EcsTask answer = CompletableFuture.supplyAsync(() ->
+                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION))
+                    .get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+            assertEquals("STOPPING", answer.getLastStatus());
             // Holding the task's monitor while the first stop fails lets a tick retry it before
             // StopTask, woken by the failure, can take the monitor back.
             synchronized (task) {
                 failFirstStop.countDown();
-                for (int i = 0; i < 100 && !retryEntered.await(50, TimeUnit.MILLISECONDS); i++) {
-                    service.reconcile();
-                }
-                assertEquals(0, retryEntered.getCount(), "no tick retried the failed stop");
+                // A stop that fails ends without the task's monitor, so it is over before the tick.
+                service.awaitPendingStops();
+                service.reconcile();
+                assertTrue(retryEntered.await(5, TimeUnit.SECONDS), "the tick did not retry the failed stop");
             }
-            assertThrows(TimeoutException.class, () -> userStop.get(500, TimeUnit.MILLISECONDS),
-                    "StopTask answers once the retry has landed, not while it runs");
         } finally {
             failFirstStop.countDown();
             releaseRetry.countDown();
         }
 
-        EcsTask stopped = userStop.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        service.awaitPendingStops();
+        EcsTask stopped = describe(service, task);
         assertEquals("STOPPED", stopped.getLastStatus());
         assertEquals(137, stopped.getContainers().getFirst().getExitCode());
         assertEquals(2, stops.get());
@@ -403,27 +467,7 @@ class EcsGracefulStopConcurrencyServiceTest {
         assertEquals("RUNNING", lastStatus(service, replacement));
     }
 
-    @Test
-    void teardownPreparationPausesReconciliationUntilReset() throws Exception {
-        EcsService service = newService();
-        createService(service, "draining", 1);
-        tick(service);
-        EcsTask original = onlyRunningTask(service, "draining");
-
-        service.beginTeardown();
-        assertTrue(service.isReconcilerShutdown(), "preparation stops the scheduler before other owners drain");
-        service.updateService(CLUSTER, "draining", null, 2, null, REGION);
-        tick(service);
-        service.reconcileServices();
-        verify(containerManager, times(1)).startTask(any(), any(), any(), anyString());
-
-        service.stopManagedContainers();
-        verify(containerManager).stopTask(handleOf(original));
-        service.clear();
-        service.afterReset();
-        tick(service);
-        assertEquals(2, runningTasks(service, "draining").size(), "reset resumes the desired service count");
-    }
+    
 
     @Test
     void preparationInterruptsTheScheduledPullBeforeWaitingForItsPass() throws Exception {
@@ -508,42 +552,7 @@ class EcsGracefulStopConcurrencyServiceTest {
         }
     }
 
-    @Test
-    void teardownPreparationWaitsForTaskLaunchBeforeStoppingContainers() throws Exception {
-        EcsService service = newService();
-        createService(service, "launching", 1);
-        CountDownLatch launchEntered = new CountDownLatch(1);
-        CountDownLatch releaseLaunch = new CountDownLatch(1);
-        doAnswer(invocation -> {
-            EcsTask task = invocation.getArgument(0);
-            launchEntered.countDown();
-            assertTrue(releaseLaunch.await(30, TimeUnit.SECONDS), "test must release the in-flight launch");
-            Container container = new Container();
-            container.setName("app");
-            container.setRuntimeId("launching-container");
-            task.setContainers(List.of(container));
-            return new EcsTaskHandle(task.getTaskArn(), Map.of("app", container.getRuntimeId()), Map.of());
-        }).when(containerManager).startTask(any(), any(), any(), anyString());
-        FutureTask<Void> launch = startTick(service);
-        FutureTask<Void> preparation = new FutureTask<>(service::beginTeardown, null);
-        Thread preparationThread = new Thread(preparation, "test-ecs-teardown-preparation");
-        preparationThread.setDaemon(true);
-        try {
-            assertTrue(launchEntered.await(5, TimeUnit.SECONDS), "the task launch must be in flight");
-            preparationThread.start();
-            Thread.State state = ThreadStates.awaitState(preparationThread,
-                    EnumSet.of(Thread.State.TIMED_WAITING, Thread.State.TERMINATED), TICK_BUDGET,
-                    "teardown preparation");
-            assertEquals(Thread.State.TIMED_WAITING, state, "preparation must wait for the admitted task launch");
-        } finally {
-            releaseLaunch.countDown();
-        }
-        launch.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
-        preparation.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
-        EcsTask launched = onlyRunningTask(service, "launching");
-        service.stopManagedContainers();
-        verify(containerManager).stopTask(handleOf(launched));
-    }
+    
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

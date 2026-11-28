@@ -39,6 +39,22 @@ class CloudFrontKeyValueStoreServiceTest {
     }
 
     @Test
+    void storeIdentityUsesTheDeploymentPartitionAndExactReturnedArn() {
+        StorageFactory factory = Mockito.mock(StorageFactory.class);
+        when(factory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenAnswer(call -> AccountAwareStorageBackend.inMemory(ACCOUNT));
+        CloudFrontKeyValueStoreService service = new CloudFrontKeyValueStoreService(
+                factory, new RegionResolver("cn-north-1", ACCOUNT));
+        KeyValueStore store = service.create("partition", "china");
+        assertEquals("arn:aws-cn:cloudfront::" + ACCOUNT + ":key-value-store/" + store.getId(), store.getArn());
+        assertEquals(store.getArn(), service.describeByArn(store.getArn()).getArn());
+        assertError("ResourceNotFoundException", 404,
+                () -> service.describeByArn(store.getArn().replace("arn:aws-cn:", "arn:aws:")));
+        assertError("ResourceNotFoundException", 404,
+                () -> service.describeByArn(store.getArn().replace(ACCOUNT, "111111111111")));
+    }
+
+    @Test
     void createStoresAReadyStoreWithAnArnAndAnEtag() {
         CloudFrontKeyValueStoreService service = newService();
 

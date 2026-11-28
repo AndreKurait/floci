@@ -12,6 +12,7 @@ import io.floci.aws.services.cognito.verification.CognitoMessageDispatcher;
 import io.floci.aws.services.cognito.verification.VerificationCode;
 import io.floci.aws.services.cognito.verification.VerificationCodeException;
 import io.floci.aws.services.cognito.verification.VerificationCodeService;
+import io.floci.aws.testing.LockWaits;
 import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
@@ -26,7 +27,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -62,11 +62,14 @@ class CognitoAttributeVerificationConcurrencyTest {
         CountDownLatch firstIssueEntered = new CountDownLatch(1);
         CountDownLatch releaseFirstIssue = new CountDownLatch(1);
         CountDownLatch secondStarted = new CountDownLatch(1);
+        AtomicReference<Thread> holder = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
 
         when(codes.issueTracked(anyString(), anyString(), any(), any(Duration.class)))
                 .thenAnswer(invocation -> {
                     int issue = issues.incrementAndGet();
                     if (issue == 1) {
+                        holder.set(Thread.currentThread());
                         firstIssueEntered.countDown();
                         await(releaseFirstIssue);
                     }
@@ -89,12 +92,13 @@ class CognitoAttributeVerificationConcurrencyTest {
             assertTrue(firstIssueEntered.await(5, TimeUnit.SECONDS));
 
             Future<?> second = executor.submit(() -> {
+                waiter.set(Thread.currentThread());
                 secondStarted.countDown();
                 harness.service().updateUserAttributes(
                         harness.accessToken(), Map.of("email", SECOND_EMAIL));
             });
             assertTrue(secondStarted.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class, () -> second.get(100, TimeUnit.MILLISECONDS));
+            LockWaits.awaitBlockedBehind(waiter, holder, second);
             releaseFirstIssue.countDown();
             first.get(5, TimeUnit.SECONDS);
             second.get(5, TimeUnit.SECONDS);
@@ -122,11 +126,14 @@ class CognitoAttributeVerificationConcurrencyTest {
         CountDownLatch resendIssueEntered = new CountDownLatch(1);
         CountDownLatch releaseResendIssue = new CountDownLatch(1);
         CountDownLatch updateStarted = new CountDownLatch(1);
+        AtomicReference<Thread> holder = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
 
         when(codes.issueTracked(anyString(), anyString(), any(), any(Duration.class)))
                 .thenAnswer(invocation -> {
                     int issue = issues.incrementAndGet();
                     if (issue == 2) {
+                        holder.set(Thread.currentThread());
                         resendIssueEntered.countDown();
                         await(releaseResendIssue);
                     }
@@ -146,12 +153,13 @@ class CognitoAttributeVerificationConcurrencyTest {
             assertTrue(resendIssueEntered.await(5, TimeUnit.SECONDS));
 
             Future<?> update = executor.submit(() -> {
+                waiter.set(Thread.currentThread());
                 updateStarted.countDown();
                 harness.service().updateUserAttributes(
                         harness.accessToken(), Map.of("email", SECOND_EMAIL));
             });
             assertTrue(updateStarted.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class, () -> update.get(100, TimeUnit.MILLISECONDS));
+            LockWaits.awaitBlockedBehind(waiter, holder, update);
             releaseResendIssue.countDown();
             Map<String, Object> resendResult = resend.get(5, TimeUnit.SECONDS);
             update.get(5, TimeUnit.SECONDS);
@@ -177,6 +185,8 @@ class CognitoAttributeVerificationConcurrencyTest {
         CountDownLatch consumeEntered = new CountDownLatch(1);
         CountDownLatch releaseConsume = new CountDownLatch(1);
         CountDownLatch updateStarted = new CountDownLatch(1);
+        AtomicReference<Thread> holder = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
 
         when(codes.issueTracked(anyString(), anyString(), any(), any(Duration.class)))
                 .thenAnswer(invocation -> {
@@ -186,6 +196,7 @@ class CognitoAttributeVerificationConcurrencyTest {
                 });
         doAnswer(invocation -> {
             assertEquals(FIRST_CODE, invocation.getArgument(3));
+            holder.set(Thread.currentThread());
             consumeEntered.countDown();
             await(releaseConsume);
             return null;
@@ -201,12 +212,13 @@ class CognitoAttributeVerificationConcurrencyTest {
             assertTrue(consumeEntered.await(5, TimeUnit.SECONDS));
 
             Future<?> update = executor.submit(() -> {
+                waiter.set(Thread.currentThread());
                 updateStarted.countDown();
                 harness.service().updateUserAttributes(
                         harness.accessToken(), Map.of("email", SECOND_EMAIL));
             });
             assertTrue(updateStarted.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class, () -> update.get(100, TimeUnit.MILLISECONDS));
+            LockWaits.awaitBlockedBehind(waiter, holder, update);
             releaseConsume.countDown();
             verify.get(5, TimeUnit.SECONDS);
             update.get(5, TimeUnit.SECONDS);
@@ -228,11 +240,14 @@ class CognitoAttributeVerificationConcurrencyTest {
         CountDownLatch consumeEntered = new CountDownLatch(1);
         CountDownLatch releaseConsume = new CountDownLatch(1);
         CountDownLatch adminStarted = new CountDownLatch(1);
+        AtomicReference<Thread> holder = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
 
         when(codes.issueTracked(anyString(), anyString(), any(), any(Duration.class)))
                 .thenReturn(new VerificationCodeService.IssuedCode(FIRST_CODE, "test-hash"));
         doAnswer(invocation -> {
             assertEquals(FIRST_CODE, invocation.getArgument(3));
+            holder.set(Thread.currentThread());
             consumeEntered.countDown();
             await(releaseConsume);
             return null;
@@ -247,13 +262,13 @@ class CognitoAttributeVerificationConcurrencyTest {
             assertTrue(consumeEntered.await(5, TimeUnit.SECONDS));
 
             Future<?> adminUpdate = executor.submit(() -> {
+                waiter.set(Thread.currentThread());
                 adminStarted.countDown();
                 harness.service().adminUpdateUserAttributes(
                         harness.poolId(), "alice", Map.of("email", ADMIN_EMAIL));
             });
             assertTrue(adminStarted.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class,
-                    () -> adminUpdate.get(100, TimeUnit.MILLISECONDS));
+            LockWaits.awaitBlockedBehind(waiter, holder, adminUpdate);
 
             releaseConsume.countDown();
             verify.get(5, TimeUnit.SECONDS);
@@ -277,11 +292,14 @@ class CognitoAttributeVerificationConcurrencyTest {
         CountDownLatch consumeEntered = new CountDownLatch(1);
         CountDownLatch releaseConsume = new CountDownLatch(1);
         CountDownLatch adminStarted = new CountDownLatch(1);
+        AtomicReference<Thread> holder = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
 
         when(codes.issueTracked(anyString(), anyString(), any(), any(Duration.class)))
                 .thenReturn(new VerificationCodeService.IssuedCode(FIRST_CODE, "test-hash"));
         doAnswer(invocation -> {
             assertEquals(FIRST_CODE, invocation.getArgument(3));
+            holder.set(Thread.currentThread());
             consumeEntered.countDown();
             await(releaseConsume);
             return null;
@@ -296,13 +314,13 @@ class CognitoAttributeVerificationConcurrencyTest {
             assertTrue(consumeEntered.await(5, TimeUnit.SECONDS));
 
             Future<?> adminDelete = executor.submit(() -> {
+                waiter.set(Thread.currentThread());
                 adminStarted.countDown();
                 harness.service().adminDeleteUserAttributes(
                         harness.poolId(), "alice", List.of("email"));
             });
             assertTrue(adminStarted.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class,
-                    () -> adminDelete.get(100, TimeUnit.MILLISECONDS));
+            LockWaits.awaitBlockedBehind(waiter, holder, adminDelete);
 
             releaseConsume.countDown();
             verify.get(5, TimeUnit.SECONDS);
@@ -325,11 +343,14 @@ class CognitoAttributeVerificationConcurrencyTest {
         CountDownLatch consumeEntered = new CountDownLatch(1);
         CountDownLatch releaseConsume = new CountDownLatch(1);
         CountDownLatch adminStarted = new CountDownLatch(1);
+        AtomicReference<Thread> holder = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
 
         when(codes.issueTracked(anyString(), anyString(), any(), any(Duration.class)))
                 .thenReturn(new VerificationCodeService.IssuedCode(FIRST_CODE, "test-hash"));
         doAnswer(invocation -> {
             assertEquals(FIRST_CODE, invocation.getArgument(3));
+            holder.set(Thread.currentThread());
             consumeEntered.countDown();
             await(releaseConsume);
             return null;
@@ -344,12 +365,12 @@ class CognitoAttributeVerificationConcurrencyTest {
             assertTrue(consumeEntered.await(5, TimeUnit.SECONDS));
 
             Future<?> adminDelete = executor.submit(() -> {
+                waiter.set(Thread.currentThread());
                 adminStarted.countDown();
                 harness.service().adminDeleteUser(harness.poolId(), "alice");
             });
             assertTrue(adminStarted.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class,
-                    () -> adminDelete.get(100, TimeUnit.MILLISECONDS));
+            LockWaits.awaitBlockedBehind(waiter, holder, adminDelete);
 
             releaseConsume.countDown();
             verify.get(5, TimeUnit.SECONDS);
@@ -377,11 +398,14 @@ class CognitoAttributeVerificationConcurrencyTest {
         CountDownLatch consumeEntered = new CountDownLatch(1);
         CountDownLatch releaseConsume = new CountDownLatch(1);
         CountDownLatch changeStarted = new CountDownLatch(1);
+        AtomicReference<Thread> holder = new AtomicReference<>();
+        AtomicReference<Thread> waiter = new AtomicReference<>();
 
         when(codes.issueTracked(anyString(), anyString(), any(), any(Duration.class)))
                 .thenReturn(new VerificationCodeService.IssuedCode(FIRST_CODE, "test-hash"));
         doAnswer(invocation -> {
             assertEquals(FIRST_CODE, invocation.getArgument(3));
+            holder.set(Thread.currentThread());
             consumeEntered.countDown();
             await(releaseConsume);
             return null;
@@ -396,12 +420,12 @@ class CognitoAttributeVerificationConcurrencyTest {
             assertTrue(consumeEntered.await(5, TimeUnit.SECONDS));
 
             Future<?> changePassword = executor.submit(() -> {
+                waiter.set(Thread.currentThread());
                 changeStarted.countDown();
                 harness.service().changePassword(harness.accessToken(), "Permanent1!", "Permanent2!");
             });
             assertTrue(changeStarted.await(5, TimeUnit.SECONDS));
-            assertThrows(TimeoutException.class,
-                    () -> changePassword.get(100, TimeUnit.MILLISECONDS));
+            LockWaits.awaitBlockedBehind(waiter, holder, changePassword);
 
             releaseConsume.countDown();
             verify.get(5, TimeUnit.SECONDS);

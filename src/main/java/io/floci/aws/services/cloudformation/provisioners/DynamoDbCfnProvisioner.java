@@ -12,6 +12,9 @@ import io.floci.aws.core.common.SmithyValidationErrors;
 import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Api;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Call;
 import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Scope;
 import io.floci.aws.services.dynamodb.backend.DynamoDbTableAccess.CapacityUnits;
 import io.floci.aws.services.dynamodb.backend.DynamoDbTableAccess.ThroughputChange;
@@ -54,10 +57,10 @@ import java.util.Set;
  *
  * <p>A table's {@code TimeToLiveSpecification} is reconciled against what DescribeTimeToLive
  * reports, so UpdateTimeToLive is called only when the setting differs. Its
- * {@code KinesisStreamSpecification} is reconciled against the table's active Kinesis streaming
- * destinations the same way. An in-place update of an {@code AWS::DynamoDB::Table} keeps the tags,
- * stream, TTL setting and Kinesis streaming destinations it replaces, so a failed stack update can
- * put all four back.
+ * {@code KinesisStreamSpecification} is reconciled against active streaming destinations.
+ * In-place updates retain tags, stream, TTL, deletion protection and Kinesis destinations
+ * for rollback. Stack deletion uses the public DynamoDB operation and respects protection
+ * enabled either by the stack or through the DynamoDB API.
  */
 @ApplicationScoped
 public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
@@ -86,10 +89,12 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private final DynamoDbFacade dynamoDb;
+    private final DynamoDbOperations operations;
 
     @Inject
-    public DynamoDbCfnProvisioner(DynamoDbFacade dynamoDb) {
+    public DynamoDbCfnProvisioner(DynamoDbFacade dynamoDb, DynamoDbOperations operations) {
         this.dynamoDb = dynamoDb;
+        this.operations = operations;
     }
 
     @Override
@@ -125,7 +130,8 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
             case "AWS::DynamoDB::Table", "AWS::DynamoDB::GlobalTable" -> CfnDeletes.safeDelete(
                     "DynamoDB table", physicalId,
                     // Deletes get no ProvisionContext; the engine and Cloud Control run them as the stack account.
-                    () -> dynamoDb.tables().deleteTable(dynamoDb.scope(region), physicalId),
+                    () -> callDynamoDb(dynamoDb.scope(region), "DeleteTable",
+                            MAPPER.createObjectNode().put("TableName", physicalId)),
                     "ResourceNotFoundException");
             // Nothing to derive from the id alone once the attributes are gone; the replica stays.
             case "Custom::DynamoDBReplica" -> LOG.warnv(
@@ -147,6 +153,14 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
         Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
         CloudFormationTemplateEngine engine = ctx.engine();
         String region = ctx.region();
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(engine);
+        JsonNode protection = TABLE.equals(r.getResourceType()) && props != null
+                ? types.read("DeletionProtectionEnabled", props.get("DeletionProtectionEnabled"),
+                        CfnPropertyTypes.propertyShape(TABLE, "DeletionProtectionEnabled")) : null;
+        types.finish();
+        boolean protectionManaged = TABLE.equals(r.getResourceType())
+                && (protection != null || ctx.previouslyDeclared("DeletionProtectionEnabled"));
+        boolean desiredProtection = protection != null && protection.booleanValue();
         // The engine's change decides whether the update replaces the table: TableName and
         // ImportSourceSpecification are create-only in the registry. A named table cannot be
         // replaced under the same name.
@@ -379,6 +393,9 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 r.getAttributes().put("TableId", table.getTableId());
                 reconcileGlobalTableReplicas(tableName, props, ctx);
             }
+            if (protectionManaged) {
+                reconcileDeletionProtection(scope, tableName, table, desiredProtection);
+            }
             // Only a live stream has an ARN worth handing to Fn::GetAtt. Publishing one unconditionally
             // resolved to nothing on a streamless table; publishing the retained ARN of a stream that
             // has since been switched off would resolve to something no longer running. An update
@@ -571,6 +588,23 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 r.setPhysicalId(tableName);
                 r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
             }
+        }
+    }
+
+    private void callDynamoDb(Scope scope, String action, ObjectNode request) {
+        try {
+            operations.execute(new Call(scope, Api.DYNAMODB, action, request)).successBody();
+        } catch (RuntimeException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw new IllegalStateException("DynamoDB " + action + " failed", failure);
+        }
+    }
+
+    private void reconcileDeletionProtection(Scope scope, String tableName, TableDefinition table, boolean enabled) {
+        if (table.isDeletionProtectionEnabled() != enabled) {
+            callDynamoDb(scope, "UpdateTable", MAPPER.createObjectNode()
+                    .put("TableName", tableName).put("DeletionProtectionEnabled", enabled));
         }
     }
 
@@ -781,6 +815,7 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
                 indexCapacities.set(gsi.getIndexName(), capacityNode(gsi.getProvisionedThroughput()));
             }
         }
+        snapshot.put("deletionProtectionEnabled", table.isDeletionProtectionEnabled());
         if (kinesisManaged) {
             ArrayNode destinations = snapshot.putArray("kinesisDestinations");
             for (KinesisDestinationSpec destination : activeKinesisDestinations(table)) {
@@ -898,6 +933,10 @@ public class DynamoDbCfnProvisioner implements CfnResourceProvisioner {
             table = reconcileKinesisDestinations(scope, tableName, table, priorDestinations, false);
         }
 
+        if (snapshot.has("deletionProtectionEnabled")) {
+            reconcileDeletionProtection(scope, tableName, table,
+                    snapshot.path("deletionProtectionEnabled").asBoolean());
+        }
         publishStreamArn(resource, table);
         resource.getAttributes().remove(CfnRollback.DYNAMODB_TABLE_UPDATE_SNAPSHOT_ATTR);
         return true;

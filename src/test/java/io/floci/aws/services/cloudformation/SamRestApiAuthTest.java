@@ -152,7 +152,7 @@ class SamRestApiAuthTest {
     @ParameterizedTest
     @ValueSource(strings = {
             "{\"Authorizers\":{}}", "{\"Authorizers\":{\"custom\":{\"FunctionArn\":\"example\"}}}",
-            "{\"ResourcePolicy\":{}}", "{\"UsagePlan\":{}}",
+            "{\"UsagePlan\":{}}",
             "{\"InvokeRole\":\"CALLER_CREDENTIALS\"}", "{\"AddDefaultAuthorizerToCorsPreflight\":false}",
             "{\"DefaultAuthorizer\":\"CUSTOM\"}", "{\"DefaultAuthorizer\":null}",
             "{\"ApiKeyRequired\":\"true\"}", "\"AWS_IAM\""

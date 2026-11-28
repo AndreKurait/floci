@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.LongNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.services.cloudformation.CloudFormationDriftSnapshot;
 import io.floci.aws.services.cloudformation.model.StackEvent;
 import io.floci.aws.services.cloudformation.model.StackResource;
 
@@ -25,6 +27,30 @@ import java.util.function.Consumer;
 public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
+
+    /** Only a real provider read can qualify drift; unimplemented readers must not report IN_SYNC. */
+    default CfnDriftProjection readDrift(CloudFormationDriftSnapshot.Resource resource, JsonNode properties,
+                                        String account, String region) {
+        throw new AwsException("ValidationError", "Drift detection is not implemented for " + resource.type(), 400);
+    }
+
+    /** Ref can expose one part of a resource's compound physical identity. */
+    default String referenceValue(String physicalId) {
+        return physicalId;
+    }
+
+    /**
+     * Replacement rules that depend on the desired properties, which may still contain unresolved
+     * expressions. This read-only preview cannot override unconditional create-only schema properties.
+     */
+    default Map<String, CfnReplacement> conditionalReplacements(String resourceType, JsonNode properties) {
+        return Map.of();
+    }
+
+    /** Public CFN responses can expose one part of an internally compound physical identity. */
+    default String publicPhysicalId(String physicalId) {
+        return physicalId;
+    }
 
     /** GetAtt attributes the registry schema types as integers, by resource type. */
     default Map<String, Set<String>> integerAttributes() {
@@ -53,6 +79,18 @@ public interface CfnResourceProvisioner {
 
     void provision(StackResource resource, JsonNode properties, ProvisionContext ctx);
 
+    /** Read-only identifier properties accepted when importing an existing resource. */
+    default Set<String> importIdentifiers(String resourceType) {
+        return Set.of();
+    }
+
+    /** Reads an existing entity and sets its reference attributes without changing the entity. */
+    default void importResource(StackResource resource, JsonNode properties, Map<String, String> identifiers,
+                                ProvisionContext ctx) {
+        throw new AwsException("ValidationError",
+                "Resource import is not supported for " + resource.getResourceType(), 400);
+    }
+
     /**
      * True when the service this provisioner wraps is turned off. {@link CloudFormationResourceRegistry}
      * then serves none of its types, so the dispatcher stubs them instead of provisioning them.
@@ -64,6 +102,16 @@ public interface CfnResourceProvisioner {
     /** The config property that turns this provisioner's service on, named in messages about it being off. */
     default String serviceEnabledFlag() {
         return null;
+    }
+
+    /** Whether a stored resource lacks ownership metadata needed for its next lifecycle operation. */
+    default boolean requiresOwnershipRecovery(StackResource resource) {
+        return false;
+    }
+
+    /** Recovers metadata on a copy, using only the stack's previous template and resource identities. */
+    default void recoverOwnership(StackResource resource, JsonNode properties, ProvisionContext context) {
+        // Existing provisioners already retain their required ownership metadata.
     }
 
     /** Most implementations delegate to {@code service.deleteX(physicalId, region)}. */

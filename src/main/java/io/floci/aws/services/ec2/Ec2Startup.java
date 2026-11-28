@@ -19,6 +19,7 @@ public class Ec2Startup {
 
     // Run after the lifecycle's boot hooks and persistent-path validation.
     void onStart(@Observes @Priority(Interceptor.Priority.APPLICATION + 600) StartupEvent ignored) {
+        service.restoreMetadataRegistrations();
         service.seedDefaultRegionIfEnabled();
     }
 }

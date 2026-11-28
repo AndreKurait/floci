@@ -192,6 +192,7 @@ With IAM enforcement enabled, its permission can be scoped to the selected origi
 | `PublishFunction` | POST | `/2020-05-31/function/{Name}/publish` |
 | `DeleteFunction` | DELETE | `/2020-05-31/function/{Name}` |
 | `ListFunctions` | GET | `/2020-05-31/function` |
+| `TestFunction` | POST | `/2020-05-31/function/{Name}/test` |
 
 ### Key Value Stores
 
@@ -265,16 +266,34 @@ These operations store what they are given and return it, so code that manages t
 | Operation | Method | Path |
 |---|---|---|
 | `CreateFieldLevelEncryptionConfig` | POST | `/2020-05-31/field-level-encryption` |
+| `GetFieldLevelEncryption` | GET | `/2020-05-31/field-level-encryption/{Id}` |
 | `GetFieldLevelEncryptionConfig` | GET | `/2020-05-31/field-level-encryption/{Id}/config` |
 | `UpdateFieldLevelEncryptionConfig` | PUT | `/2020-05-31/field-level-encryption/{Id}/config` |
 | `DeleteFieldLevelEncryptionConfig` | DELETE | `/2020-05-31/field-level-encryption/{Id}` |
 | `ListFieldLevelEncryptionConfigs` | GET | `/2020-05-31/field-level-encryption` |
 | `CreateFieldLevelEncryptionProfile` | POST | `/2020-05-31/field-level-encryption-profile` |
 | `GetFieldLevelEncryptionProfile` | GET | `/2020-05-31/field-level-encryption-profile/{Id}` |
+| `GetFieldLevelEncryptionProfileConfig` | GET | `/2020-05-31/field-level-encryption-profile/{Id}/config` |
 | `UpdateFieldLevelEncryptionProfile` | PUT | `/2020-05-31/field-level-encryption-profile/{Id}/config` |
 | `DeleteFieldLevelEncryptionProfile` | DELETE | `/2020-05-31/field-level-encryption-profile/{Id}` |
 | `ListFieldLevelEncryptionProfiles` | GET | `/2020-05-31/field-level-encryption-profile` |
 
+Creation and replacement updates persist the query-argument and content-type profile mappings,
+including their forwarding flags, and profile encryption entities with public-key IDs, provider
+IDs and field patterns. Omitted optional blocks remain absent, and zero-count collections remain
+empty. Declared quantities must match the submitted items. Profile IDs and public-key IDs must
+resolve in the caller's account. Field patterns are case-sensitive and cannot overlap. Rejected
+requests preserve the prior configuration and ETag. Nested configuration and profile metadata
+survive persistent, hybrid, and WAL reloads. Older persisted profiles whose encryption entities
+were discarded remain readable, but their lost entities cannot be reconstructed.
+
+`GetFieldLevelEncryption` and `GetFieldLevelEncryptionProfile` return the stored ID,
+last-modified time and nested configuration; their `Config` getters return the configuration
+directly. All four return the current ETag and authorize their own IAM action against the global
+`arn:${Partition}:cloudfront::${Account}:field-level-encryption-config/${Id}` or
+`arn:${Partition}:cloudfront::${Account}:field-level-encryption-profile/${Id}` resource.
+Ownership follows the signing credential's account. These operations manage metadata;
+viewer field encryption and profile-reference deletion constraints are outside this implementation.
 #### Monitoring subscriptions
 
 | Operation | Method | Path |
@@ -303,6 +322,12 @@ These operations store what they are given and return it, so code that manages t
 
 ## Behavior
 
+- The matching cache behavior's `ViewerProtocolPolicy` applies to HTTP and WebSocket viewers.
+  `https-only` rejects HTTP with 403. `redirect-to-https` returns 301 for GET/HEAD and 307 for
+  other allowed HTTP/1.1-or-later methods; those other methods receive 403 over HTTP/1.0.
+  Redirects preserve the raw path and query. All three policies accept HTTPS, and denied or
+  redirected requests do not reach the origin. Local delivery URLs retain explicit ports other
+  than the default HTTP port 80.
 - All distributions are immediately set to `Deployed` state (no async `InProgress` delay).
 - Distribution IDs are 14 uppercase alphanumeric characters starting with `E` (e.g. `E1Z2X3C4V5B6N7`).
 - Distribution domain names follow the pattern `{id}.cloudfront.net`, with the id lower-cased as AWS
@@ -333,6 +358,10 @@ These operations store what they are given and return it, so code that manages t
   method; any other method returns 403 `Invalid method.`. A behavior without `AllowedMethods` allows
   GET and HEAD. Origin forwarding preserves the raw path, including `%25` for a literal percent
   sign, on generated domains and aliases. Custom-origin redirects are not followed.
+- Viewer host lookup spans accounts, while management APIs remain account-scoped. Policy and key
+  references resolve in the distribution's owning account without replacing the viewer identity
+  used for origin authorization. Equally specific conflicting stored host claims are not routed.
+  Cross-account S3 origins use the existing `FLOCI_SERVICES_S3_GLOBAL_BUCKET_NAMESPACE=true` setting.
 - POST, PUT, PATCH and DELETE are forwarded to custom origins with the viewer request body and its
   `Content-Type`. The body is streamed to the origin with the viewer's `Content-Length`, or chunked
   when the viewer sent it chunked or, as HTTP/2 allows, with no length, so it is never held in
@@ -558,6 +587,10 @@ These operations store what they are given and return it, so code that manages t
   certificate, no `Aliases` or `PriceClass`) are not enforced, because no error code is published
   for them, and an omitted `ViewerCertificate` on a `tenant-only` distribution reads as the default
   certificate, the same as on a standard one. AWS documents no default for that case.
+
+- CloudFormation distribution create and update preserve `ViewerCertificate`, including resolved
+  references and conditions. The CloudFormation names `AcmCertificateArn`, `IamCertificateId` and
+  `SslSupportMethod` map to the corresponding CloudFront API fields.
 - Up to 20 custom response headers policies can be created, and one policy can be associated with
   up to 100 distributions.
 - The five AWS managed response headers policy IDs are available and can be selected with
@@ -600,14 +633,57 @@ and described through the CloudFront control plane, and its keys are managed thr
 - A function can name at most one store in `FunctionConfig.KeyValueStoreAssociations`, and only with the
   `cloudfront-js-2.0` runtime. The store has to exist (`EntityNotFound`), and a store that a function
   uses cannot be deleted (`CannotDeleteEntityWhileInUse`).
-- Floci does not run CloudFront Functions. A function that reads the store with `cf.kvs()` is stored and
-  associated, but nothing executes it, so the store is useful for testing the code that writes it.
+- KVS APIs are not available to `TestFunction`, and Floci does not execute functions on edge delivery.
+  A function that reads the store with `cf.kvs()` can be stored and associated; the data plane supports
+  testing the code that writes those keys.
+
+## Testing function code
+
+`TestFunction` executes a captured DEVELOPMENT or LIVE source version in a fresh disposable
+Node container. Supply its current `If-Match` version and a base64-encoded JSON event through
+the normal SDK request. The response contains the captured function summary, bounded console
+logs and request/response output, or a function execution error. Testing does not publish code
+or change its configuration. ComputeUtilization is omitted; no AWS utilization percentage is
+estimated. Viewer delivery constraints, including required headers, are not validated here.
+
+This local runtime supports synchronous JavaScript handlers. Modules, async handlers, KVS APIs,
+edge delivery, and complete CloudFront JavaScript runtime compatibility are not implemented.
+Each call uses a stock Node 22 image and Docker as its isolation boundary; Node VM contexts alone
+are not a security boundary. The container has no network, host mounts, Docker socket or caller
+credential environment. It runs as uid/gid 1000 with a read-only filesystem, all capabilities
+dropped, no new privileges, 128 MiB memory including swap, one CPU and a 64-task PID limit.
+The common manager may copy Floci's public CA certificate and public trust settings into it;
+no private CA key or credential is intentionally provided.
+
+Four calls may be admitted at once, with no waiting queue. Event input is limited to 40,960 UTF-8
+bytes, local source to 10 KiB, output to 40,960 bytes and logs to 100 lines / 8 KiB. Evaluation
+inside the VM has a two-second timeout. An independent five-second watchdog is armed before
+container start and requests strict removal even if the start response or output attachment is
+blocked. Docker image preparation and transport calls use the common manager's deadlines;
+Docker unavailability can delay HTTP completion and confirmed removal. Failed or uncertain
+cleanup retains the invocation and its capacity until a later strict cleanup confirms absence.
+A failed create with no returned container ID remains uncertain even if its unique name is initially
+absent; it is reconciled only after an owned container is observed and removed. This uncertainty
+can prevent reset from clearing storage.
+Reset closes admission and must drain these receipts before storage is cleared.
+
+The execution deadline stops once a complete, bounded result has been collected. Strict container
+cleanup then keeps its separate 30-second confirmation budget and retains the invocation's capacity
+until removal is confirmed. A genuine emulator reset still cancels the response during cleanup.
+
+IAM checks `cloudfront:TestFunction` on the function ARN and its current resource tags. Its new
+snapshot/tag reads do not migrate legacy rows. Source capture is synchronized with the existing
+function writers; a later update or publication cannot replace the captured result's version.
+IAM evaluation and later snapshot capture are separate operations. Function records retain the
+existing account/global storage semantics and do not persist independent partition provenance;
+the response ARN captures the request's partition. Existing tag rows remain ARN-scoped.
 
 ## Configuration
 
 | Property | Env var | Default | Description |
 |---|---|---|---|
 | `floci.services.cloudfront.enabled` | `FLOCI_SERVICES_CLOUDFRONT_ENABLED` | `true` | Enable or disable the service |
+| `floci.services.cloudfront.function-runtime-image` | `FLOCI_SERVICES_CLOUDFRONT_FUNCTION_RUNTIME_IMAGE` | `node:22-alpine` | Image for each disposable TestFunction process |
 | `floci.services.cloudfront.domain-suffix` | `FLOCI_SERVICES_CLOUDFRONT_DOMAIN_SUFFIX` | unset | Domain suffix for generated distribution domain names. Unset, it follows the request's partition: `cloudfront.net`, or `cloudfront.cn` in China. A configured suffix applies in every partition |
 | `floci.services.cloudfront.allowed-private-origin-hosts` | `FLOCI_SERVICES_CLOUDFRONT_ALLOWED_PRIVATE_ORIGIN_HOSTS` | `[]` | Exact custom-origin hosts permitted to resolve to private/non-routable addresses (comma-separated in the environment variable) |
 
@@ -805,3 +881,18 @@ signatures must still return 403. Verify those cases through the proxy after con
 - Forwarding POST, PUT, PATCH and DELETE to S3 origins. AWS passes them to S3, which evaluates them
   against the bucket policy (OAC supports `PUT` and `DELETE`); Floci's in-process S3 origin answers
   them with 403 `Access Denied`, as S3 does for a request that holds no write grant.
+
+### Key value store version checks
+
+The control plane keeps an ETag separate from the data plane's ETag. Updating a comment changes only the
+control ETag; writing keys changes only the data ETag. `UpdateKeyValueStore` and `DeleteKeyValueStore`
+return `412 PreconditionFailed` for a valid but stale control ETag, and `400 InvalidIfMatchVersion` for a
+missing or malformed version. Rejected requests preserve the store and its current versions. Floci keeps
+accepting the UUID versions it issues and persists; it also recognizes the observed CloudFront `E` plus
+13 uppercase alphanumeric form. This is a bounded compatibility rule, not a published AWS format guarantee.
+
+The dev backport adds IAM route and resource coverage for these five KVS control operations and the six
+`cloudfront-keyvaluestore` data operations. Other CloudFront control operations keep their previous IAM
+coverage. Native SDK tests use canonical SigV4A credentials with IAM enforcement; enabling the optional
+`validate-signatures` setting still rejects SigV4A in the existing global signature filter. This feature
+adds no SigV4A cryptographic verification or CloudFront Function execution engine.

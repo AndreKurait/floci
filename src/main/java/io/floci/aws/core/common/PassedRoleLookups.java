@@ -42,6 +42,24 @@ public class PassedRoleLookups {
     PassedRoles.Lookups in(String partition, String accountId, String region) {
         return new PassedRoles.Lookups() {
             @Override
+            public List<String> importedHttpApiRoles(String document) {
+                List<String> roles = new ArrayList<>();
+                for (PassedRoleLookup lookup : services()) {
+                    roles.addAll(lookup.importedHttpApiRoles(document, region));
+                }
+                return roles;
+            }
+
+            @Override
+            public List<String> importedRestApiRoles(String document) {
+                List<String> roles = new ArrayList<>();
+                for (PassedRoleLookup lookup : services()) {
+                    roles.addAll(lookup.importedRestApiRoles(document, region));
+                }
+                return roles;
+            }
+
+            @Override
             public List<String> instanceProfileRoleArns(String profileName, String profileArn) {
                 return PassedRoleLookups.this.instanceProfileRoleArns(accountId, profileName, profileArn);
             }
@@ -92,7 +110,7 @@ public class PassedRoleLookups {
 
             @Override
             public List<String> openApiDefinitions(String operation, String body) {
-                for (PassedRoleLookup lookup : services) {
+                for (PassedRoleLookup lookup : services()) {
                     List<String> definitions = lookup.openApiDefinitions(operation, body, region);
                     if (!definitions.isEmpty()) {
                         return definitions;

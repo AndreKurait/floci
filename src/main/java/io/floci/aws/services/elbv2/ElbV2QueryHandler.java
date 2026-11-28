@@ -71,6 +71,7 @@ public class ElbV2QueryHandler {
                 case "ModifyLoadBalancerAttributes"  -> handleModifyLoadBalancerAttributes(params, region);
                 case "DescribeLoadBalancerAttributes"-> handleDescribeLoadBalancerAttributes(params, region);
                 case "DescribeCapacityReservation"   -> handleDescribeCapacityReservation(params, region);
+                case "DescribeProvisionedCapacity"   -> handleDescribeProvisionedCapacity(params, region);
                 case "SetSecurityGroups"             -> handleSetSecurityGroups(params, region);
                 case "SetSubnets"                    -> handleSetSubnets(params, region);
                 case "SetIpAddressType"              -> handleSetIpAddressType(params, region);
@@ -234,6 +235,31 @@ public class ElbV2QueryHandler {
            .raw(AwsQueryResponse.responseMetadata())
            .end("DescribeCapacityReservationResponse");
         return Response.ok(xml.build()).type(MediaType.APPLICATION_XML).build();
+    }
+
+    private Response handleDescribeProvisionedCapacity(MultivaluedMap<String, String> p, String region) {
+        List<String> versions = p.get("Version");
+        if (versions == null || versions.size() != 1 || !"2015-12-01".equals(versions.get(0))) {
+            throw new AwsException("ValidationError", "Version must be 2015-12-01.", 400);
+        }
+        List<String> arns = p.get("LoadBalancerArn");
+        if (arns == null || arns.size() != 1) {
+            throw new AwsException("ValidationError", "Exactly one LoadBalancerArn must be specified.", 400);
+        }
+        ElbV2Service.ProvisionedCapacity capacity = service.describeProvisionedCapacity(region, arns.get(0));
+        String xml = new XmlBuilder()
+                .start("DescribeProvisionedCapacityResponse", AwsNamespaces.ELB_V2)
+                .start("DescribeProvisionedCapacityResult")
+                  .start("ProvisionedCapacity")
+                    .elem("MinimumLBCapacityUnits", capacity.minimumLBCapacityUnits())
+                    .elem("Status", capacity.status())
+                    .elem("DecreasesRemaining", capacity.decreasesRemaining())
+                  .end("ProvisionedCapacity")
+                .end("DescribeProvisionedCapacityResult")
+                .raw(AwsQueryResponse.responseMetadata())
+                .end("DescribeProvisionedCapacityResponse")
+                .build();
+        return Response.ok(xml).type(MediaType.APPLICATION_XML).build();
     }
 
     private Response handleSetSecurityGroups(MultivaluedMap<String, String> p, String region) {
@@ -617,7 +643,11 @@ public class ElbV2QueryHandler {
             String arn = p.getFirst("RulePriorities.member." + i + ".RuleArn");
             String priorityStr = p.getFirst("RulePriorities.member." + i + ".Priority");
             if (arn == null) break;
-            arnToPriority.put(arn, Integer.parseInt(priorityStr));
+            if (priorityStr == null) {
+                throw new AwsException("ValidationError",
+                        "RulePriorities.member." + i + ".Priority is required.", 400);
+            }
+            arnToPriority.put(arn, parseInt(priorityStr));
             i++;
         }
         service.setRulePriorities(region, arnToPriority);
@@ -1044,11 +1074,11 @@ public class ElbV2QueryHandler {
         XmlBuilder xml = new XmlBuilder();
         xml.elem("Field", safe(c.getField()));
         xml.start("Values");
-        for (String v : c.getValues()) xml.start("member").raw(v).end("member");
+        for (String v : c.getValues()) xml.elem("member", v);
         xml.end("Values");
         if (!c.getHostHeaderValues().isEmpty()) {
             xml.start("HostHeaderConfig").start("Values");
-            for (String v : c.getHostHeaderValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHostHeaderValues()) xml.elem("member", v);
             xml.end("Values").end("HostHeaderConfig");
         }
         if (!c.getPathPatternValues().isEmpty() || !c.getPathPatternRegexValues().isEmpty()) {
@@ -1056,7 +1086,7 @@ public class ElbV2QueryHandler {
             if (!c.getPathPatternValues().isEmpty()) {
                 xml.start("Values");
                 for (String value : c.getPathPatternValues()) {
-                    xml.start("member").raw(value).end("member");
+                    xml.elem("member", value);
                 }
                 xml.end("Values");
             }
@@ -1073,17 +1103,17 @@ public class ElbV2QueryHandler {
             xml.start("HttpHeaderConfig")
                .elem("HttpHeaderName", c.getHttpHeaderName())
                .start("Values");
-            for (String v : c.getHttpHeaderValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHttpHeaderValues()) xml.elem("member", v);
             xml.end("Values").end("HttpHeaderConfig");
         }
         if (!c.getHttpMethodValues().isEmpty()) {
             xml.start("HttpRequestMethodConfig").start("Values");
-            for (String v : c.getHttpMethodValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getHttpMethodValues()) xml.elem("member", v);
             xml.end("Values").end("HttpRequestMethodConfig");
         }
         if (!c.getSourceIpValues().isEmpty()) {
             xml.start("SourceIpConfig").start("Values");
-            for (String v : c.getSourceIpValues()) xml.start("member").raw(v).end("member");
+            for (String v : c.getSourceIpValues()) xml.elem("member", v);
             xml.end("Values").end("SourceIpConfig");
         }
         if (!c.getQueryStringValues().isEmpty()) {
@@ -1201,7 +1231,7 @@ public class ElbV2QueryHandler {
             Action a = new Action();
             a.setType(type);
             String orderStr = p.getFirst(prefix + ".member." + i + ".Order");
-            if (orderStr != null) a.setOrder(Integer.parseInt(orderStr));
+            if (orderStr != null) a.setOrder(parseInt(orderStr));
 
             switch (type) {
                 case "forward" -> {
@@ -1216,7 +1246,7 @@ public class ElbV2QueryHandler {
                         Action.TargetGroupTuple t = new Action.TargetGroupTuple();
                         t.setTargetGroupArn(tgArnW);
                         String wStr = p.getFirst(prefix + ".member." + i + ".ForwardConfig.TargetGroups.member." + j + ".Weight");
-                        if (wStr != null) t.setWeight(Integer.parseInt(wStr));
+                        if (wStr != null) t.setWeight(parseInt(wStr));
                         tuples.add(t);
                         j++;
                     }
@@ -1224,7 +1254,7 @@ public class ElbV2QueryHandler {
                     String stickyEnabled = p.getFirst(prefix + ".member." + i + ".ForwardConfig.TargetGroupStickinessConfig.Enabled");
                     if (stickyEnabled != null) a.setStickinessEnabled(Boolean.parseBoolean(stickyEnabled));
                     String stickyDuration = p.getFirst(prefix + ".member." + i + ".ForwardConfig.TargetGroupStickinessConfig.DurationSeconds");
-                    if (stickyDuration != null) a.setStickinessDurationSeconds(Integer.parseInt(stickyDuration));
+                    if (stickyDuration != null) a.setStickinessDurationSeconds(parseInt(stickyDuration));
                 }
                 case "redirect" -> {
                     a.setRedirectProtocol(p.getFirst(prefix + ".member." + i + ".RedirectConfig.Protocol"));
@@ -1466,6 +1496,14 @@ public class ElbV2QueryHandler {
         }
     }
 
+    /**
+     * A path-pattern condition carries either glob {@code Values} or {@code RegexValues}, never both.
+     * Each regular expression is at most 128 characters and must compile.
+     */
+    static void validatePathPatternRegexValues(List<String> regexValues, boolean hasGlobValues) {
+        PathPatternRegexValues.validate(regexValues, hasGlobValues);
+    }
+
     private List<TargetDescription> parseTargets(MultivaluedMap<String, String> p) {
         List<TargetDescription> result = new ArrayList<>();
         int i = 1;
@@ -1475,7 +1513,7 @@ public class ElbV2QueryHandler {
             TargetDescription t = new TargetDescription();
             t.setId(id);
             String portStr = p.getFirst("Targets.member." + i + ".Port");
-            if (portStr != null) t.setPort(Integer.parseInt(portStr));
+            if (portStr != null) t.setPort(parseInt(portStr));
             t.setAvailabilityZone(p.getFirst("Targets.member." + i + ".AvailabilityZone"));
             result.add(t);
             i++;
@@ -1516,7 +1554,15 @@ public class ElbV2QueryHandler {
 
     private static Integer parseIntOrNull(String s) {
         if (s == null || s.isEmpty()) return null;
-        return Integer.parseInt(s);
+        return parseInt(s);
+    }
+
+    private static int parseInt(String s) {
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError", "'" + s + "' is not a valid integer.", 400);
+        }
     }
 
     private static Boolean parseBoolOrNull(String s) {

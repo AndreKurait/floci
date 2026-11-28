@@ -23,6 +23,8 @@ import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.QuarkusTestProfile;
+import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,6 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -59,10 +62,21 @@ import static org.mockito.Mockito.mock;
  * the container's command and mounts, and Alpine's busybox {@code /sbin/init} stays up as PID 1.
  */
 @QuarkusTest
+@TestProfile(Ec2SystemdGuestDockerIntegrationTest.SystemdGuest.class)
 class Ec2SystemdGuestDockerIntegrationTest {
 
     private static final String REGION = "us-east-1";
     private static final Logger LOG = Logger.getLogger(Ec2SystemdGuestDockerIntegrationTest.class);
+
+    public static class SystemdGuest implements QuarkusTestProfile {
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            return Map.of("floci.services.ec2.mock", "false");
+        }
+    }
+
+    @Inject
+    Ec2MetadataServer metadataServer;
 
     @Inject
     DockerClient docker;
@@ -101,7 +115,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
         String imageId = buildConsoleGuardImage();
         Ec2ContainerManager manager = new Ec2ContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), dockerHostResolver, docker,
-                portAllocator, config, mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class),
+                portAllocator, config, metadataServer, mock(Ec2PortForwardManager.class),
                 regionResolver, mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 reachableEndpoint);
         Instance instance = new Instance();
@@ -209,7 +223,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
     void systemdGuestSeesHostModulesReadOnlyInPrivateCgroupNamespace() {
         Ec2ContainerManager manager = new Ec2ContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), dockerHostResolver, docker,
-                portAllocator, config, mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class),
+                portAllocator, config, metadataServer, mock(Ec2PortForwardManager.class),
                 regionResolver, mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 reachableEndpoint);
         Instance instance = new Instance();
@@ -312,7 +326,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
     private Ec2ContainerManager guestShutdownManager() {
         return new Ec2ContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), dockerHostResolver, docker,
-                portAllocator, config, mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class),
+                portAllocator, config, metadataServer, mock(Ec2PortForwardManager.class),
                 regionResolver, mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 reachableEndpoint);
     }

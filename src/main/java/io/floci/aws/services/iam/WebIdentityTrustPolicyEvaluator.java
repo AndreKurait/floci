@@ -74,6 +74,28 @@ public class WebIdentityTrustPolicyEvaluator {
                 roleSessionName, roleTags);
     }
 
+    public boolean allows(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
+                          Map<String, List<String>> claims) {
+        return allows(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, null, Map.of());
+    }
+
+    public boolean allows(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
+                          Map<String, List<String>> claims, String roleSessionName) {
+        return allows(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, roleSessionName, Map.of());
+    }
+
+    public boolean allowsAction(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
+                                Map<String, List<String>> claims, String roleSessionName, String action) {
+        return allowsAction(trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, roleSessionName,
+                action, Map.of());
+    }
+
+    public boolean allowsAction(String trustPolicyDocument, String oidcProviderArn, String issuerKeyPrefix,
+                                Map<String, List<String>> claims, String roleSessionName, String action,
+                                Map<String, List<String>> roleTags) {
+        return allows(action, trustPolicyDocument, oidcProviderArn, issuerKeyPrefix, claims, roleSessionName, roleTags);
+    }
+
     private boolean allows(String action, String trustPolicyDocument, String oidcProviderArn,
                            String issuerKeyPrefix, Map<String, List<String>> claims,
                            String roleSessionName, Map<String, List<String>> roleTags) {
@@ -241,9 +263,10 @@ public class WebIdentityTrustPolicyEvaluator {
         }
 
         return switch (operator) {
-            case "StringEquals" -> actual.stream().anyMatch(expectedValues::contains);
+            case "StringEquals", "ForAnyValue:StringEquals" -> actual.stream().anyMatch(expectedValues::contains);
+            case "ForAllValues:StringEquals" -> actual.stream().allMatch(expectedValues::contains);
             case "StringNotEquals" -> actual.stream().noneMatch(expectedValues::contains);
-            case "StringLike" -> actual.stream().anyMatch(
+            case "StringLike", "ForAnyValue:StringLike" -> actual.stream().anyMatch(
                     a -> expectedValues.stream().anyMatch(e -> IamPolicyEvaluator.caseSensitiveGlobMatches(e, a)));
             case "StringNotLike" -> actual.stream().noneMatch(
                     a -> expectedValues.stream().anyMatch(e -> IamPolicyEvaluator.caseSensitiveGlobMatches(e, a)));
@@ -264,6 +287,9 @@ public class WebIdentityTrustPolicyEvaluator {
                                       Map<String, List<String>> claims) {
         if (conditionKey == null) {
             return List.of();
+        }
+        if ("sts:SourceIdentity".equalsIgnoreCase(conditionKey)) {
+            return claims.getOrDefault("sts:SourceIdentity", List.of());
         }
         int separator = conditionKey.lastIndexOf(':');
         if (separator < 0) {

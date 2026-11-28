@@ -155,6 +155,7 @@ workflow's declared secrets.
 The default workflow publishes a build-and-commit-derived convenience tag:
 
 - `<YYYYMMDD.HHMMSS>.<commit-sha-8>` for the JVM image
+- `network-helper.<YYYYMMDD.HHMMSS>.<commit-sha-8>` for the stock network helper
 
 Callers that also need native artifacts can pass `publish-native: true`. This
 adds `<YYYYMMDD.HHMMSS>.<commit-sha-8>-native` and
@@ -169,6 +170,41 @@ digest-qualified reference when they require an immutable image:
 ```text
 ghcr.io/example/floci@sha256:...
 ```
+
+The fork can optionally deliver the original provenance archive to a private
+cache ingress after its build, smoke, stock-agent, and tag-promotion jobs succeed.
+Set all three repository variables, `FLOCI_CACHE_ROLE_ARN`, `FLOCI_CACHE_BUCKET`,
+and `FLOCI_CACHE_REGION`, to enable this job. The role must trust the fork's
+`refs/heads/dev` OIDC subject and permit object reads and writes only under
+`fleet-releases/floci-ingress/v1/` in the configured versioned bucket. Delivery
+uses conditional creation. No personal GitHub token is copied to AWS.
+
+Delivery preserves the GitHub artifact's original ZIP bytes and publishes a
+request referencing its exact S3 version. Repeated delivery can reuse identical
+objects; a conflicting object or unknown write outcome stops the job. The
+receiving backend must wait for the entire original workflow to succeed and
+validate its provenance before importing images. Delivery alone does not
+qualify a cache publication or a native test run.
+
+The reusable workflow builds the network helper for both architectures before
+the Floci images and embeds its digest in their EC2 metadata, security-group,
+and ECS task-role proxy configuration. These images pull the matching helper
+from the same registry instead of building it when the first workload starts.
+The helper contains the tools from Floci's bundled
+`src/main/resources/docker/network-helper.Dockerfile`; it has no application
+code or separate release lifecycle.
+
+The helper digest is returned as `network-helper-digest-ref` and recorded as
+`images.networkHelper` in the provenance artifact. Retain this referenced image
+when applying registry retention rules. Runtime helper-image settings remain
+overridable. Standalone Java runs and Docker builds without
+`--build-arg NETWORK_HELPER_IMAGE=<image>` keep the local helper-build default.
+
+The fork's `dev` workflow tests EC2 first-boot metadata, stop/start, and
+termination with the published helper on native AMD64 and ARM64 runners before
+updating the moving `dev` tag. Each runner tests both guest architectures, using
+Docker's QEMU registration for the foreign guest. The helper must always match
+the Docker daemon's architecture.
 
 ## What's in the Compat Image
 

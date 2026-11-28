@@ -34,8 +34,10 @@ class RdsPostgresCancelIntegrationTest {
     private static final String SLEEP = "SELECT pg_sleep(30)";
 
     @BeforeEach
-    void checkDocker() throws InterruptedException {
+    void checkDocker() throws InterruptedException, ClassNotFoundException {
         assumeDocker();
+        // A Quarkus profile restart needs a driver visible to this test's class loader.
+        Class.forName("org.postgresql.Driver");
     }
 
     @Test

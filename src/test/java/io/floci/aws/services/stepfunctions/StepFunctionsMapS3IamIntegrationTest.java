@@ -18,6 +18,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -499,14 +500,16 @@ class StepFunctionsMapS3IamIntegrationTest {
         map.remove("End");
         map.put("Next", "Done");
 
-        Response completed = terminal(start(machineWithFallback(map,
-                role("STATES".equals(trust) ? STATES_TRUST : LAMBDA_TRUST, READ_ONLY)), "{}"));
+        String machine = machineWithFallback(map,
+                role("STATES".equals(trust) ? STATES_TRUST : LAMBDA_TRUST, READ_ONLY));
+        long started = System.nanoTime();
+        Response completed = terminal(start(machine, "{}"));
 
         assertEquals("SUCCEEDED", completed.jsonPath().getString("status"), completed.asString());
         JsonNode caught = MAPPER.readTree(completed.jsonPath().getString("output")).path("caught");
         assertEquals(error, caught.path("Error").asText(), completed.asString());
-        JsonNode described = MAPPER.readTree(completed.asString());
-        assertTrue(described.path("stopDate").asDouble() - described.path("startDate").asDouble() >= 1,
+        // MutableClock advances on reads; retry waits are measured by elapsed time.
+        assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofSeconds(1)) >= 0,
                 completed.asString());
     }
 

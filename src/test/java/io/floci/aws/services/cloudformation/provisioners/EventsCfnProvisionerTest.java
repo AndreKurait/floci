@@ -90,6 +90,7 @@ class EventsCfnProvisionerTest {
     }
 
     private void stubPutRule() {
+        when(events.ruleExists(anyString(), any(), anyString())).thenReturn(true);
         Rule rule = new Rule();
         rule.setArn(RULE_ARN);
         when(events.putRule(anyString(), any(), any(), any(), any(), any(), any(), any(), anyString()))
@@ -681,6 +682,9 @@ class EventsCfnProvisionerTest {
     }
 
     // ── the policy statement id is held to the modeled pattern ────────────────
+
+
+
 
     @Test
     void aStatementIdCarryingTheIdSeparatorIsRejected() {

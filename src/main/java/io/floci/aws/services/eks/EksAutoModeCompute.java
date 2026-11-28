@@ -97,8 +97,8 @@ public class EksAutoModeCompute implements EksAutoModeCleanup {
     private final IamService iam;
     private final Ec2InstanceTypeCatalog instanceTypes;
     private final EmulatorConfig config;
-    private Duration terminationWait = TERMINATION_WAIT;
     private final Clock clock;
+    private Duration terminationWait = TERMINATION_WAIT;
     /**
      * By cluster ARN, then instance ID: since when each Auto Mode node has run no workload and been counted on by
      * no pending pod. Kept in memory, so a restart starts each node's wait again.
@@ -107,15 +107,14 @@ public class EksAutoModeCompute implements EksAutoModeCleanup {
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "eks-auto-mode-compute"));
 
-    @Inject
     public EksAutoModeCompute(EksService eksService, EksClusterManager clusterManager, Ec2Service ec2,
                               IamService iam, Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config) {
         this(eksService, clusterManager, ec2, iam, instanceTypes, config, Clock.systemUTC());
     }
 
-    /** As above; with the {@code clock} empty nodes are timed by. */
-    EksAutoModeCompute(EksService eksService, EksClusterManager clusterManager, Ec2Service ec2, IamService iam,
-                       Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config, Clock clock) {
+    @Inject
+    public EksAutoModeCompute(EksService eksService, EksClusterManager clusterManager, Ec2Service ec2,
+                              IamService iam, Ec2InstanceTypeCatalog instanceTypes, EmulatorConfig config, Clock clock) {
         this.eksService = eksService;
         this.clusterManager = clusterManager;
         this.ec2 = ec2;

@@ -14,6 +14,7 @@ import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -27,6 +28,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.xml.HasXPath.hasXPath;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -521,6 +523,26 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
         return tags;
     }
 
+    @Test
+    void differentArchitecturesCanBeCopiedUnderOneName() {
+        Image arm = service.registerImage(EAST, uniqueName("copy-arm-source"), null,
+                "arm64", "/dev/xvda", null);
+        Image x86 = service.registerImage(EAST, uniqueName("copy-x86-source"), null,
+                "x86_64", "/dev/xvda", null);
+        String name = uniqueName("multiarch-copy");
+        String armCopy = xmlValue(ec2(WEST_AUTH, "CopyImage", "SourceRegion", EAST,
+                "SourceImageId", arm.getImageId(), "Name", name), "imageId");
+        String x86Copy = xmlValue(ec2(WEST_AUTH, "CopyImage", "SourceRegion", EAST,
+                "SourceImageId", x86.getImageId(), "Name", name), "imageId");
+
+        assertNotEquals(armCopy, x86Copy);
+        List<Image> images = service.describeImages(WEST, List.of(armCopy, x86Copy), List.of());
+        assertEquals(Set.of("arm64", "x86_64"),
+                images.stream().map(Image::getArchitecture).collect(Collectors.toSet()));
+        assertTrue(images.stream().allMatch(image -> name.equals(image.getName())
+                && "available".equals(image.getState())));
+    }
+
     // ─── Concurrency ──────────────────────────────────────────────────────────
     //
     // Driven through the service rather than over HTTP: requests through the test server are
@@ -529,24 +551,23 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
     // Ec2ModifyVpcEndpointTest.concurrentAssociationsAllSurvive).
 
     @Test
-    void concurrentCopiesUnderOneNameYieldExactlyOneAmi() throws Exception {
-        // A multi-region promotion job fans out and retries, so the same (region, name) can be
-        // requested several times at once. The duplicate-name check is a read-modify-write over
-        // the whole image store: unlocked, every racer sees no duplicate and every racer inserts,
-        // leaving several AMIs sharing a name that is documented as unique.
+    void concurrentRegistrationsUnderOneNameYieldExactlyOneAmi() throws Exception {
+        // RegisterImage requires unique names even though CopyImage allows repeated names.
+        // The duplicate-name check is a read-modify-write over the whole image store:
+        // unlocked, every racer sees no duplicate and every racer inserts.
         //
         // The window between the scan and the insert is what has to be hit, so the store is
         // padded first: with a few thousand images the scan takes long enough that the race is
         // reproducible rather than theoretical. Removing the lock in registerImage fails this
         // test; the same test against an empty store passes with or without it.
-        Image source = padStoreAndRegisterSource();
+        padImageStore();
 
         for (int round = 0; round < RACE_ROUNDS; round++) {
             String name = uniqueName("floci-race-dst");
             AtomicInteger duplicates = new AtomicInteger();
             StartGate.Results<Image> created = StartGate.runConcurrently(RACE_THREADS, index -> {
                 try {
-                    return service.copyImage(WEST, EAST, source.getImageId(), name, null, false, List.of());
+                    return service.registerImage(WEST, name, null, "x86_64", "/dev/xvda", null);
                 } catch (AwsException e) {
                     assertEquals("InvalidAMIName.Duplicate", e.getErrorCode());
                     duplicates.incrementAndGet();
@@ -557,7 +578,7 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
             assertTrue(created.errors().isEmpty(), () -> "copy workers failed: " + created.errors());
             List<Image> winners = created.values().stream().filter(Objects::nonNull).toList();
             assertEquals(1, winners.size(),
-                    "exactly one copy may claim the name; round " + round + " produced " + winners.size());
+                    "exactly one registration may claim the name; round " + round + " produced " + winners.size());
             assertEquals(RACE_THREADS - 1, duplicates.get());
             assertEquals(1, service.describeImages(WEST, List.of(), List.of("self")).stream()
                     .filter(img -> name.equals(img.getName()))
@@ -597,6 +618,24 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
     }
 
     @Test
+    void concurrentCopiesUnderOneNameAllSurvive() throws Exception {
+        // AWS accepts repeated copies of the same source under the same name.
+        Image source = service.registerImage(EAST, uniqueName("floci-fanout-src"), null,
+                "x86_64", "/dev/xvda", null);
+        String name = uniqueName("floci-fanout-dst");
+
+        StartGate.Results<Image> copies = StartGate.runConcurrently(24,
+                index -> service.copyImage(WEST, EAST, source.getImageId(), name, null, false, List.of()));
+
+        assertTrue(copies.errors().isEmpty(), () -> "copy workers failed: " + copies.errors());
+        Set<String> ids = copies.values().stream().map(Image::getImageId).collect(Collectors.toSet());
+        assertEquals(24, ids.size(), "every concurrent copy must get a distinct id");
+        assertEquals(24, service.describeImages(WEST, List.of(), List.of("self")).stream()
+                .filter(img -> name.equals(img.getName()))
+                .count(), "every concurrent copy must survive in the store");
+    }
+
+    @Test
     void concurrentCopiesUnderDistinctNamesAllSurvive() throws Exception {
         // The name stripe must not swallow unrelated copies: fanning one AMI out under distinct
         // names has to leave every one of them in the store.
@@ -621,17 +660,13 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
     private static final int STORE_PADDING = 2000;
 
     /**
-     * Pads the image store so the read-modify-write windows are wide enough to hit, and returns a
-     * source AMI to copy. The padding is what makes the race reproducible: the duplicate-name
-     * check scans every image in the store.
+     * Pads the image store so the duplicate-name scan is long enough to expose registration races.
      */
-    private Image padStoreAndRegisterSource() {
+    private void padImageStore() {
         String padPrefix = uniqueName("floci-race-pad");
         for (int i = 0; i < STORE_PADDING; i++) {
             service.registerImage(WEST, padPrefix + "-" + i, null, "x86_64", "/dev/xvda", null);
         }
-        return service.registerImage(EAST, uniqueName("floci-race-src"), null,
-                "x86_64", "/dev/xvda", null);
     }
 
     /**
@@ -707,23 +742,20 @@ class Ec2DeregisterAndCopyImageIntegrationTest {
 
     /**
      * Blocks until the launch thread is waiting to enter the registry-lock section of
-     * {@code runInstances}, which is the only point at which the tombstone can be landed
+     * {@code launchInstances}, which is the only point at which the tombstone can be landed
      * mid-launch on purpose. Matching on the frame as well as the state keeps a thread blocked
      * somewhere else from being mistaken for a parked launch, which would deregister too early
      * and let the launch fail its *first* check instead, proving nothing.
      */
-    private static void awaitParkedOnTheRegistryLock(Thread thread) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (System.nanoTime() - deadline < 0) {
-            StackTraceElement[] stack = thread.getStackTrace();
-            if (thread.getState() == Thread.State.BLOCKED && stack.length > 0
-                    && "runInstances".equals(stack[0].getMethodName())
-                    && Ec2Service.class.getName().equals(stack[0].getClassName())) {
-                return;
-            }
-            Thread.sleep(1);
-        }
-        throw new AssertionError("the launch never parked on the image registry lock");
+    private static void awaitParkedOnTheRegistryLock(Thread thread) {
+        await("the launch parked on the image registry lock").atMost(Duration.ofSeconds(30))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> {
+                    StackTraceElement[] stack = thread.getStackTrace();
+                    return thread.getState() == Thread.State.BLOCKED && stack.length > 0
+                            && "launchInstances".equals(stack[0].getMethodName())
+                            && Ec2Service.class.getName().equals(stack[0].getClassName());
+                });
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────

@@ -37,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -108,7 +109,8 @@ class EcsContainerManagerProtectedTaskRoleTest {
 
         firewallManager = mock(SecurityGroupFirewallManager.class);
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "172.18.0.9"));
         taskRoleCredentials = mock(EcsTaskRoleCredentials.class);
         when(taskRoleCredentials.issue(any(), any(), any(), any())).thenReturn(Optional.of(RELATIVE_URI));
@@ -130,7 +132,7 @@ class EcsContainerManagerProtectedTaskRoleTest {
 
         verify(credentialsProxy).ensureProxyOn(NETWORK);
         verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
-                eq(List.of("169.254.170.1")));
+                any(), anyBoolean(), eq(List.of("169.254.170.1")));
         // A container joined to the helper has no network endpoint of its own to give an address to.
         verify(builder, never()).withLinkLocalIp(anyString());
         @SuppressWarnings("unchecked")
@@ -147,7 +149,7 @@ class EcsContainerManagerProtectedTaskRoleTest {
         manager.startTask(awsvpcTask(), taskDef(null, container("app", 0)), List.of(), "us-east-1");
 
         verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
-                eq(List.of()));
+                any(), anyBoolean(), eq(List.of()));
         verify(taskRoleCredentials, never()).issue(any(), any(), any(), any());
     }
 
@@ -159,7 +161,8 @@ class EcsContainerManagerProtectedTaskRoleTest {
         assertThrows(IllegalStateException.class, () -> manager.startTask(awsvpcTask(),
                 taskDef(ROLE_ARN, container("app", 0)), List.of(), "us-east-1"));
 
-        verify(firewallManager, never()).createNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any());
+        verify(firewallManager, never()).createNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any());
         verify(taskRoleCredentials).revoke(TASK_ARN);
     }
 
@@ -186,7 +189,7 @@ class EcsContainerManagerProtectedTaskRoleTest {
         assertThrows(IllegalStateException.class, () -> manager.stopTaskAndCollectExitCodes(handle));
 
         assertTrue(handle.isNamespaceHelperPending(), "the handle keeps the helper's removal to retry");
-        verify(firewallManager, never()).unregister(anyString());
+        verify(firewallManager).unregister("eni-1");
         verify(taskRoleCredentials).revoke(TASK_ARN);
         assertEquals("169.254.170.3", linkLocalAddresses.allocate(NETWORK, OTHER_TASK),
                 "169.254.170.1 is still the helper's, and .2 is the endpoint's own");
@@ -201,7 +204,8 @@ class EcsContainerManagerProtectedTaskRoleTest {
 
     @Test
     void aNamespaceThatCannotBeBuiltFreesItsAddressOnceTheHelperIsGone() {
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenThrow(new IllegalStateException("cannot prepare the protected namespace"));
 
         assertThrows(IllegalStateException.class, () -> manager.startTask(awsvpcTask(),
@@ -216,7 +220,8 @@ class EcsContainerManagerProtectedTaskRoleTest {
 
     @Test
     void aHelperAFailedStartLeftBehindKeepsItsAddressAndItsCleanup() {
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenThrow(new IllegalStateException("inspect failed after the helper started"));
         doThrow(new IllegalStateException("helper busy")).when(firewallManager).removeProtectedNamespaceStrict("abc123");
 

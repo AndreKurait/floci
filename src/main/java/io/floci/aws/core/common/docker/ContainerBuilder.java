@@ -18,6 +18,7 @@ import jakarta.inject.Inject;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -55,6 +56,7 @@ public class ContainerBuilder {
     private final ContainerEngineDetector containerEngineDetector;
     private final GelfLogListener gelfLogListener;
 
+
     @Inject
     public ContainerBuilder(EmulatorConfig config, DockerHostResolver dockerHostResolver,
                             EmbeddedDnsServer embeddedDnsServer,
@@ -80,7 +82,14 @@ public class ContainerBuilder {
     public ContainerBuilder(EmulatorConfig config, DockerHostResolver dockerHostResolver,
                             EmbeddedDnsServer embeddedDnsServer,
                             CurrentContainerNetworkResolver currentContainerNetworkResolver) {
-        this(config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver, null);
+        this(config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver, null, GelfLogListener.disabled());
+    }
+
+    public ContainerBuilder(EmulatorConfig config, DockerHostResolver dockerHostResolver,
+                            EmbeddedDnsServer embeddedDnsServer,
+                            CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                            GelfLogListener gelfLogListener) {
+        this(config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver, null, gelfLogListener);
     }
 
     public ContainerBuilder(EmulatorConfig config, DockerHostResolver dockerHostResolver,
@@ -235,6 +244,7 @@ public class ContainerBuilder {
         private Long memoryBytes;
         private Long nanoCpus;
         private Integer cpuShares;
+        private final Map<String, ContainerSpec.ResourceLimit> ulimits = new HashMap<>();
         private boolean readonlyRootfs;
         private boolean init;
         private final Map<Integer, Integer> portBindings = new HashMap<>();
@@ -251,12 +261,16 @@ public class ContainerBuilder {
         private LogConfig logConfig;
         private boolean privileged;
         private String cgroupnsMode;
+        private String pidMode;
+        private String apparmorProfile;
+        private String stopSignal;
         private String user;
         private final List<String> groupAdd = new ArrayList<>();
         private final List<String> dnsServers = new ArrayList<>();
         private final List<String> linkLocalIps = new ArrayList<>();
         private final List<DeviceRequest> deviceRequests = new ArrayList<>();
         private final List<String> capAdd = new ArrayList<>();
+        private final Map<String, String> networkSysctls = new LinkedHashMap<>();
         private final List<String> capDrop = new ArrayList<>();
         private final List<Device> devices = new ArrayList<>();
         private Long shmSizeBytes;
@@ -266,6 +280,8 @@ public class ContainerBuilder {
         private boolean javaTrustStore;
         private String dnsName;
         private final List<String> joinedNetworks = new ArrayList<>();
+        private Long pidsLimit;
+        private boolean noNewPrivileges;
         private GelfLogListener logDriver;
         private boolean pushedLogs;
 
@@ -362,6 +378,15 @@ public class ContainerBuilder {
             return this;
         }
 
+        /** Sets one process resource limit without changing the daemon's defaults for other limits. */
+        public Builder withUlimit(String name, long soft, long hard) {
+            if (name == null || !name.matches("[a-z][a-z0-9]*")) {
+                throw new IllegalArgumentException("Invalid container resource limit name: " + name);
+            }
+            ulimits.put(name, new ContainerSpec.ResourceLimit(soft, hard));
+            return this;
+        }
+
         /**
          * Caps the container at a fraction of the host's CPUs, expressed the way ECS expresses it:
          * 1024 CPU units is one vCPU.
@@ -394,6 +419,12 @@ public class ContainerBuilder {
          */
         public Builder withInit() {
             this.init = true;
+            return this;
+        }
+
+        /** Selects the signal Docker sends before enforcing its stop deadline. */
+        public Builder withStopSignal(String stopSignal) {
+            this.stopSignal = stopSignal;
             return this;
         }
 
@@ -661,6 +692,16 @@ public class ContainerBuilder {
             return this;
         }
 
+        public Builder withPidMode(String pidMode) {
+            this.pidMode = pidMode;
+            return this;
+        }
+
+        public Builder withApparmorProfile(String profile) {
+            this.apparmorProfile = profile;
+            return this;
+        }
+
         /**
          * Sets the user the container process runs as, formatted {@code "uid[:gid]"}
          * (Docker's top-level container user). Null or blank leaves the image {@code USER}
@@ -777,6 +818,11 @@ public class ContainerBuilder {
             return this;
         }
 
+        public Builder withNetworkSysctl(String name, String value) {
+            this.networkSysctls.put(name, value);
+            return this;
+        }
+
         /**
          * Adds a capability to the daemon's default set ({@code --cap-add}), named without the
          * {@code CAP_} prefix, or {@code ALL}.
@@ -785,6 +831,7 @@ public class ContainerBuilder {
             this.capAdd.add(capability);
             return this;
         }
+
 
         /**
          * Drops a capability from the daemon's default set ({@code --cap-drop}), named without the
@@ -836,6 +883,21 @@ public class ContainerBuilder {
          */
         public Builder withMemorySwappiness(long memorySwappiness) {
             this.memorySwappiness = memorySwappiness;
+            return this;
+        }
+
+        /** Caps the container's processes and threads. */
+        public Builder withPidsLimit(long limit) {
+            if (limit < 1) {
+                throw new IllegalArgumentException("The PID limit must be positive");
+            }
+            this.pidsLimit = limit;
+            return this;
+        }
+
+        /** Prevents exec from granting privileges through setuid or file capabilities. */
+        public Builder withNoNewPrivileges() {
+            this.noNewPrivileges = true;
             return this;
         }
 
@@ -937,10 +999,12 @@ public class ContainerBuilder {
                     Map.copyOf(portBindingHostIps),
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
-                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness),
+                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness,
+                            networkSysctls, pidMode, apparmorProfile, stopSignal, pidsLimit, noNewPrivileges),
                     javaTrustStore,
                     dnsName,
-                    List.copyOf(joinedNetworks)
+                    List.copyOf(joinedNetworks),
+                    Map.copyOf(ulimits)
             );
         }
     }

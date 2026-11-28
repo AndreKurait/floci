@@ -25,9 +25,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class AccountService implements Resettable, StoredResourceArns, AccountPlacementListener {
+    private static final Pattern ACCOUNT_ID = Pattern.compile("\\d{12}");
     private static final String ACCOUNT_MANAGEMENT_SERVICE_PRINCIPAL = ServicePrincipals.of("account");
     private static final Set<String> COUNTRIES_REQUIRING_STATE_OR_REGION =
             Set.of("US", "CA", "GB", "DE", "JP", "IN", "BR");
@@ -162,10 +164,26 @@ public class AccountService implements Resettable, StoredResourceArns, AccountPl
         return new AccountInformation(account.getId(), account.getName(), created, state);
     }
 
-    private String resolveTargetAccount(String callerAccountId, JsonNode request) {
-        String requestedAccountId = text(request, "AccountId");
-        if (requestedAccountId == null) {
+    String resolveTargetAccount(String callerAccountId, JsonNode request) {
+        return resolveTargetAccount(callerAccountId, request, false);
+    }
+
+    String resolveRegionTargetAccount(String callerAccountId, JsonNode request) {
+        return resolveTargetAccount(callerAccountId, request, true);
+    }
+
+    private String resolveTargetAccount(String callerAccountId, JsonNode request, boolean regionOperation) {
+        JsonNode accountIdNode = request == null ? null : request.get("AccountId");
+        if (accountIdNode == null || accountIdNode.isNull()) {
             return callerAccountId;
+        }
+        if (!accountIdNode.isTextual()) {
+            throw new AwsException("SerializationException",
+                    "AccountId must be a string.", 400);
+        }
+        String requestedAccountId = accountIdNode.textValue();
+        if (!ACCOUNT_ID.matcher(requestedAccountId).matches()) {
+            throw validation("AccountId must be a 12 digit account ID.");
         }
 
         Organization organization;
@@ -196,10 +214,33 @@ public class AccountService implements Resettable, StoredResourceArns, AccountPl
                     "The calling account is not the management account or a delegated administrator.", 403);
         }
         if (requestedAccountId.equals(organization.getMasterAccountId())) {
+            if (regionOperation) {
+                throw validation("AccountId must name a member account, not the management account of the organization.");
+            }
             throw new AwsException("AccessDeniedException",
                     "AccountId must name a member account, not the management account of the organization.", 403);
         }
         return requestedAccountId;
+    }
+
+    /**
+     * Resolves only the new Region operations' organization member target. Alternate-contact admission
+     * retains its existing path. Execution separately enforces trusted access and caller membership.
+     */
+    public Optional<String> regionMemberArn(String callerAccountId, String requestedAccountId) {
+        if (requestedAccountId == null || !ACCOUNT_ID.matcher(requestedAccountId).matches()) {
+            return Optional.empty();
+        }
+        Organization organization;
+        try {
+            organization = organizationsService.describeOrganization(callerAccountId);
+            organizationsService.describeAccount(callerAccountId, requestedAccountId);
+        } catch (AwsException e) {
+            return Optional.empty();
+        }
+        return Optional.of(AwsArnUtils.Arn.global(AwsArnUtils.parse(organization.getArn()).partition(), "account",
+                organization.getMasterAccountId(), "account/" + organization.getId() + "/" + requestedAccountId)
+                .toString());
     }
 
     @Override

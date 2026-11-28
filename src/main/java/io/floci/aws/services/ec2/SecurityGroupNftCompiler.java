@@ -1,5 +1,6 @@
 package io.floci.aws.services.ec2;
 
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.ec2.model.IpPermission;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 
@@ -7,29 +8,66 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
 
 /** Builds only rules for an endpoint's private nftables table. Docker's tables are untouched. */
 public final class SecurityGroupNftCompiler {
 
-    /** The ECS task metadata and credentials endpoint, which security groups do not filter on AWS. */
+    /** The ECS task metadata and credentials endpoint, exempt only on its own listener. */
     static final String ECS_TASK_METADATA_ADDRESS = "169.254.170.2";
 
     private SecurityGroupNftCompiler() {}
 
-    /**
-     * A managed ENI: its logical addresses (the ENI's own, which security-group rules are written against) and the
-     * Docker transport addresses its traffic actually carries. An ENI may hold several IPv6 addresses, all carried
-     * by the helper's one Docker IPv6 address, which is null on a Docker network without IPv6.
-     */
     public record Endpoint(String accountId, String region, String vpcId, String eniId,
                            String logicalAddress, List<String> logicalIpv6Addresses,
                            String transportAddress, String transportIpv6Address,
-                           Set<String> groupIds, List<SecurityGroup> groups) {
+                           Set<String> groupIds, List<SecurityGroup> groups,
+                           List<ControlConnection> controlConnections, boolean instanceMetadataAllowed,
+                           Set<String> additionalTransportAddresses, List<ControlListener> controlListeners,
+                           Map<String, ControlConnection> nativePeerDependencies) {
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, List<String> logicalIpv6Addresses,
+                        String transportAddress, String transportIpv6Address,
+                        Set<String> groupIds, List<SecurityGroup> groups,
+                        List<ControlConnection> controlConnections, boolean instanceMetadataAllowed,
+                        Set<String> additionalTransportAddresses) {
+            this(accountId, region, vpcId, eniId, logicalAddress, logicalIpv6Addresses, transportAddress,
+                    transportIpv6Address, groupIds, groups, controlConnections, instanceMetadataAllowed,
+                    additionalTransportAddresses, List.of());
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses,
+                        List<ControlListener> controlListeners) {
+            this(accountId, region, vpcId, eniId, logicalAddress, List.of(), transportAddress, null, groupIds,
+                    groups, controlConnections, instanceMetadataAllowed, additionalTransportAddresses, controlListeners);
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, List<String> logicalIpv6Addresses,
+                        String transportAddress, String transportIpv6Address,
+                        Set<String> groupIds, List<SecurityGroup> groups) {
+            this(accountId, region, vpcId, eniId, logicalAddress, logicalIpv6Addresses, transportAddress,
+                    transportIpv6Address, groupIds, groups, List.of(), true, Set.of());
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses) {
+            this(accountId, region, vpcId, eniId, logicalAddress, List.of(), transportAddress, null, groupIds,
+                    groups, controlConnections, instanceMetadataAllowed, additionalTransportAddresses);
+        }
 
         public Endpoint(String accountId, String region, String vpcId, String eniId,
                         String logicalAddress, String transportAddress, Set<String> groupIds,
@@ -38,20 +76,59 @@ public final class SecurityGroupNftCompiler {
                     groups);
         }
 
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, List<String> logicalIpv6Addresses,
+                        String transportAddress, String transportIpv6Address,
+                        Set<String> groupIds, List<SecurityGroup> groups,
+                        List<ControlConnection> controlConnections, boolean instanceMetadataAllowed,
+                        Set<String> additionalTransportAddresses, List<ControlListener> controlListeners) {
+            this(accountId, region, vpcId, eniId, logicalAddress, logicalIpv6Addresses, transportAddress,
+                    transportIpv6Address, groupIds, groups, controlConnections, instanceMetadataAllowed,
+                    additionalTransportAddresses, controlListeners, Map.of());
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses,
+                        List<ControlListener> controlListeners, Map<String, ControlConnection> nativePeerDependencies) {
+            this(accountId, region, vpcId, eniId, logicalAddress, List.of(), transportAddress, null, groupIds,
+                    groups, controlConnections, instanceMetadataAllowed, additionalTransportAddresses,
+                    controlListeners, nativePeerDependencies);
+        }
+
         public Endpoint {
             logicalIpv6Addresses = logicalIpv6Addresses == null ? List.of() : List.copyOf(logicalIpv6Addresses);
+            controlConnections = List.copyOf(controlConnections);
+            controlListeners = List.copyOf(controlListeners);
+            additionalTransportAddresses = Set.copyOf(additionalTransportAddresses);
+            nativePeerDependencies = Map.copyOf(nativePeerDependencies);
+            nativePeerDependencies.keySet().forEach(Ec2NativePeerDependencies::requireHostname);
+            if ((!instanceMetadataAllowed && !nativePeerDependencies.isEmpty())
+                    || !controlConnections.containsAll(nativePeerDependencies.values())) {
+                throw new IllegalArgumentException("Native peer DNS requires its EC2 endpoint's exact control admission");
+            }
+            if (additionalTransportAddresses.stream().anyMatch(address -> !literal(address))) {
+                throw new IllegalArgumentException("Transport addresses must be literal IP addresses");
+            }
         }
 
         /** The same ENI identity with the policy the manager re-resolved. */
         public Endpoint withPolicy(Set<String> groupIds, List<SecurityGroup> groups) {
             return new Endpoint(accountId, region, vpcId, eniId, logicalAddress, logicalIpv6Addresses,
-                    transportAddress, transportIpv6Address, groupIds, groups);
+                    transportAddress, transportIpv6Address, groupIds, groups, controlConnections,
+                    instanceMetadataAllowed, additionalTransportAddresses, controlListeners, nativePeerDependencies);
         }
 
         /** The same ENI and policy, holding {@code addresses} as its IPv6 addresses now. */
         public Endpoint withIpv6Addresses(List<String> addresses) {
             return new Endpoint(accountId, region, vpcId, eniId, logicalAddress, addresses, transportAddress,
-                    transportIpv6Address, groupIds, groups);
+                    transportIpv6Address, groupIds, groups, controlConnections,
+                    instanceMetadataAllowed, additionalTransportAddresses, controlListeners, nativePeerDependencies);
+        }
+
+        boolean sameVpc(Endpoint other) {
+            return accountId.equals(other.accountId) && region.equals(other.region) && vpcId.equals(other.vpcId);
         }
 
         SecurityGroupPolicy.Peer peer(String address) {
@@ -78,6 +155,34 @@ public final class SecurityGroupNftCompiler {
             return identities;
         }
 
+        List<AddressIdentity> identities(boolean includeAdditionalAddresses) {
+            List<AddressIdentity> identities = identities();
+            if (includeAdditionalAddresses) {
+                for (String address : additionalTransportAddresses) {
+                    if (address.equals(logicalAddress) || logicalIpv6Addresses.contains(address)) {
+                        identities.add(new AddressIdentity(address, address));
+                    } else if (!address.contains(":") && literal(logicalAddress) && !logicalAddress.contains(":")) {
+                        identities.add(new AddressIdentity(logicalAddress, address));
+                    }
+                }
+            }
+            return identities;
+        }
+
+        List<String> visibleTransports(Endpoint target, boolean isolatedAddressSpaces) {
+            if (!isolatedAddressSpaces || sameVpc(target)) {
+                return transports();
+            }
+            List<String> visible = new ArrayList<>(2);
+            if (literal(transportAddress)) {
+                visible.add(transportAddress);
+            }
+            if (literal(transportIpv6Address)) {
+                visible.add(transportIpv6Address);
+            }
+            return visible;
+        }
+
         /** Every Docker address the endpoint's traffic can carry, whether or not an identity uses it. */
         List<String> transports() {
             List<String> transports = new ArrayList<>(2);
@@ -87,11 +192,95 @@ public final class SecurityGroupNftCompiler {
             if (literal(transportIpv6Address)) {
                 transports.add(transportIpv6Address);
             }
+            additionalTransportAddresses.stream().sorted().filter(address -> !transports.contains(address))
+                    .forEach(transports::add);
             return transports;
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups,
+                    controlConnections, instanceMetadataAllowed, Set.of());
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, Set<String> additionalTransportAddresses) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups,
+                    List.of(), true, additionalTransportAddresses);
+        }
+
+        List<String> transportAddresses() {
+            Set<String> addresses = new LinkedHashSet<>();
+            if (literal(transportAddress)) {
+                addresses.add(transportAddress);
+            }
+            additionalTransportAddresses.stream().sorted().forEach(addresses::add);
+            return List.copyOf(addresses);
+        }
+
+        SecurityGroupPolicy.Peer peer() {
+            return new SecurityGroupPolicy.Peer(logicalAddress, accountId, vpcId, groupIds);
         }
     }
 
     record AddressIdentity(String logical, String transport) {
+    }
+
+    /** A service-owned TCP endpoint, such as one execution environment's Lambda Runtime API. */
+    public record ControlConnection(String address, int port) {
+        public ControlConnection {
+            if (!literal(address) || port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Control connections require a literal IP and one TCP port");
+            }
+        }
+    }
+
+    /** A service-owned listener reached only from its controller's literal address. */
+    public record ControlListener(String controllerAddress, int port) {
+        public ControlListener {
+            if (!literal(controllerAddress) || port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Control listeners require a literal controller IP and one TCP port");
+            }
+        }
+    }
+
+    /**
+     * Security groups of a load balancer whose health checks and forwarded requests Floci sends from
+     * its own address. On AWS that traffic comes from load-balancer nodes in these groups.
+     */
+    public record EmulatorOrigin(String accountId, String region, String vpcId, Set<String> groupIds) {
+        public EmulatorOrigin {
+            groupIds = Set.copyOf(groupIds);
+        }
+    }
+
+    /**
+     * A hot-attached interface's device in a protected namespace. Its own security groups are enforced in
+     * a chain pair of its own, which the namespace's base chains enter for that device only.
+     */
+    public record AttachedDevice(String device, String eniId) {
+        private static final Pattern DEVICE = Pattern.compile("[A-Za-z0-9_.-]{1,15}");
+        private static final Pattern ENI = Pattern.compile("eni-[0-9a-z]{1,40}");
+
+        public AttachedDevice {
+            if (device == null || !DEVICE.matcher(device).matches() || "lo".equals(device)) {
+                throw new IllegalArgumentException("An attached device needs a plain interface name");
+            }
+            if (eniId == null || !ENI.matcher(eniId).matches()) {
+                throw new IllegalArgumentException("An attached device needs its network interface id");
+            }
+        }
+
+        String ingressChain() {
+            return "attached_" + eniId.replace('-', '_') + "_ingress";
+        }
+
+        String egressChain() {
+            return "attached_" + eniId.replace('-', '_') + "_egress";
+        }
     }
 
     public static String initialRuleset() {
@@ -107,22 +296,101 @@ public final class SecurityGroupNftCompiler {
 
     public static String compile(Endpoint target, Collection<Endpoint> peers,
                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers) {
+        return compile(target, peers, prefixLists, vpcResolvers, false);
+    }
+
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, peer -> true);
+    }
+
+    /**
+     * Compiles {@code target}'s policy, granting security-group accepts only to {@code admitted} peers.
+     * A managed peer that is not admitted keeps its drop rules, so the result never accepts more
+     * than the policy compiled with every peer admitted: it only withholds accepts toward peers.
+     */
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, admitted,
+                List.of(), List.of());
+    }
+
+    /**
+     * As above, and an ingress rule that references a security group of an {@code emulatorOrigins}
+     * load balancer in the target's VPC also accepts that traffic from {@code emulatorAddresses},
+     * the addresses Floci sends it from. Only group references match, never CIDR rules.
+     */
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
+                                  Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, admitted,
+                emulatorOrigins, emulatorAddresses, Set.of());
+    }
+
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
+                                  Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses,
+                                  Set<String> routedPublicAddresses) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, admitted, emulatorOrigins,
+                emulatorAddresses, routedPublicAddresses, List.of());
+    }
+
+    /**
+     * As above, for a namespace that also holds hot-attached devices. Each device's traffic enters only its
+     * own chain pair and is dropped if that chain returns, so the primary interface's rules never see it.
+     * With no attached device the ruleset is exactly the one above.
+     */
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
+                                  Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses,
+                                  Set<String> routedPublicAddresses, List<AttachedDevice> attachedDevices) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
         StringBuilder rules = new StringBuilder("flush chain inet floci_sg ingress\n")
-                .append("flush chain inet floci_sg egress\n")
-                .append("add rule inet floci_sg ingress iifname lo accept\n")
+                .append("flush chain inet floci_sg egress\n");
+        List<AttachedDevice> devices = attachedDevices.stream()
+                .sorted(Comparator.comparing(AttachedDevice::device)).toList();
+        if (devices.stream().map(AttachedDevice::device).distinct().count() != devices.size()) {
+            throw new IllegalArgumentException("Two attached interfaces cannot share one device");
+        }
+        for (AttachedDevice device : devices) {
+            rules.append("add chain inet floci_sg ").append(device.ingressChain()).append('\n')
+                    .append("add chain inet floci_sg ").append(device.egressChain()).append('\n')
+                    .append("add rule inet floci_sg ingress iifname \"").append(device.device())
+                    .append("\" jump ").append(device.ingressChain()).append('\n')
+                    .append("add rule inet floci_sg ingress iifname \"").append(device.device()).append("\" drop\n")
+                    .append("add rule inet floci_sg egress oifname \"").append(device.device())
+                    .append("\" jump ").append(device.egressChain()).append('\n')
+                    .append("add rule inet floci_sg egress oifname \"").append(device.device()).append("\" drop\n");
+        }
+        if (!target.instanceMetadataAllowed()) {
+            // Lambda has no EC2 instance metadata, even after DNAT or a control-endpoint override.
+            rules.append("add rule inet floci_sg egress ip daddr 169.254.169.254 drop\n")
+                    .append("add rule inet floci_sg egress ip6 daddr fd00:ec2::254 drop\n")
+                    .append("add rule inet floci_sg egress meta l4proto tcp"
+                            + " ct original ip daddr 169.254.169.254 ct original proto-dst 80 drop\n")
+                    .append("add rule inet floci_sg egress meta l4proto tcp"
+                            + " ct original ip6 daddr fd00:ec2::254 ct original proto-dst 80 drop\n");
+        }
+        rules.append("add rule inet floci_sg ingress iifname lo accept\n")
                 .append("add rule inet floci_sg egress oifname lo accept\n")
                 .append("add rule inet floci_sg ingress ct state established,related accept\n")
                 .append("add rule inet floci_sg egress ct state established,related accept\n");
 
+        // A running endpoint can gain public routing before its next policy refresh.
+        // Keep the original-tuple policy installed before that routing enables DNAT.
+        appendTranslatedPublicApiPolicy(rules, target, prefixLists);
+
         // Docker's embedded DNS listens on loopback but forwards from this namespace. Security
         // groups never filter the VPC resolver on AWS. Only DNS is exempt, because the resolver
-        // address also serves Floci's API. DHCP, the link-local metadata endpoint and the ECS
-        // task metadata endpoint, where a task reads its role credentials, are the other local
-        // infrastructure exceptions. The ECS endpoint is opened for its one listener only, so a
-        // workload cannot use it to reach anything else on the Docker network.
+        // address also serves Floci's API. DHCP and the link-local metadata endpoint are the
+        // other local infrastructure exceptions.
         for (String server : vpcResolvers) {
             String family = server.contains(":") ? "ip6" : "ip";
             rules.append("add rule inet floci_sg egress ").append(family).append(" daddr ").append(server)
@@ -130,11 +398,32 @@ public final class SecurityGroupNftCompiler {
                     .append("add rule inet floci_sg egress ").append(family).append(" daddr ").append(server)
                     .append(" tcp dport 53 accept\n");
         }
+        for (ControlConnection connection : target.controlConnections()) {
+            appendRule(rules, "egress", "daddr", connection.address(),
+                    "tcp dport " + connection.port() + " accept");
+        }
+        for (ControlListener listener : target.controlListeners()) {
+            appendRule(rules, "ingress", "saddr", listener.controllerAddress(),
+                    "tcp dport " + listener.port() + " accept");
+        }
         rules.append("add rule inet floci_sg egress udp sport 68 udp dport 67 accept\n")
-                .append("add rule inet floci_sg ingress udp sport 67 udp dport 68 accept\n")
-                .append("add rule inet floci_sg egress ip daddr 169.254.169.254 accept\n")
-                .append("add rule inet floci_sg ingress ip saddr 169.254.169.254 accept\n")
-                .append("add rule inet floci_sg egress ip daddr ").append(ECS_TASK_METADATA_ADDRESS)
+                .append("add rule inet floci_sg ingress udp sport 67 udp dport 68 accept\n");
+        // IPv6 neighbor discovery is the link layer's address resolution, as ARP is for IPv4. Conntrack
+        // leaves it untracked, so without these an IPv6 address on the VPC interface never resolves a neighbor.
+        rules.append("add rule inet floci_sg egress ip6 hoplimit 255 icmpv6 type { nd-neighbor-solicit,"
+                        + " nd-neighbor-advert } accept\n")
+                .append("add rule inet floci_sg ingress ip6 hoplimit 255 icmpv6 type { nd-neighbor-solicit,"
+                        + " nd-neighbor-advert } accept\n");
+        if (target.instanceMetadataAllowed()) {
+            rules.append("add rule inet floci_sg egress ip daddr 169.254.169.254 accept\n")
+                // OUTPUT DNAT runs before this filter. Exempt only traffic originally sent to
+                // IMDS, not direct connections to the emulator's metadata or API ports.
+                .append("add rule inet floci_sg egress meta l4proto tcp"
+                        + " ct original ip daddr 169.254.169.254 ct original proto-dst 80 accept\n")
+                    .append("add rule inet floci_sg ingress ip saddr 169.254.169.254 accept\n");
+        }
+
+        rules.append("add rule inet floci_sg egress ip daddr ").append(ECS_TASK_METADATA_ADDRESS)
                 .append(" tcp dport 80 accept\n");
 
         List<Endpoint> managed = peers == null ? List.of() : peers.stream()
@@ -157,15 +446,26 @@ public final class SecurityGroupNftCompiler {
                         continue;
                     }
                     for (Endpoint peer : managed) {
-                        if (!target.accountId().equals(peer.accountId()) || !target.region().equals(peer.region())
-                                || !target.vpcId().equals(peer.vpcId())) {
+                        if (!admitted.test(peer)) {
                             continue;
                         }
-                        for (AddressIdentity identity : peer.identities()) {
-                            if (protocolFitsFamily(permission, identity.transport())
-                                    && SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(identity.logical()),
-                                    prefixLists)) {
+                        boolean sameVpc = target.sameVpc(peer);
+                        List<AddressIdentity> identities = peer.identities(!isolatedAddressSpaces || sameVpc);
+                        for (AddressIdentity identity : identities) {
+                            boolean matches = sameVpc
+                                    ? SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(identity.logical()),
+                                            prefixLists)
+                                    : SecurityGroupPolicy.matchesPeerAddress(permission, peer.peer(identity.logical()),
+                                            prefixLists);
+                            if (matches && protocolFitsFamily(permission, identity.transport())) {
                                 appendRule(rules, chain, addressField, identity.transport(), protocol);
+                            }
+                        }
+                    }
+                    if (!egress && admitsEmulatorOrigin(target, group, permission, emulatorOrigins)) {
+                        for (String address : emulatorAddresses) {
+                            if (literal(address) && protocolFitsFamily(permission, address)) {
+                                appendRule(rules, chain, addressField, address, protocol);
                             }
                         }
                     }
@@ -173,12 +473,15 @@ public final class SecurityGroupNftCompiler {
             }
             // A managed peer must never fall through to a broad external CIDR rule
             // evaluated against its Docker bridge IP instead of its logical ENI address.
-            // Every transport a managed peer has, its IPv6 one included when its ENI holds no IPv6 address, so its
-            // traffic on that address cannot reach a broad IPv6 CIDR rule either.
-            Set<String> transports = new LinkedHashSet<>();
-            managed.forEach(peer -> transports.addAll(peer.transports()));
-            for (String transport : transports) {
-                appendRule(rules, chain, addressField, transport, "drop");
+            for (Endpoint peer : managed) {
+                List<String> visible = peer.visibleTransports(target, isolatedAddressSpaces);
+                for (String address : visible) {
+                    if (egress && admitted.test(peer) && routedPublicAddresses.contains(address)) {
+                        // The native route policy controls its NAT/IGW path; evaluate public egress CIDRs below.
+                        continue;
+                    }
+                    appendRule(rules, chain, addressField, address, "drop");
+                }
             }
             for (SecurityGroup group : target.groups()) {
                 List<IpPermission> permissions = egress
@@ -203,14 +506,101 @@ public final class SecurityGroupNftCompiler {
                                 cidrs.addAll(prefixLists.getOrDefault(ref.getPrefixListId(), List.of())));
                     }
                     for (String cidr : cidrs) {
-                        if (SecurityGroupPolicy.validCidr(cidr)) {
+                        if (SecurityGroupPolicy.validCidr(cidr) && protocolFitsFamily(permission, cidr)) {
                             appendRule(rules, chain, addressField, cidr, protocol);
                         }
                     }
                 }
             }
         }
+        if (isolatedAddressSpaces) {
+            // Native private addresses can repeat across VPCs. The resolver identifies a
+            // namespace by its unique control address, including when a client binds its ENI.
+            if (!literal(target.transportAddress()) || target.transportAddress().contains(":")) {
+                throw new IllegalArgumentException("Isolated IPv4 VPCs require an IPv4 control transport");
+            }
+            rules.append("add table ip floci_vpc_dns\n")
+                    .append("add chain ip floci_vpc_dns source { type nat hook postrouting priority srcnat; }\n")
+                    .append("flush chain ip floci_vpc_dns source\n");
+            for (String resolver : vpcResolvers) {
+                if (literal(resolver) && !resolver.contains(":")) {
+                    rules.append("add rule ip floci_vpc_dns source ip daddr ").append(resolver)
+                            .append(" meta l4proto { tcp, udp } th dport 53 snat to ")
+                            .append(target.transportAddress()).append('\n');
+                }
+            }
+        }
         return rules.toString();
+    }
+
+    /**
+     * The policy of a hot-attached interface, for its own chain pair: its own security groups toward the
+     * peers of its own VPC, exactly as {@link #compile} builds it for an interface that owns a namespace.
+     * It never carries the namespace's control, resolver or metadata admissions, which stay on the
+     * primary interface's device, and it is installed together with the primary policy that enters it.
+     */
+    public static String compileAttached(Endpoint attached, AttachedDevice device, Collection<Endpoint> peers,
+                                         Map<String, List<String>> prefixLists, Predicate<Endpoint> admitted) {
+        if (attached.instanceMetadataAllowed() || !attached.controlConnections().isEmpty()
+                || !attached.controlListeners().isEmpty() || !attached.eniId().equals(device.eniId())) {
+            throw new IllegalArgumentException("An attached interface's policy carries no namespace admissions");
+        }
+        String compiled = compile(attached, peers, prefixLists, List.of(), true, admitted, List.of(), List.of(),
+                Set.of());
+        StringBuilder rules = new StringBuilder()
+                .append("add chain inet floci_sg ").append(device.ingressChain()).append('\n')
+                .append("add chain inet floci_sg ").append(device.egressChain()).append('\n');
+        for (String line : compiled.split("\n")) {
+            if (line.equals("add rule inet floci_sg egress ip daddr " + ECS_TASK_METADATA_ADDRESS
+                    + " tcp dport 80 accept")) {
+                continue;
+            }
+            if (line.startsWith("flush chain inet floci_sg ingress")
+                    || line.startsWith("add rule inet floci_sg ingress ")) {
+                rules.append(line.replaceFirst(" inet floci_sg ingress", " inet floci_sg " + device.ingressChain()));
+            } else if (line.startsWith("flush chain inet floci_sg egress")
+                    || line.startsWith("add rule inet floci_sg egress ")) {
+                rules.append(line.replaceFirst(" inet floci_sg egress", " inet floci_sg " + device.egressChain()));
+            } else if (line.matches("(add table|add chain|flush chain|add rule) ip floci_vpc_dns\\b.*")) {
+                // The namespace's resolver translation belongs to its primary interface.
+                continue;
+            } else {
+                throw new IllegalStateException("Unexpected rule for an attached interface: " + line);
+            }
+            rules.append('\n');
+        }
+        return rules.toString();
+    }
+
+    private static void appendTranslatedPublicApiPolicy(StringBuilder rules, Endpoint target,
+                                                         Map<String, List<String>> prefixLists) {
+        String address = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+        SecurityGroupPolicy.Peer destination = new SecurityGroupPolicy.Peer(address, null, null, Set.of());
+        for (int port : List.of(80, 443)) {
+            boolean allowed = SecurityGroupPolicy.allows(target.groups(), true, "tcp", port, -1,
+                    destination, prefixLists);
+            rules.append("add rule inet floci_sg egress meta l4proto tcp ct direction original ct status dnat")
+                    .append(" ct original ip daddr ").append(address).append(" ct original proto-dst ").append(port)
+                    .append(allowed ? " counter accept\n" : " counter drop\n");
+        }
+    }
+
+    private static boolean admitsEmulatorOrigin(Endpoint target, SecurityGroup group, IpPermission permission,
+                                                Collection<EmulatorOrigin> origins) {
+        if (origins == null || permission.getUserIdGroupPairs() == null
+                || permission.getUserIdGroupPairs().isEmpty()) {
+            return false;
+        }
+        for (EmulatorOrigin origin : origins) {
+            if (target.accountId().equals(origin.accountId()) && target.region().equals(origin.region())
+                    && target.vpcId().equals(origin.vpcId())
+                    && SecurityGroupPolicy.matchesPeer(group, permission,
+                            new SecurityGroupPolicy.Peer(null, origin.accountId(), origin.vpcId(),
+                                    origin.groupIds()), Map.of())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void appendRule(StringBuilder rules, String chain, String addressField,
@@ -221,10 +611,6 @@ public final class SecurityGroupNftCompiler {
                 .append(expression).append('\n');
     }
 
-    /**
-     * Whether a permission's protocol can be written against {@code address}'s family: ICMP is IPv4's and ICMPv6 is
-     * IPv6's, and nftables refuses an {@code icmp} header match beside an {@code ip6} address, and the reverse.
-     */
     private static boolean protocolFitsFamily(IpPermission permission, String address) {
         String protocol = permission.getIpProtocol() == null ? "" : permission.getIpProtocol().toLowerCase(Locale.ROOT);
         boolean ipv6 = address.indexOf(':') >= 0;

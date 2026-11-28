@@ -1,3 +1,4 @@
+AWS::ACMPCA::CertificateAuthority	Arn,CertificateSigningRequest	CsrExtensions,KeyAlgorithm,KeyStorageSecurityStandard,RevocationConfiguration,SigningAlgorithm,Subject,Tags,Type,UsageMode
 AWS::ApiGateway::Account	Id	CloudWatchRoleArn
 AWS::ApiGateway::ApiKey	APIKeyId	CustomerId,Description,Enabled,GenerateDistinctId,Name,StageKeys,Tags,Value
 AWS::ApiGateway::Authorizer	AuthorizerId	AuthType,AuthorizerCredentials,AuthorizerResultTtlInSeconds,AuthorizerUri,IdentitySource,IdentityValidationExpression,JwtConfiguration,Name,ProviderARNs,RestApiId,Type
@@ -22,8 +23,10 @@ AWS::ApiGatewayV2::Stage		AccessLogSettings,ApiId,AutoDeploy,ClientCertificateId
 AWS::ApiGatewayV2::VpcLink	VpcLinkId	Name,SecurityGroupIds,SubnetIds,Tags
 AWS::AppConfig::Application	ApplicationId	Description,Name,Tags
 AWS::AppConfig::ConfigurationProfile	ConfigurationProfileId,KmsKeyArn	ApplicationId,DeletionProtectionCheck,Description,KmsKeyIdentifier,LocationUri,Name,RetrievalRoleArn,Tags,Type,Validators
+AWS::AppConfig::Deployment	DeploymentNumber,State	ApplicationId,ConfigurationProfileId,ConfigurationVersion,DeploymentStrategyId,Description,DynamicExtensionParameters,EnvironmentId,KmsKeyIdentifier,Tags
 AWS::AppConfig::DeploymentStrategy	Id	DeploymentDurationInMinutes,Description,FinalBakeTimeInMinutes,GrowthFactor,GrowthType,Name,ReplicateTo,Tags
 AWS::AppConfig::Environment	EnvironmentId	ApplicationId,DeletionProtectionCheck,Description,Monitors,Name,Tags
+AWS::AppConfig::HostedConfigurationVersion	VersionNumber	ApplicationId,ConfigurationProfileId,Content,ContentType,Description,LatestVersionNumber,VersionLabel
 AWS::AppSync::ApiKey	ApiKey,ApiKeyId,Arn	ApiId,Description,Expires
 AWS::AppSync::DataSource	DataSourceArn	ApiId,Description,DynamoDBConfig,EventBridgeConfig,HttpConfig,LambdaConfig,MetricsConfig,Name,OpenSearchServiceConfig,RelationalDatabaseConfig,ServiceRoleArn,Type
 AWS::AppSync::FunctionConfiguration	FunctionArn,FunctionId	ApiId,Code,CodeS3Location,DataSourceName,Description,FunctionVersion,MaxBatchSize,Name,RequestMappingTemplate,RequestMappingTemplateS3Location,ResponseMappingTemplate,ResponseMappingTemplateS3Location,Runtime,SyncConfig
@@ -47,6 +50,8 @@ AWS::BedrockAgentCore::RuntimeEndpoint	AgentRuntimeArn,AgentRuntimeEndpointArn,C
 AWS::CertificateManager::Certificate	CertificateArn	CertificateAuthorityArn,CertificateExport,CertificateTransparencyLoggingPreference,CertificateUsage,DomainName,DomainValidationOptions,KeyAlgorithm,RootHierarchyType,SubjectAlternativeNames,Tags,ValidationMethod
 AWS::CloudFormation::CustomResource	Id	ServiceTimeout,ServiceToken
 AWS::CloudFormation::StackSet	StackSetId	AdministrationRoleARN,AutoDeployment,CallAs,Capabilities,Description,ExecutionRoleName,ManagedExecution,OperationPreferences,Parameters,PermissionModel,StackInstancesGroup,StackSetName,Tags,TemplateBody,TemplateURL
+AWS::CloudFormation::WaitCondition	Data,Id	Count,Handle,Timeout
+AWS::CloudFormation::WaitConditionHandle	Id	
 AWS::CloudFront::CachePolicy	Id,LastModifiedTime	CachePolicyConfig
 AWS::CloudFront::ConnectionGroup	Arn,CreatedTime,ETag,Id,IsDefault,LastModifiedTime,RoutingEndpoint,Status	AnycastIpListId,Enabled,Ipv6Enabled,Name,Tags,ViewerFallback
 AWS::CloudFront::Distribution	DomainName,Id	DistributionConfig,Tags
@@ -61,8 +66,11 @@ AWS::CloudTrail::Trail	Arn,SnsTopicArn	AdvancedEventSelectors,AggregationConfigu
 AWS::CloudWatch::Alarm	Arn	ActionConfiguration,ActionsEnabled,AlarmActions,AlarmDescription,AlarmName,ComparisonOperator,DatapointsToAlarm,Dimensions,EvaluateLowSampleCountPercentile,EvaluationCriteria,EvaluationInterval,EvaluationPeriods,EvaluationWindow,ExtendedStatistic,InsufficientDataActions,MetricName,Metrics,Namespace,OKActions,Period,Statistic,Tags,Threshold,ThresholdMetricId,TreatMissingData,Unit,WarmUpConfiguration
 AWS::CloudWatch::CompositeAlarm	Arn	ActionConfiguration,ActionsEnabled,ActionsSuppressor,ActionsSuppressorExtensionPeriod,ActionsSuppressorWaitPeriod,AlarmActions,AlarmDescription,AlarmName,AlarmRule,InsufficientDataActions,OKActions,Tags
 AWS::CloudWatch::Dashboard		DashboardBody,DashboardName,Tags
+AWS::CloudWatch::InsightRule	Arn	ApplyOnTransformedLogs,RuleBody,RuleName,RuleState,Tags
 AWS::CodeBuild::Project	Arn	Artifacts,AutoRetryLimit,BadgeEnabled,BuildBatchConfig,Cache,ConcurrentBuildLimit,Description,EncryptionKey,Environment,FileSystemLocations,LogsConfig,Name,QueuedTimeoutInMinutes,ResourceAccessRole,SecondaryArtifacts,SecondarySourceVersions,SecondarySources,ServiceRole,Source,SourceVersion,Tags,TimeoutInMinutes,Triggers,Visibility,VpcConfig
 AWS::CodeDeploy::Application		ApplicationName,ComputePlatform,Tags
+AWS::CodeDeploy::DeploymentConfig		ComputePlatform,DeploymentConfigName,MinimumHealthyHosts,TrafficRoutingConfig,ZonalConfig
+AWS::CodeDeploy::DeploymentGroup		AlarmConfiguration,ApplicationName,AutoRollbackConfiguration,AutoScalingGroups,BlueGreenDeploymentConfiguration,Deployment,DeploymentConfigName,DeploymentGroupName,DeploymentStyle,ECSServices,Ec2DeploymentOptions,Ec2TagFilters,Ec2TagSet,LoadBalancerInfo,OnPremisesInstanceTagFilters,OnPremisesTagSet,OutdatedInstancesStrategy,ServiceRoleArn,Tags,TerminationHookEnabled,TriggerConfigurations
 AWS::CodePipeline::CustomActionType	Id	Category,ConfigurationProperties,InputArtifactDetails,OutputArtifactDetails,Provider,Settings,Tags,Version
 AWS::CodePipeline::Pipeline	Arn,Version	ArtifactStore,ArtifactStores,DisableInboundStageTransitions,ExecutionMode,Name,PipelineType,RestartExecutionOnUpdate,RoleArn,Stages,Tags,Triggers,Variables
 AWS::CodePipeline::Webhook	Id,Url	Authentication,AuthenticationConfiguration,Filters,Name,RegisterWithThirdParty,Tags,TargetAction,TargetPipeline,TargetPipelineVersion
@@ -78,6 +86,7 @@ AWS::Config::ConfigRule	Arn,ConfigRuleId	Compliance,ConfigRuleName,Description,E
 AWS::DSQL::Cluster	CreationTime,EncryptionDetails,Endpoint,Identifier,PolicyVersion,ResourceArn,Status,VpcEndpoint,VpcEndpointServiceName	DeletionProtectionEnabled,KmsEncryptionKey,MetricGroups,MultiRegionProperties,PolicyDocument,Tags
 AWS::DynamoDB::GlobalTable	Arn,StreamArn,TableId	AttributeDefinitions,BillingMode,GlobalSecondaryIndexes,GlobalTableSourceArn,GlobalTableWitnesses,KeySchema,LocalSecondaryIndexes,MultiRegionConsistency,ReadOnDemandThroughputSettings,ReadProvisionedThroughputSettings,Replicas,SSESpecification,StreamSpecification,TableName,TableType,TimeToLiveSpecification,VectorIndexes,WarmThroughput,WriteOnDemandThroughputSettings,WriteProvisionedThroughputSettings
 AWS::DynamoDB::Table	Arn,StreamArn	AttributeDefinitions,BillingMode,ContributorInsightsSpecification,DeletionProtectionEnabled,GlobalSecondaryIndexes,ImportSourceSpecification,KeySchema,KinesisStreamSpecification,LocalSecondaryIndexes,OnDemandThroughput,PointInTimeRecoverySpecification,ProvisionedThroughput,ResourcePolicy,SSESpecification,StreamSpecification,TableClass,TableName,Tags,TimeToLiveSpecification,VectorIndexes,WarmThroughput
+AWS::EC2::DHCPOptions	DhcpOptionsId	DomainName,DomainNameServers,Ipv6AddressPreferredLeaseTime,NetbiosNameServers,NetbiosNodeType,NtpServers,Tags
 AWS::EC2::EIP	AllocationId,PublicIp	Address,Domain,InstanceId,IpamPoolId,NetworkBorderGroup,PublicIpv4Pool,Tags,TransferAddress
 AWS::EC2::FlowLog	Id	DeliverCrossAccountRole,DeliverLogsPermissionArn,DestinationOptions,LogDestination,LogDestinationType,LogFormat,LogGroupName,MaxAggregationInterval,ResourceId,ResourceType,TagFieldSpecifications,Tags,TrafficType
 AWS::EC2::Instance	InstanceId,PrivateDnsName,PrivateIp,PublicDnsName,PublicIp,State,VpcId	AdditionalInfo,Affinity,AvailabilityZone,BlockDeviceMappings,CpuOptions,CreditSpecification,DisableApiTermination,EbsOptimized,ElasticGpuSpecifications,ElasticInferenceAccelerators,EnclaveOptions,HibernationOptions,HostId,HostResourceGroupArn,IamInstanceProfile,ImageId,InstanceInitiatedShutdownBehavior,InstanceType,Ipv6AddressCount,Ipv6Addresses,KernelId,KeyName,LaunchTemplate,LicenseSpecifications,MetadataOptions,Monitoring,NetworkInterfaces,PlacementGroupName,PrivateDnsNameOptions,PrivateIpAddress,PropagateTagsToVolumeOnCreation,RamdiskId,SecurityGroupIds,SecurityGroups,SourceDestCheck,SsmAssociations,SubnetId,Tags,Tenancy,UserData,Volumes
@@ -97,7 +106,10 @@ AWS::EC2::Subnet	BlockPublicAccessStates,Ipv6CidrBlocks,NetworkAclAssociationId,
 AWS::EC2::SubnetNetworkAclAssociation	AssociationId	NetworkAclId,SubnetId
 AWS::EC2::SubnetRouteTableAssociation	Id	RouteTableId,SubnetId
 AWS::EC2::VPC	CidrBlockAssociations,DefaultNetworkAcl,DefaultSecurityGroup,Ipv6CidrBlocks,VpcId	CidrBlock,EnableDnsHostnames,EnableDnsSupport,InstanceTenancy,Ipv4IpamPoolId,Ipv4NetmaskLength,Tags,VpcEncryptionControl
+AWS::EC2::VPCDHCPOptionsAssociation		DhcpOptionsId,VpcId
 AWS::EC2::VPCEndpoint	CreationTimestamp,DnsEntries,Id,NetworkInterfaceIds	DnsOptions,IpAddressType,PolicyDocument,PrivateDnsEnabled,ResourceConfigurationArn,RouteTableIds,SecurityGroupIds,ServiceName,ServiceNetworkArn,ServiceRegion,SubnetIds,Tags,VpcEndpointType,VpcId
+AWS::EC2::VPCEndpointService	ServiceId	AcceptanceRequired,ContributorInsightsEnabled,GatewayLoadBalancerArns,NetworkLoadBalancerArns,PayerResponsibility,PrivateDnsName,PrivateDnsNameConfiguration,SupportedIpAddressTypes,SupportedRegions,Tags
+AWS::EC2::VPCEndpointServicePermissions		AllowedPrincipals,ServiceId,TransitGatewayAttachmentAllowedPrincipals
 AWS::EC2::VPCGatewayAttachment	AttachmentType	InternetGatewayId,VpcId,VpnGatewayId
 AWS::ECR::Repository	Arn,RepositoryUri	EmptyOnDelete,EncryptionConfiguration,ImageScanningConfiguration,ImageTagMutability,ImageTagMutabilityExclusionFilters,LifecyclePolicy,RepositoryName,RepositoryPolicyText,Tags
 AWS::ECS::CapacityProvider		AutoScalingGroupProvider,ClusterName,ManagedInstancesProvider,Name,Tags
@@ -125,6 +137,7 @@ AWS::ElastiCache::ServerlessCache	ARN,CreateTime,FullEngineVersion,Status	CacheU
 AWS::ElastiCache::SubnetGroup		CacheSubnetGroupName,Description,SubnetIds,Tags
 AWS::ElastiCache::User	Arn,Status	AccessString,AuthenticationMode,Engine,NoPasswordRequired,Passwords,Tags,UserId,UserName
 AWS::ElastiCache::UserGroup	Arn,Status	Engine,Tags,UserGroupId,UserIds
+AWS::ElasticLoadBalancing::LoadBalancer	CanonicalHostedZoneName,CanonicalHostedZoneNameID,DNSName,SourceSecurityGroup	AccessLoggingPolicy,AppCookieStickinessPolicy,AvailabilityZones,ConnectionDrainingPolicy,ConnectionSettings,CrossZone,HealthCheck,Instances,LBCookieStickinessPolicy,Listeners,LoadBalancerName,Policies,Scheme,SecurityGroups,Subnets,Tags
 AWS::ElasticLoadBalancingV2::Listener	ListenerArn	AlpnPolicy,Certificates,DefaultActions,ListenerAttributes,LoadBalancerArn,MutualAuthentication,Port,Protocol,SslPolicy,Tags
 AWS::ElasticLoadBalancingV2::ListenerCertificate	Id	Certificates,ListenerArn
 AWS::ElasticLoadBalancingV2::ListenerRule	IsDefault,RuleArn	Actions,Conditions,ListenerArn,Priority,Tags,Transforms
@@ -171,6 +184,7 @@ AWS::Lambda::WebFunctionRevision	CreatedAt,FunctionArn,RevisionArn,RevisionId,St
 AWS::Logs::LogGroup	Arn	BearerTokenAuthenticationEnabled,DataProtectionPolicy,DeletionProtectionEnabled,FieldIndexPolicies,KmsKeyId,LogGroupClass,LogGroupName,ResourcePolicyDocument,RetentionInDays,Tags
 AWS::Logs::LogStream		LogGroupName,LogStreamName
 AWS::Logs::MetricFilter		ApplyOnTransformedLogs,EmitSystemFieldDimensions,FieldSelectionCriteria,FilterName,FilterPattern,LogGroupName,MetricTransformations
+AWS::Logs::SubscriptionFilter		ApplyOnTransformedLogs,DestinationArn,Distribution,EmitSystemFields,FieldSelectionCriteria,FilterName,FilterPattern,LogGroupName,RoleArn
 AWS::Organizations::Account	AccountId,Arn,JoinedMethod,JoinedTimestamp,Paths,State,Status	AccountName,Email,ParentIds,RoleName,Tags
 AWS::Organizations::Organization	Arn,Id,ManagementAccountArn,ManagementAccountEmail,ManagementAccountId,RootId	FeatureSet
 AWS::Organizations::OrganizationalUnit	Arn,Id,Path	Name,ParentId,Tags
@@ -208,7 +222,11 @@ AWS::SNS::Topic	TopicArn	ArchivePolicy,ContentBasedDeduplication,DataProtectionP
 AWS::SNS::TopicPolicy	Id	PolicyDocument,Topics
 AWS::SQS::Queue	Arn,QueueUrl	ContentBasedDeduplication,DeduplicationScope,DelaySeconds,FifoQueue,FifoThroughputLimit,KmsDataKeyReusePeriodSeconds,KmsMasterKeyId,MaximumMessageSize,MessageRetentionPeriod,QueueName,ReceiveMessageWaitTimeSeconds,RedriveAllowPolicy,RedrivePolicy,SqsManagedSseEnabled,Tags,VisibilityTimeout
 AWS::SQS::QueuePolicy	Id	PolicyDocument,Queues
+AWS::SSM::Association	AssociationId	ApplyOnlyAtCronInterval,AssociationDispatchAssumeRole,AssociationName,AutomationTargetParameterName,CalendarNames,ComplianceSeverity,DocumentVersion,InstanceId,MaxConcurrency,MaxErrors,Name,OutputLocation,Parameters,ScheduleExpression,ScheduleOffset,SyncCompliance,Tags,Targets,WaitForSuccessTimeoutSeconds
+AWS::SSM::Document		Attachments,Content,DocumentFormat,DocumentType,Name,Requires,Tags,TargetType,UpdateMethod,VersionName
 AWS::SSM::Parameter	Arn	AllowedPattern,DataType,Description,Name,Policies,Tags,Tier,Type,Value
+AWS::SSM::PatchBaseline	Id	ApprovalRules,ApprovedPatches,ApprovedPatchesComplianceLevel,ApprovedPatchesEnableNonSecurity,AvailableSecurityUpdatesComplianceStatus,DefaultBaseline,Description,GlobalFilters,Name,OperatingSystem,PatchGroups,RejectedPatches,RejectedPatchesAction,Sources,Tags
+AWS::SSM::ResourceDataSync		BucketName,BucketPrefix,BucketRegion,KMSKeyArn,S3Destination,SyncFormat,SyncName,SyncSource,SyncType
 AWS::Scheduler::Schedule	Arn	Description,EndDate,FlexibleTimeWindow,GroupName,KmsKeyArn,Name,ScheduleExpression,ScheduleExpressionTimezone,StartDate,State,Target
 AWS::Scheduler::ScheduleGroup	Arn,CreationDate,LastModificationDate,State	Name,Tags
 AWS::SecretsManager::Secret	Id	Description,GenerateSecretString,KmsKeyId,Name,ReplicaRegions,SecretString,Tags,Type
@@ -218,6 +236,7 @@ AWS::ServiceDiscovery::PrivateDnsNamespace	Arn,HostedZoneId,Id	Description,Name,
 AWS::ServiceDiscovery::PublicDnsNamespace	Arn,HostedZoneId,Id	Description,Name,Properties,Tags
 AWS::ServiceDiscovery::Service	Arn,Id	Description,DnsConfig,HealthCheckConfig,HealthCheckCustomConfig,Name,NamespaceId,ServiceAttributes,Tags,Type
 AWS::Signer::SigningProfile	Arn,ProfileName,ProfileVersion,ProfileVersionArn	PlatformId,SignatureValidityPeriod,Tags
+AWS::StepFunctions::Activity	Arn	EncryptionConfiguration,Name,Tags
 AWS::StepFunctions::StateMachine	Arn,Name,StateMachineRevisionId	Definition,DefinitionS3Location,DefinitionString,DefinitionSubstitutions,EncryptionConfiguration,LoggingConfiguration,RoleArn,StateMachineName,StateMachineType,Tags,TracingConfiguration
 AWS::Transfer::Server	Arn,As2ServiceManagedEgressIpAddresses,ServerId,State	Certificate,CreateWithHostKey,Domain,EndpointDetails,EndpointType,IdentityProviderDetails,IdentityProviderType,IpAddressType,LoggingRole,PostAuthenticationLoginBanner,PreAuthenticationLoginBanner,ProtocolDetails,Protocols,S3StorageOptions,SecurityPolicyName,StructuredLogDestinations,Tags,WorkflowDetails
 AWS::Transfer::User	Arn	HomeDirectory,HomeDirectoryMappings,HomeDirectoryType,Policy,PosixProfile,Role,ServerId,SshPublicKeys,Tags,UserName

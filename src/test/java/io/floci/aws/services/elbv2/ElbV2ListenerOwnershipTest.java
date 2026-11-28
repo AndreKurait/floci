@@ -19,7 +19,13 @@ import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.net.NetServer;
+import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.SSLOptions;
+import io.vertx.core.net.SocketAddress;
+import io.vertx.ext.web.Route;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
@@ -62,6 +68,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -71,6 +78,35 @@ class ElbV2ListenerOwnershipTest {
     private static final String REGION = "us-west-2";
     private static final String HOST = "shared.example.test";
     private static final String CERTIFICATE = "arn:aws:acm:us-west-2:000000000000:certificate/shared";
+
+    @ParameterizedTest
+    @CsvSource({"HTTP,true", "HTTPS,false", "TCP,false"})
+    void sharedEdgeDispatchesOnlyHttpListeners(String protocol, boolean dispatch) {
+        Fixture fixture = new Fixture(new Registry());
+        Listener listener = listener("edge", 8443, "HTTPS".equals(protocol));
+        listener.setProtocol(protocol);
+        try {
+            publishRuntime(fixture.plane, listener, REGION, null, List.of(rule("edge")));
+            fixture.sharedEdge(HOST + ":8443", dispatch);
+            if (!"TCP".equals(protocol)) {
+                fixture.serves(8443, "edge");
+            }
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"shared.example.test,true", "shared.example.test:80,true", "shared.example.test:0,false"})
+    void sharedEdgeDistinguishesAnOmittedPortFromExplicitZero(String authority, boolean dispatch) {
+        Fixture fixture = new Fixture(new Registry());
+        try {
+            publishRuntime(fixture.plane, listener("edge", 80, false), REGION, null, List.of(rule("edge")));
+            fixture.sharedEdge(authority, dispatch);
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -270,14 +306,16 @@ class ElbV2ListenerOwnershipTest {
                     return current.get();
                 });
             });
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-                assertNotNull(refresher.get());
-                ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(refresher.get().threadId(), 30);
-                assertNotNull(info);
-                assertEquals(Thread.State.BLOCKED, info.getThreadState());
-                assertEquals(owner.get().threadId(), info.getLockOwnerId());
-                assertTrue(Arrays.stream(info.getStackTrace()).anyMatch(frame -> frame.getMethodName().equals("onPort")));
-            });
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        assertNotNull(refresher.get());
+                        ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(refresher.get().threadId(), 30);
+                        assertNotNull(info);
+                        assertEquals(Thread.State.BLOCKED, info.getThreadState());
+                        assertEquals(owner.get().threadId(), info.getLockOwnerId());
+                        assertTrue(Arrays.stream(info.getStackTrace()).anyMatch(frame -> frame.getMethodName().equals("onPort")));
+                    });
             assertEquals(0, reads.get(), "rule membership must not be read before acquiring the gate");
             current.set(List.of(rule("added"), rule("old")));
             publishRuntime(fixture.plane, listener("unrelated", 10443, false), REGION, null, List.of(rule("progress")));
@@ -419,14 +457,16 @@ class ElbV2ListenerOwnershipTest {
             stopping.start();
             assertTrue(insideClose.await(5, TimeUnit.SECONDS));
             publishing.start();
-            await().atMost(5, TimeUnit.SECONDS).until(() -> {
-                ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(publishing.threadId(), 30);
-                return info != null && info.getThreadState() == Thread.State.BLOCKED
-                        && info.getLockOwnerId() == stopping.threadId()
-                        && Arrays.stream(info.getStackTrace()).anyMatch(frame ->
-                                frame.getClassName().equals(ElbV2DataPlane.class.getName())
-                                        && frame.getMethodName().equals("onPort"));
-            });
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> {
+                        ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(publishing.threadId(), 30);
+                        return info != null && info.getThreadState() == Thread.State.BLOCKED
+                                && info.getLockOwnerId() == stopping.threadId()
+                                && Arrays.stream(info.getStackTrace()).anyMatch(frame ->
+                                        frame.getClassName().equals(ElbV2DataPlane.class.getName())
+                                                && frame.getMethodName().equals("onPort"));
+                    });
             publishRuntime(fixture.plane, listener("unrelated", 9443, false), REGION, null, List.of(rule("unrelated")));
             fixture.serves(9443, "unrelated");
             releaseClose.countDown();
@@ -640,13 +680,15 @@ class ElbV2ListenerOwnershipTest {
             when(plane.config.services()).thenReturn(services);
             when(services.elbv2()).thenReturn(config);
             when(config.mock()).thenReturn(false);
+            when(config.enabled()).thenReturn(true);
             when(plane.config.port()).thenReturn(4566);
             plane.tlsProxyServer = mock(TlsProxyServer.class);
             when(plane.tlsProxyServer.reservesPort(anyInt())).thenReturn(false);
             plane.elbV2Service = mock(ElbV2Service.class);
             LoadBalancer balancer = new LoadBalancer();
             balancer.setDnsName(HOST);
-            when(plane.elbV2Service.getLoadBalancer(eq(REGION), anyString())).thenReturn(balancer);
+            when(plane.elbV2Service.getLoadBalancerForListener(eq(REGION), anyString(), anyString()))
+                    .thenReturn(balancer);
             plane.certificateResolver = mock(CertificateReferenceResolver.class);
             CertificateGenerator.GeneratedCertificate pair = new CertificateGenerator().generateSelfSignedCertificate(
                     HOST, List.of(), KeyAlgorithm.RSA_2048);
@@ -661,6 +703,11 @@ class ElbV2ListenerOwnershipTest {
             });
             when(plane.vertx.cancelTimer(anyLong())).thenAnswer(call ->
                     timers.remove(call.<Long>getArgument(0)) != null);
+            NetServer tcpServer = mock(NetServer.class);
+            when(tcpServer.connectHandler(any())).thenReturn(tcpServer);
+            when(tcpServer.listen()).thenReturn(Future.succeededFuture(tcpServer));
+            when(tcpServer.close()).thenReturn(Future.succeededFuture());
+            when(plane.vertx.createNetServer(any(NetServerOptions.class))).thenReturn(tcpServer);
             when(plane.vertx.createHttpServer(any(HttpServerOptions.class))).thenAnswer(call -> {
                 int port = ((HttpServerOptions) call.getArgument(0)).getPort();
                 created.computeIfAbsent(port, ignored -> new AtomicInteger()).incrementAndGet();
@@ -704,10 +751,40 @@ class ElbV2ListenerOwnershipTest {
             return count == null ? 0 : count.get();
         }
 
+        private void sharedEdge(String authority, boolean dispatch) {
+            Router router = mock(Router.class);
+            Route route = mock(Route.class);
+            AtomicReference<Handler<RoutingContext>> handler = new AtomicReference<>();
+            when(router.route()).thenReturn(route);
+            when(route.order(anyInt())).thenReturn(route);
+            when(route.handler(any())).thenAnswer(call -> {
+                handler.set(call.getArgument(0));
+                return route;
+            });
+            plane.register(router);
+            RoutingContext context = mock(RoutingContext.class);
+            HttpServerRequest request = mock(HttpServerRequest.class);
+            HttpServerResponse response = mock(HttpServerResponse.class);
+            when(context.request()).thenReturn(request);
+            when(request.getHeader("Host")).thenReturn(authority);
+            when(request.host()).thenReturn(authority);
+            when(request.response()).thenReturn(response);
+            when(response.setStatusCode(anyInt())).thenReturn(response);
+            handler.get().handle(context);
+            if (dispatch) {
+                verify(response).end("edge");
+                verify(context, never()).next();
+            } else {
+                verify(context).next();
+                verify(response, never()).end(anyString());
+            }
+        }
+
         private void serves(int port, String body) {
             HttpServerRequest request = mock(HttpServerRequest.class);
             HttpServerResponse response = mock(HttpServerResponse.class);
             when(request.host()).thenReturn(HOST);
+            when(request.localAddress()).thenReturn(SocketAddress.inetSocketAddress(port, "127.0.0.1"));
             when(request.response()).thenReturn(response);
             when(response.setStatusCode(anyInt())).thenReturn(response);
             handlers.get(port).handle(request);

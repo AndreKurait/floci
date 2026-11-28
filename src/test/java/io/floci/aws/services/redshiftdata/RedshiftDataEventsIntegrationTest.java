@@ -61,7 +61,8 @@ class RedshiftDataEventsIntegrationTest {
                             .put("StatementName", name), REGION, "arn:aws:iam::" + ACCOUNT + ":role/etl"))
                     .path("Id").asText();
             AtomicReference<JsonNode> delivered = new AtomicReference<>();
-            await().atMost(Duration.ofSeconds(10)).until(() -> {
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(10))
+                    .until(() -> {
                 List<Message> messages = RequestScopes.callAs(ACCOUNT, REGION,
                         () -> sqs.receiveMessage(queue, 1, 30, 0, REGION));
                 if (messages.isEmpty()) {

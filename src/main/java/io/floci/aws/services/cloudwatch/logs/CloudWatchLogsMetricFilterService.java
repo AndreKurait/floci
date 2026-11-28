@@ -226,7 +226,7 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
                 filter.setFilterName(filterName);
                 filter.setFilterPattern(definition.getFilterPattern());
                 filter.setMetricTransformations(List.of(copy(transformation)));
-                filter.setCreationTime(before == null ? System.currentTimeMillis() : before.getCreationTime());
+                filter.setCreationTime(before == null ? logsService.currentTimeMillis() : before.getCreationTime());
                 filter.setApplyOnTransformedLogs(definition.getApplyOnTransformedLogs());
                 filter.setFieldSelectionCriteria(definition.getFieldSelectionCriteria());
                 filter.setEmitSystemFieldDimensions(definition.getEmitSystemFieldDimensions() == null
@@ -570,7 +570,11 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
         Owner owner = new Owner(account, event.region(), event.logGroupName(), filter.getFilterName());
         List<Publication> publications = new ArrayList<>();
         for (LogEvent logEvent : event.events()) {
-            FilterMatch match = pattern.match(logEvent.getMessage());
+            String message = logEvent.messageForFilter(Boolean.TRUE.equals(filter.getApplyOnTransformedLogs()));
+            if (message == null) {
+                continue;
+            }
+            FilterMatch match = pattern.match(message);
             Double value = t.getDefaultValue();
             List<Dimension> dimensions = new ArrayList<>();
             if (match.matched()) {

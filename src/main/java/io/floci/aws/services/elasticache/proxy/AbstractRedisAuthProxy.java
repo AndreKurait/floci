@@ -39,7 +39,7 @@ import java.util.function.LongSupplier;
  */
 public abstract class AbstractRedisAuthProxy {
     private static final int HANDSHAKE_TIMEOUT_MILLIS = 10_000;
-    private static final long RELAY_JOIN_TIMEOUT_MILLIS = 1_000;
+    static final long RELAY_JOIN_TIMEOUT_MILLIS = 1_000;
     /** How long a connection signed in with an IAM token lasts, unless it signs in again. */
     private static final long IAM_CONNECTION_LIFETIME_NANOS = TimeUnit.HOURS.toNanos(12);
 
@@ -195,6 +195,14 @@ public abstract class AbstractRedisAuthProxy {
      */
     ServerSocket listenSocket(int proxyPort, int backlog) throws IOException {
         return new ServerSocket(proxyPort, backlog);
+    }
+
+    /**
+     * Waits for a relay direction to end, for at most {@code timeoutMillis}. A seam so a test can
+     * hold the wait on a controlled timeline instead of sitting it out.
+     */
+    void joinRelay(Thread relay, long timeoutMillis) throws InterruptedException {
+        relay.join(timeoutMillis);
     }
 
     int localPort() {
@@ -474,8 +482,8 @@ public abstract class AbstractRedisAuthProxy {
             if (connection.awaitEnd()) {
                 closeExpired(connection);
             }
-            t1.join(RELAY_JOIN_TIMEOUT_MILLIS);
-            t2.join(RELAY_JOIN_TIMEOUT_MILLIS);
+            joinRelay(t1, RELAY_JOIN_TIMEOUT_MILLIS);
+            joinRelay(t2, RELAY_JOIN_TIMEOUT_MILLIS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {

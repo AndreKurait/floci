@@ -14,6 +14,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -24,6 +25,7 @@ import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -55,6 +57,22 @@ class S3BucketCreationAccountTest {
 
     private S3Service service(boolean global) {
         return new S3Service(buckets, objects, Path.of("s3-account-create-test"), true, global);
+    }
+
+    @Test
+    void serviceBucketsAreHiddenWithoutReservingOrHidingCustomerBucketNames() {
+        S3Service service = service(true);
+        String name = "floci-internal-cfn-wait-example";
+        Bucket bucket = service.createServiceOwnedBucket(name, "us-east-1");
+        assertTrue(bucket.isServiceOwned());
+        assertTrue(service.listBuckets().isEmpty());
+        assertTrue(service.isServiceOwnedBucket(name));
+        assertThrows(AwsException.class, () -> service.createServiceOwnedBucket(name, "us-east-1"));
+        service.deleteBucket(name);
+        Bucket customer = service.createBucket(name, "us-east-1");
+        assertFalse(customer.isServiceOwned());
+        assertEquals(List.of(customer), service.listBuckets());
+        assertFalse(service.isServiceOwnedBucket(name));
     }
 
     @Test

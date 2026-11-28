@@ -142,7 +142,7 @@ jobs:
         run: pip install -r tools/aws/requirements.txt
 
       # A pull request checks the files it changes; the weekly and manual runs check every file. A
-      # diff that cannot be read leaves CHANGED empty, which checks every file too.
+      # unreadable diff fails the step; an empty manifest checks every file too.
       - name: Check the vendored IAM files still match upstream
         env:
           EVENT_NAME: ${{ github.event_name }}

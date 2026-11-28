@@ -1,8 +1,10 @@
 package io.floci.aws.lifecycle;
 
 import io.floci.aws.config.FlociVersion;
+import io.floci.aws.services.ec2.Ec2NativePeerDependencies;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -22,6 +24,9 @@ import static org.hamcrest.Matchers.startsWith;
 @QuarkusTest
 class ControlPlaneContractIntegrationTest {
 
+    @Inject
+    Ec2NativePeerDependencies nativePeerDependencies;
+
     private static final String NOT_FOUND_BODY = "\"error\":\"NotFound\"";
 
     @BeforeAll
@@ -37,6 +42,7 @@ class ControlPlaneContractIntegrationTest {
             .then()
                 .statusCode(200)
                 .contentType("application/json")
+                .body("features.ec2_native_peer_dependencies", equalTo(1))
                 .body("status", equalTo("UP"))
                 .body("cloud", equalTo("aws"))
                 .body("version", equalTo(FlociVersion.current()))
@@ -53,6 +59,7 @@ class ControlPlaneContractIntegrationTest {
             .then()
                 .statusCode(200)
                 .body("cloud", equalTo("aws"))
+                .body("ec2_native_peer_dependencies", equalTo(nativePeerDependencies.attestation()))
                 .body("version", equalTo(FlociVersion.current()));
     }
 

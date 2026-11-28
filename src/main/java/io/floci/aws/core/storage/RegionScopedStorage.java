@@ -5,6 +5,7 @@ import io.floci.aws.core.common.RegionResolver;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,6 +46,15 @@ public final class RegionScopedStorage<V> implements StorageBackend<String, V> {
         if (regionlessHere(key) && delegate.get(key).isPresent()) {
             delegate.delete(key);
         }
+    }
+
+    /** Publishes one regional batch; legacy values stay shadowed until normal deletion. */
+    @Override
+    public void putAllAtomically(Map<String, V> entries) {
+        Map<String, V> scoped = new LinkedHashMap<>();
+        String regionPrefix = prefix();
+        entries.forEach((key, value) -> scoped.put(regionPrefix + key, value));
+        delegate.putAllAtomically(scoped);
     }
 
     @Override
@@ -97,6 +107,9 @@ public final class RegionScopedStorage<V> implements StorageBackend<String, V> {
             boolean prefixed = regionPrefixed(stored);
             String region = prefixed ? stored.substring(0, stored.indexOf('/')) : regions.getDefaultRegion();
             String key = prefixed ? stored.substring(region.length() + 1) : stored;
+            if (!prefixed && delegate.get(prefix(region) + key).isPresent()) {
+                continue;
+            }
             delegate.get(stored).ifPresent(value -> entries.add(new RegionEntry<>(region, key, value)));
         }
         return entries;
@@ -145,6 +158,11 @@ public final class RegionScopedStorage<V> implements StorageBackend<String, V> {
     @Override
     public void clear() {
         keys().forEach(this::delete);
+    }
+
+    @Override
+    public void flushOrThrow() {
+        delegate.flushOrThrow();
     }
 
     @Override

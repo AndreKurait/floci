@@ -28,6 +28,7 @@ import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -57,20 +58,27 @@ class Ec2InstanceGroupSynchronizationIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void detachedInterfaceProtectsReplacementAfterInstanceReferenceIsRemoved(boolean primaryAtLaunch) {
+    void retainedInterfaceProtectsItsGroupAfterInstanceReferenceIsRemoved(boolean primaryAtLaunch) {
         Fixture fixture = fixture(primaryAtLaunch);
         replace(fixture, fixture.replacement());
-        fixture.client().detachNetworkInterface(request -> request.attachmentId(fixture.attachment()));
-        // Leave no instance reference to the replacement: only the standalone ENI protects it. The instance now
-        // has at most one interface, so the instance-level change is one AWS accepts.
-        fixture.client().modifyInstanceAttribute(request -> request.instanceId(fixture.instance())
-                .groups(fixture.original()));
+        String protectedGroup = fixture.replacement();
+        if (primaryAtLaunch) {
+            fixture.client().terminateInstances(request -> request.instanceIds(fixture.instance()));
+            assertEquals("terminated", instance(fixture).state().nameAsString());
+        } else {
+            fixture.client().detachNetworkInterface(request -> request.attachmentId(fixture.attachment()));
+            assertEquals(List.of(fixture.original()), groupIds(instance(fixture).securityGroups()));
+        }
+        NetworkInterface retained = networkInterface(fixture);
+        assertNull(retained.attachment());
+        assertEquals("available", retained.statusAsString());
+        // The terminated instance or remaining primary interface does not protect this group.
 
         Ec2Exception error = assertThrows(Ec2Exception.class, () -> fixture.client()
-                .deleteSecurityGroup(request -> request.groupId(fixture.replacement())));
+                .deleteSecurityGroup(request -> request.groupId(protectedGroup)));
 
         assertEquals("DependencyViolation", error.awsErrorDetails().errorCode());
-        assertEquals(List.of(fixture.replacement()), groupIds(networkInterface(fixture).groups()));
+        assertEquals(List.of(protectedGroup), groupIds(networkInterface(fixture).groups()));
     }
 
     @ParameterizedTest
@@ -301,7 +309,7 @@ class Ec2InstanceGroupSynchronizationIntegrationTest {
         cleanup.register(() -> {
             NetworkInterface current = client.describeNetworkInterfaces(request -> request.networkInterfaceIds(eni))
                     .networkInterfaces().getFirst();
-            if (current.attachment() != null) {
+            if (current.attachment() != null && current.attachment().deviceIndex() != 0) {
                 client.detachNetworkInterface(request -> request.attachmentId(current.attachment().attachmentId()));
             }
         });

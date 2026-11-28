@@ -745,6 +745,7 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
                 config.setConnectionMode(connectionMode);
             }
             config.setAliases(cfnStringList(dc.path("Aliases"), engine));
+            config.setViewerCertificate(cfnViewerCertificate(dc.path("ViewerCertificate"), engine));
             config.setOrigins(cfnOrigins(dc, engine));
             config.setDefaultCacheBehavior(cfnDefaultCacheBehavior(dc.path("DefaultCacheBehavior"), engine));
             config.setCacheBehaviors(cfnCacheBehaviors(dc, engine));
@@ -775,8 +776,11 @@ public class CloudFrontCfnProvisioner implements CfnResourceProvisioner {
      * certificate.
      */
     private Map<String, String> cfnViewerCertificate(JsonNode node, CloudFormationTemplateEngine engine) {
-        if (node == null || !node.isObject()) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
             return null;
+        }
+        if (!node.isObject()) {
+            throw new AwsException("ValidationError", "DistributionConfig.ViewerCertificate must be an object", 400);
         }
         Map<String, String> certificate = new LinkedHashMap<>();
         putIfPresent(certificate, "ACMCertificateArn", cfnText(node, "AcmCertificateArn", engine));

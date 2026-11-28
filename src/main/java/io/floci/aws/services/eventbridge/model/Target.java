@@ -34,6 +34,21 @@ public class Target {
         this.inputPath = inputPath;
     }
 
+    public Target(Target source) {
+        this(source.id, source.arn, source.input, source.inputPath);
+        roleArn = source.roleArn;
+        inputTransformer = source.inputTransformer;
+        kinesisParameters = source.kinesisParameters;
+        sqsParameters = source.sqsParameters;
+        batchParameters = source.batchParameters;
+        ecsParameters = source.ecsParameters;
+        redshiftDataParameters = source.redshiftDataParameters;
+        retryPolicy = source.retryPolicy;
+        deadLetterConfig = source.deadLetterConfig;
+        httpParameters = source.httpParameters;
+        appSyncParameters = source.appSyncParameters;
+    }
+
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
 

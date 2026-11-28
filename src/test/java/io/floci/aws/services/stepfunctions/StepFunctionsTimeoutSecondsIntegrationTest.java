@@ -11,16 +11,16 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * The two {@code TimeoutSeconds} fields of ASL, each enforced on its own clock: the state
- * machine's total budget and a {@code Task}'s wait for its task token, the second one bounded a
- * second time by {@code HeartbeatSeconds}.
+ * The two {@code TimeoutSeconds} fields of ASL over HTTP and in real time: one case for each way
+ * the shipped executor waits (its sleep, the Parallel and Map joins, a nested execution's status,
+ * a task token under the service's heartbeat clock), with bounds of one second.
  *
  * <p>The bounds here are one to ten seconds where the report that measured them against us-east-1
  * used three and five; the shape of the terminal execution is what the assertions pin, not the
@@ -57,7 +57,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
                 """);
 
         String execArn = startExecution(smArn, "{}");
-        Response timedOut = waitForTerminalExecution(execArn);
+        Response timedOut = waitForTerminalState(execArn);
 
         assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"));
         JsonNode body = mapper.readTree(timedOut.body().asString());
@@ -100,7 +100,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
 
         String execArn = startExecution(smArn, "{\"items\": [1, 2]}");
         long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
+        Response timedOut = waitForTerminalState(execArn);
         long elapsedMillis = System.currentTimeMillis() - startedAt;
 
         assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"), timedOut.body().asString());
@@ -141,7 +141,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
 
         String execArn = startExecution(smArn, "{\"items\": [1]}");
         long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
+        Response timedOut = waitForTerminalState(execArn);
         long elapsedMillis = System.currentTimeMillis() - startedAt;
 
         assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"), timedOut.body().asString());
@@ -158,7 +158,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         String activityArn = createActivity("timeout-seconds-total");
         String smArn = createStateMachine("task-timeout-seconds", activityTask(activityArn, 1, 0));
 
-        Response failed = waitForTerminalExecution(startExecution(smArn, "{}"));
+        Response failed = waitForTerminalState(startExecution(smArn, "{}"));
 
         assertEquals("FAILED", failed.jsonPath().getString("status"));
         assertEquals("States.Timeout", failed.jsonPath().getString("error"));
@@ -176,7 +176,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         // A worker picks the task up and then goes silent, so the gap HeartbeatSeconds allows runs
         // out long before the state's TimeoutSeconds does.
         getActivityTask(activityArn);
-        Response failed = waitForTerminalExecution(execArn);
+        Response failed = waitForTerminalState(execArn);
 
         assertEquals("FAILED", failed.jsonPath().getString("status"));
         assertEquals("States.Timeout", failed.jsonPath().getString("error"));
@@ -210,7 +210,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         }
         sendTaskSuccess(taskToken, "{\"answered\":true}");
 
-        Response succeeded = waitForTerminalExecution(execArn);
+        Response succeeded = waitForTerminalState(execArn);
         assertEquals("SUCCEEDED", succeeded.jsonPath().getString("status"),
                 "execution was " + succeeded.body().asString());
         assertTrue(mapper.readTree(succeeded.jsonPath().getString("output")).path("answered").asBoolean());
@@ -267,32 +267,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         return taskToken;
     }
 
-    private static void sendTaskHeartbeat(String taskToken) {
-        given()
-                .header("X-Amz-Target", "AWSStepFunctions.SendTaskHeartbeat")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"taskToken": %s}
-                        """.formatted(quote(taskToken)))
-                .when()
-                .post("/")
-                .then()
-                .statusCode(200);
-    }
-
-    private static void sendTaskSuccess(String taskToken, String output) {
-        given()
-                .header("X-Amz-Target", "AWSStepFunctions.SendTaskSuccess")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"taskToken": %s, "output": %s}
-                        """.formatted(quote(taskToken), quote(output)))
-                .when()
-                .post("/")
-                .then()
-                .statusCode(200);
-    }
-
     private static String createStateMachine(String name, String definition) {
         Response resp = given()
                 .header("X-Amz-Target", "AWSStepFunctions.CreateStateMachine")
@@ -319,17 +293,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private static Response describeExecution(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"executionArn": "%s"}
-                        """.formatted(execArn))
-                .when()
-                .post("/");
-    }
-
     private static Response getExecutionHistory(String execArn) {
         return given()
                 .header("X-Amz-Target", "AWSStepFunctions.GetExecutionHistory")
@@ -341,23 +304,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
                 .post("/");
     }
 
-    /**
-     * Polls for 20 seconds: twice the longest bound any definition here declares, and far short of
-     * the 300-second default a task that ignores TimeoutSeconds falls back on.
-     */
-    private static Response waitForTerminalExecution(String execArn) throws InterruptedException {
-        for (int poll = 0; poll < 200; poll++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if (!"RUNNING".equals(status)) {
-                return resp;
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution " + execArn + " was still RUNNING after 20 seconds");
-        return null;
-    }
-
     private static String quote(String raw) {
         return "\"" + raw
                 .replace("\\", "\\\\")
@@ -366,5 +312,31 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
                 .replace("\r", "\\r")
                 .replace("\t", "\\t")
                 + "\"";
+    }
+
+    private static void sendTaskHeartbeat(String taskToken) {
+        given()
+                .header("X-Amz-Target", "AWSStepFunctions.SendTaskHeartbeat")
+                .contentType(SFN_CONTENT_TYPE)
+                .body("""
+                        {"taskToken": %s}
+                        """.formatted(quote(taskToken)))
+                .when()
+                .post("/")
+                .then()
+                .statusCode(200);
+    }
+
+    private static void sendTaskSuccess(String taskToken, String output) {
+        given()
+                .header("X-Amz-Target", "AWSStepFunctions.SendTaskSuccess")
+                .contentType(SFN_CONTENT_TYPE)
+                .body("""
+                        {"taskToken": %s, "output": %s}
+                        """.formatted(quote(taskToken), quote(output)))
+                .when()
+                .post("/")
+                .then()
+                .statusCode(200);
     }
 }
