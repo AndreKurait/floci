@@ -706,6 +706,10 @@ class StepFunctionsMessagingTaskIamIntegrationTest {
         String topicArn = EnforcementFixtures.createTopic(cleanup, baseUri.getPort(), auth(ACCOUNT, "sns"),
                 "sfn-iam-" + UUID.randomUUID());
         SqsTestQueue sink = queue();
+        sink.setPolicy(MAPPER.valueToTree(Map.of("Version", "2012-10-17", "Statement", List.of(Map.of(
+                "Effect", "Allow", "Principal", Map.of("Service", "sns.amazonaws.com"),
+                "Action", "sqs:SendMessage", "Resource", sink.arn(),
+                "Condition", Map.of("ArnEquals", Map.of("aws:SourceArn", topicArn)))))).toString());
         given().port(baseUri.getPort()).header("Authorization", auth(ACCOUNT, "sns"))
                 .formParam("Action", "Subscribe").formParam("TopicArn", topicArn)
                 .formParam("Protocol", "sqs").formParam("Endpoint", sink.arn())
