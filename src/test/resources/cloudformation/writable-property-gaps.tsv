@@ -600,7 +600,6 @@ AWS::S3::Bucket	AccessControl	silently dropped, as the S3CfnProvisioner javadoc 
 AWS::S3::Bucket	AnalyticsConfigurations	silently dropped, as the S3CfnProvisioner javadoc records
 AWS::S3::Bucket	IntelligentTieringConfigurations	silently dropped, as the S3CfnProvisioner javadoc records
 AWS::S3::Bucket	InventoryConfigurations	silently dropped, as the S3CfnProvisioner javadoc records
-AWS::S3::Bucket	LoggingConfiguration	silently dropped, as the S3CfnProvisioner javadoc records
 AWS::S3::Bucket	MetadataConfiguration	accepted and ignored
 AWS::S3::Bucket	MetadataTableConfiguration	accepted and ignored
 AWS::S3::Bucket	MetricsConfigurations	silently dropped, as the S3CfnProvisioner javadoc records

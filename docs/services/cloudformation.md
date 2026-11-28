@@ -729,6 +729,16 @@ publishes no format for this resource's identifier, so the format is Floci's.
   the stack for instance, was not added by the resource: neither dropping it from `Certificates` nor
   deleting the resource takes it off the listener.
 
+## S3 access logging configuration
+
+`AWS::S3::Bucket.LoggingConfiguration` reaches the S3 bucket logging API, including the
+destination, log prefix and simple or date-partitioned object key format. An omitted
+destination means the source bucket. Updates preserve the bucket, removing a previously
+declared configuration disables logging, and failed updates restore the previous setting.
+Configurations set outside a template remain intact while that property is undeclared.
+Server access log delivery is described in the S3 service documentation.
+
+
 ## S3 ownership controls
 
 `AWS::S3::Bucket` applies `OwnershipControls` through the same S3 call as
