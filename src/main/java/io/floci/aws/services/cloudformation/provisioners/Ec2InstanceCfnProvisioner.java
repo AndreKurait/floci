@@ -19,6 +19,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -27,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /**
  * CloudFormation provisioning for {@code AWS::EC2::Instance}. It delegates to {@link Ec2Service} so
@@ -65,14 +67,29 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
     private static final String DECLARED_PREFIX = "__FlociDeclared";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** How long {@link #delete} waits for a terminated instance, and how often it looks. */
+    private static final Duration TERMINATE_TIMEOUT = Duration.ofSeconds(90);
+    private static final Duration TERMINATE_POLL = Duration.ofMillis(250);
+
     private final Ec2Service ec2Service;
-    /** How long {@link #delete} waits for a terminated instance; package-visible so tests can shorten it. */
-    long terminateTimeoutMillis = 90_000L;
-    long terminatePollMillis = 250L;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
 
     @Inject
     public Ec2InstanceCfnProvisioner(Ec2Service ec2Service) {
+        this(ec2Service, System::nanoTime, Thread::sleep);
+    }
+
+    /** For tests that put the wait for termination on a timeline they control. */
+    Ec2InstanceCfnProvisioner(Ec2Service ec2Service, LongSupplier nanoTime, Sleeper sleeper) {
         this.ec2Service = ec2Service;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(Duration delay) throws InterruptedException;
     }
 
     @Override
@@ -661,17 +678,17 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void awaitTerminated(String region, String instanceId) {
-        long deadline = System.currentTimeMillis() + terminateTimeoutMillis;
+        long started = nanoTime.getAsLong();
         while (true) {
             if (isTerminatedOrGone(region, instanceId)) {
                 return;
             }
-            if (System.currentTimeMillis() >= deadline) {
+            if (nanoTime.getAsLong() - started >= TERMINATE_TIMEOUT.toNanos()) {
                 throw new AwsException("ValidationError", "Instance " + instanceId
-                        + " did not reach terminated within " + (terminateTimeoutMillis / 1000) + "s", 400);
+                        + " did not reach terminated within " + TERMINATE_TIMEOUT.toSeconds() + "s", 400);
             }
             try {
-                Thread.sleep(terminatePollMillis);
+                sleeper.sleep(TERMINATE_POLL);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AwsException("ValidationError",

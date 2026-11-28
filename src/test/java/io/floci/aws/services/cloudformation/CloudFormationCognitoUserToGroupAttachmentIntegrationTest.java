@@ -1,5 +1,6 @@
 package io.floci.aws.services.cloudformation;
 
+import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.config.EncoderConfig;
@@ -10,11 +11,12 @@ import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * {@code AWS::Cognito::UserPoolUserToGroupAttachment} end to end. The pool, user and groups are
@@ -220,17 +222,10 @@ class CloudFormationCognitoUserToGroupAttachmentIntegrationTest {
     }
 
     private static void awaitStackStatus(String stackId, String status) throws InterruptedException {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = describeStacks(stackId);
-            if (status.equals(XmlPath.from(xml).getString(
-                    "DescribeStacksResponse.DescribeStacksResult.Stacks.member.StackStatus"))) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        fail("stack " + stackId + " never reached " + status + ": " + xml);
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> describeStacks(stackId),
+                xml -> status.equals(XmlPath.from(xml).getString(
+                        "DescribeStacksResponse.DescribeStacksResult.Stacks.member.StackStatus")),
+                xml -> "stack " + stackId + " never reached " + status + ": " + xml);
     }
 
     private static String outputValue(String stackId, String key) {
