@@ -380,6 +380,31 @@ def test_a_built_document_validates_and_matches_botocore(corrections, tmp_path):
     assert json.loads(r.render(document)) == document
 
 
+def test_partial_coverage_keeps_only_qualified_operations_and_round_trips(corrections, tmp_path):
+    corrections.setattr(r, "PARTIAL_NAMESPACES", {"svc": ["CreateThing"]})
+    write_models(tmp_path, SIMPLE)
+    docs = [reference("svc", {"CreateThing": ["svc:TagResource"], "CreateOther": ["svc:TagResource"]})]
+    document = r.build(docs, "test", tmp_path, "botocore test")
+    assert document["partialNamespaces"] == {"svc": ["CreateThing"]}
+    assert set(document["operations"]) == {"svc:CreateThing"}
+    assert r.validate(document) == []
+    assert r.derive(document, tmp_path) == []
+    assert json.loads(r.render(document)) == document
+    assert r.verify_against(document, r.tag_on_create_operations(docs)) == ([], [])
+    del document["operations"]["svc:CreateThing"]
+    assert r.verify_against(document, r.tag_on_create_operations(docs)) == ([], ["svc:CreateThing"])
+
+
+@pytest.mark.parametrize("partial", [
+    [], {"other": ["A"]}, {"svc": []}, {"svc": ["A", "A"]},
+    {"svc": ["A", "B", "C"]}, {"svc": ["A", "B", "C", "D", "E"]},
+])
+def test_partial_coverage_cannot_hide_missing_or_unqualified_operations(partial):
+    document = good_document()
+    document["partialNamespaces"] = partial
+    assert any("partialNamespaces" in problem for problem in r.validate(document))
+
+
 def test_a_hand_edited_member_does_not_match_botocore(corrections, tmp_path):
     write_models(tmp_path, SIMPLE)
     document = r.build([reference("svc", {"CreateThing": ["svc:TagResource"]})], "test", tmp_path, "botocore test")

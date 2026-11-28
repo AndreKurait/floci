@@ -1,6 +1,34 @@
 from regen_rpcv2_cbor_shapes import build, project_model
 
 
+def test_codedeploy_agent_aliases_keep_their_own_wire_types_and_unit_output(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    catalog = tmp_path / "Catalog.java"
+    catalog.write_text('Set.of("CodeDeployCommandService.", "CodeDeployCommandService_v20141006.")')
+
+    result = build(data, catalog, "test")
+
+    assert result["aliases"]["CodeDeployCommandService"] == "codedeploy-commands"
+    assert result["aliases"]["CodeDeployCommandService_v20141006"] == "codedeploy-commands"
+    assert result["services"]["codedeploy-commands"] == {
+        "timestampFormat": "unixTimestamp", "shapes": {},
+        "operations": {"PutHostCommandComplete": {"input": None, "output": None, "hasOutput": False}}}
+    assert "types.rs blob 11c19b70191a0bbb6e47868adcef9ba040259523" in result["_source"]["codedeploy-commands"]
+
+
+def test_agent_models_do_not_hide_an_unmodeled_catalog_prefix(tmp_path):
+    import pytest
+
+    data = tmp_path / "data"
+    data.mkdir()
+    catalog = tmp_path / "Catalog.java"
+    catalog.write_text('Set.of("CodeDeployCommandService.", "UnknownCommandService.")')
+
+    with pytest.raises(ValueError, match="No RPC v2 wire model.*UnknownCommandService"):
+        build(data, catalog, "test")
+
+
 def test_agent_target_prefixes_share_the_string_only_wire_model(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
