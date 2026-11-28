@@ -50,4 +50,16 @@ class DnsAnswerTest {
         assertEquals(List.of("10.0.0.1"), answer.addresses());
         assertThrows(UnsupportedOperationException.class, () -> answer.addresses().add("10.0.0.3"));
     }
+
+    @Test
+    void upstreamTransportRequiresResolvedAddressesAndSurvivesAuthority() {
+        DnsAnswer answer = DnsAnswer.records(List.of("192.0.2.7"), 30).viaUpstream();
+        assertTrue(answer.upstream());
+        assertTrue(answer.withAuthority("example",
+                new DnsRecord.Soa("ns.example hostmaster.example 1 2 3 4 5"), 30).upstream());
+        assertThrows(IllegalArgumentException.class,
+                () -> DnsAnswer.noData().viaUpstream());
+        assertThrows(IllegalArgumentException.class,
+                () -> DnsAnswer.nxDomain().viaUpstream());
+    }
 }

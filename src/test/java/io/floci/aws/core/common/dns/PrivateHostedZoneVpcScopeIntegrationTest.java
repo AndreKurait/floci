@@ -32,6 +32,9 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @QuarkusTest
 class PrivateHostedZoneVpcScopeIntegrationTest {
@@ -370,5 +373,32 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
 
     private static String uniqueName() {
         return "vpc-scope-" + UUID.randomUUID() + ".example";
+    }
+
+    @Test
+    void publicCnameTargetRetainsTheQueryingVpcVisibility() {
+        String privateName = uniqueName();
+        addAddress(zone(privateName, firstVpc), "target." + privateName, "10.73.1.7");
+        String publicName = uniqueName();
+        String publicZone = zone(publicName, null);
+        ResourceRecordSet cname = new ResourceRecordSet();
+        cname.setName("alias." + publicName);
+        cname.setType("CNAME");
+        cname.setTtl(30L);
+        cname.setRecords(List.of(new ResourceRecord("target." + privateName)));
+        route53.changeResourceRecordSets(publicZone, List.of(Map.of("action", "CREATE", "rrs", cname)), null);
+        DnsLookupHelper fallback = mock(DnsLookupHelper.class);
+        when(fallback.resolveIpv4(anyString())).thenReturn(List.of());
+        List<DnsRecordSource> sources = new ArrayList<>();
+        DnsClientVpcSource clients = address -> Optional.of(new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "192.0.2.10".equals(address) ? firstVpc : secondVpc));
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), sources, List.of(), List.of(clients));
+        sources.add(new Route53DnsRecordSource(route53, config, fallback, server));
+        DnsAnswer visible = server.planQuery("alias." + publicName, "192.0.2.10", "127.0.0.1", 1)
+                .answer().orElseThrow();
+        assertEquals(List.of("10.73.1.7"), visible.addresses());
+        assertEquals(30, visible.ttlSeconds());
+        assertTrue(server.planQuery("alias." + publicName, "192.0.2.20", "127.0.0.1", 1)
+                .answer().orElseThrow().isEmpty());
     }
 }

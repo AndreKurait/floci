@@ -2,6 +2,8 @@ package io.floci.aws.core.common.dns;
 
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.TlsConfigSource;
+import io.floci.aws.core.common.docker.ContainerDetector;
+import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.services.ec2.Ec2MetadataServer;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.route53.Route53DnsRecordSource;
@@ -26,6 +28,9 @@ import org.junit.jupiter.params.provider.CsvSource;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.route53.Route53Client;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -42,6 +47,9 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @QuarkusTest
 class Route53DnsPacketIntegrationTest {
@@ -670,4 +678,167 @@ class Route53DnsPacketIntegrationTest {
         return DnsTestQuery.query(name, type, 0x1234);
     }
 
+    @Test
+    void apiChangesAndDeletesReachAuthoritativeTxtDespiteAwsEndpointSpoofing() throws Exception {
+        String name = uniqueName() + ".amazonaws.com";
+        String id = createZone(name);
+        String endpoint = "version." + name;
+        for (String value : List.of("first", "second")) {
+            given().contentType("application/xml").body("""
+                    <ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
+                      <ChangeBatch><Changes><Change><Action>UPSERT</Action><ResourceRecordSet>
+                        <Name>%s</Name><Type>TXT</Type><TTL>17</TTL>
+                        <ResourceRecords><ResourceRecord><Value>"%s"</Value></ResourceRecord></ResourceRecords>
+                      </ResourceRecordSet></Change></Changes></ChangeBatch>
+                    </ChangeResourceRecordSetsRequest>
+                    """.formatted(endpoint, value))
+                    .post("/2013-04-01/hostedzone/" + id + "/rrset").then().statusCode(200);
+            byte[] request = DnsTestQuery.query(endpoint, 16, 0x1234);
+            byte[] response = query(request);
+            assertHeader(response, 0, true, 1, 0);
+            assertEquals(17, ByteBuffer.wrap(response).getInt(request.length + 6));
+            assertArrayEquals(new DnsRecord.Txt("\"" + value + "\"").data(),
+                    Arrays.copyOfRange(response, request.length + 12, response.length));
+        }
+        change(id, "DELETE", record(endpoint, "TXT", 17, "\"second\""));
+        assertNegative(query(DnsTestQuery.query(endpoint, 16, 0x1234)), name, 3, 900);
+    }
+
+    @Test
+    void weightedPublicCnamePreservesTheSelectedTargetAndTtl() throws Exception {
+        String name = uniqueName() + ".example";
+        String zone = createZone(name);
+        ResourceRecordSet excluded = record("alias." + name, "CNAME", 50, "ip-192-0-2-1.ec2.internal.");
+        excluded.setSetIdentifier("excluded");
+        excluded.setWeight(0L);
+        ResourceRecordSet selected = record("alias." + name, "CNAME", 17, "ip-192-0-2-2.ec2.internal.");
+        selected.setSetIdentifier("selected");
+        selected.setWeight(1L);
+        change(zone, "CREATE", excluded);
+        change(zone, "CREATE", selected);
+        byte[] request = DnsTestQuery.query("alias." + name, 1, 0x1234);
+        byte[] response = query(request);
+        assertHeader(response, 0, true, 1, 0);
+        assertEquals(17, ByteBuffer.wrap(response).getInt(request.length + 6));
+        assertArrayEquals(new DnsRecord.Address(1, "192.0.2.2").data(),
+                Arrays.copyOfRange(response, request.length + 12, response.length));
+    }
+
+    @Test
+    void configuredAuthorityReturnsNxDomainOverUdpInsteadOfSpoofing() throws Exception {
+        try (AuthorityFixture fixture = authority(List.of(source))) {
+            EmbeddedDnsServer server = fixture.server();
+            byte[] response = queryUsingServer(DnsTestQuery.query("missing.owned.amazonaws.com", 1, 0x1234), server);
+            assertHeader(response, 3, true, 0, 0);
+        }
+    }
+
+    @Test
+    void configuredAuthorityMarksStoredAnswersWithoutRequiringASoa() throws Exception {
+        for (DnsAnswer answer : List.of(DnsAnswer.records(List.of("192.0.2.17"), 17),
+                DnsAnswer.noData(), DnsAnswer.refused())) {
+            DnsRecordSource records = name -> Optional.of(answer);
+            try (AuthorityFixture fixture = authority(List.of(records))) {
+                EmbeddedDnsServer server = fixture.server();
+                byte[] response = queryUsingServer(DnsTestQuery.query("stored.owned.amazonaws.com", 1, 0x1234), server);
+                assertHeader(response, answer.responseCode(), answer.responseCode() != 5, answer.records().size(), 0);
+            }
+        }
+    }
+
+    @Test
+    void configuredAuthorityRefusesUnsupportedQueryClassWithoutAdvertisingAuthority() throws Exception {
+        try (AuthorityFixture fixture = authority(List.of(source))) {
+            EmbeddedDnsServer server = fixture.server();
+            byte[] request = DnsTestQuery.query("missing.owned.amazonaws.com", 1, 0x1234);
+            request[request.length - 1] = 3;
+            assertHeader(queryUsingServer(request, server), 5, false, 0, 0);
+        }
+    }
+
+    @Test
+    void tcpReturnsTheFullStoredTxtRecordAfterUdpTruncation() throws Exception {
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        String value = "\"" + "x".repeat(255) + "\" \"" + "y".repeat(255) + "\"";
+        change(id, "CREATE", record("text." + name, "TXT", 90, value));
+        byte[] request = DnsTestQuery.query("text." + name, 16, 0x1234);
+        byte[] udp = query(request);
+        assertEquals(0x0200, ByteBuffer.wrap(udp).getShort(2) & 0x0200);
+        byte[] tcp = queryTcp(request);
+        assertTrue(tcp.length > 512);
+        assertEquals(0, ByteBuffer.wrap(tcp).getShort(2) & 0x0200);
+        assertHeader(tcp, 0, true, 1, 0);
+        assertEquals(512, Short.toUnsignedInt(ByteBuffer.wrap(tcp).getShort(request.length + 10)));
+    }
+
+    @Test
+    void tcpChasesStoredPublicCnamesAndPreservesTheMinimumTtl() throws Exception {
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        change(id, "CREATE", record("target." + name, "A", 17, "192.0.2.17"));
+        change(id, "CREATE", record("alias." + name, "CNAME", 30, "target." + name + "."));
+        byte[] request = DnsTestQuery.query("alias." + name, 1, 0x1234);
+        byte[] tcp = queryTcp(request);
+        assertHeader(tcp, 0, true, 1, 0);
+        assertEquals(17, ByteBuffer.wrap(tcp).getInt(request.length + 6));
+        assertArrayEquals(new DnsRecord.Address(1, "192.0.2.17").data(),
+                Arrays.copyOfRange(tcp, request.length + 12, tcp.length));
+    }
+
+    private byte[] queryUsingServer(byte[] request, EmbeddedDnsServer dns) throws Exception {
+        DatagramSocket server = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
+        DatagramSocket client = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
+        try {
+            server.listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            server.handler(packet -> dns.handleQuery(vertx, server, packet.data().getBytes(),
+                    packet.sender().host(), packet.sender().port(), "127.0.0.1"));
+            client.listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            CompletableFuture<byte[]> received = new CompletableFuture<>();
+            client.handler(packet -> received.complete(packet.data().getBytes()));
+            client.send(Buffer.buffer(request), server.localAddress().port(), "127.0.0.1")
+                    .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            return received.get(5, TimeUnit.SECONDS);
+        } finally {
+            server.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            client.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private byte[] queryTcp(byte[] request) throws Exception {
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of("amazonaws.com"), List.of(source),
+                List.of(), List.of());
+        EmbeddedDnsServer.Listeners listeners = dns.bindAll(vertx, "127.0.0.1", 0, false)
+                .toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        try (Socket socket = new Socket("127.0.0.1", listeners.tcp().actualPort())) {
+            socket.setSoTimeout(5000);
+            DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+            output.writeShort(request.length);
+            output.write(request);
+            output.flush();
+            DataInputStream input = new DataInputStream(socket.getInputStream());
+            byte[] response = new byte[input.readUnsignedShort()];
+            input.readFully(response);
+            return response;
+        } finally {
+            listeners.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    private AuthorityFixture authority(List<DnsRecordSource> records) {
+        EmulatorConfig authorityConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(authorityConfig.dns().listenAddress()).thenReturn(Optional.of("127.0.0.1"));
+        when(authorityConfig.dns().extraSuffixes()).thenReturn(Optional.of(List.of("amazonaws.com")));
+        when(authorityConfig.dns().authoritativeSuffixes()).thenReturn(Optional.of(List.of("owned.amazonaws.com")));
+        when(authorityConfig.dns().containerFallbackServers()).thenReturn(List.of());
+        return new AuthorityFixture(new EmbeddedDnsServer(authorityConfig, mock(ContainerDetector.class), vertx,
+                records, List.of(), List.of(), mock(CurrentContainerNetworkResolver.class), 0));
+    }
+
+    private record AuthorityFixture(EmbeddedDnsServer server) implements AutoCloseable {
+        @Override
+        public void close() {
+            server.stop();
+        }
+    }
 }
