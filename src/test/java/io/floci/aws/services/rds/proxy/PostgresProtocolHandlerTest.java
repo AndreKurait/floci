@@ -31,6 +31,7 @@ import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -333,7 +334,6 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
-                authThread.awaitAuthentication();
                 authThread.await();
                 proxyClient.close();
                 backendTask.await();
@@ -530,7 +530,6 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
-                authThread.awaitAuthentication();
                 authThread.await();
                 proxyClient.close();
                 backendTask.await();
@@ -790,7 +789,6 @@ class PostgresProtocolHandlerTest {
                 assertEquals("approle", readParametersUntilReadyForQuery(clientIn).get("session_authorization"));
 
                 ourClient.close();
-                authThread.awaitAuthentication();
                 authThread.await();
                 proxyClient.close();
                 backendTask.await();
