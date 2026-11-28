@@ -3,11 +3,16 @@ package io.floci.aws.services.s3;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.IamEnforcementFilter;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.HybridStorage;
 import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.LambdaFunction;
@@ -22,12 +27,16 @@ import io.floci.aws.services.s3.model.ObjectAttributeName;
 import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import io.floci.aws.services.s3.model.WebsiteConfiguration;
+import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -60,9 +69,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class S3ServiceTest {
 
     @TempDir
@@ -397,8 +408,20 @@ class S3ServiceTest {
 
     @Test
     void putObjectWithKmsKeepsTheKeyId() {
+        InMemoryStorageFactory factory = new InMemoryStorageFactory("000000000000");
+        RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
+        KmsService kms = new KmsService(factory, regions);
+        String kmsKeyId = kms.createKey("object key", "us-east-1").getArn();
+        S3KmsEncryption encryption = new S3KmsEncryption(kms, mock(IamEnforcementFilter.class),
+                new RequestContext(), regions, mock(IamService.class));
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage().persistentPath()).thenReturn(tempDir.toString());
+        when(config.storage().mode()).thenReturn("persistent");
+        when(config.storage().services().s3().mode()).thenReturn(Optional.of("persistent"));
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        s3Service = new S3Service(factory, config, null, null, null, null, null,
+                regions, new ObjectMapper(), null, encryption);
         s3Service.createBucket("test-bucket", "us-east-1");
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
 
         S3Object put = s3Service.putObject(
                 "test-bucket",
@@ -413,6 +436,8 @@ class S3ServiceTest {
 
         assertEquals("aws:kms", put.getServerSideEncryption());
         assertEquals(kmsKeyId, put.getSseKmsKeyId());
+        assertArrayEquals("data".getBytes(StandardCharsets.UTF_8),
+                s3Service.getObject("test-bucket", "kms-with-key-id.txt").getData());
     }
 
     @Test
@@ -596,7 +621,7 @@ class S3ServiceTest {
                 "application/octet-stream", null);
 
         S3Object latest = objectStore.get("versioned-leak-bucket/big.bin").orElseThrow();
-        S3Object versioned = objectStore.get("versioned-leak-bucket/big.bin#v#" + put.getVersionId())
+        S3Object versioned = objectStore.get(S3HistoryKeys.key("versioned-leak-bucket", "big.bin", put.getVersionId()))
                 .orElseThrow();
         assertNull(latest.getData(),
                 "Latest S3Object cached in objectStore must not retain byte[] after disk persistence");
