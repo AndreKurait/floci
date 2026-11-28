@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.TlsProxyServer;
 import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.auth.CredentialScope;
 import io.floci.aws.core.common.auth.SigV4AuthorizationHeader;
@@ -75,6 +76,7 @@ class ApiGatewayTaskInvokerTest {
     private ApiGatewayTaskInvoker invoker;
     // Quarkus and the JDK test server share the HttpServer simple name.
     private final io.quarkus.vertx.http.HttpServer listener = mock(io.quarkus.vertx.http.HttpServer.class);
+    private final TlsProxyServer proxy = mock(TlsProxyServer.class);
     private HttpServer server;
     private StateMachine machine;
     private ObjectNode request;
@@ -86,6 +88,7 @@ class ApiGatewayTaskInvokerTest {
 
     @BeforeEach
     void setup() throws Exception {
+        when(proxy.localApiEndpoint(any())).thenAnswer(call -> call.getArgument(0));
         IamPolicyEvaluator policies = new IamPolicyEvaluator(mapper);
         AssumeRolePolicyEvaluator trust = new AssumeRolePolicyEvaluator(mapper, policies);
         Instance<ResourcePolicyProvider> resourcePolicies = mock(Instance.class);
@@ -93,7 +96,7 @@ class ApiGatewayTaskInvokerTest {
         RoleResourceAccessAuthorizer access = new RoleResourceAccessAuthorizer(iam, policies, resourcePolicies, scps);
         LambdaTaskAuthorizer authorizer = new LambdaTaskAuthorizer(iam, policies, trust, resourcePolicies, access);
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
-        invoker = new ApiGatewayTaskInvoker(api, iam, trust, authorizer, config, mapper, listener);
+        invoker = new ApiGatewayTaskInvoker(api, iam, trust, authorizer, config, mapper, listener, proxy);
         machine = new StateMachine();
         machine.setStateMachineArn("arn:aws:states:eu-west-1:" + ACCOUNT + ":stateMachine:Owned");
         machine.setRoleArn(ROLE);
@@ -156,6 +159,27 @@ class ApiGatewayTaskInvokerTest {
         if (server != null) {
             server.stop(0);
         }
+    }
+
+    @Test
+    void internalListenerUsesTheProxyEndpointBeforeSigning() throws Exception {
+        URI proxyEndpoint = listener.getLocalBaseUri();
+        URI internal = URI.create("http://127.0.0.1:1");
+        when(listener.getLocalBaseUri()).thenReturn(internal);
+        when(proxy.localApiEndpoint(internal)).thenReturn(proxyEndpoint);
+        assertEquals(200, invoker.invoke(request, machine, null).path("StatusCode").asInt());
+        assertEquals(1, calls.get());
+        verify(proxy).localApiEndpoint(internal);
+    }
+
+    @Test
+    void unavailableProxyCannotMintCredentials() {
+        when(proxy.localApiEndpoint(any())).thenReturn(null);
+        AslExecutor.FailStateException error = assertThrows(AslExecutor.FailStateException.class,
+                () -> invoker.invoke(request, machine, null));
+        assertTrue(error.getMessage().contains("listener is not ready"));
+        assertEquals(0, calls.get());
+        assertEquals(null, credentials.get());
     }
 
     @Test
@@ -247,7 +271,7 @@ class ApiGatewayTaskInvokerTest {
     }
 
     @Test
-    void optionalRequestAndResourcePolicyFeaturesRefuseBeforeTransport() {
+    void optionalRequestFeaturesRefuseBeforeTransport() {
         request.putObject("QueryParameters").putArray("key").add("value");
         denied("States.TaskFailed");
         request.remove("QueryParameters");
@@ -256,13 +280,19 @@ class ApiGatewayTaskInvokerTest {
         request.remove("AllowNullValues");
         ((ObjectNode) request.path("RequestBody")).putNull("optional");
         denied("States.TaskFailed");
-        ((ObjectNode) request.path("RequestBody")).remove("optional");
-        RestApi resourcePolicyApi = new RestApi();
-        resourcePolicyApi.setPolicy("{}");
-        when(api.getRestApi("eu-west-1", "owned")).thenReturn(resourcePolicyApi);
-        denied("States.TaskFailed");
         assertEquals(0, calls.get());
         assertEquals(null, credentials.get());
+    }
+
+    @Test
+    void resourcePolicyApisAreSentToTheListenerForEvaluation() throws Exception {
+        RestApi resourcePolicyApi = new RestApi();
+        resourcePolicyApi.setPolicy("{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\","
+                + "\"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}");
+        when(api.getRestApi("eu-west-1", "owned")).thenReturn(resourcePolicyApi);
+        assertEquals(200, invoker.invoke(request, machine, null).path("StatusCode").asInt());
+        assertEquals(1, calls.get());
+        assertEquals(null, serverFailure.get());
     }
 
     @Test
