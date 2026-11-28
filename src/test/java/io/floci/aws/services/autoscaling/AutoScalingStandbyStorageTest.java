@@ -7,6 +7,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.autoscaling.model.AsgInstance;
 import io.floci.aws.services.autoscaling.model.AutoScalingGroup;
+import io.floci.aws.services.autoscaling.model.ScalingActivity;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceState;
@@ -47,6 +48,24 @@ class AutoScalingStandbyStorageTest {
             "DescribeScalingActivitiesResponse.DescribeScalingActivitiesResult.Activities.member";
     @TempDir Path directory;
     private final List<StorageFactory> factories = new ArrayList<>();
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void acceptedTerminationCompletesTheSameActivityAfterRestart(String mode) throws IOException {
+        AutoScalingService service = storedService(mode);
+        storeGroup(service);
+        ScalingActivity accepted = service.terminateInstanceInAutoScalingGroup(REGION, "i-a", true);
+        service = restart(mode);
+        assertEquals("Terminating", lifecycle(service, "i-a"));
+        assertEquals("InProgress", activity(service, accepted.getActivityId(), "StatusCode"));
+        Ec2Service ec2 = reconcile(service, Set.of());
+        verify(ec2).terminateInstances(REGION, List.of("i-a"));
+        service = restart(mode);
+        assertEquals(List.of("i-b"), memberIds(service));
+        assertEquals("Successful", activity(service, accepted.getActivityId(), "StatusCode"));
+        assertEquals("100", activity(service, accepted.getActivityId(), "Progress"));
+        assertFalse(activity(service, accepted.getActivityId(), "EndTime").isBlank());
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})

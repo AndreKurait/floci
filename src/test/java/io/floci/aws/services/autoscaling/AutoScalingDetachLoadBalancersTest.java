@@ -7,6 +7,9 @@ import io.floci.aws.services.autoscaling.model.AutoScalingGroup;
 import io.floci.aws.services.autoscaling.model.InstanceRefresh;
 import io.floci.aws.services.autoscaling.model.InstanceRefreshReplacement;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.model.Instance;
+import io.floci.aws.services.ec2.model.InstanceState;
+import io.floci.aws.services.ec2.model.Reservation;
 import io.floci.aws.services.elb.ElbClassicService;
 import io.floci.aws.services.elbv2.ElbV2Service;
 import org.junit.jupiter.api.Test;
@@ -45,7 +48,7 @@ class AutoScalingDetachLoadBalancersTest {
     void detachCleansBothBalancerKindsAndOnlyActualMembers(String state) {
         owned.setLifecycleState(state);
 
-        service.detachInstances(REGION, "group", List.of("i-owned", "i-other-group"), false);
+        service.detachInstances(REGION, "group", List.of("i-owned"), false);
 
         verify(classic).deregisterInstances(REGION, "first", List.of("i-owned"));
         verify(classic).deregisterInstances(REGION, "second", List.of("i-owned"));
@@ -57,6 +60,13 @@ class AutoScalingDetachLoadBalancersTest {
 
     @Test
     void failedClassicCleanupPreservesMembershipCapacityTagsAndRefreshUntilRetry() {
+        Instance running = new Instance();
+        running.setInstanceId("i-owned");
+        running.setState(InstanceState.running());
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(running));
+        when(service.ec2Service.describeInstances(REGION, List.of("i-owned"), null))
+                .thenReturn(List.of(reservation));
         InstanceRefresh refresh = service.startInstanceRefresh(REGION, "group", new InstanceRefresh());
         assertEquals(List.of("i-owned", "i-retained"), refresh.getReplacements().stream()
                 .map(InstanceRefreshReplacement::getOriginalInstanceId).toList());
@@ -68,7 +78,7 @@ class AutoScalingDetachLoadBalancersTest {
                 () -> service.detachInstances(REGION, "group", List.of("i-owned"), true)));
         assertEquals(List.of(owned, retained), group.getInstances());
         assertEquals(2, group.getDesiredCapacity());
-        verifyNoInteractions(service.ec2Service);
+        verify(service.ec2Service, never()).deleteSystemTag(anyString(), anyList(), anyString(), anyString());
         assertEquals(List.of("i-owned", "i-retained"), refresh.getReplacements().stream()
                 .map(InstanceRefreshReplacement::getOriginalInstanceId).toList());
 
@@ -108,20 +118,24 @@ class AutoScalingDetachLoadBalancersTest {
 
     @Test
     void nonmemberDetachDoesNotTouchLoadBalancers() {
-        service.detachInstances(REGION, "group", List.of("i-other-group"), false);
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "group", List.of("i-other-group"), false));
+        assertEquals("ValidationError", error.getErrorCode());
 
         verifyNoInteractions(classic, targets, service.ec2Service);
         assertEquals(List.of(owned, retained), group.getInstances());
     }
 
     @Test
-    void detachDeregistersOnlyActualMembersBeforeRemovingOwnership() {
+    void mixedMemberAndNonmemberRequestPreservesEveryMembership() {
         group.setTargetGroupARNs(List.of("shared-target-group"));
 
-        service.detachInstances(REGION, "group", List.of("i-owned", "i-other-group"), false);
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.detachInstances(REGION, "group", List.of("i-owned", "i-other-group"), false));
 
-        verify(targets).deregisterTargets(eq(REGION), eq("shared-target-group"), onlyTarget("i-owned"));
-        assertEquals(List.of(retained), group.getInstances());
+        assertEquals("ValidationError", error.getErrorCode());
+        verifyNoInteractions(classic, targets, service.ec2Service);
+        assertEquals(List.of(owned, retained), group.getInstances());
     }
 
     @Test
