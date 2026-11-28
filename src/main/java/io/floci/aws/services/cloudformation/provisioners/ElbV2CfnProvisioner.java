@@ -74,10 +74,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final ElbV2Service elbV2Service;
+    private final ElbV2CfnTargetGroupAttributes targetGroupAttributes;
 
     @Inject
     public ElbV2CfnProvisioner(ElbV2Service elbV2Service) {
         this.elbV2Service = elbV2Service;
+        this.targetGroupAttributes = new ElbV2CfnTargetGroupAttributes(elbV2Service);
     }
 
     @Override
@@ -90,6 +92,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
         r.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
         r.getAttributes().remove(HEALTH_UPDATE_SNAPSHOT_ATTR);
+        r.getAttributes().remove(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR);
         r.getAttributes().remove(CfnRollback.LISTENER_CERTIFICATES_UPDATE_SNAPSHOT_ATTR);
         Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
         switch (r.getResourceType()) {
@@ -176,6 +179,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     private static void clearTargetUpdateRecords(StackResource resource) {
         resource.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(HEALTH_UPDATE_SNAPSHOT_ATTR);
+        resource.getAttributes().remove(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.LISTENER_CERTIFICATES_UPDATE_SNAPSHOT_ATTR);
         DECLARED_TARGETS.clearPrior(resource);
     }
@@ -190,14 +194,15 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
         CfnRollback.carryFailedUndoSnapshot(previous, attempted,
                 CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR,
-                CfnRollback.LISTENER_CERTIFICATES_UPDATE_SNAPSHOT_ATTR, HEALTH_UPDATE_SNAPSHOT_ATTR);
+                CfnRollback.LISTENER_CERTIFICATES_UPDATE_SNAPSHOT_ATTR, HEALTH_UPDATE_SNAPSHOT_ATTR,
+                CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR);
     }
 
     /**
      * A replacement is undone through the cleanup record, and a target group's record of its declared
      * targets goes back with it, even when deleting the replacement fails. Without a cleanup record, a
      * load balancer is moved back to the subnets an update took it off, and a target group gets back
-     * the registrations and health settings the update changed. A listener certificate resource gets
+     * the registrations, attributes and health settings the update changed. A listener certificate resource gets
      * back the certificates the update changed on its listener. A listener or rule without a record
      * was modified in place, and putting that back needs a snapshot this provisioner does not keep, so
      * the engine reports it as not rolled back, as it did for the switch.
@@ -230,18 +235,16 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     private void restorePriorTargetGroup(StackResource resource) {
         RuntimeException failure = null;
-        try {
-            restorePriorRegistrations(resource);
-        } catch (RuntimeException e) {
-            failure = e;
-        }
-        try {
-            restorePriorHealth(resource);
-        } catch (RuntimeException e) {
-            if (failure == null) {
-                failure = e;
-            } else if (failure != e) {
-                failure.addSuppressed(e);
+        for (Runnable restore : List.<Runnable>of(() -> targetGroupAttributes.restore(resource),
+                () -> restorePriorRegistrations(resource), () -> restorePriorHealth(resource))) {
+            try {
+                restore.run();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else if (failure != e) {
+                    failure.addSuppressed(e);
+                }
             }
         }
         if (failure != null) {
@@ -423,7 +426,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
      * to the template's targets in place (see {@link #reconcileTargets}). When that fails, what it did
      * is undone before the failure propagates ({@link CfnRollback#guarded}): a target group this
      * provision created, on a create or a replacement, is deleted again, and a kept one gets back the
-     * registrations and health settings it had.
+     * registrations, attributes and health settings it had.
      */
     private void provisionTargetGroup(StackResource r, JsonNode props, ProvisionContext ctx,
                                       Map<String, String> attributesBefore) {
@@ -445,6 +448,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         String matcher = parseMatcher(props, ctx);
         String ipAddressType = ctx.resolveOptional(props, "IpAddressType");
         Map<String, String> tags = ctx.resolveTags(props, "Tags");
+        Map<String, String> declaredAttributes = ElbV2CfnTargetGroupAttributes.declared(props, ctx);
         List<TargetDescription> targets = declaredTargets(props, ctx);
         // Taken before RegisterTargets fills in the group's port on these targets, so the record
         // keeps them as declared.
@@ -472,6 +476,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         // forwards to the group, as on AWS.
         r.getAttributes().put("LoadBalancerArns", String.join(",", tg.getLoadBalancerArns()));
         TargetGroup group = tg;
+        boolean createdGroup = created;
         CfnRollback.guarded(r, ctx, created,
                 () -> elbV2Service.deleteTargetGroup(ctx.region(), group.getTargetGroupArn()),
                 () -> restorePriorTargetGroup(r),
@@ -485,8 +490,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
                                 hcProtocol, hcPort, hcEnabled, hcPath, hcInterval, hcTimeout,
                                 healthyThreshold, unhealthyThreshold, matcher);
                     }
+                    targetGroupAttributes.apply(r, declaredAttributes, ctx, createdGroup);
                     reconcileTargets(r, group, targets, ctx);
                 });
+        if (!ctx.isUpdate()) {
+            r.getAttributes().remove(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR);
+        }
         DECLARED_TARGETS.record(r, ctx, attributesBefore, declaredRecord);
     }
 
@@ -500,21 +509,23 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         if (props == null || !props.has("Targets")) {
             return targets;
         }
-        JsonNode declared = ctx.engine().resolveNodeOmittingNoValue(props.get("Targets"));
-        if (declared == null || !declared.isArray()) {
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(ctx.engine());
+        JsonNode declared = types.read("Targets", props.get("Targets"),
+                CfnPropertyTypes.propertyShape(TARGET_GROUP, "Targets"));
+        types.finish();
+        if (declared == null) {
             return targets;
         }
         for (int i = 0; i < declared.size(); i++) {
             JsonNode item = declared.get(i);
-            String id = ctx.resolveOptional(item, "Id");
-            if (id == null) {
+            if (!item.hasNonNull("Id")) {
                 throw new AwsException("InvalidRequest",
                         "Model validation failed (#/Targets/" + i + ": required key [Id] not found)", 400);
             }
             TargetDescription target = new TargetDescription();
-            target.setId(id);
-            target.setPort(ctx.resolveOptionalInt(item, "Port"));
-            target.setAvailabilityZone(ctx.resolveOptional(item, "AvailabilityZone"));
+            target.setId(item.path("Id").asText());
+            target.setPort(item.hasNonNull("Port") ? item.path("Port").intValue() : null);
+            target.setAvailabilityZone(item.path("AvailabilityZone").asText(null));
             targets.add(target);
         }
         return targets;

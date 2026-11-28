@@ -686,6 +686,9 @@ Dynamic-reference expansion is currently scoped to these RDS credential properti
 
 ## ELBv2 target group targets
 
+Target declarations are validated against their modeled list, ID and integer port types before
+any target group is created or changed. Intrinsic functions resolve before validation.
+
 `AWS::ElasticLoadBalancingV2::TargetGroup` registers its `Targets` once the group is created, as
 `RegisterTargets` does, so `DescribeTargetHealth` reports them. A target is its `Id` and its `Port`,
 the group's port when it names none, so one instance can be declared on several ports. A Lambda
@@ -1530,3 +1533,5 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
+
+`AWS::ElasticLoadBalancingV2::TargetGroup` applies the declared `TargetGroupAttributes` on create and update. Only declared keys change; omitted keys retain their values. Failed updates restore those attributes independently of target registrations and health settings, and retain a failed restoration for a rollback retry. Network target groups report the `preserve_client_ip.enabled` default for TCP, TLS, UDP and TCP_UDP: false for IP targets over TCP or TLS, true otherwise.
