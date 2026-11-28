@@ -21,7 +21,7 @@ import static org.assertj.core.api.Assertions.*;
 class SsmShellExecutionBudgetTest {
     @ParameterizedTest
     @CsvSource({"0,3600", "1,1", "5,5", "172800,172800"})
-    void publicCommandReportsDeliveryAndTotalBudgets(int supplied, int execution) {
+    void publicCommandReportsDeliveryAndTotalBudgets(int supplied, int execution) throws Exception {
         Assumptions.assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed-node fixture");
         String instance = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
         Map<String, List<String>> parameters = new LinkedHashMap<>();
@@ -30,6 +30,7 @@ class SsmShellExecutionBudgetTest {
             parameters.put("executionTimeout", List.of(Integer.toString(supplied)));
         }
         try (SsmClient ssm = TestFixtures.ssmClient()) {
+            SsmManagedNodeFixture.register(instance);
             try {
                 Command command = ssm.sendCommand(r -> r.documentName("AWS-RunShellScript")
                         .instanceIds(instance).parameters(parameters).timeoutSeconds(30)).command();
@@ -50,10 +51,11 @@ class SsmShellExecutionBudgetTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"0", "172801", "not-a-number", "+5", "01"})
-    void malformedExecutionBudgetDoesNotCreateACommand(String value) {
+    void malformedExecutionBudgetDoesNotCreateACommand(String value) throws Exception {
         Assumptions.assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed-node fixture");
         String instance = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
         try (SsmClient ssm = TestFixtures.ssmClient()) {
+            SsmManagedNodeFixture.register(instance);
             try {
                 assertThat(ssm.listCommands(r -> r.instanceId(instance)).commands()).isEmpty();
                 assertThatThrownBy(() -> ssm.sendCommand(r -> r.documentName("AWS-RunShellScript")
@@ -72,10 +74,11 @@ class SsmShellExecutionBudgetTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"missing", "empty", "only-timeout"})
-    void requiredScriptIsCheckedBeforeCreatingACommand(String shape) {
+    void requiredScriptIsCheckedBeforeCreatingACommand(String shape) throws Exception {
         Assumptions.assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed-node fixture");
         String instance = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
         try (SsmClient ssm = TestFixtures.ssmClient()) {
+            SsmManagedNodeFixture.register(instance);
             try {
                 assertThatThrownBy(() -> ssm.sendCommand(request -> {
                     request.documentName("AWS-RunShellScript").instanceIds(instance).timeoutSeconds(30);
