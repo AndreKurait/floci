@@ -27,6 +27,7 @@ public record TemplateSummary(
             String defaultValue,
             boolean noEcho,
             String description,
-            String parameterType) {
+            String parameterType,
+            List<String> allowedValues) {
     }
 }

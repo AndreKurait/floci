@@ -34,7 +34,8 @@ public class AppConfigResourceArns implements StoredResourceArns {
 
     @Override
     public Optional<String> find(String type, List<String> names, String region) {
-        return Optional.empty();
+        return "application".equals(type) && names.size() == 1
+                ? findByVariables(type, Map.of("ApplicationId", names.getFirst()), region) : Optional.empty();
     }
 
     @Override

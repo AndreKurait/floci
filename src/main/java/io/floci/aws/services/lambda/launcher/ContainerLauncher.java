@@ -10,6 +10,7 @@ import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.AdditionalDockerNetworks;
 import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerExitWatcher;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerSpec;
@@ -144,7 +145,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final Ec2Service ec2Service;
-    /** When off, each container's exit is watched with its own wait stream (LambdaExitWatcher). */
+    /** When off, each container's exit is watched with its own wait stream (ContainerExitWatcher). */
     private final DockerExitEvents exitEvents;
     private final LambdaContainerReconciler containerReconciler;
     /** The VPC address each VpcConfig function's container holds, returned once it is removed. */
@@ -426,7 +427,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // failing even after the daemon recovers.
         String containerId = null;
         Closeable logHandle = null;
-        LambdaExitWatcher exitWatcher = null;
+        ContainerExitWatcher exitWatcher = null;
         boolean registeredForExitEvents = false;
         // Hoisted alongside containerId, for the same reason: the resolved volume name (if any)
         // must be visible in the catch block below to release its in-flight reference on any
@@ -682,7 +683,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             registeredForExitEvents = true;
             exitEvents.register(containerId, runtimeApiServer::handleRuntimeProcessExited);
         } else {
-            exitWatcher = LambdaExitWatcher.watchBeforeStart(dockerClient, streamingDocker, containerId,
+            exitWatcher = ContainerExitWatcher.watchBeforeStart(dockerClient, streamingDocker, containerId,
                     runtimeApiServer::handleRuntimeProcessExited, readinessBudget);
         }
         logHandle = logStreamer.attachBeforeStartForAccount(
@@ -1855,11 +1856,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * <p>Fires once per container exit, including an intentional {@code docker stop} during
      * normal teardown. {@link RuntimeApiServer#handleRuntimeProcessExited} itself distinguishes
      * a genuine crash from that case (its own {@code stopped}/{@code faulted} guard). The watch
-     * survives its stream timing out on a quiet container; see {@link LambdaExitWatcher}.
+     * survives its stream timing out on a quiet container; see {@link ContainerExitWatcher}.
      */
     private void watchForUnexpectedExit(DockerClient dockerClient, String containerId,
                                         RuntimeApiServer runtimeApiServer) {
-        LambdaExitWatcher.watch(dockerClient, streamingDocker, containerId,
+        ContainerExitWatcher.watch(dockerClient, streamingDocker, containerId,
                 runtimeApiServer::handleRuntimeProcessExited);
     }
 

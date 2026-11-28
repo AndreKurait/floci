@@ -1,4 +1,4 @@
-package io.floci.aws.services.lambda.launcher;
+package io.floci.aws.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerCmd;
@@ -30,10 +30,10 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-class LambdaExitWatcherTest {
+class ContainerExitWatcherTest {
 
     private static final String CONTAINER = "lambda-container";
-    private static final long LONG_LIVED_NANOS = LambdaExitWatcher.QUICK_FAILURE.toNanos() + 1;
+    private static final long LONG_LIVED_NANOS = ContainerExitWatcher.QUICK_FAILURE.toNanos() + 1;
 
     private final List<WaitContainerResultCallback> armed = new ArrayList<>();
     private final List<Integer> exits = new ArrayList<>();
@@ -65,7 +65,7 @@ class LambdaExitWatcherTest {
 
     /** A watch whose clock is {@link #now} and whose scheduler records each delay and runs the task at once. */
     private void watch() {
-        new LambdaExitWatcher(docker, streamingDocker, CONTAINER, exits::add, (delay, task) -> {
+        new ContainerExitWatcher(docker, streamingDocker, CONTAINER, exits::add, (delay, task) -> {
             delays.add(delay);
             task.run();
         }, () -> now).arm();
@@ -105,7 +105,7 @@ class LambdaExitWatcherTest {
 
     @Test
     void preStartReadinessUsesTheStreamingClientAndReportsExitOnce() {
-        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+        ContainerExitWatcher watcher = ContainerExitWatcher.watchBeforeStart(
                 docker, streamingDocker, CONTAINER, exits::add, Duration.ZERO);
         verify(streamingDocker).waitContainerCmd(CONTAINER);
         verify(docker, never()).waitContainerCmd(CONTAINER);
@@ -156,7 +156,7 @@ class LambdaExitWatcherTest {
 
     @Test
     void prearmedNextExitKeepsTheExitStatusEvenAfterAutoRemoval() {
-        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+        ContainerExitWatcher watcher = ContainerExitWatcher.watchBeforeStart(
                 docker, CONTAINER, exits::add, Duration.ZERO);
         verify(wait).withCondition(WaitContainerCondition.NEXT_EXIT);
         assertEquals(List.of(), exits, "Created is not an exit");
@@ -174,7 +174,7 @@ class LambdaExitWatcherTest {
     void missingOrFailedWaitRegistrationRefusesLaunchWithoutInventingAnExit() {
         doThrow(new NotFoundException("Captured container is absent")).when(wait).exec(any());
 
-        assertThrows(IllegalStateException.class, () -> LambdaExitWatcher.watchBeforeStart(
+        assertThrows(IllegalStateException.class, () -> ContainerExitWatcher.watchBeforeStart(
                 docker, CONTAINER, exits::add, Duration.ZERO));
 
         assertEquals(List.of(), exits);
@@ -193,7 +193,7 @@ class LambdaExitWatcherTest {
             }
             return callback;
         }).when(wait).exec(any());
-        assertThrows(IllegalStateException.class, () -> LambdaExitWatcher.watchBeforeStart(
+        assertThrows(IllegalStateException.class, () -> ContainerExitWatcher.watchBeforeStart(
                 docker, CONTAINER, exits::add, Duration.ZERO));
         Closeable lateTransport = mock(Closeable.class);
         callbacks.getFirst().onStart(lateTransport);
@@ -212,7 +212,7 @@ class LambdaExitWatcherTest {
             return callback;
         }).when(wait).exec(any());
 
-        assertThrows(IllegalStateException.class, () -> LambdaExitWatcher.watchBeforeStart(
+        assertThrows(IllegalStateException.class, () -> ContainerExitWatcher.watchBeforeStart(
                 docker, CONTAINER, exits::add, Duration.ZERO));
         assertEquals(List.of(), exits);
         verify(docker, never()).inspectContainerCmd(CONTAINER);
@@ -220,7 +220,7 @@ class LambdaExitWatcherTest {
 
     @Test
     void intentionalCancellationClosesItsCapturedStreamAndSuppressesLateExitAndError() throws Exception {
-        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+        ContainerExitWatcher watcher = ContainerExitWatcher.watchBeforeStart(
                 docker, CONTAINER, exits::add, Duration.ZERO);
         watcher.containerStarted();
         watcher.cancel();
@@ -235,7 +235,7 @@ class LambdaExitWatcherTest {
     @Test
     void failureDuringStartIsHandedOverOnceEvenIfTheRuntimeAlreadyDisappeared() {
         when(inspect.exec()).thenThrow(new NotFoundException("Auto-removed during start"));
-        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+        ContainerExitWatcher watcher = ContainerExitWatcher.watchBeforeStart(
                 docker, CONTAINER, exits::add, Duration.ZERO);
         armed.getFirst().onError(new SocketTimeoutException("Failed while start was in flight"));
         assertEquals(List.of(), exits, "A created container must not be reported as an exited runtime");
@@ -250,7 +250,7 @@ class LambdaExitWatcherTest {
     @Test
     void anEmptyTerminalWaitAfterStartDoesNotSilentlyLoseAnAutoRemovedExit() {
         when(inspect.exec()).thenThrow(new NotFoundException("Auto-removed runtime"));
-        LambdaExitWatcher watcher = LambdaExitWatcher.watchBeforeStart(
+        ContainerExitWatcher watcher = ContainerExitWatcher.watchBeforeStart(
                 docker, CONTAINER, exits::add, Duration.ZERO);
         watcher.containerStarted();
 
@@ -267,12 +267,12 @@ class LambdaExitWatcherTest {
         containerState(true, null);
         watch();
 
-        for (int i = 0; i <= LambdaExitWatcher.MAX_QUICK_FAILURES; i++) {
+        for (int i = 0; i <= ContainerExitWatcher.MAX_QUICK_FAILURES; i++) {
             failLatestStream("Connection reset");
         }
 
         assertEquals(seconds(1, 2, 4, 8, 16), delays);
-        assertEquals(LambdaExitWatcher.MAX_QUICK_FAILURES + 1, armed.size());
+        assertEquals(ContainerExitWatcher.MAX_QUICK_FAILURES + 1, armed.size());
         assertEquals(List.of(), exits);
     }
 

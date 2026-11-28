@@ -30,6 +30,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.core.storage.StorageJson;
 import io.floci.aws.services.ec2.Ec2InstanceTypeCatalog.CatalogInstanceType;
 import io.floci.aws.services.ec2.Ec2SystemdV1Runtime.GuestIdentityChangedException;
 import io.floci.aws.services.ec2.model.Address;
@@ -77,6 +78,7 @@ import io.floci.aws.services.ec2.model.PrefixList;
 import io.floci.aws.services.ec2.model.PrefixListEntry;
 import io.floci.aws.services.ec2.model.PrefixListId;
 import io.floci.aws.services.ec2.model.ReferencedSecurityGroup;
+import io.floci.aws.services.ec2.model.ReplaceRootVolumeTask;
 import io.floci.aws.services.ec2.model.Reservation;
 import io.floci.aws.services.ec2.model.Route;
 import io.floci.aws.services.ec2.model.RouteTable;
@@ -338,6 +340,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private final StorageBackend<String, Instance> instances;
     private final StorageBackend<String, Volume> volumes;
     private final StorageBackend<String, VolumeModification> volumeModifications;
+    /**
+     * Not final: the StorageFactory constructor replaces this in-memory default after delegating, so the
+     * many package-private test constructors keep their signatures.
+     */
+    private StorageBackend<String, ReplaceRootVolumeTask> replaceRootVolumeTasks = new InMemoryStorage<>();
     private final StorageBackend<String, Image> registeredImages;
     private final StorageBackend<String, Snapshot> snapshots;
     private final StorageBackend<String, LaunchTemplate> launchTemplates;
@@ -616,6 +623,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public Optional<String> effectiveVpcCidr(String accountId, String region, String vpcId) {
         return vpcNetworkManager == null ? Optional.empty()
                 : vpcNetworkManager.effectiveVpcCidr(accountId, region, vpcId);
+    }
+
+    /**
+     * The IPv4 range a subnet's addresses on its VPC's Docker network come from, which a substituted CIDR makes differ
+     * from the declared one.
+     */
+    public Optional<String> effectiveSubnetCidr(String accountId, String region, String subnetId) {
+        return vpcNetworkManager == null ? Optional.empty()
+                : vpcNetworkManager.effectiveSubnetCidr(accountId, region, subnetId);
     }
 
     /**
@@ -921,6 +937,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 new Ec2RunInstancesReplay(storageFactory),
                 storageFactory.create("ec2", "ec2-instance-connect-endpoints.json",
                         new TypeReference<Map<String, InstanceConnectEndpoint>>() {}));
+        this.replaceRootVolumeTasks = storageFactory.create("ec2", "ec2-replace-root-volume-tasks.json",
+                new TypeReference<Map<String, ReplaceRootVolumeTask>>() {});
     }
 
     // Package-private for hermetic tests (pass in-memory or temp-dir-backed StorageBackends directly).
@@ -1531,6 +1549,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (containerManager != null) {
             containerManager.setPersister(persister);
+            containerManager.setGuestShutdownHandler(this::applyGuestShutdown);
         }
         stampUntimedTerminatedRecords();
         if (!config.services().ec2().enabled() || config.services().ec2().mock()) {
@@ -1567,7 +1586,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * which {@link #pruneTerminatedInstances(Instant)} reads as "not yet expired" for ever.
      */
     private void stampUntimedTerminatedRecords() {
-        long now = System.currentTimeMillis();
+        long now = clock.millis();
         int stamped = 0;
         for (AccountAwareStorageBackend.AccountEntry<Instance> entry : entriesOfEveryAccount(instances)) {
             Instance instance = entry.value();
@@ -5057,6 +5076,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 blockDeviceMappings, spot, privateIpAddress, capacitySpecification, null);
     }
 
+    /**
+     * @param instanceInitiatedShutdownBehavior InstanceInitiatedShutdownBehavior, or null for the
+     *                                          default, stop. Set before any container launches, so a
+     *                                          guest that powers off at once already finds it.
+     */
     public Reservation runInstances(String region, String imageId, String instanceType,
                                     int minCount, int maxCount, String keyName,
                                     List<String> securityGroupIds, String subnetId,
@@ -5071,12 +5095,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     String privateIpAddress,
                                     LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
                                     Boolean networkInterfaceDeleteOnTermination) {
+        return runInstances(region, imageId, instanceType, minCount,
+                maxCount, keyName, securityGroupIds, subnetId, clientToken, instanceTags, userData,
+                iamInstanceProfileArn, associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex,
+                availabilityZone, metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId,
+                tenancy, blockDeviceMappings, spot, privateIpAddress, capacitySpecification,
+                networkInterfaceDeleteOnTermination, null);
+    }
+
+    public Reservation runInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy,
+                                    List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
+                                    String privateIpAddress,
+                                    LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
+                                    Boolean networkInterfaceDeleteOnTermination,
+                                    String instanceInitiatedShutdownBehavior) {
         return operationAdmission.call(() -> runInstancesAdmitted(region, imageId, instanceType, minCount,
                 maxCount, keyName, securityGroupIds, subnetId, clientToken, instanceTags, userData,
                 iamInstanceProfileArn, associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex,
                 availabilityZone, metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId,
                 tenancy, blockDeviceMappings, spot, privateIpAddress, capacitySpecification,
-                networkInterfaceDeleteOnTermination));
+                networkInterfaceDeleteOnTermination, instanceInitiatedShutdownBehavior));
     }
 
     private Reservation runInstancesAdmitted(String region, String imageId, String instanceType,
@@ -5092,7 +5139,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
                                     String privateIpAddress,
                                     LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
-                                    Boolean networkInterfaceDeleteOnTermination) {
+                                    Boolean networkInterfaceDeleteOnTermination,
+                                    String instanceInitiatedShutdownBehavior) {
         Map<String, List<String>> parameters = new LinkedHashMap<>();
         replayParameter(parameters, "imageId", imageId);
         replayParameter(parameters, "instanceType", instanceType);
@@ -5119,6 +5167,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         replayParameter(parameters, "privateIpAddress", privateIpAddress);
         replayParameter(parameters, "capacitySpecification", capacitySpecification);
         replayParameter(parameters, "networkInterfaceDeleteOnTermination", networkInterfaceDeleteOnTermination);
+        replayParameter(parameters, "instanceInitiatedShutdownBehavior", instanceInitiatedShutdownBehavior);
         return replayRunInstances(region, clientToken, dryRun, parameters, networkInterfaceId,
                 () -> runInstancesScope(region, subnetId, networkInterfaceId, availabilityZone, hostId),
                 attempt -> launchInstances(region, imageId, instanceType, minCount, maxCount, keyName,
@@ -5126,7 +5175,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone,
                         metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy,
                         blockDeviceMappings, spot, privateIpAddress, capacitySpecification,
-                        networkInterfaceDeleteOnTermination, attempt));
+                        networkInterfaceDeleteOnTermination, instanceInitiatedShutdownBehavior, attempt));
     }
 
     Reservation launchInstances(String region, String imageId, String instanceType,
@@ -5165,6 +5214,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
                                     Boolean networkInterfaceDeleteOnTermination,
                                     Ec2RunInstancesReplay.Attempt attempt) {
+        return launchInstances(region, imageId, instanceType, minCount, maxCount, keyName, securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn, associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions, creditSpecificationCpuCredits, encodedUserData, dryRun, hostId, tenancy, blockDeviceMappings, spot, privateIpAddress, capacitySpecification, networkInterfaceDeleteOnTermination, null, attempt);
+    }
+
+    Reservation launchInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp, String networkInterfaceId,
+                                    int networkInterfaceDeviceIndex, String availabilityZone,
+                                    LaunchTemplateData.MetadataOptions metadataOptions,
+                                    String creditSpecificationCpuCredits, String encodedUserData, boolean dryRun,
+                                    String hostId, String tenancy,
+                                    List<LaunchTemplateData.BlockDeviceMapping> blockDeviceMappings, boolean spot,
+                                    String privateIpAddress,
+                                    LaunchTemplateData.CapacityReservationSpecification capacitySpecification,
+                                    Boolean networkInterfaceDeleteOnTermination,
+                                    String instanceInitiatedShutdownBehavior,
+                                    Ec2RunInstancesReplay.Attempt attempt) {
+        requireShutdownBehavior(instanceInitiatedShutdownBehavior);
         String capacityPreference = capacitySpecification == null
                 || capacitySpecification.getCapacityReservationPreference() == null ? "open"
                 : capacitySpecification.getCapacityReservationPreference();
@@ -5507,6 +5576,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setReplayProtected(attempt != null);
                             inst.setUserData(userData);
                             inst.setEncodedUserData(encodedUserData);
+                            inst.setInstanceInitiatedShutdownBehavior(instanceInitiatedShutdownBehavior);
                             inst.setIamInstanceProfileArn(iamInstanceProfileArn);
                             if (launchProfile != null) {
                                 inst.setIamInstanceProfileId(launchProfile.getInstanceProfileId());
@@ -5704,8 +5774,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             String volumeId = matches.getFirst().getVolumeId();
             prepared.add(withVolumeLock(volumeId, () -> {
                 String storeKey = key(region, volumeId);
-                Volume volume = volumes.get(storeKey).orElseThrow(() ->
-                        launchFailure(instance, "its data volume disappeared"));
+                Volume volume = StorageJson.copy(volumes.get(storeKey).orElseThrow(() ->
+                        launchFailure(instance, "its data volume disappeared")));
                 if (!isCurrentLaunchInstance(region, instance)
                         || !hasLaunchAttachment(volume, instance, mapping.device())) {
                     throw launchFailure(instance, "its data-volume attachment changed");
@@ -7323,12 +7393,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             boolean startable = "stopped".equals(prev.getName()) || "stopping".equals(prev.getName());
             synchronized (capacityReservationLock) {
                 if (startable) {
+                    String prevReasonCode = inst.getStateReasonCode();
+                    String prevReasonMessage = inst.getStateReasonMessage();
                     inst.setState(InstanceState.pending());
+                    inst.setStateReasonCode(null);
+                    inst.setStateReasonMessage(null);
                     try {
                         instances.put(key(region, id), inst);
                         acquireCapacity(region, List.of(inst));
                     } catch (RuntimeException failure) {
                         inst.setState(prev);
+                        inst.setStateReasonCode(prevReasonCode);
+                        inst.setStateReasonMessage(prevReasonMessage);
                         instances.put(key(region, id), inst);
                         throw failure;
                     }
@@ -7461,6 +7537,294 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         () -> synchronizeRuntimeInterfaceAddresses(accountId, region, inst));
             }
         }
+    }
+
+    // ─── Root volume replacement ───────────────────────────────────────────────
+
+    private static final Set<String> REPLACE_ROOT_VOLUME_TASK_FILTERS = Set.of("instance-id");
+    private static final Set<String> ACTIVE_REPLACE_ROOT_VOLUME_STATES = Set.of("pending", "in-progress");
+
+    /**
+     * Starts a root volume replacement, answering with the task in {@code pending}. The guest is
+     * recreated from the AMI's image, or from the instance's current one when only a snapshot or the
+     * launch state is restored, keeping the instance's id, interfaces, addresses, tags and data
+     * volumes. A failed task leaves the instance running on its old root.
+     */
+    public ReplaceRootVolumeTask createReplaceRootVolumeTask(String region, String instanceId, String imageId,
+                                                             String snapshotId, boolean deleteReplacedRootVolume,
+                                                             String clientToken, List<Tag> tags, boolean dryRun) {
+        return operationAdmission.call(() -> createReplaceRootVolumeTaskAdmitted(region, instanceId, imageId,
+                snapshotId, deleteReplacedRootVolume, clientToken, tags, dryRun));
+    }
+
+    private ReplaceRootVolumeTask createReplaceRootVolumeTaskAdmitted(String region, String instanceId,
+                                                                      String imageId, String snapshotId,
+                                                                      boolean deleteReplacedRootVolume,
+                                                                      String clientToken, List<Tag> tags,
+                                                                      boolean dryRun) {
+        ensureDefaultResources(region);
+        if (instanceId == null || instanceId.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceId", 400);
+        }
+        if (imageId != null && snapshotId != null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "You can specify either a snapshot ID or an AMI ID, but not both.", 400);
+        }
+        Instance inst = requireEc2ManagedInstance(region, instanceId, "replaced");
+        if (clientToken != null && !clientToken.isBlank()) {
+            Optional<ReplaceRootVolumeTask> replay = replaceRootVolumeTasks.scan(k -> k.startsWith(region + "::"))
+                    .stream().filter(task -> clientToken.equals(task.getClientToken())).findFirst();
+            if (replay.isPresent()) {
+                if (!instanceId.equals(replay.get().getInstanceId())
+                        || !Objects.equals(imageId, replay.get().getImageId())
+                        || !Objects.equals(snapshotId, replay.get().getSnapshotId())
+                        || deleteReplacedRootVolume
+                                != Boolean.TRUE.equals(replay.get().getDeleteReplacedRootVolume())) {
+                    throw new AwsException("IdempotentParameterMismatch",
+                            "The client token was already used with different parameters.", 400);
+                }
+                return replay.get();
+            }
+        }
+        if (!"running".equals(inst.getState().getName())) {
+            throw new AwsException("IncorrectInstanceState",
+                    "The instance '" + instanceId + "' is not in the running state.", 400);
+        }
+        boolean active = replaceRootVolumeTasks.scan(k -> k.startsWith(region + "::")).stream()
+                .anyMatch(task -> instanceId.equals(task.getInstanceId())
+                        && ACTIVE_REPLACE_ROOT_VOLUME_STATES.contains(task.getTaskState()));
+        if (active) {
+            throw new AwsException("IncorrectState",
+                    "A root volume replacement task is already in progress for instance '" + instanceId + "'.", 400);
+        }
+        if (snapshotId != null) {
+            requireFound(snapshots.get(key(region, snapshotId)).isPresent(),
+                    "InvalidSnapshot.NotFound", "The snapshot '" + snapshotId + "' does not exist.");
+        }
+        // shortcut: a snapshot restore recreates the guest from the instance's current image, since
+        // a snapshot holds no container file system here; upgrade when snapshots capture one.
+        String sourceImageId = imageId != null ? imageId : inst.getImageId();
+        ResolvedAmiImage image = config.services().ec2().mock() ? null
+                : resolveReplacementImage(region, sourceImageId);
+        if (dryRun) {
+            throw dryRunOperation();
+        }
+
+        ReplaceRootVolumeTask task = new ReplaceRootVolumeTask();
+        task.setReplaceRootVolumeTaskId("replacevol-" + Ec2Ids.randomHex(17));
+        task.setInstanceId(instanceId);
+        task.setTaskState("pending");
+        task.setStartTime(clock.instant());
+        task.setImageId(imageId);
+        task.setSnapshotId(snapshotId);
+        task.setDeleteReplacedRootVolume(deleteReplacedRootVolume);
+        task.setClientToken(clientToken == null || clientToken.isBlank() ? null : clientToken);
+        task.setRegion(region);
+        task.setTags(tags == null ? new ArrayList<>() : new ArrayList<>(tags));
+        String taskKey = key(region, task.getReplaceRootVolumeTaskId());
+        replaceRootVolumeTasks.put(taskKey, task);
+        ReplaceRootVolumeTask answer = copyOf(task);
+
+        String accountId = callerAccountId();
+        Runnable inProgress = () -> RequestScopes.runAs(accountId, region,
+                () -> updateReplaceRootVolumeTask(taskKey, "in-progress", null));
+        Runnable replaced = () -> RequestScopes.runAs(accountId, region, () -> {
+            if (imageId != null) {
+                // As AWS: DescribeInstances and IMDS report the new AMI once the task succeeds.
+                inst.setImageId(imageId);
+            }
+            instances.put(key(region, instanceId), inst);
+            if (!config.services().ec2().mock()) {
+                restoreAttachedVolumesForInstance(region, inst);
+                completeContainerStart(region, inst);
+            }
+            updateReplaceRootVolumeTask(taskKey, "succeeded", null);
+        });
+        Consumer<String> failed = reason -> RequestScopes.runAs(accountId, region,
+                () -> updateReplaceRootVolumeTask(taskKey, "failed", reason));
+        if (config.services().ec2().mock()) {
+            inProgress.run();
+            replaced.run();
+        } else {
+            String publicKey = null;
+            if (inst.getKeyName() != null) {
+                KeyPair keyPair = findKeyPair(region, inst.getKeyName());
+                publicKey = keyPair == null ? null : keyPair.getPublicKey();
+            }
+            containerManager.replaceRoot(inst, image, publicKey,
+                    () -> RequestScopes.callAs(accountId, region,
+                            () -> prepareReplacementMounts(region, inst, image.volumeMounts())),
+                    inProgress, replaced, failed);
+        }
+        return answer;
+    }
+
+    /**
+     * The data-volume mounts a replacement guest takes over. The new image's mounts are picked as
+     * RunInstances picks them: one per declared device the instance has a volume at, prepared on
+     * that volume's existing Docker volume and loop device. Every other mount the old guest holds is
+     * carried over unchanged, as a real root volume swap leaves non-root EBS volumes attached.
+     */
+    private List<Ec2VolumeBlockDeviceManager.PreparedMount> prepareReplacementMounts(
+            String region, Instance instance, List<Ec2ImageCatalog.VolumeMount> mappings) {
+        List<Volume> attached = volumes.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(volume -> volume != null && !volume.getVolumeId().equals(instance.getRootVolumeId()))
+                .filter(volume -> volume.getAttachments().stream()
+                        .anyMatch(attachment -> instance.getInstanceId().equals(attachment.getInstanceId())))
+                .toList();
+        List<Ec2ImageCatalog.VolumeMount> declared = new ArrayList<>();
+        for (Ec2ImageCatalog.VolumeMount mapping : mappings) {
+            List<Volume> matches = attached.stream().filter(volume -> volume.getAttachments().stream()
+                    .anyMatch(attachment -> instance.getInstanceId().equals(attachment.getInstanceId())
+                            && isSameDevice(mapping.device(), attachment.getDevice()))).toList();
+            boolean root = isSameDevice(mapping.device(), instance.getRootDeviceName());
+            // As at launch: a declared device with no volume gets no managed mount.
+            if (matches.isEmpty() && !root) {
+                continue;
+            }
+            if (root || matches.size() != 1 || matches.getFirst().getSnapshotId() != null
+                    && !matches.getFirst().getSnapshotId().isBlank()) {
+                throw replacementMountFailure("the new image's data-volume mount at " + mapping.device()
+                        + " needs one snapshot-free non-root volume attached there");
+            }
+            declared.add(mapping);
+        }
+        boolean retains = attached.stream().anyMatch(volume -> volume.getManagedFilesystem() != null);
+        if (declared.isEmpty() && !retains) {
+            return List.of();
+        }
+        if (volumeBlockDeviceManager == null || !callerAccountId().equals(instance.getOwnerId())
+                || !region.equals(instance.getRegion())) {
+            throw replacementMountFailure("its data volumes' owner cannot be resolved");
+        }
+        List<Ec2VolumeBlockDeviceManager.PreparedMount> prepared =
+                new ArrayList<>(prepareInstanceMounts(region, instance, declared));
+        for (Volume volume : attached) {
+            if (volume.getManagedFilesystem() == null) {
+                continue;
+            }
+            for (VolumeAttachment attachment : volume.getAttachments()) {
+                if (!instance.getInstanceId().equals(attachment.getInstanceId())
+                        || declared.stream().anyMatch(mapping -> isSameDevice(mapping.device(), attachment.getDevice()))) {
+                    continue;
+                }
+                // Empty for a raw-device guest; the post-replace hook attaches those volumes again.
+                Optional<Ec2VolumeBlockDeviceManager.PreparedMount> retained = withVolumeLock(volume.getVolumeId(),
+                        () -> volumeBlockDeviceManager.retainedMount(volume, instance, attachment.getDevice()));
+                retained.ifPresent(prepared::add);
+            }
+        }
+        for (int i = 0; i < prepared.size(); i++) {
+            Path first = Path.of(prepared.get(i).target()).normalize();
+            for (int j = i + 1; j < prepared.size(); j++) {
+                Path second = Path.of(prepared.get(j).target()).normalize();
+                if (first.startsWith(second) || second.startsWith(first)) {
+                    throw replacementMountFailure("the data-volume mount of " + prepared.get(i).volumeId()
+                            + " at " + first + " overlaps the mount of " + prepared.get(j).volumeId()
+                            + " at " + second);
+                }
+            }
+        }
+        return List.copyOf(prepared);
+    }
+
+    private static AwsException replacementMountFailure(String reason) {
+        return new AwsException("InternalError", "Its data volumes cannot be kept: " + reason, 500);
+    }
+
+    /** The image a replacement guest runs, resolved as RunInstances resolves the AMI it launches. */
+    private ResolvedAmiImage resolveReplacementImage(String region, String imageId) {
+        if (imageId == null || imageId.isBlank()) {
+            throw new AwsException("InvalidAMIID.NotFound", "The instance has no image to restore.", 400);
+        }
+        synchronized (imageRegistryLock) {
+            requireNotDeregistered(region, imageId);
+            Image image = imageForCaller(region, imageId).orElseGet(() -> sharedImageForCaller(region, imageId)
+                    .orElseGet(() -> imageCatalog.findByIdOrAlias(imageId)
+                            .map(Ec2ImageCatalog.CatalogImage::toImage).orElse(null)));
+            ResolvedAmiImage resolved = amiImageResolver.resolveImage(
+                    launchableImageForCaller(region, imageId, image));
+            String captured = capturedImageFor(region, imageId);
+            if (captured != null) {
+                resolved = new ResolvedAmiImage(captured, resolved.guestRuntime(), resolved.cloudInit(),
+                        resolved.dockerPlatform(), resolved.volumeMounts());
+            }
+            return resolved;
+        }
+    }
+
+    /** Moves an active task to {@code state}; a task that already ended keeps its outcome. */
+    private void updateReplaceRootVolumeTask(String taskKey, String state, String reason) {
+        synchronized (replaceRootVolumeTasks) {
+            ReplaceRootVolumeTask task = replaceRootVolumeTasks.get(taskKey).orElse(null);
+            if (task == null || !ACTIVE_REPLACE_ROOT_VOLUME_STATES.contains(task.getTaskState())) {
+                return;
+            }
+            task.setTaskState(state);
+            if ("succeeded".equals(state) || "failed".equals(state)) {
+                task.setCompleteTime(clock.instant());
+            }
+            if (reason != null) {
+                task.setFailureReason(reason);
+                LOG.warnv("Root volume replacement {0} for instance {1} failed: {2}",
+                        task.getReplaceRootVolumeTaskId(), task.getInstanceId(), reason);
+            }
+            replaceRootVolumeTasks.put(taskKey, task);
+        }
+    }
+
+    /**
+     * The caller's tasks in this region, by id and the {@code instance-id} filter, in task ID order.
+     * An unknown id is {@code InvalidReplaceRootVolumeTaskId.NotFound}, and {@code maxResults} is
+     * the model's 1 to 50.
+     */
+    public PaginatedResult<ReplaceRootVolumeTask> describeReplaceRootVolumeTasks(
+            String region, List<String> ids, List<Map.Entry<String, List<String>>> filters,
+            Integer maxResults, String nextToken) {
+        if (filters != null) {
+            requireSupportedFilters(filters.stream().map(Map.Entry::getKey).toList(),
+                    REPLACE_ROOT_VOLUME_TASK_FILTERS);
+        }
+        if (maxResults != null && (maxResults < 1 || maxResults > 50)) {
+            throw new AwsException("InvalidMaxResults",
+                    "Value (" + maxResults + ") for parameter MaxResults is invalid. "
+                            + "Expecting a value between 1 and 50.", 400);
+        }
+        for (String id : ids) {
+            if (replaceRootVolumeTasks.get(key(region, id)).isEmpty()) {
+                throw new AwsException("InvalidReplaceRootVolumeTaskId.NotFound",
+                        "The replace root volume task ID '" + id + "' does not exist.", 400);
+            }
+        }
+        List<ReplaceRootVolumeTask> matching = replaceRootVolumeTasks.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(task -> ids.isEmpty() || ids.contains(task.getReplaceRootVolumeTaskId()))
+                .filter(task -> filters == null || filters.stream().allMatch(filter ->
+                        !"instance-id".equals(filter.getKey()) || filter.getValue().contains(task.getInstanceId())))
+                .map(Ec2Service::copyOf)
+                .sorted(Comparator.comparing(ReplaceRootVolumeTask::getReplaceRootVolumeTaskId))
+                .collect(Collectors.toList());
+        return Pagination.paginate(matching, ReplaceRootVolumeTask::getReplaceRootVolumeTaskId,
+                maxResults == null ? Integer.MAX_VALUE : maxResults, nextToken, "replacevol",
+                token -> new AwsException("InvalidParameterValue", "Invalid NextToken", 400));
+    }
+
+    /** A snapshot of the task, so a response is not rewritten by the worker while it is serialized. */
+    private static ReplaceRootVolumeTask copyOf(ReplaceRootVolumeTask task) {
+        ReplaceRootVolumeTask copy = new ReplaceRootVolumeTask();
+        copy.setReplaceRootVolumeTaskId(task.getReplaceRootVolumeTaskId());
+        copy.setInstanceId(task.getInstanceId());
+        copy.setTaskState(task.getTaskState());
+        copy.setStartTime(task.getStartTime());
+        copy.setCompleteTime(task.getCompleteTime());
+        copy.setImageId(task.getImageId());
+        copy.setSnapshotId(task.getSnapshotId());
+        copy.setDeleteReplacedRootVolume(task.getDeleteReplacedRootVolume());
+        copy.setClientToken(task.getClientToken());
+        copy.setFailureReason(task.getFailureReason());
+        copy.setRegion(task.getRegion());
+        copy.setTags(new ArrayList<>(task.getTags()));
+        return copy;
     }
 
     public void pruneTerminatedInstances() {
@@ -7904,8 +8268,41 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 inst.setSourceDestCheck(Boolean.parseBoolean(value));
             }
             case "ebsOptimized" -> inst.setEbsOptimized(Boolean.parseBoolean(value));
+            case "instanceInitiatedShutdownBehavior" -> {
+                requireShutdownBehavior(value);
+                inst.setInstanceInitiatedShutdownBehavior(value);
+            }
         }
         storeInstance(region, inst);
+    }
+
+    private static void requireShutdownBehavior(String behavior) {
+        if (behavior != null && !"stop".equals(behavior) && !"terminate".equals(behavior)) {
+            throw new AwsException("InvalidParameterValue", "Value (" + behavior
+                    + ") for parameter instanceInitiatedShutdownBehavior is invalid. Valid values are 'stop' and 'terminate'.",
+                    400);
+        }
+    }
+
+    /**
+     * A guest that powered itself off: the instance stops, as on EC2, or terminates when launched with
+     * {@code InstanceInitiatedShutdownBehavior=terminate}. Runs off a request, as the instance's account.
+     */
+    void applyGuestShutdown(Instance instance) {
+        String region = instance.getRegion();
+        List<String> ids = List.of(instance.getInstanceId());
+        String owner = instance.getOwnerId() != null ? instance.getOwnerId() : defaultAccountId;
+        RequestScopes.runAs(owner, region, () -> {
+            Instance stored = instances.get(key(region, instance.getInstanceId())).orElse(instance);
+            stored.setStateReasonCode("Client.InstanceInitiatedShutdown");
+            stored.setStateReasonMessage("Client.InstanceInitiatedShutdown: Instance initiated shutdown");
+            storeInstance(region, stored);
+            if ("terminate".equals(stored.getInstanceInitiatedShutdownBehavior())) {
+                terminateInstances(region, ids);
+            } else {
+                stopInstances(region, ids);
+            }
+        });
     }
 
     public record InstanceBlockDeviceMappingChange(String deviceName, String volumeId, boolean deleteOnTermination) {}
@@ -9147,10 +9544,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 IpPermission ipv6All = new IpPermission();
                 ipv6All.setIpProtocol("-1");
                 ipv6All.getIpv6Ranges().add(new Ipv6Range("::/0"));
-                List<IpPermission> next = new ArrayList<>(current.getIpPermissionsEgress());
-                next.add(ipv6All);
+                IpPermission dualStack = copyPermissionSources(current.getIpPermissionsEgress().getFirst());
+                dualStack.getIpv6Ranges().addAll(ipv6All.getIpv6Ranges());
                 createRules(region, current.getGroupId(), ipv6All, true);
-                current.setIpPermissionsEgress(next);
+                current.setIpPermissionsEgress(new ArrayList<>(List.of(dualStack)));
                 securityGroups.put(key(region, current.getGroupId()), current);
             }
         }
@@ -9281,7 +9678,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         endpoint.setIpAddressType(ipAddressType != null ? ipAddressType : "ipv4");
         boolean isInterface = "Interface".equalsIgnoreCase(endpoint.getVpcEndpointType());
         endpoint.setPrivateDnsEnabled(privateDnsEnabled != null ? privateDnsEnabled : isInterface);
-        endpoint.setCreationTimestamp(Instant.now());
+        endpoint.setCreationTimestamp(clock.instant());
         endpoint.setRegion(region);
         endpoint.setRouteTableIds(new ArrayList<>(routeTableIds));
         endpoint.setSubnetIds(effectiveSubnetIds);
@@ -10330,10 +10727,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         sg.setVpcId(vpcId);
         sg.setOwnerId(callerAccountId());
         sg.setRegion(region);
-        IpPermission egressAll = defaultEgress(groupVpc);
-        sg.getIpPermissionsEgress().add(egressAll);
         synchronized (attachmentTopologyLock(region)) {
-            getRequiredVpc(region, sg.getVpcId());
+            Vpc currentGroupVpc = getRequiredVpc(region, sg.getVpcId());
+            IpPermission egressAll = defaultEgress(currentGroupVpc);
+            sg.getIpPermissionsEgress().add(egressAll);
             boolean exists = securityGroups.scan(k -> true).stream()
                     .anyMatch(existing -> existing.getRegion().equals(region)
                             && Objects.equals(existing.getGroupName(), groupName)
@@ -16882,7 +17279,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         natGateway.setVpcId(subnet.getVpcId());
         natGateway.setAllocationId(allocationId);
         natGateway.setConnectivityType(connectivityType != null && !connectivityType.isBlank() ? connectivityType : "public");
-        natGateway.setCreateTime(Instant.now());
+        natGateway.setCreateTime(clock.instant());
         natGateway.setRegion(region);
         if (routing != null) {
             natGateway.setState("pending");

@@ -181,6 +181,9 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
     private static final String EPC_VPC_IDS_KEY = "vpcEndpointIds";
     private static final String EPC_TYPES_PATH = "/endpointConfiguration/types/";
     private static final String EPC_VPC_IDS_PATH = "/endpointConfiguration/vpcEndpointIds";
+    private static final String MIN_COMPRESSION_PATH = "/minimumCompressionSize";
+    /** The largest {@code minimumCompressionSize} AWS accepts: 10 MiB. */
+    private static final int MAX_MINIMUM_COMPRESSION_SIZE = 10_485_760;
     private static final String TLS_1_2 = "TLS_1_2";
     /** The API type a mapping to a REST API is stored with, beside a v2 API's protocol type. */
     private static final String REST_API_TYPE = "REST";
@@ -366,6 +369,9 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
         if (request.get("apiKeySource") != null) {
             api.setApiKeySource(apiKeySource(request.get("apiKeySource")));
         }
+        if (request.get("minimumCompressionSize") != null) {
+            api.setMinimumCompressionSize(minimumCompressionSize(request.get("minimumCompressionSize")));
+        }
 
         EndpointConfiguration endpointConfiguration = new EndpointConfiguration();
         if (request.get(EPC_KEY) instanceof Map<?, ?> epMap) {
@@ -423,6 +429,28 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
             return (String) value;
         }
         throw new AwsException("BadRequestException", "API key source must be HEADER or AUTHORIZER.", 400);
+    }
+
+    /**
+     * A valid {@code minimumCompressionSize}: a whole number of bytes from 0 to 10485760. The value
+     * is a JSON number on create and a string in a patch operation, so both are read.
+     */
+    private static Integer minimumCompressionSize(Object value) {
+        Long size = null;
+        if (value instanceof Integer || value instanceof Long || value instanceof Short) {
+            size = ((Number) value).longValue();
+        } else if (value instanceof String text) {
+            try {
+                size = Long.parseLong(text.trim());
+            } catch (NumberFormatException ignored) {
+                // Not a whole number of bytes: refused below.
+            }
+        }
+        if (size == null || size < 0 || size > MAX_MINIMUM_COMPRESSION_SIZE) {
+            throw new AwsException("BadRequestException",
+                    "Invalid minimum compression size, must be between 0 and 10485760", 400);
+        }
+        return size.intValue();
     }
 
     /** The endpoint type {@code value} names, in any case. */
@@ -508,6 +536,10 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
         return apiStore.scan(k -> k.startsWith(prefix));
     }
 
+    public PaginatedResult<RestApi> getRestApiPage(String region, Integer limit, String position) {
+        return pageById(getRestApis(region), RestApi::getId, limit, position);
+    }
+
     public synchronized void deleteRestApi(String region, String apiId) {
         getRestApi(region, apiId);
         apiStore.delete(apiKey(region, apiId));
@@ -533,6 +565,11 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
         getRestApi(region, apiId);
         String prefix = region + "::" + apiId + "::";
         return resourceStore.scan(k -> k.startsWith(prefix));
+    }
+
+    public PaginatedResult<ApiGatewayResource> getResourcePage(String region, String apiId, Integer limit,
+                                                               String position) {
+        return pageById(getResources(region, apiId), ApiGatewayResource::getId, limit, position);
     }
 
     /** The root resource id, with a resource-store fallback for data persisted before it was stored on the API. */
@@ -1336,14 +1373,15 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
 
     /**
      * One page of a list, sorted by id here. The token is the id of the last item returned, and
-     * an unrecognised token is a {@code BadRequestException}, as on AWS.
+     * an unrecognised token is a {@code BadRequestException}, as on AWS. So is an explicitly empty
+     * {@code position}, which AWS refuses instead of serving the first page, and a blank one.
      */
     private static <T> PaginatedResult<T> pageById(List<T> items, Function<T, String> idOf, Integer limit,
                                                    String position) {
         List<T> sorted = items.stream().sorted(Comparator.comparing(idOf)).toList();
         int pageSize = resolvePageSize(limit);
         int start = 0;
-        if (position != null && !position.isBlank()) {
+        if (position != null) {
             while (start < sorted.size() && !position.equals(idOf.apply(sorted.get(start)))) {
                 start++;
             }
@@ -1987,9 +2025,10 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
 
         // The page token is the last key id already returned, so a page resumes after it rather
         // than at a positional offset a concurrent key attachment could shift. Measured: an
-        // unrecognised token is a BadRequestException, not an empty page.
+        // unrecognised token is a BadRequestException, not an empty page. An empty or blank one
+        // is refused the same way, as on the collections paged by pageById.
         int from = 0;
-        if (position != null && !position.isBlank()) {
+        if (position != null) {
             int previous = -1;
             for (int i = 0; i < keys.size(); i++) {
                 if (position.equals(keys.get(i).getId())) {
@@ -2185,6 +2224,11 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
     public List<UsagePlanKey> getUsagePlanKeys(String region, String usagePlanId) {
         String prefix = region + "::" + usagePlanId + "::";
         return usagePlanKeyStore.scan(k -> k.startsWith(prefix));
+    }
+
+    public PaginatedResult<UsagePlanKey> getUsagePlanKeyPage(String region, String usagePlanId, Integer limit,
+                                                             String position) {
+        return pageById(getUsagePlanKeys(region, usagePlanId), UsagePlanKey::getId, limit, position);
     }
 
     public void deleteUsagePlanKey(String region, String usagePlanId, String keyId) {
@@ -4004,8 +4048,13 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
             // endpoint change or API key source must leave it as it was.
             EndpointConfiguration endpointConfiguration = patchEndpointConfiguration(api, patchOperations, region);
             for (Map<String, String> op : patchOperations) {
-                if ("replace".equals(op.get("op")) && "/apiKeySource".equals(op.get("path"))) {
+                if (!"replace".equals(op.get("op"))) {
+                    continue;
+                }
+                if ("/apiKeySource".equals(op.get("path"))) {
                     apiKeySource(op.get("value"));
+                } else if (MIN_COMPRESSION_PATH.equals(op.get("path")) && !clearsCompression(op.get("value"))) {
+                    minimumCompressionSize(op.get("value"));
                 }
             }
             for (Map<String, String> op : patchOperations) {
@@ -4025,6 +4074,10 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
                 } else if ("/apiKeySource" .equals(path)) {
                     // aws_api_gateway_rest_api sends this for a changed api_key_source.
                     api.setApiKeySource(apiKeySource(value));
+                } else if (MIN_COMPRESSION_PATH.equals(path)) {
+                    // A patch without a value turns compression off, which is how
+                    // aws_api_gateway_rest_api clears minimum_compression_size.
+                    api.setMinimumCompressionSize(clearsCompression(value) ? null : minimumCompressionSize(value));
                 }
             }
             if (endpointConfiguration != null) {
@@ -4033,6 +4086,11 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
         }
         apiStore.put(apiKey(region, apiId), api);
         return api;
+    }
+
+    /** True when a {@code /minimumCompressionSize} patch value turns compression off. */
+    private static boolean clearsCompression(String value) {
+        return value == null || value.isBlank();
     }
 
     /**
@@ -4658,6 +4716,17 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
             restoreRestApi(region, apiId, snapshot);
             throw e;
         }
+    }
+
+    /**
+     * The definition an import or an overwrite reads, its whole body, its AWS variables resolved as
+     * {@link #importRestApi} and {@link #putRestApi} resolve them, so the roles IAM checks are the ones the
+     * integrations take.
+     */
+    @Override
+    public List<String> openApiDefinitions(String operation, String body, String region) {
+        return ("apigateway:ImportRestApi".equals(operation) || "apigateway:PutRestApi".equals(operation))
+                && body != null ? List.of(resolveOpenApiAwsVariables(region, body)) : List.of();
     }
 
     private String resolveOpenApiAwsVariables(String region, String value) {

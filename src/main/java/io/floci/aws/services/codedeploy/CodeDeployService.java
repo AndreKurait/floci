@@ -967,6 +967,15 @@ public class CodeDeployService {
                 ignored -> new ConcurrentHashMap<>());
     }
 
+    /**
+     * Runs a deployment's state machine on its own virtual thread as the account that created it,
+     * in its region, so the Lambda, ECS, EC2 and SSM calls it makes act on that account's resources.
+     */
+    private void startDeploymentThread(String name, String region, Runnable stateMachine) {
+        String accountId = regionResolver.getAccountId();
+        Thread.ofVirtual().name(name).start(() -> RequestScopes.runAs(accountId, region, stateMachine));
+    }
+
     private Map<String, OnPremisesInstance> onPremisesFor(String region) {
         return onPremisesInstances.computeIfAbsent(region, r -> new ConcurrentHashMap<>());
     }
@@ -1054,10 +1063,9 @@ public class CodeDeployService {
         stopFlags.put(deploymentId, stopFlag);
 
         String serviceRoleArn = group.getServiceRoleArn();
-        String accountId = regionResolver.getAccountId();
-        Thread.ofVirtual().name("codedeploy-" + deploymentId).start(
-                () -> RequestScopes.runAs(accountId, region,
-                        () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag, effectiveConfig, serviceRoleArn)));
+        startDeploymentThread("codedeploy-" + deploymentId, region,
+                () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag,
+                        effectiveConfig, serviceRoleArn));
 
         return deploymentId;
     }
@@ -1339,7 +1347,7 @@ public class CodeDeployService {
 
             stopFlags.put(deploymentId, stopFlag);
 
-            Thread.ofVirtual().name("codedeploy-server-" + deploymentId).start(
+            startDeploymentThread("codedeploy-server-" + deploymentId, region,
                     () -> {
                         try {
                             if (prepared != null) {
@@ -1957,7 +1965,7 @@ public class CodeDeployService {
         final String finalBlueTgArn = blueTgArn;
         final String finalGreenTgArn = greenTgArn;
         final List<String> finalListenerArns = listenerArns;
-        Thread.ofVirtual().name("codedeploy-ecs-" + deploymentId).start(
+        startDeploymentThread("codedeploy-ecs-" + deploymentId, region,
                 () -> runEcsStateMachine(region, deployment, appSpec, ecsTargetMap, stopFlag,
                         effectiveConfig, finalCluster, finalService,
                         finalBlueTgArn, finalGreenTgArn, finalListenerArns, List.copyOf(testListenerArns)));

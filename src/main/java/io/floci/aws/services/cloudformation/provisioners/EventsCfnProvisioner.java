@@ -160,7 +160,13 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
         resource.getAttributes().remove(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR);
-        return ReplacementCleanup.complete(resource, this::delete);
+        return ReplacementCleanup.complete(resource, (resourceType, physicalId, region) -> {
+            // An older debt can become the live rule under a different accepted bus alias.
+            if (!"AWS::Events::Rule".equals(resourceType)
+                    || !sameRuleBackend(physicalId, resource.getPhysicalId())) {
+                delete(resourceType, physicalId, region);
+            }
+        });
     }
 
     @Override
@@ -203,14 +209,8 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         String roleArn = ctx.resolveOptional(props, "RoleArn");
         String scheduleExpression = ctx.resolveOptional(props, "ScheduleExpression");
 
-        String eventPattern = null;
-        if (props != null && props.has("EventPattern") && !props.get("EventPattern").isNull()) {
-            JsonNode patternNode = ctx.engine().resolveNode(props.get("EventPattern"));
-            // A template writes the pattern as a JSON object or as a string that holds one, and
-            // CloudFormation accepts both. PutRule takes the string, so a string is passed as
-            // written; serializing it again would hand PutRule a quoted string, not an object.
-            eventPattern = patternNode.isTextual() ? patternNode.asText() : patternNode.toString();
-        }
+        String eventPattern = props == null ? null
+                : ctx.engine().resolveJsonAttribute(props.path("EventPattern"));
 
         String stateStr = ctx.resolveOptional(props, "State");
         RuleState state = "DISABLED".equals(stateStr) ? RuleState.DISABLED : RuleState.ENABLED;
@@ -226,8 +226,8 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
             priorPhysicalId = rulePhysicalId(ruleNameOf(priorPhysicalId),
                     priorBus != null ? priorBus : attributesBefore.get("EventBusName"), ctx.accountId());
         }
-        boolean replaced = ctx.isUpdate() && !physicalId.equals(priorPhysicalId);
-        boolean replacementPreexisting = replaced && ruleExists(ruleName, busName, ctx.region());
+        boolean replaced = ctx.isUpdate() && !sameRuleBackend(physicalId, priorPhysicalId);
+        boolean replacementPreexisting = replaced && eventBridgeService.ruleExists(ruleName, busName, ctx.region());
         Rule rule = eventBridgeService.putRule(ruleName, busName, eventPattern, scheduleExpression,
                 state, description, roleArn, Map.of(), ctx.region());
         r.setPhysicalId(physicalId);
@@ -242,8 +242,7 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         }
 
         if (ctx.isUpdate()) {
-            ReplacementCleanup.record(r, new ProvisionContext(ctx.engine(), ctx.region(), ctx.accountId(), ctx.stackName(),
-                    priorPhysicalId, ctx.progress(), ctx.priorProperties(), ctx.updatePolicy(), ctx.priorUpdatePolicy()), attributesBefore,
+            ReplacementCleanup.record(r, ctx.withPriorPhysicalId(priorPhysicalId), attributesBefore,
                     replaced, !replacementPreexisting);
         }
         try {
@@ -431,7 +430,8 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         return ("AWS::Events::EventBus".equals(resource.getResourceType())
                 && resource.getAttributes().containsKey(CfnRollback.EVENT_BUS_UPDATE_SNAPSHOT_ATTR))
                 || ("AWS::Events::Rule".equals(resource.getResourceType())
-                && resource.getAttributes().containsKey(CfnRollback.REPLACEMENT_CLEANUP_ATTR));
+                && (resource.getAttributes().containsKey(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR)
+                    || ReplacementCleanup.hasRollbackState(resource)));
     }
 
     /**
@@ -878,6 +878,12 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
             return DEFAULT_EVENT_BUS.equals(busName) ? ruleName : busName + RULE_ID_SEPARATOR + ruleName;
         }
         return busNameOrArn + RULE_ID_SEPARATOR + ruleName;
+    }
+
+    private static boolean sameRuleBackend(String first, String second) {
+        return first != null && second != null && ruleNameOf(first).equals(ruleNameOf(second))
+                && EventBridgeService.resolvedBusName(busNameOf(first))
+                        .equals(EventBridgeService.resolvedBusName(busNameOf(second)));
     }
 
     /** The rule name a rule's physical id carries: all of it, or what follows its custom bus. */

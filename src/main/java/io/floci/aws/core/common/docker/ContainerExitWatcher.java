@@ -1,4 +1,4 @@
-package io.floci.aws.services.lambda.launcher;
+package io.floci.aws.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
@@ -21,7 +21,7 @@ import java.util.function.IntConsumer;
 import java.util.function.LongSupplier;
 
 /**
- * Reports when a Lambda container's main process exits, through Docker's wait-for-exit stream.
+ * Reports when a container's main process exits, through Docker's wait-for-exit stream.
  *
  * <p>The stream sends nothing until the container exits, so on a quiet container it ends with a read
  * timeout or a transport failure while the container still runs. A watch that simply
@@ -39,9 +39,9 @@ import java.util.function.LongSupplier;
  * <p>The wait stream holds its connection for the container's whole lifetime, so it runs on the
  * streaming client; the inspect is a short call and stays on the control-plane client.
  */
-final class LambdaExitWatcher {
+public final class ContainerExitWatcher {
 
-    private static final Logger LOG = Logger.getLogger(LambdaExitWatcher.class);
+    private static final Logger LOG = Logger.getLogger(ContainerExitWatcher.class);
 
     /** A stream that fails sooner than this after it was armed counts as a quick failure. */
     static final Duration QUICK_FAILURE = Duration.ofSeconds(5);
@@ -63,7 +63,7 @@ final class LambdaExitWatcher {
     private volatile WaitContainerResultCallback currentCallback;
     private int quickFailures;
 
-    LambdaExitWatcher(DockerClient dockerClient, DockerClient streamingDocker, String containerId,
+    ContainerExitWatcher(DockerClient dockerClient, DockerClient streamingDocker, String containerId,
                       IntConsumer onExit, BiConsumer<Duration, Runnable> scheduler, LongSupplier nanoClock) {
         this.dockerClient = dockerClient;
         this.streamingDocker = streamingDocker;
@@ -73,28 +73,28 @@ final class LambdaExitWatcher {
         this.nanoClock = nanoClock;
     }
 
-    LambdaExitWatcher(DockerClient dockerClient, String containerId,
+    ContainerExitWatcher(DockerClient dockerClient, String containerId,
                       IntConsumer onExit, BiConsumer<Duration, Runnable> scheduler, LongSupplier nanoClock) {
         this(dockerClient, dockerClient, containerId, onExit, scheduler, nanoClock);
     }
 
     /** Arms a watch that calls {@code onExit} with the exit status, at most once per exit. */
-    static void watch(DockerClient dockerClient, DockerClient streamingDocker, String containerId,
+    public static void watch(DockerClient dockerClient, DockerClient streamingDocker, String containerId,
                       IntConsumer onExit) {
-        new LambdaExitWatcher(dockerClient, streamingDocker, containerId, onExit, LambdaExitWatcher::schedule,
+        new ContainerExitWatcher(dockerClient, streamingDocker, containerId, onExit, ContainerExitWatcher::schedule,
                 System::nanoTime).arm();
     }
 
-    static LambdaExitWatcher watchBeforeStart(
+    public static ContainerExitWatcher watchBeforeStart(
             DockerClient dockerClient, String containerId, IntConsumer onExit, Duration timeout) {
         return watchBeforeStart(dockerClient, dockerClient, containerId, onExit, timeout);
     }
 
-    static LambdaExitWatcher watchBeforeStart(
+    public static ContainerExitWatcher watchBeforeStart(
             DockerClient dockerClient, DockerClient streamingDocker, String containerId,
             IntConsumer onExit, Duration timeout) {
-        LambdaExitWatcher watcher = new LambdaExitWatcher(
-                dockerClient, streamingDocker, containerId, onExit, LambdaExitWatcher::schedule, System::nanoTime);
+        ContainerExitWatcher watcher = new ContainerExitWatcher(
+                dockerClient, streamingDocker, containerId, onExit, ContainerExitWatcher::schedule, System::nanoTime);
         watcher.awaitingStart = true;
         try {
             if (Thread.currentThread().isInterrupted()) {
@@ -116,7 +116,7 @@ final class LambdaExitWatcher {
         }
     }
 
-    void requireHealthy() {
+    public void requireHealthy() {
         if (beforeStartFailure != null) {
             throw new IllegalStateException("Lambda exit watcher failed before start", beforeStartFailure);
         }
@@ -125,7 +125,7 @@ final class LambdaExitWatcher {
         }
     }
 
-    void containerStarted() {
+    public void containerStarted() {
         Throwable failure;
         synchronized (this) {
             awaitingStart = false;
@@ -136,7 +136,7 @@ final class LambdaExitWatcher {
         }
     }
 
-    void cancel() {
+    public void cancel() {
         reported.set(true);
         if (currentCallback != null) {
             try {

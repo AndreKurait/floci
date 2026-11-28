@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
@@ -249,7 +250,12 @@ class AthenaServiceTest {
     void getQueryResultsRefusesAnUnsucceededQueryAsAthenaWordsIt() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger executions = new AtomicInteger();
+        // Stubbed once: re-stubbing the mock while the first worker may still call it races Mockito.
         doAnswer(invocation -> {
+            if (executions.getAndIncrement() > 0) {
+                throw new IllegalStateException("duck failed");
+            }
             started.countDown();
             release.await(10, TimeUnit.SECONDS);
             return null;
@@ -262,9 +268,6 @@ class AthenaServiceTest {
         release.countDown();
         assertEquals("Could not find results", resultsRefusal(id));
 
-        doAnswer(invocation -> {
-            throw new IllegalStateException("duck failed");
-        }).when(duckClient).execute(anyString(), any(), any(), any());
         String failed = service.startQueryExecution("SELECT 1", "primary", null, null);
         awaitState(failed, QueryExecutionState.FAILED);
         assertEquals("Query did not finish successfully. Final query state: FAILED", resultsRefusal(failed));

@@ -548,6 +548,7 @@ deferred_handlers:
   - { path: services/ssm/SsmDataChannelController.java }  # Session Manager data channel documented in the SSM multi-table doc
   - { path: services/ssm/SsmMessagesController.java }  # control channel documented in the SSM multi-table doc
   - { path: services/ssm/SsmJsonHandler.java }  # multi-table doc
+  - { path: services/ssm/SsmSessionJsonHandler.java }  # dispatch already counted from SsmJsonHandler
   - { path: services/textract/TextractJsonHandler.java }  # no standalone action table yet
   - { path: services/transcribe/TranscribeJsonHandler.java }  # no standalone action table yet
   - { path: services/transfer/TransferHandler.java }  # multi-table doc

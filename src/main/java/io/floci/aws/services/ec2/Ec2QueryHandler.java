@@ -148,6 +148,8 @@ public class Ec2QueryHandler {
                 case "StartInstances" -> handleStartInstances(params, region);
                 case "StopInstances" -> handleStopInstances(params, region);
                 case "RebootInstances" -> handleRebootInstances(params, region);
+                case "CreateReplaceRootVolumeTask" -> handleCreateReplaceRootVolumeTask(params, region);
+                case "DescribeReplaceRootVolumeTasks" -> handleDescribeReplaceRootVolumeTasks(params, region);
                 case "GetConsoleOutput" -> handleGetConsoleOutput(params, region);
                 case "MonitorInstances" -> handleMonitoring(params, region, "MonitorInstances", true);
                 case "UnmonitorInstances" -> handleMonitoring(params, region, "UnmonitorInstances", false);
@@ -1117,20 +1119,24 @@ public class Ec2QueryHandler {
             Ec2Service.validateNewResourceTags(new ArrayList<>(primaryInterfaceTags.values()));
         }
 
+        String shutdownBehavior = p.getFirst("InstanceInitiatedShutdownBehavior");
+        if (shutdownBehavior == null && launchTemplateData != null) {
+            shutdownBehavior = launchTemplateData.getInstanceInitiatedShutdownBehavior();
+        }
         String availabilityZone = runInstancesAvailabilityZone(p, region, launchTemplateData);
         Reservation res = attempt == null ? service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, dryRun(p),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
-                "spot".equals(marketType), privateIpAddress, capacitySpecification, networkInterfaceDeleteOnTermination)
+                "spot".equals(marketType), privateIpAddress, capacitySpecification, networkInterfaceDeleteOnTermination, shutdownBehavior)
                 : service.launchInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, false,
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification,
-                networkInterfaceDeleteOnTermination, attempt);
+                networkInterfaceDeleteOnTermination, shutdownBehavior, attempt);
 
         if (launchTemplateData != null && !isSet(networkInterfaceId)) {
             List<Tag> templateInterfaceTags = launchTemplateData.tagsForResource("network-interface");
@@ -1750,6 +1756,73 @@ public class Ec2QueryHandler {
         return booleanResponse("RebootInstances");
     }
 
+    private Response handleCreateReplaceRootVolumeTask(MultivaluedMap<String, String> p, String region) {
+        if (p.getFirst("VolumeId") != null) {
+            // shortcut: replacing the root with an existing EBS volume needs a volume-backed guest; upgrade on demand.
+            throw new AwsException("UnsupportedOperation",
+                    "Replacing the root volume with an existing volume (VolumeId) is not supported.", 400);
+        }
+        List<Tag> tags = parseTagsForResource(p, "replace-root-volume-task", Set.of("replace-root-volume-task"));
+        ReplaceRootVolumeTask task = service.createReplaceRootVolumeTask(region, p.getFirst("InstanceId"),
+                blankToNull(p.getFirst("ImageId")), blankToNull(p.getFirst("SnapshotId")),
+                Boolean.TRUE.equals(boolParam(p, "DeleteReplacedRootVolume")), p.getFirst("ClientToken"),
+                tags, dryRun(p));
+        XmlBuilder xml = new XmlBuilder()
+                .start("CreateReplaceRootVolumeTaskResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("replaceRootVolumeTask").raw(replaceRootVolumeTaskXml(task)).end("replaceRootVolumeTask")
+                .end("CreateReplaceRootVolumeTaskResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeReplaceRootVolumeTasks(MultivaluedMap<String, String> p, String region) {
+        String maxResults = p.getFirst("MaxResults");
+        PaginatedResult<ReplaceRootVolumeTask> page = service.describeReplaceRootVolumeTasks(region,
+                getList(p, "ReplaceRootVolumeTaskId"), getFiltersList(p),
+                maxResults == null || maxResults.isEmpty() ? null : parseIntParam(p, "MaxResults", 0),
+                p.getFirst("NextToken"));
+        // After the describe, so an unknown ID, filter or NextToken fails on its own error first.
+        checkDryRun(p);
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeReplaceRootVolumeTasksResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("replaceRootVolumeTaskSet");
+        for (ReplaceRootVolumeTask task : page.items()) {
+            xml.start("item").raw(replaceRootVolumeTaskXml(task)).end("item");
+        }
+        xml.end("replaceRootVolumeTaskSet");
+        if (page.nextToken() != null) {
+            xml.elem("nextToken", page.nextToken());
+        }
+        xml.end("DescribeReplaceRootVolumeTasksResponse");
+        return xmlResponse(xml.build());
+    }
+
+    /** The members of the ReplaceRootVolumeTask shape; its times are strings in the model, sent as ISO 8601. */
+    private static String replaceRootVolumeTaskXml(ReplaceRootVolumeTask task) {
+        XmlBuilder xml = new XmlBuilder()
+                .elem("replaceRootVolumeTaskId", task.getReplaceRootVolumeTaskId())
+                .elem("instanceId", task.getInstanceId())
+                .elem("taskState", task.getTaskState())
+                .elem("startTime", task.getStartTime() == null ? null : ISO_FMT.format(task.getStartTime()));
+        if (task.getCompleteTime() != null) {
+            xml.elem("completeTime", ISO_FMT.format(task.getCompleteTime()));
+        }
+        xml.raw(tagSetXml(task.getTags()));
+        if (task.getImageId() != null) {
+            xml.elem("imageId", task.getImageId());
+        }
+        if (task.getSnapshotId() != null) {
+            xml.elem("snapshotId", task.getSnapshotId());
+        }
+        xml.elem("deleteReplacedRootVolume", String.valueOf(Boolean.TRUE.equals(task.getDeleteReplacedRootVolume())));
+        return xml.build();
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
     private Response handleDescribeInstanceStatus(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "InstanceId");
         List<Instance> runningInstances = service.describeInstanceStatus(region, ids);
@@ -1841,6 +1914,11 @@ public class Ec2QueryHandler {
             xml.start("disableApiStop").elem("value", String.valueOf(inst.isDisableApiStop())).end("disableApiStop");
         } else if ("disableApiTermination".equals(attribute)) {
             xml.start("disableApiTermination").elem("value", String.valueOf(inst.isDisableApiTermination())).end("disableApiTermination");
+        } else if ("instanceInitiatedShutdownBehavior".equals(attribute)) {
+            xml.start("instanceInitiatedShutdownBehavior")
+                    .elem("value", inst.getInstanceInitiatedShutdownBehavior() == null
+                            ? "stop" : inst.getInstanceInitiatedShutdownBehavior())
+                    .end("instanceInitiatedShutdownBehavior");
         } else if ("groupSet".equals(attribute)) {
             xml.start("groupSet");
             for (GroupIdentifier gi : inst.getSecurityGroups()) {
@@ -1867,7 +1945,8 @@ public class Ec2QueryHandler {
         // Find which attribute is being modified
         String attrName = null;
         String attrValue = null;
-        for (String attr : List.of("InstanceType.Value", "SourceDestCheck.Value", "EbsOptimized.Value")) {
+        for (String attr : List.of("InstanceType.Value", "SourceDestCheck.Value", "EbsOptimized.Value",
+                "InstanceInitiatedShutdownBehavior.Value")) {
             String val = p.getFirst(attr);
             if (val != null) {
                 attrName = attr.replace(".Value", "");

@@ -651,7 +651,10 @@ IAM_AUTHORIZED_ACTIONS_PATHS := src/main/resources/aws/iam-authorized-actions.js
 	src/main/resources/aws/rest-routes.json tools/aws/sources/s3-required-actions.json \
 	tools/aws/fetch_s3_required_actions.py tools/aws/test_fetch_s3_required_actions.py
 IAM_PASSED_ROLES_PATHS := src/main/resources/aws/iam-passed-roles.json $(IAM_PASSED_ROLES_GENERATOR) \
-	tools/aws/test_regen_iam_passed_roles.py
+	tools/aws/test_regen_iam_passed_roles.py tools/aws/sources/eks-roles.json tools/aws/fetch_eks_roles.py \
+	tools/aws/test_fetch_eks_roles.py tools/aws/sources/emr-roles.json tools/aws/fetch_emr_roles.py \
+	tools/aws/test_fetch_emr_roles.py tools/aws/sources/apigateway-roles.json tools/aws/fetch_apigateway_roles.py \
+	tools/aws/test_fetch_apigateway_roles.py
 IAM_PASSED_NETWORK_CONNECTORS_PATHS := src/main/resources/aws/iam-passed-network-connectors.json \
 	tools/aws/regen_iam_passed_network_connectors.py $(IAM_PASSED_ROLES_GENERATOR) \
 	tools/aws/test_regen_iam_passed_network_connectors.py
@@ -683,6 +686,8 @@ IAM_REQUEST_RESOURCES_PATHS := src/main/resources/aws/iam-request-resources.json
 	tools/aws/fetch_dynamodb_permissions.py tools/aws/test_fetch_dynamodb_permissions.py \
 	tools/aws/sources/iam-identifiers.json tools/aws/fetch_iam_identifiers.py tools/aws/test_fetch_iam_identifiers.py \
 	tools/aws/sources/ec2-id-examples.json tools/aws/fetch_ec2_id_examples.py tools/aws/test_fetch_ec2_id_examples.py \
+	tools/aws/sources/ssm-session-permissions.json tools/aws/fetch_ssm_session_permissions.py \
+	tools/aws/test_fetch_ssm_session_permissions.py \
 	tools/aws/sources/required-resource-types.json tools/aws/fetch_required_resource_types.py \
 	tools/aws/test_fetch_required_resource_types.py
 CLOUDTRAIL_S3_DATA_EVENTS_PATHS := src/main/resources/aws/cloudtrail-s3-data-events.json \
@@ -924,7 +929,7 @@ iam-request-resources-verify: ## CI gate (online): every vendored operation must
 	fi
 
 iam-request-resources-test: ## Run the IAM request resource generator's unit tests
-	$(PYTHON) -m pytest tools/aws/test_regen_iam_request_resources.py tools/aws/test_fetch_ec2_id_examples.py -q
+	$(PYTHON) -m pytest tools/aws/test_regen_iam_request_resources.py tools/aws/test_fetch_ec2_id_examples.py tools/aws/test_fetch_ssm_session_permissions.py -q
 
 cfn-property-types-sync: ## Regenerate src/main/resources/aws/cfn-property-types.json from AWS's resource schemas (commit the result)
 	$(PYTHON) tools/aws/regen_cfn_property_types.py

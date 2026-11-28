@@ -30,6 +30,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.core.storage.StorageJson;
 import io.floci.aws.services.ec2.model.Address;
 import io.floci.aws.services.ec2.model.BlockDeviceMapping;
 import io.floci.aws.services.ec2.model.EbsBlockDevice;
@@ -59,6 +60,7 @@ import io.floci.aws.services.ec2.model.Placement;
 import io.floci.aws.services.ec2.model.PrefixList;
 import io.floci.aws.services.ec2.model.PrefixListEntry;
 import io.floci.aws.services.ec2.model.PrefixListId;
+import io.floci.aws.services.ec2.model.ReplaceRootVolumeTask;
 import io.floci.aws.services.ec2.model.Reservation;
 import io.floci.aws.services.ec2.model.Route;
 import io.floci.aws.services.ec2.model.RouteTable;
@@ -201,6 +203,39 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
+
+    @Test
+    void failedMountMetadataWriteLeavesThePublishedVolumeUnchanged() {
+        AccountAwareStorageBackend<Volume> volumes = spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        AtomicReference<Supplier<List<Ec2VolumeBlockDeviceManager.PreparedMount>>> preparation =
+                new AtomicReference<>();
+        doAnswer(call -> {
+            preparation.set(call.getArgument(7));
+            return null;
+        }).when(containers).launch(any(), any(ResolvedAmiImage.class), any(), anyString(),
+                any(), anyList(), anyMap(), any(), any(), any());
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage("ami-test")).thenReturn(new ResolvedAmiImage(
+                "guest:local", "image", false, null,
+                List.of(new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4"))));
+        Ec2Service service = new Ec2Service(mockConfig(false), containers,
+                mock(Ec2PortForwardManager.class), images, mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-volumes.json", volumes)),
+                null, null, devices);
+        Instance instance = launchKeepingADataVolume(service).getInstances().getFirst();
+        Volume published = volumes.scan(key -> true).stream()
+                .filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId()))
+                .findFirst().orElseThrow();
+        doThrow(new IllegalStateException("synthetic checked write refusal"))
+                .when(volumes).putAllDurablyForAccount(anyString(), anyMap());
+
+        assertThrows(IllegalStateException.class, () -> preparation.get().get());
+
+        assertNull(published.getManagedFilesystem(), "Failed write must not modify the published volume");
+        verify(devices, never()).prepareMount(any(), any(), any());
+    }
 
     @Test
     void storedInstanceTagsUseTheArnAccountAndRegionWithoutBorrowingState() {
@@ -730,6 +765,240 @@ class Ec2ServiceTest {
         assertEquals("InvalidGroup.NotFound", error.getErrorCode());
         assertTrue(service.describeInstances(region, List.of(), Map.of()).isEmpty());
         assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty());
+    }
+
+    /** A running mock-mode instance; DescribeInstances is what moves a mock launch out of pending. */
+    private static String runningMockInstance(Ec2Service service) {
+        String instanceId = service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1, null, List.of(), null,
+                null, List.of(), null, null).getInstances().getFirst().getInstanceId();
+        service.describeInstances("us-east-1", List.of(), Map.of());
+        return instanceId;
+    }
+
+    @Test
+    void replaceRootVolumeTaskWithAnImageSucceedsAndReportsTheNewImage() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String instanceId = runningMockInstance(service);
+        Instance before = describedInstance(service, instanceId);
+        String privateIp = before.getPrivateIpAddress();
+
+        ReplaceRootVolumeTask created = service.createReplaceRootVolumeTask("us-east-1", instanceId, "ami-new",
+                null, true, null, List.of(new Tag("purpose", "upgrade")), false);
+
+        assertTrue(created.getReplaceRootVolumeTaskId().startsWith("replacevol-"));
+        assertEquals("pending", created.getTaskState());
+        ReplaceRootVolumeTask described = service.describeReplaceRootVolumeTasks("us-east-1",
+                List.of(created.getReplaceRootVolumeTaskId()), List.of(), null, null).items().getFirst();
+        assertEquals("succeeded", described.getTaskState());
+        assertEquals("ami-new", described.getImageId());
+        assertEquals(Boolean.TRUE, described.getDeleteReplacedRootVolume());
+        assertNotNull(described.getCompleteTime());
+        assertEquals("upgrade", described.getTags().getFirst().getValue());
+        Instance after = describedInstance(service, instanceId);
+        assertEquals(instanceId, after.getInstanceId());
+        assertEquals("ami-new", after.getImageId());
+        assertEquals(privateIp, after.getPrivateIpAddress());
+        assertEquals("running", after.getState().getName());
+    }
+
+    @Test
+    void replaceRootVolumeTaskIsDescribedByIdAndByInstanceFilterAndPaged() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String first = runningMockInstance(service);
+        String second = runningMockInstance(service);
+        String firstTask = service.createReplaceRootVolumeTask("us-east-1", first, null, null, false, null,
+                List.of(), false).getReplaceRootVolumeTaskId();
+        String secondTask = service.createReplaceRootVolumeTask("us-east-1", second, null, null, false, null,
+                List.of(), false).getReplaceRootVolumeTaskId();
+
+        PaginatedResult<ReplaceRootVolumeTask> byFilter = service.describeReplaceRootVolumeTasks("us-east-1",
+                List.of(), List.of(Map.entry("instance-id", List.of(second))), null, null);
+        assertEquals(List.of(secondTask), byFilter.items().stream()
+                .map(ReplaceRootVolumeTask::getReplaceRootVolumeTaskId).toList());
+        assertEquals(second, byFilter.items().getFirst().getInstanceId());
+
+        PaginatedResult<ReplaceRootVolumeTask> firstPage = service.describeReplaceRootVolumeTasks("us-east-1",
+                List.of(), List.of(), 1, null);
+        assertEquals(1, firstPage.items().size());
+        assertNotNull(firstPage.nextToken());
+        PaginatedResult<ReplaceRootVolumeTask> secondPage = service.describeReplaceRootVolumeTasks("us-east-1",
+                List.of(), List.of(), 1, firstPage.nextToken());
+        assertEquals(Set.of(firstTask, secondTask), Set.of(firstPage.items().getFirst().getReplaceRootVolumeTaskId(),
+                secondPage.items().getFirst().getReplaceRootVolumeTaskId()));
+
+        AwsException unknown = assertThrows(AwsException.class, () -> service.describeReplaceRootVolumeTasks(
+                "us-east-1", List.of("replacevol-0123456789abcdef0"), List.of(), null, null));
+        assertEquals("InvalidReplaceRootVolumeTaskId.NotFound", unknown.getErrorCode());
+        AwsException badFilter = assertThrows(AwsException.class, () -> service.describeReplaceRootVolumeTasks(
+                "us-east-1", List.of(), List.of(Map.entry("task-state", List.of("pending"))), null, null));
+        assertEquals("InvalidParameterValue", badFilter.getErrorCode());
+    }
+
+    @Test
+    void replaceRootVolumeTaskThatFailsLeavesTheInstanceOnItsOldImage() {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String instanceId = runningMockInstance(service);
+        when(config.services().ec2().mock()).thenReturn(false);
+        AtomicReference<Runnable> inProgress = new AtomicReference<>();
+        AtomicReference<Consumer<String>> failed = new AtomicReference<>();
+        doAnswer(call -> {
+            inProgress.set(call.getArgument(4));
+            failed.set(call.getArgument(6));
+            return null;
+        }).when(manager).replaceRoot(any(Instance.class), any(), any(), any(), any(), any(), any());
+
+        ReplaceRootVolumeTask task = service.createReplaceRootVolumeTask("us-east-1", instanceId, "ami-new",
+                null, false, "token-1", List.of(), false);
+        String taskId = task.getReplaceRootVolumeTaskId();
+        assertEquals("pending", task.getTaskState());
+        // The same client token answers with the same task instead of starting another.
+        assertEquals(taskId, service.createReplaceRootVolumeTask("us-east-1", instanceId, "ami-new",
+                null, false, "token-1", List.of(), false).getReplaceRootVolumeTaskId());
+        verify(manager, times(1)).replaceRoot(any(Instance.class), any(), any(), any(), any(), any(), any());
+
+        inProgress.get().run();
+        assertEquals("in-progress", service.describeReplaceRootVolumeTasks("us-east-1", List.of(taskId),
+                List.of(), null, null).items().getFirst().getTaskState());
+        AwsException concurrent = assertThrows(AwsException.class, () -> service.createReplaceRootVolumeTask(
+                "us-east-1", instanceId, null, null, false, null, List.of(), false));
+        assertEquals("IncorrectState", concurrent.getErrorCode());
+
+        failed.get().accept("the new guest did not reach running state");
+        ReplaceRootVolumeTask ended = service.describeReplaceRootVolumeTasks("us-east-1", List.of(taskId),
+                List.of(), null, null).items().getFirst();
+        assertEquals("failed", ended.getTaskState());
+        assertEquals("the new guest did not reach running state", ended.getFailureReason());
+        Instance after = service.describeInstances("us-east-1", List.of(instanceId), Map.of())
+                .getFirst().getInstances().getFirst();
+        assertEquals("ami-test", after.getImageId());
+        assertEquals("running", after.getState().getName());
+    }
+
+    @Test
+    void replaceRootVolumeTaskKeepsTheDataVolumeMountsAnImageDeclares() {
+        EmulatorConfig config = mockConfig(true);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        AmiImageResolver resolver = mock(AmiImageResolver.class);
+        Ec2VolumeBlockDeviceManager blockDevices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class), resolver,
+                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, blockDevices);
+        String region = "us-east-1";
+        String instanceId = launchWithDataVolume(service, false).getInstances().getFirst().getInstanceId();
+        service.describeInstances(region, List.of(), Map.of());
+        Instance before = describedInstance(service, instanceId);
+        String dataVolume = service.describeVolumes(region, List.of(), Map.of()).stream()
+                .filter(volume -> "/dev/sdf".equals(volume.getAttachments().getFirst().getDevice()))
+                .findFirst().orElseThrow().getVolumeId();
+        when(config.services().ec2().mock()).thenReturn(false);
+        Ec2ImageCatalog.VolumeMount mapping = new Ec2ImageCatalog.VolumeMount("sdf", "/app-data", "ext4");
+        when(resolver.resolveImage("ami-data")).thenReturn(
+                new ResolvedAmiImage("app-guest:2", ResolvedAmiImage.DEFAULT_RUNTIME, false, null, List.of(mapping)));
+        when(resolver.resolveImage("ami-plain")).thenReturn(ResolvedAmiImage.minimal("app-guest:3"));
+        Ec2VolumeBlockDeviceManager.PreparedMount mount = new Ec2VolumeBlockDeviceManager.PreparedMount(
+                dataVolume, "/dev/sdf", "/dev/loop42", "floci-" + dataVolume, "/app-data");
+        when(blockDevices.prepareMount(any(Volume.class), any(Instance.class), eq(mapping))).thenReturn(mount);
+        when(blockDevices.retainedMount(any(Volume.class), any(Instance.class), eq("/dev/sdf")))
+                .thenReturn(Optional.of(mount));
+        AtomicReference<Supplier<List<Ec2VolumeBlockDeviceManager.PreparedMount>>> mounts = new AtomicReference<>();
+        AtomicReference<Runnable> replaced = new AtomicReference<>();
+        doAnswer(call -> {
+            mounts.set(call.getArgument(3));
+            replaced.set(call.getArgument(5));
+            return null;
+        }).when(manager).replaceRoot(any(Instance.class), any(), any(), any(), any(), any(), any());
+
+        // The new image declares the data volume: it is prepared on that volume, as launch prepares it.
+        String declaredTask = service.createReplaceRootVolumeTask(region, instanceId, "ami-data", null, false,
+                null, List.of(), false).getReplaceRootVolumeTaskId();
+        assertEquals(List.of(mount), mounts.get().get());
+        verify(blockDevices).prepareMount(argThat(volume -> dataVolume.equals(volume.getVolumeId())),
+                any(Instance.class), eq(mapping));
+        replaced.get().run();
+        assertEquals("succeeded", service.describeReplaceRootVolumeTasks(region, List.of(declaredTask),
+                List.of(), null, null).items().getFirst().getTaskState());
+
+        // An image that declares nothing still keeps the mount the old guest holds, from the same source.
+        service.createReplaceRootVolumeTask(region, instanceId, "ami-plain", null, false, null, List.of(), false);
+        assertEquals(List.of(mount), mounts.get().get());
+        verify(blockDevices).retainedMount(argThat(volume -> dataVolume.equals(volume.getVolumeId())),
+                any(Instance.class), eq("/dev/sdf"));
+        replaced.get().run();
+
+        Instance after = describedInstance(service, instanceId);
+        assertEquals(instanceId, after.getInstanceId());
+        assertEquals("ami-plain", after.getImageId());
+        assertEquals(before.getPrivateIpAddress(), after.getPrivateIpAddress());
+        assertEquals("running", after.getState().getName());
+        Volume kept = service.describeVolumes(region, List.of(dataVolume), Map.of()).getFirst();
+        assertEquals(instanceId, kept.getAttachments().getFirst().getInstanceId());
+        assertEquals("/dev/sdf", kept.getAttachments().getFirst().getDevice());
+    }
+
+    @Test
+    void replaceRootVolumeTaskQueryActionsAnswerInTheEc2Shape() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String instanceId = runningMockInstance(service);
+        Ec2QueryHandler handler = new Ec2QueryHandler(service, mock(EmulatorConfig.class),
+                mock(FlowLogService.class), mock(Ec2EbsEncryptionService.class),
+                mock(Ec2BlockPublicAccessService.class), mock(Ec2IpamService.class),
+                new RegionResolver("us-east-1", "000000000000"));
+        MultivaluedHashMap<String, String> create = new MultivaluedHashMap<>();
+        create.putSingle("InstanceId", instanceId);
+        create.putSingle("ImageId", "ami-new");
+        create.putSingle("TagSpecification.1.ResourceType", "replace-root-volume-task");
+        create.putSingle("TagSpecification.1.Tag.1.Key", "purpose");
+        create.putSingle("TagSpecification.1.Tag.1.Value", "upgrade");
+
+        Response created = handler.handle("CreateReplaceRootVolumeTask", create, "us-east-1");
+
+        assertEquals(200, created.getStatus());
+        String createdXml = created.getEntity().toString();
+        assertTrue(createdXml.contains("<CreateReplaceRootVolumeTaskResponse"), createdXml);
+        assertTrue(createdXml.contains("<taskState>pending</taskState>"), createdXml);
+        assertTrue(createdXml.contains("<instanceId>" + instanceId + "</instanceId>"), createdXml);
+        assertTrue(createdXml.contains("<imageId>ami-new</imageId>"), createdXml);
+        assertTrue(createdXml.contains("<deleteReplacedRootVolume>false</deleteReplacedRootVolume>"), createdXml);
+        assertTrue(createdXml.contains("<key>purpose</key>"), createdXml);
+
+        MultivaluedHashMap<String, String> describe = new MultivaluedHashMap<>();
+        describe.putSingle("Filter.1.Name", "instance-id");
+        describe.putSingle("Filter.1.Value.1", instanceId);
+        Response described = handler.handle("DescribeReplaceRootVolumeTasks", describe, "us-east-1");
+
+        assertEquals(200, described.getStatus());
+        String describedXml = described.getEntity().toString();
+        assertTrue(describedXml.contains("<replaceRootVolumeTaskSet><item>"), describedXml);
+        assertTrue(describedXml.contains("<taskState>succeeded</taskState>"), describedXml);
+        assertTrue(describedXml.contains("<completeTime>"), describedXml);
+    }
+
+    @Test
+    void replaceRootVolumeTaskRejectsBothSourcesAndAStoppedInstance() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String instanceId = runningMockInstance(service);
+        AwsException both = assertThrows(AwsException.class, () -> service.createReplaceRootVolumeTask(
+                "us-east-1", instanceId, "ami-new", "snap-0123456789abcdef0", false, null, List.of(), false));
+        assertEquals("InvalidParameterCombination", both.getErrorCode());
+        AwsException dryRun = assertThrows(AwsException.class, () -> service.createReplaceRootVolumeTask(
+                "us-east-1", instanceId, null, null, false, null, List.of(), true));
+        assertEquals("DryRunOperation", dryRun.getErrorCode());
+        service.stopInstances("us-east-1", List.of(instanceId));
+        AwsException stopped = assertThrows(AwsException.class, () -> service.createReplaceRootVolumeTask(
+                "us-east-1", instanceId, null, null, false, null, List.of(), false));
+        assertEquals("IncorrectInstanceState", stopped.getErrorCode());
     }
 
     @Test
@@ -3522,6 +3791,118 @@ class Ec2ServiceTest {
         instance.setState(InstanceState.terminated());
         completed.getValue().run();
         assertEquals("available", retained.getStatus());
+    }
+
+    @Test
+    void anInstanceCarriesItsShutdownBehaviorBeforeItsContainerLaunches() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        List<String> behaviorsAtLaunch = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            Instance launched = invocation.getArgument(0);
+            behaviorsAtLaunch.add(launched.getInstanceInitiatedShutdownBehavior());
+            return null;
+        }).when(containerManager).launch(any(), any(ResolvedAmiImage.class), any(), any(), any(), any(), any(), any(), any(), any());
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+
+        service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro", 2, 2, null, List.of(), null, null,
+                List.of(), null, null, null, null, 0, null, null, null, null, false, null, null, null, false, null,
+                null, null, "terminate");
+
+        assertEquals(List.of("terminate", "terminate"), behaviorsAtLaunch);
+    }
+
+    @Test
+    void aGuestShutdownStopsAnInstanceByDefault() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.252.0.0/24"),
+                null);
+
+        service.applyGuestShutdown(instance);
+
+        verify(containerManager).stop(instance);
+        verify(containerManager, never()).terminate(eq(instance), any());
+    }
+
+    @Test
+    void aGuestShutdownRecordsAnInstanceInitiatedShutdownAsTheStateReason() {
+        Ec2Service service = guestShutdownService();
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.250.0.0/24"),
+                null);
+
+        service.applyGuestShutdown(instance);
+
+        Instance described = describedInstance(service, region, instance.getInstanceId());
+        assertEquals("Client.InstanceInitiatedShutdown", described.getStateReasonCode());
+        assertEquals("Client.InstanceInitiatedShutdown: Instance initiated shutdown",
+                described.getStateReasonMessage());
+    }
+
+    @Test
+    void aGuestShutdownThatTerminatesRecordsAnInstanceInitiatedShutdownAsTheStateReason() {
+        Ec2Service service = guestShutdownService();
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.249.0.0/24"),
+                null);
+        service.modifyInstanceAttribute(region, instance.getInstanceId(), "instanceInitiatedShutdownBehavior",
+                "terminate");
+
+        service.applyGuestShutdown(instance);
+
+        assertEquals("Client.InstanceInitiatedShutdown",
+                describedInstance(service, region, instance.getInstanceId()).getStateReasonCode());
+    }
+
+    @Test
+    void anInstanceStartedAfterAGuestShutdownHasNoStateReason() {
+        Ec2Service service = guestShutdownService();
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.248.0.0/24"),
+                null);
+        service.applyGuestShutdown(instance);
+        instance.setState(InstanceState.stopped());
+
+        service.startInstances(region, List.of(instance.getInstanceId()));
+
+        assertNull(describedInstance(service, region, instance.getInstanceId()).getStateReasonCode());
+    }
+
+    private Ec2Service guestShutdownService() {
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        return new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+    }
+
+    private static Instance describedInstance(Ec2Service service, String region, String instanceId) {
+        return service.describeInstances(region, List.of(instanceId), Map.of()).getFirst().getInstances().getFirst();
+    }
+
+    @Test
+    void aGuestShutdownTerminatesAnInstanceWhoseShutdownBehaviorIsTerminate() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.253.0.0/24"),
+                null);
+        service.modifyInstanceAttribute(region, instance.getInstanceId(), "instanceInitiatedShutdownBehavior",
+                "terminate");
+
+        service.applyGuestShutdown(instance);
+
+        verify(containerManager).terminate(eq(instance), any());
+        verify(containerManager, never()).stop(instance);
     }
 
     /** Ec2Service in container mode, with a container manager whose containers answer on loopback. */
@@ -9029,7 +9410,8 @@ class Ec2ServiceTest {
             assertEquals(original.getClientToken(), published.getClientToken());
             assertEquals(original.getRequestTags(), published.getRequestTags());
             assertEquals(original.getRequestParameters(), published.getRequestParameters());
-            assertEquals(original.getAttachments(), published.getAttachments());
+            assertEquals(StorageJson.mapper().valueToTree(original.getAttachments()),
+                    StorageJson.mapper().valueToTree(published.getAttachments()));
             return mount;
         });
         if ("success".equals(scenario)) {
@@ -9452,6 +9834,7 @@ class Ec2ServiceTest {
 
         verify(forwarding).setPersister(any());
         verify(containers).setPersister(any());
+        verify(containers).setGuestShutdownHandler(any());
         if (enabled) {
             verify(containers).restoreMetadataRegistration(instance);
             verify(containers).reconcileOrphanedContainers(any());

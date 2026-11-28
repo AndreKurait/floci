@@ -28,6 +28,9 @@ class AppConfigResourceArnsTest {
         Map<String, String> ids = Map.of("ApplicationId", fixture.application(), "EnvironmentId", fixture.environment(),
                 "ConfigurationProfileId", fixture.profile(), "DeploymentNumber", "42");
         String application = "application/" + fixture.application();
+        assertEquals(prefix + application, fixture.arns().find("application", List.of("orders"), region).orElseThrow());
+        assertEquals(prefix + application,
+                fixture.arns().find("application", List.of(fixture.application()), region).orElseThrow());
         Map<String, String> resources = Map.of(
                 "application", application,
                 "environment", application + "/environment/" + fixture.environment(),

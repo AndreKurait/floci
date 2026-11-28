@@ -36,6 +36,7 @@ import static org.mockito.Mockito.verify;
 @EnabledIfSystemProperty(named = "floci.test.isolated-helper-docker", matches = "true")
 @ResourceLock(value = ParallelLocks.DOCKER_ACTIVE_STREAMS, mode = ResourceAccessMode.READ)
 @ResourceLock(ParallelLocks.CONFIG_MAPPING)
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class LocallyBuiltHelperImageDockerIntegrationTest {
     private static final String BASE = "busybox:1.37.0";
 

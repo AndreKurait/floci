@@ -29,6 +29,7 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
 import java.math.BigDecimal;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -49,6 +50,7 @@ public class SsmJsonHandler {
     private final SsmService ssmService;
     private final SsmCommandService commandService;
     private final SsmInventoryService inventoryService;
+    private final SsmSessionJsonHandler sessionHandler;
     private final ObjectMapper objectMapper;
     private final IamEnforcementFilter iamEnforcementFilter;
     private final SsmPatchBaselineService patchBaselines;
@@ -76,16 +78,28 @@ public class SsmJsonHandler {
                 null, null, managedNodeDiscovery, ec2Registrations, null);
     }
 
-    @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
                           SsmInventoryService inventoryService, ObjectMapper objectMapper,
                           IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
                           SsmResourceDataSyncService resourceDataSyncs,
                           SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
                           SsmEc2RegistrationService ec2Registrations, SsmSessionService sessions) {
+        this(ssmService, commandService, inventoryService, objectMapper, iamEnforcementFilter, patchBaselines,
+                resourceDataSyncs, agentAssociations, managedNodeDiscovery, ec2Registrations, sessions, null);
+    }
+
+    @Inject
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
+                          SsmInventoryService inventoryService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
+                          SsmResourceDataSyncService resourceDataSyncs,
+                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
+                          SsmEc2RegistrationService ec2Registrations, SsmSessionService sessions,
+                          SsmSessionJsonHandler sessionHandler) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.inventoryService = inventoryService;
+        this.sessionHandler = sessionHandler;
         this.objectMapper = objectMapper;
         this.iamEnforcementFilter = iamEnforcementFilter;
         this.patchBaselines = patchBaselines;
@@ -97,6 +111,10 @@ public class SsmJsonHandler {
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
+        return handle(action, request, region, authorization, null);
+    }
+
+    public Response handle(String action, JsonNode request, String region, String authorization, URI baseUri) {
         return switch (action) {
             case "RegisterManagedInstance" -> Response.ok(ec2Registrations.register(request, region)).build();
             // Parameter Store
@@ -123,12 +141,18 @@ public class SsmJsonHandler {
             case "ListCommandInvocations" -> handleListCommandInvocations(request, region);
             case "CancelCommand" -> handleCancelCommand(request, region);
             case "DescribeInstanceInformation" -> handleDescribeInstanceInformation(request, region);
-            // Session Manager
-            case "StartSession" -> Response.ok(sessions.start(request, region)).build();
-            case "ResumeSession" -> Response.ok(sessions.resume(request, region)).build();
-            case "TerminateSession" -> Response.ok(sessions.terminate(request, region)).build();
-            case "DescribeSessions" -> Response.ok(sessions.describe(request, region)).build();
-            case "GetConnectionStatus" -> Response.ok(sessions.connectionStatus(request, region)).build();
+            case "StartSession", "ResumeSession", "TerminateSession", "DescribeSessions", "GetConnectionStatus" -> {
+                if (sessionHandler != null) {
+                    yield sessionHandler.handle(action, request, region, baseUri);
+                }
+                yield Response.ok(switch (action) {
+                    case "StartSession" -> sessions.start(request, region);
+                    case "ResumeSession" -> sessions.resume(request, region);
+                    case "TerminateSession" -> sessions.terminate(request, region);
+                    case "DescribeSessions" -> sessions.describe(request, region);
+                    default -> sessions.connectionStatus(request, region);
+                }).build();
+            }
             case "PutInventory" -> {
                 inventoryService.putInventory(request, region);
                 yield Response.ok(objectMapper.createObjectNode()).build();
@@ -573,12 +597,10 @@ public class SsmJsonHandler {
     private static final Pattern DOCUMENT_NAME = Pattern.compile("^[a-zA-Z0-9_\\-.]{3,128}$");
 
     /**
-     * {@code GetDocument} and {@code DescribeDocument} model a wider {@code Name} pattern than
-     * the other five document operations: botocore's {@code Name} member on these two allows
-     * {@code :} and {@code /}, because {@code DescribeDocument} accepts the document's full ARN
-     * when reading a document shared from another account. The other five reject that shape.
+     * {@code GetDocument}, {@code DescribeDocument} and {@code StartSession} allow the
+     * {@code :} and {@code /} characters used by a full document ARN.
      */
-    private static final Pattern DOCUMENT_NAME_OR_ARN = Pattern.compile("^[a-zA-Z0-9_\\-.:/]{3,128}$");
+    static final Pattern DOCUMENT_NAME_OR_ARN = Pattern.compile("^[a-zA-Z0-9_\\-.:/]{3,128}$");
 
     private String requireDocumentName(JsonNode request) {
         return requireDocumentName(request, DOCUMENT_NAME);
@@ -1747,6 +1769,11 @@ public class SsmJsonHandler {
         ObjectNode documentNode = objectMapper.createObjectNode();
         documentNode.put("Name", document.getName());
         documentNode.put("DocumentType", document.getDocumentType());
+        documentNode.put("Owner", document.getOwner());
+        if ("Session".equals(document.getDocumentType())) {
+            documentNode.put("SchemaVersion", document.getSchemaVersion());
+        }
+        documentNode.put("DefaultVersion", String.valueOf(document.getDocumentVersion()));
         documentNode.put("DocumentVersion", effectiveVersion);
         documentNode.put("Content", document.getContentForVersion(effectiveVersion));
         documentNode.put("Status", document.getStatus());
