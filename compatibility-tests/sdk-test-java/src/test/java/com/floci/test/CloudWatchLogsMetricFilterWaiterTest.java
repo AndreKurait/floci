@@ -36,14 +36,20 @@ class CloudWatchLogsMetricFilterWaiterTest {
     }
 
     @Test
-    void anExpiredDeadlineFailsWithoutStartingAnotherRead() throws Exception {
+    void rejectsTheIncompleteAggregateAtTheDeadlineAndPreservesTheMismatchAssertion() throws Exception {
         JsonNode expected = new ObjectMapper().readTree("{\"Sum\":10,\"SampleCount\":2}");
         AtomicInteger reads = new AtomicInteger();
+        List<Datapoint> points = series(3, 1);
         assertThatThrownBy(() -> CloudWatchLogsMetricFilterTest.awaitSeries(() -> {
             reads.incrementAndGet();
-            return series(3, 1);
-        }, expected, Duration.ZERO)).isInstanceOf(AssertionError.class);
-        assertThat(reads.get()).isZero();
+            return points;
+        }, expected, Duration.ZERO))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("timed out waiting for all recorded statistics")
+                .hasMessageContaining("last read:");
+        assertThat(reads.get()).isEqualTo(1);
+        assertThatThrownBy(() -> assertThat(points.get(0).sum()).isEqualTo(10))
+                .isInstanceOf(AssertionError.class);
     }
 
     @Test
