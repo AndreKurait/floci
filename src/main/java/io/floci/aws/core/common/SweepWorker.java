@@ -19,16 +19,15 @@ import java.util.function.Consumer;
  */
 public final class SweepWorker {
     private static final Logger LOG = Logger.getLogger(SweepWorker.class);
-    private static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(5);
 
     private final String name;
     private final Consumer<Instant> sweep;
     private final long intervalSeconds;
     private final boolean sweepAtStart;
-    private final long shutdownTimeoutNanos;
     private final ScheduledExecutorService executor;
     private final Clock clock;
     private final AtomicReference<Thread> executorThread;
+    private final long shutdownTimeoutNanos;
     private final ReentrantLock sweepLock = new ReentrantLock();
     private volatile boolean paused;
 
@@ -46,19 +45,7 @@ public final class SweepWorker {
 
     private SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
                         Scheduler scheduler, Clock clock) {
-        this(name, intervalSeconds, sweepAtStart, sweep, scheduler.executor(), clock, scheduler.thread(), SHUTDOWN_TIMEOUT);
-    }
-
-    /**
-     * A worker whose timer and clock the caller supplies, so a test can move time itself.
-     *
-     * @param executor runs the sweeps and is shut down by {@link #stop}; {@code null} means no
-     *                 background thread, as for a disabled worker
-     * @param clock read once per scheduled sweep for the instant handed to it
-     */
-    public SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
-                       ScheduledExecutorService executor, Clock clock) {
-        this(name, intervalSeconds, sweepAtStart, sweep, executor, clock, new AtomicReference<>(), SHUTDOWN_TIMEOUT);
+        this(name, intervalSeconds, sweepAtStart, sweep, scheduler.executor(), clock, scheduler.thread());
     }
 
     SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
@@ -72,6 +59,23 @@ public final class SweepWorker {
                 scheduler.thread(), shutdownTimeout);
     }
 
+    /**
+     * A worker whose timer and clock the caller supplies, so a test can move time itself.
+     *
+     * @param executor runs the sweeps and is shut down by {@link #stop}; {@code null} means no
+     *                 background thread, as for a disabled worker
+     * @param clock read once per scheduled sweep for the instant handed to it
+     */
+    public SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
+                       ScheduledExecutorService executor, Clock clock) {
+        this(name, intervalSeconds, sweepAtStart, sweep, executor, clock, new AtomicReference<>());
+    }
+
+    private SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
+                        ScheduledExecutorService executor, Clock clock, AtomicReference<Thread> executorThread) {
+        this(name, intervalSeconds, sweepAtStart, sweep, executor, clock, executorThread, Duration.ofSeconds(5));
+    }
+
     private SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
                         ScheduledExecutorService executor, Clock clock, AtomicReference<Thread> executorThread,
                         Duration shutdownTimeout) {
@@ -79,23 +83,23 @@ public final class SweepWorker {
         this.sweep = sweep;
         this.intervalSeconds = Math.max(1, intervalSeconds);
         this.sweepAtStart = sweepAtStart;
-        this.shutdownTimeoutNanos = shutdownTimeout.toNanos();
         this.executor = executor;
         this.clock = clock;
         this.executorThread = executorThread;
+        this.shutdownTimeoutNanos = shutdownTimeout.toNanos();
     }
 
     private static Scheduler scheduler(String name, boolean enabled) {
         return scheduler(enabled ? Thread.ofPlatform().name(name).daemon(true).factory() : null);
     }
 
-    private static Scheduler scheduler(ThreadFactory threadFactory) {
+    private static Scheduler scheduler(ThreadFactory factory) {
         AtomicReference<Thread> thread = new AtomicReference<>();
-        ScheduledExecutorService executor = threadFactory == null ? null : Executors.newSingleThreadScheduledExecutor(task -> {
-            Thread created = threadFactory.newThread(task);
+        ScheduledExecutorService executor = factory != null ? Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread created = factory.newThread(task);
             thread.set(created);
             return created;
-        });
+        }) : null;
         return new Scheduler(executor, thread);
     }
 
