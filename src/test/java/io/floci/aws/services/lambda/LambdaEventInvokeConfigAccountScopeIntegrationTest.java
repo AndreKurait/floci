@@ -7,9 +7,12 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -64,5 +67,55 @@ class LambdaEventInvokeConfigAccountScopeIntegrationTest {
         assertTrue(found.isPresent(),
                 "the configuration of a function in account " + OTHER_ACCOUNT + " was not found");
         assertEquals(destination, found.get().getDestinationConfig().getOnSuccess().getDestination());
+    }
+
+    @Test
+    void deletingAFunctionOnlyRemovesItsOwnAccountsAndRegionsConfigs() {
+        String functionName = "del-invoke-" + UUID.randomUUID();
+        String otherRegion = "us-west-2";
+        String callerAccount = "100000000011";
+        String prefixedName = functionName + "-sibling";
+        List<String[]> scopes = List.of(
+                new String[] {callerAccount, REGION, functionName},
+                new String[] {OTHER_ACCOUNT, REGION, functionName},
+                new String[] {callerAccount, otherRegion, functionName},
+                new String[] {callerAccount, REGION, prefixedName});
+        List<String[]> created = new ArrayList<>();
+        try {
+            for (String[] scope : scopes) {
+                RequestScopes.runAs(scope[0], scope[1], () -> {
+                    lambdaService.createFunction(scope[1], Map.of(
+                            "FunctionName", scope[2], "PackageType", "Image",
+                            "Role", "arn:aws:iam::" + scope[0] + ":role/test-role",
+                            "Code", Map.of("ImageUri", "public.ecr.aws/lambda/nodejs:20")));
+                    created.add(scope);
+                    lambdaService.putEventInvokeConfig(scope[1], scope[2], "$LATEST",
+                            Map.of("MaximumRetryAttempts", 1));
+                    lambdaService.putEventInvokeConfig(scope[1], scope[2], "prod",
+                            Map.of("MaximumRetryAttempts", 0));
+                });
+            }
+            RequestScopes.runAs(callerAccount, REGION, () -> {
+                lambdaService.deleteFunction(REGION, functionName);
+                lambdaService.createFunction(REGION, Map.of(
+                        "FunctionName", functionName, "PackageType", "Image",
+                        "Role", "arn:aws:iam::" + callerAccount + ":role/test-role",
+                        "Code", Map.of("ImageUri", "public.ecr.aws/lambda/nodejs:20")));
+                assertTrue(lambdaService.listEventInvokeConfigs(REGION, functionName).isEmpty());
+            });
+            for (String[] scope : scopes.subList(1, scopes.size())) {
+                RequestScopes.runAs(scope[0], scope[1], () -> {
+                    assertEquals(2, lambdaService.listEventInvokeConfigs(scope[1], scope[2]).size());
+                    assertEquals(1, lambdaService.getEventInvokeConfig(scope[1], scope[2], "$LATEST")
+                            .getMaximumRetryAttempts());
+                    assertEquals(0, lambdaService.getEventInvokeConfig(scope[1], scope[2], "prod")
+                            .getMaximumRetryAttempts());
+                });
+            }
+        } finally {
+            for (String[] scope : created) {
+                RequestScopes.runAs(scope[0], scope[1], () -> lambdaService.deleteFunction(scope[1], scope[2]));
+            }
+        }
     }
 }
