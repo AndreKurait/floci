@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.exception.NotModifiedException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
@@ -19,6 +20,7 @@ import io.floci.aws.core.common.SweepWorker;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.ContainerExec;
+import io.floci.aws.core.common.docker.ContainerExitWatcher;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLiveness;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
@@ -30,6 +32,7 @@ import io.floci.aws.core.common.docker.PortAllocator;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
 import io.floci.aws.core.common.docker.UserDataPipeline;
 import io.floci.aws.services.ec2.Ec2InstanceTypeCatalog.CatalogInstanceType;
+import io.floci.aws.services.ec2.Ec2MetadataServer.DnsSuspension;
 import io.floci.aws.services.ec2.Ec2VolumeBlockDeviceManager.PreparedMount;
 import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.Instance;
@@ -188,6 +191,9 @@ public class Ec2ContainerManager {
     static long containerBridgeIpPollMillis = 500;
     private static final int PERSIST_ATTEMPTS = 5;
     private static final long PERSIST_RETRY_MILLIS = 100;
+    /** Inspects tried, the delay doubling from the first, before an exited container is left unconfirmed. */
+    private static final int EXIT_PROBE_ATTEMPTS = 5;
+    private static final long EXIT_PROBE_FIRST_RETRY_MILLIS = 200;
 
     private final Ec2ContainerPause pause;
     private final ContainerBuilder containerBuilder;
@@ -229,6 +235,9 @@ public class Ec2ContainerManager {
     private final Map<String, Integer> apiReboots = new ConcurrentHashMap<>();
     private final Clock clock;
     private final LongSupplier nanoTime;
+    private volatile Consumer<Instance> guestShutdownHandler = instance -> { };
+    /** Containers Floci itself is stopping or restarting while their instance stays running. */
+    private final Set<String> flociStoppedContainers = ConcurrentHashMap.newKeySet();
     /** Instances whose service-network lookup failed and is retried on the next address read. */
     private final Set<String> serviceNetworkRetries = ConcurrentHashMap.newKeySet();
     /** The latest service-network lookup started per instance; only that one may publish. */
@@ -968,6 +977,7 @@ public class Ec2ContainerManager {
                 if (postStart != null) {
                     postStart.run();
                 }
+                watchForGuestShutdown(instance, containerId);
 
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
                         instanceId, containerId, String.valueOf(sshHostPort));
@@ -1379,6 +1389,70 @@ public class Ec2ContainerManager {
         } else {
             spec.withCgroupnsMode("host").withBind("/sys/fs/cgroup", "/sys/fs/cgroup");
         }
+    }
+
+    /**
+     * Watches the container of a running instance for an exit Floci did not cause: a guest that powers
+     * itself off. A stop or terminate has moved the instance out of running first; a reboot or Floci's
+     * own shutdown marks the container instead, and a container running again after a reboot is no exit.
+     */
+    private void watchForGuestShutdown(Instance instance, String containerId) {
+        flociStoppedContainers.remove(containerId);
+        ContainerExitWatcher.watch(dockerClient, lifecycleManager.getStreamingDockerClient(), containerId,
+                exitCode -> onContainerExit(instance, containerId, exitCode));
+    }
+
+    private void onContainerExit(Instance instance, String containerId, int exitCode) {
+        if (flociStoppedContainers.contains(containerId) || apiReboots.containsKey(containerId)
+                || guestReboots.isRebooting(containerId)) {
+            return;
+        }
+        synchronized (instance) {
+            if (!containerId.equals(instance.getDockerContainerId()) || !"running".equals(stateName(instance))) {
+                return;
+            }
+        }
+        // Only a container Docker reports stopped is a shutdown; one running again after a reboot is
+        // not. The watch has reported its one exit, so a failed inspect is tried again, not dropped.
+        ContainerLiveness liveness = lifecycleManager.probeContainer(containerId);
+        for (int attempt = 1; liveness == ContainerLiveness.UNKNOWN && attempt < EXIT_PROBE_ATTEMPTS; attempt++) {
+            if (!pause(EXIT_PROBE_FIRST_RETRY_MILLIS << (attempt - 1))) {
+                return;
+            }
+            liveness = lifecycleManager.probeContainer(containerId);
+        }
+        if (liveness != ContainerLiveness.NOT_RUNNING) {
+            if (liveness == ContainerLiveness.UNKNOWN) {
+                LOG.warnv("EC2 instance {0}: Docker could not confirm its container {1} stopped after it "
+                        + "exited, so a shutdown from its guest is not applied", instance.getInstanceId(), containerId);
+            }
+            return;
+        }
+        if (systemdV1.hasGuest(instance)) {
+            try {
+                if (Ec2GuestReboots.requestedReboot(dockerClient.inspectContainerCmd(containerId).exec())) {
+                    guestReboots.watch(instance);
+                    return;
+                }
+            } catch (DockerException failure) {
+                LOG.warnv(failure, "Could not distinguish reboot from shutdown for EC2 instance {0}",
+                        instance.getInstanceId());
+                return;
+            }
+        }
+        LOG.infov("EC2 instance {0} shut down from its guest (container exit code {1})",
+                instance.getInstanceId(), String.valueOf(exitCode));
+        try {
+            guestShutdownHandler.accept(instance);
+        } catch (Exception e) {
+            LOG.warnv("Could not apply the shutdown behavior of EC2 instance {0}: {1}",
+                    instance.getInstanceId(), e.getMessage());
+        }
+    }
+
+    /** Called when an instance's guest shuts itself down, so its shutdown behavior can be applied. */
+    void setGuestShutdownHandler(Consumer<Instance> guestShutdownHandler) {
+        this.guestShutdownHandler = guestShutdownHandler;
     }
 
     void setPersister(Consumer<Instance> persister) {
@@ -1837,11 +1911,14 @@ public class Ec2ContainerManager {
         if (containerId == null) {
             return;
         }
+        flociStoppedContainers.add(containerId);
         portForwardManager.unpublishAll(instance);
         try {
             dockerClient.stopContainerCmd(containerId).withTimeout(5).exec();
-        } catch (NotFoundException e) {
-            // already gone
+            metadataServer.suspendDns(instance);
+        } catch (NotFoundException | NotModifiedException ignored) {
+            // The workload is confirmed absent or already stopped.
+            metadataServer.suspendDns(instance);
         } catch (Exception e) {
             LOG.warnv("Error stopping EC2 container {0} on shutdown: {1}", containerId, e.getMessage());
         }
@@ -2273,8 +2350,10 @@ public class Ec2ContainerManager {
             portForwardManager.unpublishAll(instance);
             try {
                 dockerClient.stopContainerCmd(containerId).withTimeout(30).exec();
-            } catch (NotFoundException ignored) {
-                // An already removed container needs no further stop.
+                metadataServer.suspendDns(instance);
+            } catch (NotFoundException | NotModifiedException ignored) {
+                // The workload is confirmed absent or already stopped.
+                metadataServer.suspendDns(instance);
             } catch (Exception e) {
                 LOG.warnv("Error stopping EC2 container {0}: {1}", containerId, e.getMessage());
             }
@@ -2331,10 +2410,13 @@ public class Ec2ContainerManager {
             boolean setUpMetadataEndpoint = false;
             Set<String> addedMetadataAddresses = new LinkedHashSet<>();
             ProtectedNamespace namespace = null;
+            boolean confirmedRunning = false;
+            DnsSuspension dnsSuspension;
             try {
                 if (beforeStart != null) {
                     beforeStart.run();
                 }
+                dnsSuspension = metadataServer.suspendDns(instance);
                 namespace = protectedNamespace(instance);
                 if (namespace != null) {
                     if (firewallManager != null && firewallManager.enabled() && !namespace.securityGroupsEnforced()) {
@@ -2360,6 +2442,7 @@ public class Ec2ContainerManager {
                         pause.pause(500);
                     }
                 }
+                confirmedRunning = running;
                 setUpMetadataEndpoint = refreshStartedContainerAddresses(instance, containerId, namespace);
             } catch (InterruptedException e) {
                 if (instance.compareAndSetState(pending, InstanceState.stopped())) {
@@ -2386,7 +2469,11 @@ public class Ec2ContainerManager {
                 refreshImdsSourceRegistration(instance, namespace.helperId(), namespace.privateAddress());
                 refreshMetadataAddresses(instance, namespace.helperId());
             }
+            if (confirmedRunning) {
+                metadataServer.resumeDns(instance, dnsSuspension);
+            }
             persist(instance);
+            watchForGuestShutdown(instance, containerId);
             if (postStart != null) {
                 try {
                     postStart.run();
@@ -2560,7 +2647,14 @@ public class Ec2ContainerManager {
                         && stillDeclared.test(region, instanceId)) {
                     continue;
                 }
-                lifecycleManager.removeIfExists(container.getId());
+                try {
+                    lifecycleManager.removeIfExistsStrict(container.getId());
+                } catch (RuntimeException e) {
+                    LOG.warnv(e, "Could not remove orphaned EC2 container {0}; retaining its DNS origin",
+                            container.getId());
+                    continue;
+                }
+                metadataServer.suspendContainerDns(container.getId());
                 removed++;
                 LOG.infov("Reconciled orphaned EC2 container {0} (instance {1}) left by a previous run",
                         container.getId(), String.valueOf(instanceId));
@@ -2602,6 +2696,7 @@ public class Ec2ContainerManager {
             return false;
         }
         String containerId = instance.getDockerContainerId();
+        DnsSuspension dnsSuspension = metadataServer.dnsSuspension(instance);
         boolean running = lifecycleManager.isContainerRunning(containerId);
         if (!running) {
             String state = instance.getState() == null ? "" : instance.getState().getName();
@@ -2639,7 +2734,11 @@ public class Ec2ContainerManager {
                 known.add(instance.getImdsSourceIp());
             }
             known.forEach(address -> metadataServer.registerContainer(address, instance.getInstanceId(), instance));
-            return !known.isEmpty() && (!running || restoreNativeBoot(instance, containerId));
+            boolean restored = !known.isEmpty() && (!running || restoreNativeBoot(instance, containerId));
+            if (restored && running) {
+                metadataServer.resumeDns(instance, dnsSuspension);
+            }
+            return restored;
         }
         String networkContainer = namespace == null ? containerId : namespace.helperId();
         String containerIp = namespace == null ? getContainerBridgeIp(networkContainer) : namespace.privateAddress();
@@ -2673,7 +2772,11 @@ public class Ec2ContainerManager {
         if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
             exposeReachablePublicAddress(instance);
         }
-        return !running || restoreNativeBoot(instance, containerId);
+        boolean restored = !running || restoreNativeBoot(instance, containerId);
+        if (restored && running) {
+            metadataServer.resumeDns(instance, dnsSuspension);
+        }
+        return restored;
     }
 
     /** Restore IMDS before releasing native init, retaining ordinary guests' cached-address fallback. */
@@ -3136,6 +3239,7 @@ public class Ec2ContainerManager {
             firewallEniId = instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()
                     ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
             instance.setState(InstanceState.shuttingDown());
+            metadataServer.revokeInstanceCredentials(instance);
             // In-flight lookups no longer match and publish nothing; later ones see the state.
             serviceNetworkRetries.remove(instance.getInstanceId());
             serviceNetworkLookups.remove(instance.getInstanceId());
@@ -3169,6 +3273,7 @@ public class Ec2ContainerManager {
                     task.workloadGone = containerGone;
                     // iptables/veth teardown lags behind successful removal; prevents port-reuse conflicts.
                     if (containerGone) {
+                        metadataServer.suspendDns(instance);
                         pause(500);
                     }
                 }
@@ -3367,10 +3472,15 @@ public class Ec2ContainerManager {
     boolean stopAndConfirm(Instance instance) {
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
+            metadataServer.suspendDns(instance);
             return true;
         }
         stopForShutdown(instance);
-        return lifecycleManager.probeContainer(containerId) == ContainerLiveness.NOT_RUNNING;
+        boolean stopped = lifecycleManager.probeContainer(containerId) == ContainerLiveness.NOT_RUNNING;
+        if (stopped) {
+            metadataServer.suspendDns(instance);
+        }
+        return stopped;
     }
 
     /**
@@ -3405,6 +3515,7 @@ public class Ec2ContainerManager {
                     || !containerId.equals(instance.getDockerContainerId())) {
                 return;
             }
+            flociStoppedContainers.add(containerId);
             try {
                 dockerClient.restartContainerCmd(containerId).exec();
                 guestReboots.forget(instance);
@@ -3420,6 +3531,8 @@ public class Ec2ContainerManager {
             } catch (Exception e) {
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
                 startAfterFailedReboot(instance, containerId, expected);
+            } finally {
+                watchForGuestShutdown(instance, containerId);
             }
         }), callbackCompleted).whenComplete((ignored, failure) ->
                 apiReboots.computeIfPresent(containerId, (id, count) -> count > 1 ? count - 1 : null));

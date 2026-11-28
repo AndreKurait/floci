@@ -1119,20 +1119,24 @@ public class Ec2QueryHandler {
             Ec2Service.validateNewResourceTags(new ArrayList<>(primaryInterfaceTags.values()));
         }
 
+        String shutdownBehavior = p.getFirst("InstanceInitiatedShutdownBehavior");
+        if (shutdownBehavior == null && launchTemplateData != null) {
+            shutdownBehavior = launchTemplateData.getInstanceInitiatedShutdownBehavior();
+        }
         String availabilityZone = runInstancesAvailabilityZone(p, region, launchTemplateData);
         Reservation res = attempt == null ? service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, dryRun(p),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
-                "spot".equals(marketType), privateIpAddress, capacitySpecification, networkInterfaceDeleteOnTermination)
+                "spot".equals(marketType), privateIpAddress, capacitySpecification, networkInterfaceDeleteOnTermination, shutdownBehavior)
                 : service.launchInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
                 associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, false,
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification,
-                networkInterfaceDeleteOnTermination, attempt);
+                networkInterfaceDeleteOnTermination, shutdownBehavior, attempt);
 
         if (launchTemplateData != null && !isSet(networkInterfaceId)) {
             List<Tag> templateInterfaceTags = launchTemplateData.tagsForResource("network-interface");
@@ -1910,6 +1914,11 @@ public class Ec2QueryHandler {
             xml.start("disableApiStop").elem("value", String.valueOf(inst.isDisableApiStop())).end("disableApiStop");
         } else if ("disableApiTermination".equals(attribute)) {
             xml.start("disableApiTermination").elem("value", String.valueOf(inst.isDisableApiTermination())).end("disableApiTermination");
+        } else if ("instanceInitiatedShutdownBehavior".equals(attribute)) {
+            xml.start("instanceInitiatedShutdownBehavior")
+                    .elem("value", inst.getInstanceInitiatedShutdownBehavior() == null
+                            ? "stop" : inst.getInstanceInitiatedShutdownBehavior())
+                    .end("instanceInitiatedShutdownBehavior");
         } else if ("groupSet".equals(attribute)) {
             xml.start("groupSet");
             for (GroupIdentifier gi : inst.getSecurityGroups()) {
@@ -1936,7 +1945,8 @@ public class Ec2QueryHandler {
         // Find which attribute is being modified
         String attrName = null;
         String attrValue = null;
-        for (String attr : List.of("InstanceType.Value", "SourceDestCheck.Value", "EbsOptimized.Value")) {
+        for (String attr : List.of("InstanceType.Value", "SourceDestCheck.Value", "EbsOptimized.Value",
+                "InstanceInitiatedShutdownBehavior.Value")) {
             String val = p.getFirst(attr);
             if (val != null) {
                 attrName = attr.replace(".Value", "");
