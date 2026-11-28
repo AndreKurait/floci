@@ -10,6 +10,8 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import {
   APIGatewayClient,
   CreateRestApiCommand,
@@ -326,11 +328,34 @@ describe('API Gateway v1 — execute-api data plane', () => {
 
   describe('REQUEST authorizer — full event shape', () => {
     let receivedEvent: Record<string, unknown>;
+    let callerSourceIp: string;
 
     beforeAll(async () => {
-      const res = await executeApi(apiId, 'prod', '/items/42', {
-        headers: { Authorization: 'Bearer test-token', 'X-Custom-Header': 'hello' },
-        query: 'foo=bar&baz=qux',
+      const url = new URL(`${ENDPOINT}/execute-api/${apiId}/prod/items/42?foo=bar&baz=qux`);
+      const res = await new Promise<Response>((resolve, reject) => {
+        const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, {
+          headers: {
+            Authorization: 'Bearer test-token', 'X-Custom-Header': 'hello',
+            'X-Forwarded-For': '192.0.2.77',
+          },
+        }, response => {
+          const sourceIp = response.socket.localAddress;
+          if (!sourceIp) {
+            response.destroy();
+            reject(new Error('The caller socket has no source address'));
+            return;
+          }
+          callerSourceIp = sourceIp.replace(/^::ffff:/, '');
+          const chunks: Buffer[] = [];
+          response.on('data', chunk => chunks.push(Buffer.from(chunk)));
+          response.on('error', reject);
+          response.on('end', () => resolve(new Response(Buffer.concat(chunks), {
+            status: response.statusCode,
+          })));
+        });
+        request.on('error', reject);
+        request.setTimeout(60_000, () => request.destroy(new Error('Authorizer request timed out')));
+        request.end();
       });
       expect(res.status).toBe(200);
       const body = await res.json() as { authorizer: { receivedEvent: string } };
@@ -404,7 +429,8 @@ describe('API Gateway v1 — execute-api data plane', () => {
     it('should include requestContext.identity.sourceIp', () => {
       const ctx = receivedEvent.requestContext as Record<string, unknown>;
       const identity = ctx.identity as Record<string, string>;
-      expect(identity.sourceIp).toBe('127.0.0.1');
+      expect(identity.sourceIp.replace(/^::ffff:/, '')).toBe(callerSourceIp);
+      expect(identity.sourceIp).not.toBe('192.0.2.77');
     });
 
     it('should include requestContext.resourcePath', () => {

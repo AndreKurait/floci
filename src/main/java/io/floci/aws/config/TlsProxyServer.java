@@ -4,10 +4,12 @@ import io.quarkus.runtime.Startup;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.net.NetClient;
 import io.vertx.core.net.NetServer;
 import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.NetSocket;
+import io.vertx.core.net.SocketAddress;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -211,8 +213,12 @@ public class TlsProxyServer {
                     if (ar.succeeded()) {
                         NetSocket backSocket = ar.result();
 
-                        // Send the initial buffer that we already read
-                        backSocket.write(buffer);
+                        SocketAddress source = frontSocket.remoteAddress();
+                        SocketAddress destination = frontSocket.localAddress();
+                        String family = source.hostAddress().contains(":") ? "TCP6" : "TCP4";
+                        Buffer initial = Buffer.buffer("PROXY " + family + " " + source.hostAddress() + " "
+                                + destination.hostAddress() + " " + source.port() + " " + destination.port() + "\r\n");
+                        backSocket.write(initial.appendBuffer(buffer));
 
                         // Bi-directional pipe — pipeTo handles end-of-stream
                         // propagation and will resume the paused frontSocket.
