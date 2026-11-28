@@ -1,3 +1,4 @@
+AWS::ApiGateway::Authorizer	AuthorizerCredentials	keep:the in-place authorizer patch does not update credentials	read on create; updates currently preserve the live credentials even when declared or dropped
 AWS::ApiGateway::Authorizer	AuthorizerResultTtlInSeconds	default:300
 AWS::ApiGateway::Authorizer	AuthorizerUri	keep:the patch cannot remove it
 AWS::ApiGateway::Authorizer	IdentitySource	clear	the field reads back absent; a drop from a TOKEN or COGNITO_USER_POOLS authorizer fails, as AWS requires it there
@@ -10,6 +11,7 @@ AWS::ApiGateway::Stage	Description	clear	the field reads back absent
 AWS::ApiGateway::Stage	RestApiId	create-only	a drop fails: the rest api is not found
 AWS::ApiGateway::Stage	StageName	create-only	a drop fails: the stage name is required
 AWS::ApiGatewayV2::Authorizer	ApiId	create-only	a drop fails: the authorizer is not found
+AWS::ApiGatewayV2::Authorizer	AuthorizerCredentialsArn	clear	the replacement setter clears a null credential ARN, including when omitted in both templates
 AWS::ApiGatewayV2::Authorizer	AuthorizerPayloadFormatVersion	clear	a create without it accepts the authorizer
 AWS::ApiGatewayV2::Authorizer	AuthorizerResultTtlInSeconds	clear	the field reads back absent
 AWS::ApiGatewayV2::Authorizer	AuthorizerType	keep:required by AWS
@@ -103,6 +105,27 @@ AWS::CloudTrail::Trail	S3BucketName	keep:the update skips a null, so the stored 
 AWS::CloudTrail::Trail	S3KeyPrefix	clear
 AWS::CloudTrail::Trail	SnsTopicName	keep:the update skips a null, so the stored topic stays
 AWS::CloudTrail::Trail	TrailName	keep:the update finds the trail by its physical id
+AWS::CodeDeploy::DeploymentGroup	AlarmConfiguration	clear
+AWS::CodeDeploy::DeploymentGroup	ApplicationName	keep:required; dropping is refused before mutation
+AWS::CodeDeploy::DeploymentGroup	AutoRollbackConfiguration	clear
+AWS::CodeDeploy::DeploymentGroup	AutoScalingGroups	clear
+AWS::CodeDeploy::DeploymentGroup	BlueGreenDeploymentConfiguration	clear
+AWS::CodeDeploy::DeploymentGroup	Deployment	clear	inline execution is refused whenever declared and is never provisioned
+AWS::CodeDeploy::DeploymentGroup	DeploymentConfigName	default:CodeDeployDefault.OneAtATime
+AWS::CodeDeploy::DeploymentGroup	DeploymentGroupName	create-only	dropping a declared name replaces the group under a generated identity
+AWS::CodeDeploy::DeploymentGroup	DeploymentStyle	clear
+AWS::CodeDeploy::DeploymentGroup	ECSServices	clear
+AWS::CodeDeploy::DeploymentGroup	Ec2DeploymentOptions	clear	inline execution options are refused whenever declared and are never provisioned
+AWS::CodeDeploy::DeploymentGroup	Ec2TagFilters	clear
+AWS::CodeDeploy::DeploymentGroup	Ec2TagSet	clear
+AWS::CodeDeploy::DeploymentGroup	LoadBalancerInfo	clear
+AWS::CodeDeploy::DeploymentGroup	OnPremisesInstanceTagFilters	clear
+AWS::CodeDeploy::DeploymentGroup	OnPremisesTagSet	clear
+AWS::CodeDeploy::DeploymentGroup	OutdatedInstancesStrategy	clear
+AWS::CodeDeploy::DeploymentGroup	ServiceRoleArn	keep:required; dropping is refused before mutation
+AWS::CodeDeploy::DeploymentGroup	Tags	clear
+AWS::CodeDeploy::DeploymentGroup	TerminationHookEnabled	clear
+AWS::CodeDeploy::DeploymentGroup	TriggerConfigurations	clear
 AWS::Cognito::UserPoolGroup	Description	clear
 AWS::Cognito::UserPoolGroup	GroupName	create-only	a drop gives the group a generated name, so the group is replaced
 AWS::Cognito::UserPoolGroup	Precedence	keep:the update skips a null, so the stored value stays
@@ -119,6 +142,7 @@ AWS::EC2::Instance	MetadataOptions	default:launch defaults, member by member	a m
 AWS::EC2::Instance	NetworkInterfaces	keep:read only when an instance launches
 AWS::EC2::Instance	PrivateIpAddress	create-only	a drop differs from the declared value, so the instance is replaced
 AWS::EC2::Instance	SecurityGroupIds	keep:only a declared set is applied
+AWS::EC2::Instance	SecurityGroups	create-only	currently read only to reject instance-level group names with NetworkInterfaces; names are not applied to native instance groups
 AWS::EC2::Instance	SubnetId	create-only	a drop is read as no preference and the instance is kept
 AWS::EC2::Instance	Tags	clear	only the keys the stack wrote
 AWS::EC2::Instance	UserData	clear	a running instance is stopped for the rewrite and started again
@@ -154,6 +178,22 @@ AWS::ECS::Service	NetworkConfiguration	keep:the update leaves a missing network 
 AWS::ECS::Service	ServiceName	keep:the prior name is reused
 AWS::ECS::Service	ServiceRegistries	keep:AWS removes registries only through a declared empty list
 AWS::ECS::Service	TaskDefinition	keep:required for the ECS controller
+AWS::ElasticLoadBalancing::LoadBalancer	AccessLoggingPolicy	default:disabled	disables logging; retained bucket, prefix and emit interval are not cleared
+AWS::ElasticLoadBalancing::LoadBalancer	AppCookieStickinessPolicy	clear	nonempty declarations are rejected as unsupported; no such policy is provisioned
+AWS::ElasticLoadBalancing::LoadBalancer	AvailabilityZones	clear	dropping a nonempty declaration requires replacement; a retained custom name refuses replacement; creation uses remaining subnet/zone inputs
+AWS::ElasticLoadBalancing::LoadBalancer	ConnectionDrainingPolicy	default:disabled with timeout 300	omission in both templates preserves live attributes
+AWS::ElasticLoadBalancing::LoadBalancer	ConnectionSettings	default:IdleTimeout 60	omission in both templates preserves the live timeout
+AWS::ElasticLoadBalancing::LoadBalancer	CrossZone	default:false	omission in both templates preserves the live attribute
+AWS::ElasticLoadBalancing::LoadBalancer	HealthCheck	clear	dropping a nonempty declaration requires replacement; a retained custom name refuses replacement
+AWS::ElasticLoadBalancing::LoadBalancer	Instances	clear	deregisters the previously declared instances; omission in both preserves registrations
+AWS::ElasticLoadBalancing::LoadBalancer	LBCookieStickinessPolicy	clear	nonempty declarations are rejected as unsupported; no such policy is provisioned
+AWS::ElasticLoadBalancing::LoadBalancer	Listeners	keep:at least one listener is required	a drop is rejected before mutation
+AWS::ElasticLoadBalancing::LoadBalancer	LoadBalancerName	create-only	the stable name helper retains an existing physical name unless another change requires replacement
+AWS::ElasticLoadBalancing::LoadBalancer	Policies	clear	deletes recorded managed policies and resets listener bindings to defaults; unowned policy definitions remain
+AWS::ElasticLoadBalancing::LoadBalancer	Scheme	create-only	omission resolves to internet-facing; changing from internal requires replacement and a retained custom name refuses it
+AWS::ElasticLoadBalancing::LoadBalancer	SecurityGroups	keep:in-place removal is unsupported	a drop throws UnsupportedOperation; a simultaneous replacement uses native create defaults
+AWS::ElasticLoadBalancing::LoadBalancer	Subnets	clear	dropping a nonempty declaration requires replacement; a retained custom name refuses replacement; creation uses remaining subnet/zone inputs
+AWS::ElasticLoadBalancing::LoadBalancer	Tags	clear	reconciles the complete tag map, including omission in both templates
 AWS::Events::Connection	AuthParameters	keep:refused with a ValidationError, EventBridge keeps the value it has; a real AWS account fails the update too
 AWS::Events::Connection	AuthorizationType	keep:refused with a ValidationError, EventBridge keeps the value it has; a real AWS account fails the update too
 AWS::Events::Connection	Description	keep:a real AWS account leaves a dropped Description as it is; an empty one clears it
@@ -163,7 +203,7 @@ AWS::Events::Connection	Name	keep:refused with a ValidationError, a different na
 AWS::KMS::Key	Description	clear	cleared to the empty description, KMS's own empty state; the CloudFormation page lists no default
 AWS::KMS::Key	EnableKeyRotation	default:false	the CloudFormation page: EnableKeyRotation defaults to false
 AWS::KMS::Key	Enabled	default:true	the CloudFormation page: Enabled defaults to true
-AWS::KMS::Key	KeyPolicy	keep:no AWS documentation says a dropped policy resets to the default, so the stored policy stays
+AWS::KMS::Key	KeyPolicy	default:account-root	AWS KMS resource provider defaults both prior and desired policies before updating; dropping a managed policy restores the account-root default
 AWS::KMS::Key	KeySpec	keep:a drop names the create default, so a key holding another value fails the update, as a change does
 AWS::KMS::Key	KeyUsage	keep:a drop names the create default, so a key holding another value fails the update, as a change does
 AWS::KMS::Key	MultiRegion	keep:a drop names the create default, so a key holding another value fails the update, as a change does
@@ -173,6 +213,7 @@ AWS::Lambda::Alias	Description	clear
 AWS::Lambda::Alias	FunctionName	create-only	a drop fails: the provisioner requires it
 AWS::Lambda::Alias	FunctionVersion	keep:the update skips a null, so the stored version stays
 AWS::Lambda::Alias	Name	create-only	a drop fails: the provisioner requires it
+AWS::Lambda::Alias	ProvisionedConcurrencyConfig	clear	deletes the alias configuration only when the prior template declared it; omission in both preserves live configuration
 AWS::Lambda::Alias	RoutingConfig	clear	an empty map removes the weights, also when the template never declared it, so weights set outside the stack go
 AWS::SecretsManager::Secret	Description	clear
 AWS::SecretsManager::Secret	GenerateSecretString	keep:a dropped configuration adds no version, so the stored value stays

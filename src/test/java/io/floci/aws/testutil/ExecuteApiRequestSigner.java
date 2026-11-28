@@ -123,7 +123,7 @@ public final class ExecuteApiRequestSigner {
                 + "host:" + host + "\n"
                 + "\n"
                 + "host\n"
-                + "UNSIGNED-PAYLOAD";
+                + Digests.sha256Hex(new byte[0]);
 
         String signature = sign(secretKey, scopeDate, region, credentialScope, amzDate, canonicalRequest);
         return canonicalQuery + "&X-Amz-Signature=" + signature;
