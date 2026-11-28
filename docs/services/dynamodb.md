@@ -249,7 +249,8 @@ Set `FLOCI_SERVICES_DYNAMODB_RANDOMIZE_ATTRIBUTE_ORDER=false` to turn the shuffl
 ## Time to Live
 
 With TTL enabled, a sweep runs every 60 seconds and deletes the items whose TTL attribute holds an
-epoch time in the past. Each deletion writes a `REMOVE` record to the table's stream and is
+epoch time in the past, no more than five UTC calendar years old. Older timestamps, including zero,
+are ignored by the sweeper. Each deletion writes a `REMOVE` record to the table's stream and is
 forwarded to an active Kinesis streaming destination. Between sweeps, expired items remain visible
 to reads until they are physically deleted, as on AWS. Use a filter expression on the TTL attribute
 to exclude expired items from a Query or Scan result.

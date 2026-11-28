@@ -3464,11 +3464,17 @@ public class DynamoDbService {
     }
 
     static boolean isExpired(JsonNode item, TableDefinition table) {
+        return isExpired(item, table, Instant.now());
+    }
+
+    static boolean isExpired(JsonNode item, TableDefinition table, Instant now) {
         if (!table.isTtlEnabled() || table.getTtlAttributeName() == null) return false;
         JsonNode attr = item.get(table.getTtlAttributeName());
         if (attr == null || !attr.has("N")) return false;
         try {
-            return Long.parseLong(attr.get("N").asText()) < Instant.now().getEpochSecond();
+            long ttl = Long.parseLong(attr.get("N").asText());
+            long oldestConsidered = now.atOffset(ZoneOffset.UTC).minusYears(5).toEpochSecond();
+            return ttl >= oldestConsidered && ttl < now.getEpochSecond();
         } catch (NumberFormatException e) {
             return false;
         }
