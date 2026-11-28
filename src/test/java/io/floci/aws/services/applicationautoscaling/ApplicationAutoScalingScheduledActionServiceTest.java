@@ -15,6 +15,7 @@ import io.floci.aws.services.applicationautoscaling.model.SuspendedState;
 import io.floci.aws.services.applicationautoscaling.model.TargetTrackingConfiguration;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
+import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.testing.StorageFactories;
 import io.floci.aws.testing.ThreadStates;
 import jakarta.enterprise.inject.Instance;
@@ -67,7 +68,7 @@ class ApplicationAutoScalingScheduledActionServiceTest {
         }).when(adjuster).setCapacity(anyString(), anyInt(), anyString());
         service = new ApplicationAutoScalingService(new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), actions, new RegionResolver(REGION, ACCOUNT),
-                mock(CloudWatchMetricsService.class), adjuster);
+                mock(CloudWatchMetricsService.class), adjuster, mock(DynamoDbService.class));
         register(null);
     }
 
@@ -267,7 +268,7 @@ class ApplicationAutoScalingScheduledActionServiceTest {
         InMemoryStorage<String, ScheduledAction> failing = spy(actions);
         service = new ApplicationAutoScalingService(new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), failing, new RegionResolver(REGION, ACCOUNT),
-                mock(CloudWatchMetricsService.class), adjuster);
+                mock(CloudWatchMetricsService.class), adjuster, mock(DynamoDbService.class));
         register(null);
         put("claim", NOW, 7, 10);
         doThrow(new IllegalStateException("claim write failed")).when(failing).putAllAtomically(anyMap());
@@ -411,7 +412,7 @@ class ApplicationAutoScalingScheduledActionServiceTest {
         InMemoryStorage<String, ScalingActivity> activityStore = spy(new InMemoryStorage<>());
         InMemoryStorage<String, ScheduledAction> actionStore = spy(actions);
         service = new ApplicationAutoScalingService(new InMemoryStorage<>(), new InMemoryStorage<>(),
-                activityStore, actionStore, new RegionResolver(REGION, ACCOUNT), mock(CloudWatchMetricsService.class), adjuster);
+                activityStore, actionStore, new RegionResolver(REGION, ACCOUNT), mock(CloudWatchMetricsService.class), adjuster, mock(DynamoDbService.class));
         register(null);
         put("activity", NOW, 7, 9);
         doThrow(new IllegalStateException("activity write failed")).when(activityStore).putAllAtomically(anyMap());
@@ -463,7 +464,7 @@ class ApplicationAutoScalingScheduledActionServiceTest {
         CloudWatchMetricsService cloudWatch = mock(CloudWatchMetricsService.class);
         StorageFactory first = StorageFactories.open(directory, mode, ACCOUNT);
         try {
-            service = new ApplicationAutoScalingService(first, resolver, cloudWatch, adjuster);
+            service = new ApplicationAutoScalingService(first, resolver, cloudWatch, adjuster, mock(DynamoDbService.class));
             register(null);
             put("completed", NOW, 2, 8);
             service.runScheduledActions(NOW);
@@ -483,7 +484,7 @@ class ApplicationAutoScalingScheduledActionServiceTest {
         }
         StorageFactory restored = StorageFactories.open(directory, mode, ACCOUNT);
         try {
-            service = new ApplicationAutoScalingService(restored, resolver, cloudWatch, adjuster);
+            service = new ApplicationAutoScalingService(restored, resolver, cloudWatch, adjuster, mock(DynamoDbService.class));
             restored.loadAll();
             service.recoverScheduledActions(NOW.plusSeconds(2));
             assertEquals(State.SKIPPED, action("overdue").getState());

@@ -2,6 +2,7 @@ package io.floci.aws.services.dynamodb.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
@@ -22,7 +23,9 @@ public class GlobalSecondaryIndex {
     private Integer onDemandMaxReadRequestUnits;
     private Integer onDemandMaxWriteRequestUnits;
     // Null until a request sets the index's warm throughput.
+    @JsonProperty("warmReadUnitsPerSecond")
     private Long warmReadUnitsPerSecond;
+    @JsonProperty("warmWriteUnitsPerSecond")
     private Long warmWriteUnitsPerSecond;
     // Null until the first UpdateContributorInsights call on this index.
     private ContributorInsights contributorInsights;
@@ -121,5 +124,38 @@ public class GlobalSecondaryIndex {
                 .filter(k -> "RANGE".equals(k.getKeyType()))
                 .map(KeySchemaElement::getAttributeName)
                 .toList();
+    }
+
+    public long getWarmReadUnitsPerSecond(String billingMode) {
+        return Math.max(rawWarmReadUnitsPerSecond(), warmReadFloor(billingMode));
+    }
+
+    public long getWarmWriteUnitsPerSecond(String billingMode) {
+        return Math.max(rawWarmWriteUnitsPerSecond(), warmWriteFloor(billingMode));
+    }
+
+    public long rawWarmReadUnitsPerSecond() { return warmReadUnitsPerSecond == null ? 0 : warmReadUnitsPerSecond; }
+    public long rawWarmWriteUnitsPerSecond() { return warmWriteUnitsPerSecond == null ? 0 : warmWriteUnitsPerSecond; }
+    public void setWarmReadUnitsPerSecond(long value) { warmReadUnitsPerSecond = value; }
+    public void setWarmWriteUnitsPerSecond(long value) { warmWriteUnitsPerSecond = value; }
+
+    public void initializeWarmThroughput(String billingMode) {
+        warmReadUnitsPerSecond = Math.max(rawWarmReadUnitsPerSecond(), warmReadFloor(billingMode));
+        warmWriteUnitsPerSecond = Math.max(rawWarmWriteUnitsPerSecond(), warmWriteFloor(billingMode));
+    }
+
+    public void retainWarmThroughput(String billingMode) {
+        warmReadUnitsPerSecond = getWarmReadUnitsPerSecond(billingMode);
+        warmWriteUnitsPerSecond = getWarmWriteUnitsPerSecond(billingMode);
+    }
+
+    private long warmReadFloor(String billingMode) {
+        return "PAY_PER_REQUEST".equals(billingMode) ? 12000
+                : provisionedThroughput != null ? provisionedThroughput.getReadCapacityUnits() : 0;
+    }
+
+    private long warmWriteFloor(String billingMode) {
+        return "PAY_PER_REQUEST".equals(billingMode) ? 4000
+                : provisionedThroughput != null ? provisionedThroughput.getWriteCapacityUnits() : 0;
     }
 }

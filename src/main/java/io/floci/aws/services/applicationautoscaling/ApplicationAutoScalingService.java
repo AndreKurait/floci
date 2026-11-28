@@ -27,6 +27,7 @@ import io.floci.aws.services.applicationautoscaling.model.TargetTrackingConfigur
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
+import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.iam.ServiceLinkedRoles;
 import io.floci.aws.services.scheduler.SchedulerExpressionParser;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -100,6 +101,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     private final StorageBackend<String, ScheduledAction> scheduledActions;
     private final EcsCapacityAdjuster ecsCapacityAdjuster;
     private final Object[] targetLocks = new Object[256];
+    private final DynamoDbService dynamoDbService;
     private final RegionResolver regionResolver;
     private final CloudWatchMetricsService cloudWatchMetricsService;
     private final SignedMarkers pageTokens = new SignedMarkers();
@@ -108,7 +110,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     public ApplicationAutoScalingService(StorageFactory factory,
                                          RegionResolver regionResolver,
                                          CloudWatchMetricsService cloudWatchMetricsService,
-                                         EcsCapacityAdjuster ecsCapacityAdjuster) {
+                                         EcsCapacityAdjuster ecsCapacityAdjuster, DynamoDbService dynamoDbService) {
         this(factory.create("applicationautoscaling", "application-autoscaling-targets.json",
                         new TypeReference<Map<String, ScalableTarget>>() {}),
                 factory.create("applicationautoscaling", "application-autoscaling-policies.json",
@@ -117,7 +119,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                         new TypeReference<Map<String, ScalingActivity>>() {}),
                 factory.create("applicationautoscaling", "application-autoscaling-scheduled-actions.json",
                         new TypeReference<Map<String, ScheduledAction>>() {}),
-                regionResolver, cloudWatchMetricsService, ecsCapacityAdjuster);
+                regionResolver, cloudWatchMetricsService, ecsCapacityAdjuster, dynamoDbService);
     }
 
     ApplicationAutoScalingService(StorageBackend<String, ScalableTarget> targets,
@@ -126,7 +128,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                                   StorageBackend<String, ScheduledAction> scheduledActions,
                                   RegionResolver regionResolver,
                                   CloudWatchMetricsService cloudWatchMetricsService,
-                                  EcsCapacityAdjuster ecsCapacityAdjuster) {
+                                  EcsCapacityAdjuster ecsCapacityAdjuster, DynamoDbService dynamoDbService) {
         this.scheduledActions = scheduledActions;
         this.ecsCapacityAdjuster = ecsCapacityAdjuster;
         for (int i = 0; i < targetLocks.length; i++) {
@@ -135,6 +137,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         this.targets = targets;
         this.policies = policies;
         this.activities = activities;
+        this.dynamoDbService = dynamoDbService;
         this.regionResolver = regionResolver;
         this.cloudWatchMetricsService = cloudWatchMetricsService;
     }
@@ -170,7 +173,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                 if (tags != null) {
                     target.setTags(tags);
                 }
-                targets.putAllAtomically(Map.of(key, target));
+                publishRegistration(key, target, region);
                 LOG.infov("RegisterScalableTarget: {0} {1} {2} in {3}",
                         serviceNamespace, resourceId, scalableDimension, region);
                 return target;
@@ -197,10 +200,20 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             if (tags != null && !tags.isEmpty()) {
                 existing.putTags(tags);
             }
-            targets.putAllAtomically(Map.of(key, existing));
+            publishRegistration(key, existing, region);
             LOG.infov("RegisterScalableTarget (update): {0} {1} {2} in {3}",
                     serviceNamespace, resourceId, scalableDimension, region);
             return existing;
+        }
+    }
+
+    private void publishRegistration(String key, ScalableTarget candidate, String region) {
+        if (DynamoDbRegistrationTarget.supports(candidate.getServiceNamespace(), candidate.getScalableDimension())) {
+            DynamoDbRegistrationTarget publication = new DynamoDbRegistrationTarget(targets, key, candidate);
+            dynamoDbService.reconcileScalableTarget(candidate.getResourceId(), candidate.getScalableDimension(),
+                    candidate.getMinCapacity(), candidate.getMaxCapacity(), region, publication);
+        } else {
+            targets.putAllAtomically(Map.of(key, candidate));
         }
     }
 
