@@ -362,7 +362,9 @@ public class SecretsManagerJsonHandler {
         if (secret.getKmsKeyId() != null) {
             response.put("KmsKeyId", secret.getKmsKeyId());
         }
-        response.put("RotationEnabled", secret.isRotationEnabled());
+        if (secret.isRotationConfigured()) {
+            response.put("RotationEnabled", secret.isRotationEnabled());
+        }
         if (secret.getRotationLambdaArn() != null) {
             response.put("RotationLambdaARN", secret.getRotationLambdaArn());
         }
@@ -585,7 +587,9 @@ public class SecretsManagerJsonHandler {
             if (secret.getKmsKeyId() != null) {
                 node.put("KmsKeyId", secret.getKmsKeyId());
             }
-            node.put("RotationEnabled", secret.isRotationEnabled());
+            if (secret.isRotationConfigured()) {
+                node.put("RotationEnabled", secret.isRotationEnabled());
+            }
             if (secret.getRotationLambdaArn() != null) {
                 node.put("RotationLambdaARN", secret.getRotationLambdaArn());
             }

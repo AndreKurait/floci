@@ -21,7 +21,7 @@ import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.ssm.SsmChannelAuthentication.Caller;
-import io.floci.aws.services.ssm.model.SsmSession;
+import io.floci.aws.services.ssm.session.SsmSession;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
@@ -108,6 +108,11 @@ public class SsmSessionService implements Resettable {
         this.mapper = mapper;
         this.vertx = vertx;
         this.clock = clock;
+    }
+
+    boolean ownsConnectedTarget(String region, String target) {
+        return TARGET.matcher(target).matches() && commands.isInstanceRegistered(target, region)
+                && commands.messageGatewayConnected(target, region);
     }
 
     // ── Public API ──────────────────────────────────────────────────────────
@@ -287,6 +292,10 @@ public class SsmSessionService implements Resettable {
         }
         String output = payload.path("Output").asText("");
         end(account, region, sessionId, false, output.length() > 2048 ? output.substring(0, 2048) : output);
+    }
+
+    boolean ownsLiveSession(String region, String sessionId) {
+        return live.containsKey(liveKey(regions.getAccountId(), region, sessionId));
     }
 
     // ── Data channel ────────────────────────────────────────────────────────
