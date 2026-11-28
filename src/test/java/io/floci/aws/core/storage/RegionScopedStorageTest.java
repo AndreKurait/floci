@@ -10,11 +10,18 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class RegionScopedStorageTest {
@@ -187,6 +194,54 @@ class RegionScopedStorageTest {
         assertEquals(Optional.of("before-accounts"), east.readInAccount("000000000000", "us-east-1", "oldest"));
         assertEquals(Optional.empty(), east.readInAccount("111111111111", "us-east-1", "oldest"));
         assertEquals(Set.of("111111111111/us-west-2/app", "111111111111/older", "oldest"), raw.keys());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void atomicBatchesKeepRegionalKeysAndShadowLegacyValues(String mode) {
+        StorageFactory factory = StorageFactories.open(directory, mode, "000000000000");
+        try {
+            StorageBackend<String, String> raw = factory.create(
+                    "appconfig", "records.json", new TypeReference<>() {});
+            raw.put("existing", "legacy");
+            RegionScopedStorage<String> east = store(factory, "us-east-1");
+            RegionScopedStorage<String> west = store(factory, "us-west-2");
+            east.putAllAtomically(Map.of("existing", "east", "us-west-2/nested", "east-nested"));
+            west.putAllAtomically(Map.of("existing", "west"));
+            assertEquals(Optional.of("legacy"), raw.get("existing"));
+            assertEquals(Optional.of("east"), east.get("existing"));
+            assertEquals(Optional.of("west"), west.get("existing"));
+            assertEquals(Optional.of("east-nested"), east.get("us-west-2/nested"));
+            assertEquals(Optional.empty(), west.get("nested"));
+            assertEquals(Set.of(
+                    new RegionScopedStorage.RegionEntry<>("us-east-1", "existing", "east"),
+                    new RegionScopedStorage.RegionEntry<>("us-east-1", "us-west-2/nested", "east-nested"),
+                    new RegionScopedStorage.RegionEntry<>("us-west-2", "existing", "west")),
+                    Set.copyOf(east.scanEveryRegion()));
+            east.delete("existing");
+            assertEquals(Optional.empty(), east.get("existing"));
+            assertEquals(Optional.empty(), raw.get("existing"));
+            assertEquals(Optional.of("west"), west.get("existing"));
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    @Test
+    void failedAtomicBatchLeavesScopedAndLegacyValuesUnchanged() {
+        InMemoryStorage<String, String> original = new InMemoryStorage<>();
+        original.put("old", "legacy");
+        original.put("us-east-1/scoped", "prior");
+        InMemoryStorage<String, String> raw = spy(original);
+        RegionScopedStorage<String> east = new RegionScopedStorage<>(raw, regions("us-east-1"));
+        Map<String, String> batch = Map.of("old", "replacement", "scoped", "updated");
+        doThrow(new IllegalStateException("batch failed")).when(raw).putAllAtomically(any());
+        assertThrows(IllegalStateException.class, () -> east.putAllAtomically(batch));
+        assertEquals(Optional.of("legacy"), east.get("old"));
+        assertEquals(Optional.of("prior"), east.get("scoped"));
+        verify(raw).putAllAtomically(Map.of("us-east-1/old", "replacement", "us-east-1/scoped", "updated"));
+        verify(raw, never()).put(any(), any());
+        verify(raw, never()).delete(any());
     }
 
     private static RegionScopedStorage<String> store(StorageFactory factory, String region) {
