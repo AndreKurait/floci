@@ -225,6 +225,7 @@ public class CodeDeployService {
         int containerPort;
         String beforeInstall;
         String afterInstall;
+        String afterAllowTestTraffic;
         String beforeAllowTraffic;
         String afterAllowTraffic;
     }
@@ -1300,6 +1301,9 @@ public class CodeDeployService {
                     if (hook.has("AfterInstall")) {
                         info.afterInstall = hook.get("AfterInstall").asText(null);
                     }
+                    if (hook.has("AfterAllowTestTraffic")) {
+                        info.afterAllowTestTraffic = hook.get("AfterAllowTestTraffic").asText(null);
+                    }
                     if (hook.has("BeforeAllowTraffic")) {
                         info.beforeAllowTraffic = hook.get("BeforeAllowTraffic").asText(null);
                     }
@@ -1359,6 +1363,7 @@ public class CodeDeployService {
         String blueTgArn = null;
         String greenTgArn = null;
         List<String> listenerArns = new ArrayList<>();
+        List<String> testListenerArns = new ArrayList<>();
         Map<String, Object> lbInfo = group.getLoadBalancerInfo();
         if (lbInfo != null) {
             List<Map<String, Object>> pairList = (List<Map<String, Object>>) lbInfo.get("targetGroupPairInfoList");
@@ -1377,6 +1382,11 @@ public class CodeDeployService {
                 if (prodRoute != null) {
                     List<String> arns = (List<String>) prodRoute.get("listenerArns");
                     if (arns != null) { listenerArns.addAll(arns); }
+                }
+                Map<String, Object> testRoute = (Map<String, Object>) pair.get("testTrafficRoute");
+                if (testRoute != null) {
+                    List<String> arns = (List<String>) testRoute.get("listenerArns");
+                    if (arns != null) { testListenerArns.addAll(arns); }
                 }
             }
         }
@@ -1411,7 +1421,7 @@ public class CodeDeployService {
         startDeploymentThread("codedeploy-ecs-" + deploymentId, region,
                 () -> runEcsStateMachine(region, deployment, appSpec, ecsTargetMap, stopFlag,
                         effectiveConfig, finalCluster, finalService,
-                        finalBlueTgArn, finalGreenTgArn, finalListenerArns));
+                        finalBlueTgArn, finalGreenTgArn, finalListenerArns, List.copyOf(testListenerArns)));
 
         return deploymentId;
     }
@@ -1420,7 +1430,7 @@ public class CodeDeployService {
                                     Map<String, Object> ecsTargetMap, AtomicBoolean stopFlag,
                                     String configName, String clusterName, String serviceName,
                                     String blueTgArn, String greenTgArn,
-                                    List<String> listenerArns) {
+                                    List<String> listenerArns, List<String> testListenerArns) {
         String deploymentId = deployment.getDeploymentId();
         TaskSet greenTaskSet = null;
         TaskSet blueTaskSet = null;
@@ -1481,6 +1491,38 @@ public class CodeDeployService {
                 if (!ok) {
                     finishEcsFailed(deployment, ecsTargetMap, "HOOK_EXECUTION_FAILURE",
                             "Hook function reported failure: AfterInstall");
+                    return;
+                }
+            }
+
+            if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
+
+            if (!testListenerArns.isEmpty()) {
+                Map<String, Object> testEvent = addLifecycleEvent(ecsTargetMap, "TestTraffic");
+                try {
+                    if (blueTgArn == null || greenTgArn == null) {
+                        throw new AwsException("InvalidDeploymentConfigException",
+                                "Test traffic requires both deployment target groups", 400);
+                    }
+                    for (String listenerArn : testListenerArns) {
+                        elbV2Service.shiftListenerForward(region, listenerArn, blueTgArn, greenTgArn, 100);
+                    }
+                    finishLifecycleEvent(testEvent, "Succeeded");
+                } catch (Exception e) {
+                    finishLifecycleEvent(testEvent, "Failed");
+                    throw e;
+                }
+            }
+
+            if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
+
+            if (appSpec.afterAllowTestTraffic != null) {
+                boolean ok = invokeHook(region, deployment, appSpec.afterAllowTestTraffic,
+                        "AfterAllowTestTraffic", ecsTargetMap, stopFlag);
+                if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
+                if (!ok) {
+                    finishEcsFailed(deployment, ecsTargetMap, "HOOK_EXECUTION_FAILURE",
+                            "Hook function reported failure: AfterAllowTestTraffic");
                     return;
                 }
             }
