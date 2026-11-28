@@ -577,6 +577,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                           String matcher, String ipAddressType,
                                           Map<String, String> initialTags) {
         validateHealthCheckTimeout(healthCheckTimeout);
+        validateHealthCheckInterval(healthCheckInterval);
         validatePort(port, "port");
         validateName(name, "target group");
         if (port == null && !"lambda".equals(targetType)) {
@@ -684,6 +685,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                    Integer healthCheckTimeout, Integer healthyThreshold,
                                    Integer unhealthyThreshold, String matcher) {
         validateHealthCheckTimeout(healthCheckTimeout);
+        validateHealthCheckInterval(healthCheckInterval);
         TargetGroup tg = requireTargetGroup(region, arn);
         validateHealthCheckPort(healthCheckPort);
         validateHealthCheckEnabled(tg.getTargetType(), healthCheckEnabled);
@@ -784,6 +786,15 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (Boolean.FALSE.equals(enabled) && !"lambda".equals(targetType)) {
             throw new AwsException("InvalidConfigurationRequest",
                     "Health check enabled must be true for target groups with target type '" + targetType + "'", 400);
+        }
+    }
+
+    private static void validateHealthCheckInterval(Integer interval) {
+        if (interval != null && (interval < 5 || interval > 300)) {
+            String constraint = interval < 5 ? "greater than or equal to 5" : "less than or equal to 300";
+            throw new AwsException("ValidationError", "1 validation error detected: Value '" + interval
+                    + "' at 'healthCheckIntervalSeconds' failed to satisfy constraint: Member must have value "
+                    + constraint, 400);
         }
     }
 
