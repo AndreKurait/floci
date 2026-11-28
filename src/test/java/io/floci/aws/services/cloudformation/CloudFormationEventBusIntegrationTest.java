@@ -897,7 +897,7 @@ class CloudFormationEventBusIntegrationTest {
             properties.put("Policy", policy.toString());
         } else if ("substitution".equals(form)) {
             ((ObjectNode) policy.path("Statement").get(0)).put("Resource",
-                    "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/" + busName);
+                    "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/" + busName);
             properties.set("Policy", mapper.createObjectNode().put("Fn::Sub", policy.toString()));
         }
         String body = template.toString();

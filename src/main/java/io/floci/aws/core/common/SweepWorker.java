@@ -3,9 +3,11 @@ package io.floci.aws.core.common;
 import org.jboss.logging.Logger;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
@@ -25,6 +27,7 @@ public final class SweepWorker {
     private final ScheduledExecutorService executor;
     private final Clock clock;
     private final AtomicReference<Thread> executorThread;
+    private final long shutdownTimeoutNanos;
     private final ReentrantLock sweepLock = new ReentrantLock();
     private volatile boolean paused;
 
@@ -45,6 +48,17 @@ public final class SweepWorker {
         this(name, intervalSeconds, sweepAtStart, sweep, scheduler.executor(), clock, scheduler.thread());
     }
 
+    SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
+                ThreadFactory threadFactory, Duration shutdownTimeout) {
+        this(name, intervalSeconds, sweepAtStart, sweep, scheduler(threadFactory), shutdownTimeout);
+    }
+
+    private SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
+                        Scheduler scheduler, Duration shutdownTimeout) {
+        this(name, intervalSeconds, sweepAtStart, sweep, scheduler.executor(), Clock.systemUTC(),
+                scheduler.thread(), shutdownTimeout);
+    }
+
     /**
      * A worker whose timer and clock the caller supplies, so a test can move time itself.
      *
@@ -59,6 +73,12 @@ public final class SweepWorker {
 
     private SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
                         ScheduledExecutorService executor, Clock clock, AtomicReference<Thread> executorThread) {
+        this(name, intervalSeconds, sweepAtStart, sweep, executor, clock, executorThread, Duration.ofSeconds(5));
+    }
+
+    private SweepWorker(String name, long intervalSeconds, boolean sweepAtStart, Consumer<Instant> sweep,
+                        ScheduledExecutorService executor, Clock clock, AtomicReference<Thread> executorThread,
+                        Duration shutdownTimeout) {
         this.name = name;
         this.sweep = sweep;
         this.intervalSeconds = Math.max(1, intervalSeconds);
@@ -66,13 +86,17 @@ public final class SweepWorker {
         this.executor = executor;
         this.clock = clock;
         this.executorThread = executorThread;
+        this.shutdownTimeoutNanos = shutdownTimeout.toNanos();
     }
 
     private static Scheduler scheduler(String name, boolean enabled) {
+        return scheduler(enabled ? Thread.ofPlatform().name(name).daemon(true).factory() : null);
+    }
+
+    private static Scheduler scheduler(ThreadFactory factory) {
         AtomicReference<Thread> thread = new AtomicReference<>();
-        ScheduledExecutorService executor = enabled ? Executors.newSingleThreadScheduledExecutor(task -> {
-            Thread created = new Thread(task, name);
-            created.setDaemon(true);
+        ScheduledExecutorService executor = factory != null ? Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread created = factory.newThread(task);
             thread.set(created);
             return created;
         }) : null;
@@ -91,7 +115,7 @@ public final class SweepWorker {
             return;
         }
         long started = System.nanoTime();
-        long budget = TimeUnit.SECONDS.toNanos(5);
+        long budget = shutdownTimeoutNanos;
         executor.shutdownNow();
         if (executorThread.get() == Thread.currentThread()) {
             return;
