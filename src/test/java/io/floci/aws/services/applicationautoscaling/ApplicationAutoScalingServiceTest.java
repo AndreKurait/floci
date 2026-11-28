@@ -12,6 +12,7 @@ import io.floci.aws.services.applicationautoscaling.model.TargetTrackingConfigur
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
+import io.floci.aws.services.dynamodb.DynamoDbService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -31,9 +32,13 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class ApplicationAutoScalingServiceTest {
 
@@ -43,6 +48,7 @@ class ApplicationAutoScalingServiceTest {
     private static final String DIMENSION = "ecs:service:DesiredCount";
 
     private ApplicationAutoScalingService service;
+    private final LambdaCapacityAdjuster lambdaCapacity = mock(LambdaCapacityAdjuster.class);
     private CloudWatchMetricsService cloudWatch;
 
     /** Alarm names currently registered in the stubbed CloudWatch. */
@@ -72,7 +78,17 @@ class ApplicationAutoScalingServiceTest {
 
         service = new ApplicationAutoScalingService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), regionResolver, cloudWatch, mock(EcsCapacityAdjuster.class));
+                new InMemoryStorage<>(), regionResolver, cloudWatch, mock(EcsCapacityAdjuster.class),
+                lambdaCapacity, registrationDynamoDb());
+    }
+
+    private DynamoDbService registrationDynamoDb() {
+        DynamoDbService dynamoDb = mock(DynamoDbService.class);
+        doAnswer(call -> {
+            call.<DynamoDbRegistrationTarget>getArgument(5).publish();
+            return null;
+        }).when(dynamoDb).reconcileScalableTarget(anyString(), anyString(), anyInt(), anyInt(), anyString(), any());
+        return dynamoDb;
     }
 
     private ScalableTarget register() {
@@ -106,7 +122,7 @@ class ApplicationAutoScalingServiceTest {
         ApplicationAutoScalingService legacy = new ApplicationAutoScalingService(
                 new AccountAwareStorageBackend<>(raw, null, "000000000000"), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"),
-                cloudWatch, mock(EcsCapacityAdjuster.class));
+                cloudWatch, mock(EcsCapacityAdjuster.class), lambdaCapacity, registrationDynamoDb());
         String arn = "arn:aws:application-autoscaling:" + REGION + ":000000000000:scalable-target/0123456789abcdef";
         ScalableTarget target = new ScalableTarget();
         target.setServiceNamespace(NAMESPACE);
@@ -120,6 +136,73 @@ class ApplicationAutoScalingServiceTest {
         assertEquals(Map.of("team", "data"), legacy.storedTags(arn));
         assertEquals(Map.of(), legacy.storedTags(arn.replace(":000000000000:", ":111122223333:")));
         assertTrue(raw.get(key).isPresent());
+    }
+
+    @Test
+    void lambdaRegistrationReconcilesRetainedBoundsWhenTheRequestOmitsThem() {
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        when(lambdaCapacity.supports(dimension)).thenReturn(true);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, 1, 3,
+                null, null, null, REGION);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, null, 4,
+                null, null, null, REGION);
+        verify(lambdaCapacity).reconcileRegistration("function:worker:live", 1, 4, REGION);
+    }
+
+    @Test
+    void failedCapacityAdjustmentPreservesTheExistingTargetBounds() {
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        when(lambdaCapacity.supports(dimension)).thenReturn(true);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, 1, 3,
+                null, null, null, REGION);
+        doThrow(new AwsException("ServiceException", "capacity unavailable", 500))
+                .when(lambdaCapacity).reconcileRegistration("function:worker:live", 2, 4, REGION);
+        assertThrows(AwsException.class, () -> service.registerScalableTarget(
+                "lambda", "function:worker:live", dimension, 2, 4, null, null, null, REGION));
+        ScalableTarget stored = service.describeScalableTargets(
+                "lambda", List.of("function:worker:live"), dimension, REGION).getFirst();
+        assertEquals(1, stored.getMinCapacity());
+        assertEquals(3, stored.getMaxCapacity());
+    }
+
+    @Test
+    void lambdaRejectsUnsupportedStepScalingBeforeCreatingAPolicy() {
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        when(lambdaCapacity.supports(dimension)).thenReturn(true);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, 0, 3,
+                null, null, null, REGION);
+        AwsException error = assertThrows(AwsException.class, () -> service.putScalingPolicy(
+                "unsupported", "StepScaling", "lambda", "function:worker:live", dimension, null, null, REGION));
+        assertEquals("ValidationException", error.getErrorCode());
+        assertTrue(service.describeScalingPolicies("lambda", "function:worker:live", dimension,
+                null, REGION).isEmpty());
+    }
+
+    @Test
+    void putScalingPolicy_replacingATargetTrackingPolicyWithStepScaling_deletesItsAlarms() {
+        register();
+        service.putScalingPolicy("cpu", "TargetTrackingScaling", NAMESPACE, RESOURCE_ID, DIMENSION,
+                targetTracking(50.0, "ECSServiceAverageCPUUtilization", null), null, REGION);
+        assertEquals(2, alarmsInCloudWatch.size());
+
+        ScalingPolicy replaced = service.putScalingPolicy("cpu", "StepScaling", NAMESPACE, RESOURCE_ID,
+                DIMENSION, null, null, REGION);
+
+        assertEquals(List.of(), replaced.getAlarms());
+        assertEquals(Set.of(), alarmsInCloudWatch);
+    }
+
+    @Test
+    void savePolicy_afterThePolicyWasDeleted_doesNotBringItBack() {
+        register();
+        ScalingPolicy policy = service.putScalingPolicy("cpu", "TargetTrackingScaling", NAMESPACE, RESOURCE_ID,
+                DIMENSION, targetTracking(50.0, "ECSServiceAverageCPUUtilization", null), null, REGION);
+        // The control loop read the policy, and DeleteScalingPolicy lands while it is changing capacity.
+        service.deleteScalingPolicy("cpu", NAMESPACE, RESOURCE_ID, DIMENSION, REGION);
+
+        service.savePolicy(policy, REGION);
+
+        assertEquals(List.of(), service.describeScalingPolicies(NAMESPACE, RESOURCE_ID, DIMENSION, null, REGION));
     }
 
     private TargetTrackingConfiguration targetTracking(double value, String metricType, String resourceLabel) {
@@ -227,6 +310,28 @@ class ApplicationAutoScalingServiceTest {
         assertNull(second.nextToken());
         assertTrue(!first.items().getFirst().getResourceId()
                 .equals(second.items().getFirst().getResourceId()));
+    }
+
+    @Test
+    void policyPagesKeepTheDefaultAndAcceptLargeExplicitSizesAfterACursor() {
+        register();
+        for (int index = 0; index < 12; index++) {
+            service.putScalingPolicy("page-policy-" + index, "StepScaling", NAMESPACE, RESOURCE_ID, DIMENSION,
+                    null, null, REGION);
+        }
+        PaginatedResult<ScalingPolicy> first = service.describeScalingPolicies(
+                NAMESPACE, RESOURCE_ID, DIMENSION, null, null, null, REGION);
+        assertEquals(10, first.items().size());
+        assertNotNull(first.nextToken());
+        PaginatedResult<ScalingPolicy> all = service.describeScalingPolicies(
+                NAMESPACE, RESOURCE_ID, DIMENSION, null, 50, null, REGION);
+        assertEquals(12, all.items().size());
+        assertNull(all.nextToken());
+        PaginatedResult<ScalingPolicy> rest = service.describeScalingPolicies(
+                NAMESPACE, RESOURCE_ID, DIMENSION, null, Integer.MAX_VALUE, first.nextToken(), REGION);
+        assertEquals(all.items().subList(10, 12), rest.items());
+        assertNull(rest.nextToken());
+        assertEquals(all.items().subList(0, 10), first.items());
     }
 
     @Test
@@ -348,13 +453,12 @@ class ApplicationAutoScalingServiceTest {
     }
 
     @Test
-    void scalingPolicyPageSizeHasItsOwnMaximum() {
+    void scalingPolicyPagesAcceptPositiveLimits() {
         register();
         assertEquals(1, service.describeScalableTargets(NAMESPACE, null, null, 50, null, REGION).items().size());
         assertEquals(0, service.describeScalingPolicies(NAMESPACE, null, null, null, 10, null, REGION).items().size());
-        AwsException error = assertThrows(AwsException.class,
-                () -> service.describeScalingPolicies(NAMESPACE, null, null, null, 11, null, REGION));
-        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals(0, service.describeScalingPolicies(NAMESPACE, null, null, null, 11, null, REGION)
+                .items().size());
     }
 
     private static String editedToken(String token) {
@@ -497,6 +601,23 @@ class ApplicationAutoScalingServiceTest {
 
         assertEquals("Average", createdAlarms.get(0).getStatistic());
         assertNull(createdAlarms.get(0).getUnit());
+    }
+
+    @Test
+    void lambdaAlarmsWatchThePublishedProvisionedConcurrencyMetric() {
+        String resource = "function:worker:live";
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        service.registerScalableTarget("lambda", resource, dimension, 1, 3, null, null, Map.of(), REGION);
+        service.putScalingPolicy("utilization", "TargetTrackingScaling", "lambda", resource, dimension,
+                targetTracking(0.7, "LambdaProvisionedConcurrencyUtilization", null), null, REGION);
+
+        assertEquals(2, createdAlarms.size());
+        for (MetricAlarm alarm : createdAlarms) {
+            assertEquals("AWS/Lambda", alarm.getNamespace());
+            assertEquals("ProvisionedConcurrencyUtilization", alarm.getMetricName());
+            assertEquals(List.of(new Dimension("FunctionName", "worker"), new Dimension("Resource", "worker:live")),
+                    alarm.getDimensions());
+        }
     }
 
     @Test

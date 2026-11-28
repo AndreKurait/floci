@@ -76,6 +76,8 @@ class AthenaNamedQueryServiceTest {
         });
         RegionResolver resolver = mock(RegionResolver.class);
         when(resolver.getAccountId()).thenReturn("741680800000");
-        return new AthenaNamedQueryService(factory, mock(AthenaService.class), resolver);
+        AthenaService athena = mock(AthenaService.class);
+        when(athena.workGroupLock()).thenReturn(athena);
+        return new AthenaNamedQueryService(factory, athena, resolver);
     }
 }
