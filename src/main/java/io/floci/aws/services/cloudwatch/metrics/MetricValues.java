@@ -90,6 +90,10 @@ final class MetricValues {
         return new ArrayList<>(numbers.values());
     }
 
+    /**
+     * StatisticValues accompanying Values summarizes the same distribution. Keep the weighted samples
+     * without counting that summary again; scalar Value and Values remain alternative forms.
+     */
     private static List<MetricDatum> normalize(MetricDatum template, String memberPrefix, List<Double> values,
                                                List<Double> counts, boolean otherFormat) {
         if (values == null) {
