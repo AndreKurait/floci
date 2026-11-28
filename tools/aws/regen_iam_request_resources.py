@@ -5774,6 +5774,18 @@ def verify_statements(vendored: dict, documents: list[dict]) -> list[str]:
     return untrue
 
 
+def verify_id_examples() -> list[str]:
+    """Check that the copied EC2 identifier examples still match their API reference pages."""
+    try:
+        source = json.loads(fetch_ec2_id_examples.OUTPUT.read_text(encoding="utf-8"))
+        changed = fetch_ec2_id_examples.stale(source, {
+            url: fetch_ec2_id_examples.fetch_url(url) for url in fetch_ec2_id_examples.PAGES.values()})
+    except (OSError, ValueError) as error:
+        raise OSError(f"could not verify EC2 identifier examples ({error})") from error
+    return ["EC2 API identifier examples changed: run tools/aws/fetch_ec2_id_examples.py"] if changed else []
+
+
+
 def verify_path_sources() -> list[str]:
     """A vendored path source whose pages AWS has changed."""
     untrue: list[str] = []

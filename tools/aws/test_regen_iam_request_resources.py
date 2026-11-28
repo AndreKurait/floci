@@ -3816,6 +3816,46 @@ def test_reference_example_path_drift_and_conflicting_prefixes_fail_closed():
         r.reference_id_prefixes(models, ("vpc-endpoint",), source)
 
 
+def test_documented_prefix_refuses_to_override_conflicting_botocore_evidence(monkeypatch, tmp_path):
+    source = tmp_path / "examples.json"
+    source.write_text(json.dumps(reference_endpoint_source()))
+    monkeypatch.setattr(r, "ID_EXAMPLE_SOURCES", {"ec2": source})
+    models = reference_endpoint_model()
+    assert r.documented_id_prefixes("ec2", models).prefixes == {"vpc-endpoint": "vpce-"}
+    monkeypatch.setattr(r, "namespace_id_prefixes", lambda *args: {"vpc-endpoint": "other-"})
+    with pytest.raises(ValueError, match="disagree"):
+        r.documented_id_prefixes("ec2", models)
+
+
+def test_vendored_ec2_examples_resolve_through_the_actual_pinned_response_members():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"ec2"})
+    source = json.loads(r.fetch_ec2_id_examples.OUTPUT.read_text())
+    assert r.reference_id_prefixes(models, r.ID_TARGETS["ec2"], source)["vpc-endpoint"] == "vpce-"
+    assert r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"})).prefixes["vpc-endpoint"] == "vpce-"
+
+
+def test_identifier_reference_verification_reports_unavailable_pages(monkeypatch):
+    def unavailable(url):
+        raise OSError("offline")
+    monkeypatch.setattr(r.fetch_ec2_id_examples, "fetch_url", unavailable)
+    with pytest.raises(OSError, match="could not verify EC2 identifier examples"):
+        r.verify_id_examples()
+
+
+def test_reference_prefix_supplements_generic_lists_without_changing_typed_endpoint_deletion():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"ec2"})
+    known = r.namespace_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    generic = r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    formats = {"vpc-endpoint": "arn:${Partition}:ec2:${Region}:${Account}:vpc-endpoint/${VpcEndpointId}"}
+    for operation in ("ec2:CreateTags", "ec2:DeleteTags"):
+        assert r.id_targets(operation, ["vpc-endpoint"], formats, models, generic)["prefixes"] == {
+            "vpc-endpoint": "vpce-"}
+    assert r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, generic) == \
+        r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, known)
+
+
 def test_a_reference_prefix_joins_botocores_without_making_a_typed_list(monkeypatch, tmp_path):
     source = tmp_path / "examples.json"
     source.write_text(json.dumps(reference_endpoint_source()))

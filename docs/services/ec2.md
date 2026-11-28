@@ -12,10 +12,10 @@ every interface is checked against its own keys and tags before any tag changes;
 interface's VPC or tags cannot authorize it. Authorization reads do not create default resources.
 
 With IAM enforcement enabled, `CreateTags` and `DeleteTags` check every VPC endpoint ID
-against its endpoint ARN before changing any batch member. botocore gives no `vpce-` example,
-so the generated request resource table takes the prefix from the response examples of the
-EC2 API reference's `CreateVpcEndpoint` page, which `tools/aws/fetch_ec2_id_examples.py`
-copies, matched to botocore's output shapes.
+against its endpoint ARN before changing any batch member. The generated request resource
+table learns the `vpce-` prefix from the EC2 `CreateVpcEndpoint` API reference's response
+examples, copied by `tools/aws/fetch_ec2_id_examples.py` and matched to botocore's output
+shapes. This also covers endpoints retained under legacy unprefixed storage keys.
 
 ## Instance IAM authorization
 
