@@ -28,15 +28,16 @@ import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
 import software.amazon.awssdk.services.apigateway.model.ApiGatewayException;
 import software.amazon.awssdk.services.apigateway.model.PatchOperation;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.URI;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Base64;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
-import java.util.stream.Stream;
 
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -175,13 +176,7 @@ class ApiGatewayDocumentationVersionTagIamIntegrationTest {
             // Establish a durable boundary before each comparison, including hybrid's asynchronous writes.
             storage.flushAll();
             Path directory = Path.of(config.storage().persistentPath());
-            try (Stream<Path> paths = Files.walk(directory)) {
-                for (Path path : paths.filter(Files::isRegularFile)
-                        .filter(file -> file.getFileName().toString().startsWith("apigateway-")).toList()) {
-                    result.put("file:" + directory.relativize(path), JSON.valueToTree(
-                            Base64.getEncoder().encodeToString(Files.readAllBytes(path))));
-                }
-            }
+            result.putAll(persistedRecords(directory));
         }
         StorageBackend<String, RestApi> rawParents = raw(parents);
         for (String key : rawParents.keys()) {
@@ -194,6 +189,19 @@ class ApiGatewayDocumentationVersionTagIamIntegrationTest {
             JsonNode value = rawStages.get(key).orElseThrow();
             if (key.contains("::" + api + "::") || api.equals(value.path("apiId").asText())) {
                 result.put("stage-or-version:" + key, value.deepCopy());
+            }
+        }
+        return result;
+    }
+
+    static Map<String, JsonNode> persistedRecords(Path directory) throws IOException {
+        Map<String, JsonNode> result = new TreeMap<>();
+        try (DirectoryStream<Path> paths = Files.newDirectoryStream(directory, "apigateway-*")) {
+            for (Path path : paths) {
+                if (!path.getFileName().toString().endsWith(".tmp") && Files.isRegularFile(path)) {
+                    result.put("file:" + directory.relativize(path), JSON.valueToTree(
+                            Base64.getEncoder().encodeToString(Files.readAllBytes(path))));
+                }
             }
         }
         return result;
