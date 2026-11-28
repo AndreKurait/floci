@@ -32,14 +32,39 @@ class SsmSessionJsonHandler {
 
     private final SsmSessionService sessions;
     private final ObjectMapper mapper;
+    private final io.floci.aws.services.ssm.SsmSessionService agentSessions;
+
+    SsmSessionJsonHandler(SsmSessionService sessions, ObjectMapper mapper) {
+        this(sessions, mapper, null);
+    }
 
     @Inject
-    SsmSessionJsonHandler(SsmSessionService sessions, ObjectMapper mapper) {
+    SsmSessionJsonHandler(SsmSessionService sessions, ObjectMapper mapper,
+                          io.floci.aws.services.ssm.SsmSessionService agentSessions) {
         this.sessions = sessions;
         this.mapper = mapper;
+        this.agentSessions = agentSessions;
     }
 
     Response handle(String action, JsonNode request, String region, URI baseUri) {
+        if (agentSessions != null) {
+            if ("StartSession".equals(action) && (request.path("Target").asText().startsWith("mi-")
+                    || agentSessions.ownsConnectedTarget(region, request.path("Target").asText()))) {
+                return Response.ok(agentSessions.start(request, region)).build();
+            }
+            if ("GetConnectionStatus".equals(action) && (request.path("Target").asText().startsWith("mi-")
+                    || agentSessions.ownsConnectedTarget(region, request.path("Target").asText()))) {
+                return Response.ok(agentSessions.connectionStatus(request, region)).build();
+            }
+            if (agentSessions.ownsLiveSession(region, request.path("SessionId").asText())) {
+                if ("ResumeSession".equals(action)) {
+                    return Response.ok(agentSessions.resume(request, region)).build();
+                }
+                if ("TerminateSession".equals(action)) {
+                    return Response.ok(agentSessions.terminate(request, region)).build();
+                }
+            }
+        }
         return switch (action) {
             case "StartSession" -> start(request, region, baseUri);
             case "ResumeSession" -> connection(sessions.resume(region, sessionId(request), baseUri));
@@ -100,6 +125,9 @@ class SsmSessionJsonHandler {
             }
             if (session.reason() != null) {
                 entry.put("Reason", session.reason());
+            }
+            if (session.getMaxSessionDuration() != null) {
+                entry.put("MaxSessionDuration", session.getMaxSessionDuration());
             }
         }
         if (page.nextToken() != null) {

@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
@@ -48,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -56,6 +58,7 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -94,7 +97,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
 
         lifecycleManager = mock(ContainerLifecycleManager.class);
         // Its confirmed removal goes through the strict removal each test stubs.
-        when(lifecycleManager.stopAndConfirmRemoved(any(), any(), anyInt(), anyBoolean())).thenCallRealMethod();
+        when(lifecycleManager.stopAndConfirmRemoved(any(), any(), anyInt(), anyBoolean(), any())).thenCallRealMethod();
         when(lifecycleManager.resolveImageForLaunch(any(), any(), any()))
                 .thenAnswer(invocation -> new LaunchImage(invocation.getArgument(0), null));
         when(lifecycleManager.createAndStartEphemeral(any(), any())).thenReturn(new ContainerInfo("docker-id", Map.of()));
@@ -113,8 +116,8 @@ class EcsContainerManagerSharedTaskNetworkTest {
         ec2Service = mock(Ec2Service.class);
         firewallManager = mock(SecurityGroupFirewallManager.class);
         when(firewallManager.enabled()).thenReturn(false);
-        when(firewallManager.createSharedNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(),
-                any(), any())).thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "172.18.0.9"));
+        when(firewallManager.createSharedNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any())).thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "172.18.0.9"));
         taskRoleCredentials = mock(EcsTaskRoleCredentials.class);
         when(taskRoleCredentials.issue(any(), any(), any(), any())).thenReturn(Optional.of(RELATIVE_URI));
         linkLocalAddresses = new EcsTaskLinkLocalAddresses();
@@ -126,6 +129,42 @@ class EcsContainerManagerSharedTaskNetworkTest {
                 ecrRegistryManager, mock(HostVolumePolicy.class),
                 ec2Service, firewallManager, taskRoleCredentials, mock(EcsCredentialsProxy.class),
                 linkLocalAddresses);
+    }
+
+    @Test
+    void sharedNamespacePublishesDnsBeforeWorkloadStartsAndRevokesOnCleanup() {
+        Subnet subnet = new Subnet();
+        subnet.setVpcId("vpc-dns");
+        when(ec2Service.describeSubnets(eq("us-east-1"), eq(List.of("subnet-1")), any()))
+                .thenReturn(List.of(subnet));
+        ClientVpc expected = new ClientVpc("000000000000", "us-east-1", "vpc-dns");
+        when(lifecycleManager.createAndStartEphemeral(any(), any())).thenAnswer(invocation -> {
+            assertEquals(Optional.of(expected), manager.vpcForClient("172.18.0.9"));
+            return new ContainerInfo("docker-id", Map.of());
+        });
+        EcsTaskHandle handle = manager.startTask(awsvpcTask(), taskDef(null, container("web", 80)),
+                List.of(), "us-east-1");
+        assertEquals(Optional.of(expected), manager.vpcForClient("172.18.0.9"));
+        manager.cleanupStoppedTask(handle);
+        assertTrue(manager.vpcForClient("172.18.0.9").isEmpty());
+    }
+
+    @Test
+    void sharedDnsOwnershipSurvivesWorkloadStopsAndFailedHelperRemoval() {
+        Subnet subnet = new Subnet();
+        subnet.setVpcId("vpc-dns");
+        when(ec2Service.describeSubnets(eq("us-east-1"), eq(List.of("subnet-1")), any()))
+                .thenReturn(List.of(subnet));
+        EcsTaskHandle handle = manager.startTask(awsvpcTask(), taskDef(null, container("web", 80)),
+                List.of(), "us-east-1");
+        ClientVpc expected = new ClientVpc("000000000000", "us-east-1", "vpc-dns");
+        doThrow(new IllegalStateException("helper still running"))
+                .when(firewallManager).removeSharedNamespaceStrict("abc123");
+        assertThrows(IllegalStateException.class, () -> manager.stopTaskAndCollectExitCodes(handle));
+        assertEquals(Optional.of(expected), manager.vpcForClient("172.18.0.9"));
+        doNothing().when(firewallManager).removeSharedNamespaceStrict("abc123");
+        manager.cleanupStoppedTask(handle);
+        assertTrue(manager.vpcForClient("172.18.0.9").isEmpty());
     }
 
     @Test
@@ -141,15 +180,16 @@ class EcsContainerManagerSharedTaskNetworkTest {
         verify(builder, never()).withExposedPort(anyInt());
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Map<Integer, Integer>> ports = ArgumentCaptor.forClass(Map.class);
-        verify(firewallManager).createSharedNamespace(eq("ecs"), eq("abc123"), eq("000000000000"),
-                eq("us-east-1"), any(), ports.capture(), any(), eq("127.0.0.1"), eq(List.of()));
+        verify(firewallManager).createSharedNamespace(eq("ecs"), eq("abc123"), eq("000000000000"), eq("us-east-1"), any(), ports.capture(), any(), eq("127.0.0.1"),
+                any(), anyBoolean(), eq(List.of()));
         Map<Integer, Integer> expected = new LinkedHashMap<>();
         expected.put(8081, 0);
         expected.put(80, 0);
         assertEquals(expected, ports.getValue());
         // Each container's network bindings are read off the helper, which publishes them.
         verify(dockerClient, atLeastOnce()).inspectContainerCmd("helper-id");
-        verify(firewallManager, never()).createNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any());
+        verify(firewallManager, never()).createNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any());
         verify(firewallManager, never()).register(any(), any(), any());
         verify(ec2Service, never()).createNetworkInterface(any(), any(), any(), any(), any(), any(), any());
         assertEquals("eni-1", handle.getNetworkInterfaceId());
@@ -162,8 +202,8 @@ class EcsContainerManagerSharedTaskNetworkTest {
         manager.startTask(awsvpcTask(), taskDef(ROLE_ARN, container("app", 80), container("sidecar", 9000)),
                 List.of(), "us-east-1");
 
-        verify(firewallManager).createSharedNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(),
-                any(), eq(List.of("169.254.170.1")));
+        verify(firewallManager).createSharedNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), eq(List.of("169.254.170.1")));
         // A container joined to the helper has no network endpoint of its own to give an address to.
         verify(builder, never()).withLinkLocalIp(anyString());
         @SuppressWarnings("unchecked")
@@ -274,7 +314,8 @@ class EcsContainerManagerSharedTaskNetworkTest {
     @Test
     void aHelperThatCannotStartFailsTheLaunchAndFreesItsAddressOnceItIsGone() {
         when(config.services().ecs().taskRoleCredentials().enabled()).thenReturn(true);
-        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenThrow(new IllegalStateException("cannot start the helper"));
 
         assertThrows(IllegalStateException.class, () -> manager.startTask(awsvpcTask(),
@@ -290,7 +331,8 @@ class EcsContainerManagerSharedTaskNetworkTest {
     @Test
     void aHelperAFailedStartLeftBehindKeepsItsAddressAndItsCleanup() {
         when(config.services().ecs().taskRoleCredentials().enabled()).thenReturn(true);
-        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenThrow(new IllegalStateException("inspect failed after the helper started"));
         doThrow(new IllegalStateException("helper busy")).when(firewallManager).removeSharedNamespaceStrict("abc123");
 
@@ -313,7 +355,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
         assertThrows(IllegalStateException.class, () -> manager.startTask(awsvpcTask(),
                 taskDef(null, container("web", 8081)), List.of(), "us-east-1"));
 
-        verify(lifecycleManager).stopAndRemoveStrict(eq("docker-id"), any(), anyInt(), anyBoolean());
+        verify(lifecycleManager).stopAndRemoveStrict(eq("docker-id"), any(), anyInt(), anyBoolean(), any());
         verify(firewallManager).removeSharedNamespaceStrict("abc123");
     }
 
@@ -324,7 +366,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
         manager.startTask(awsvpcTask(), taskDef(null, container("app", 80)), List.of(), "us-east-1");
 
         verify(firewallManager, never()).createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
-                any());
+                any(), anyBoolean(), any());
         verify(builder, never()).withNetworkMode(anyString());
         verify(builder).withPortBinding(80, 0, "127.0.0.1");
     }
@@ -332,7 +374,8 @@ class EcsContainerManagerSharedTaskNetworkTest {
     @Test
     void enforcementGivesTheTaskItsProtectedNamespaceInstead() {
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenThrow(new IllegalStateException("stop once the protected path is taken"));
         NetworkInterface eni = new NetworkInterface();
         eni.setNetworkInterfaceId("eni-1");
@@ -343,9 +386,10 @@ class EcsContainerManagerSharedTaskNetworkTest {
         assertThrows(IllegalStateException.class, () -> manager.startTask(awsvpcTask(),
                 taskDef(null, container("app", 80)), List.of(), "us-east-1"));
 
-        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any());
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any());
         verify(firewallManager, never()).createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
-                any());
+                any(), anyBoolean(), any());
     }
 
     @Test
@@ -356,7 +400,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
         manager.startTask(awsvpcTask(), bridge, List.of(), "us-east-1");
 
         verify(firewallManager, never()).createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
-                any());
+                any(), anyBoolean(), any());
         verify(builder, never()).withNetworkMode(anyString());
     }
 }

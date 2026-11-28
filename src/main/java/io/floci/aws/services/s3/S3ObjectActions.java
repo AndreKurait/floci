@@ -75,8 +75,9 @@ public final class S3ObjectActions {
 
     /**
      * The actions a PutObject, CopyObject or CreateMultipartUpload needs besides {@code s3:PutObject},
-     * one for each thing its headers set on the new object: an ACL, tags, a retention period, a legal
-     * hold. The permissions table marks each one conditionally required for all three operations. A
+     * one for each thing its headers set on the new object: an ACL other than the default private
+     * ACL, tags, a retention period, a legal hold. The permissions table marks each one conditionally
+     * required for all three operations. A
      * CopyObject applies the request's tags only under {@code x-amz-tagging-directive: REPLACE}; under
      * the default {@code COPY} it gives the new object the source's tags, which S3Controller checks,
      * since only it reads the source.
@@ -89,7 +90,9 @@ public final class S3ObjectActions {
     public static List<String> objectCreationActions(Function<String, String> header, String tagging,
                                                      boolean copy) {
         List<String> actions = new ArrayList<>();
-        if (header.apply("x-amz-acl") != null || GRANT_HEADERS.stream().anyMatch(name -> header.apply(name) != null)) {
+        String cannedAcl = header.apply("x-amz-acl");
+        if ((cannedAcl != null && !"private".equals(cannedAcl))
+                || GRANT_HEADERS.stream().anyMatch(name -> header.apply(name) != null)) {
             actions.add("s3:PutObjectAcl");
         }
         if (tagging != null && !tagging.isBlank() && appliesRequestTags(header, copy)) {
@@ -145,7 +148,7 @@ public final class S3ObjectActions {
      */
     public static Map<String, List<String>> objectCreationConditions(Function<String, String> header, String tagging,
                                                                      boolean copy, Instant now) {
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        Map<String, List<String>> conditions = new LinkedHashMap<>(cannedAclConditions(header));
         Map<String, List<String>> tags = appliesRequestTags(header, copy) ? requestObjectTagConditions(tagging) : null;
         if (tags != null) {
             conditions.putAll(tags);
@@ -159,6 +162,12 @@ public final class S3ObjectActions {
         conditions.putAll(encryptionConditions(header.apply("x-amz-server-side-encryption"),
                 header.apply("x-amz-server-side-encryption-aws-kms-key-id")));
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** The requested canned ACL, without inventing a private ACL when the header is absent. */
+    public static Map<String, List<String>> cannedAclConditions(Function<String, String> header) {
+        String acl = header.apply("x-amz-acl");
+        return acl == null ? Map.of() : Map.of("s3:x-amz-acl", List.of(acl));
     }
 
     /**

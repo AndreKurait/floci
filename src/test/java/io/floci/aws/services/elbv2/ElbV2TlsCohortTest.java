@@ -20,6 +20,7 @@ import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.net.SocketAddress;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -100,7 +101,8 @@ class ElbV2TlsCohortTest {
         for (Listener listener : List.of(left, right, unrelated)) {
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(listener == left ? "left.example.test" : "right.example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn())).thenReturn(loadBalancer);
+            when(dataPlane.elbV2Service.getLoadBalancerForListener(
+                        region, listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
         }
         CountDownLatch insideSecondPeer = new CountDownLatch(1);
         CountDownLatch releaseFirst = new CountDownLatch(1);
@@ -168,6 +170,7 @@ class ElbV2TlsCohortTest {
             HttpServerRequest request = mock(HttpServerRequest.class);
             HttpServerResponse response = mock(HttpServerResponse.class);
             when(request.host()).thenReturn(alias);
+            when(request.localAddress()).thenReturn(SocketAddress.inetSocketAddress(left.getPort(), "127.0.0.1"));
             when(request.response()).thenReturn(response);
             when(response.setStatusCode(anyInt())).thenReturn(response);
             handler.getValue().handle(request);
@@ -179,6 +182,7 @@ class ElbV2TlsCohortTest {
             HttpServerRequest survivingRequest = mock(HttpServerRequest.class);
             HttpServerResponse survivingResponse = mock(HttpServerResponse.class);
             when(survivingRequest.host()).thenReturn(alias);
+            when(survivingRequest.localAddress()).thenReturn(SocketAddress.inetSocketAddress(left.getPort(), "127.0.0.1"));
             when(survivingRequest.response()).thenReturn(survivingResponse);
             when(survivingResponse.setStatusCode(anyInt())).thenReturn(survivingResponse);
             handler.getValue().handle(survivingRequest);

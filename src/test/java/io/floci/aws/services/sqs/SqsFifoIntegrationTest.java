@@ -6,7 +6,10 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -154,7 +157,7 @@ class SqsFifoIntegrationTest {
 
     @Test
     @Order(8)
-    void delayedMessageDoesNotBlockVisibleMessageInSameGroup() throws InterruptedException {
+    void delayedMessageDoesNotBlockVisibleMessageInSameGroup() {
         // Issue #2104: a message still waiting out DelaySeconds must not lock
         // its message group — only in-flight messages do.
         String delayQueueUrl = given()
@@ -183,7 +186,18 @@ class SqsFifoIntegrationTest {
         .then()
             .statusCode(200);
 
-        Thread.sleep(1100);
+        // A leaves its one-second delay on the service's own clock; wait for the queue to say so.
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(20)).untilAsserted(() ->
+                given()
+                    .contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", "GetQueueAttributes")
+                    .formParam("QueueUrl", delayQueueUrl)
+                    .formParam("AttributeName.1", "ApproximateNumberOfMessagesDelayed")
+                .when()
+                    .post("/")
+                .then()
+                    .statusCode(200)
+                    .body("GetQueueAttributesResponse.GetQueueAttributesResult.Attribute.Value", equalTo("0")));
 
         given()
             .contentType("application/x-www-form-urlencoded")

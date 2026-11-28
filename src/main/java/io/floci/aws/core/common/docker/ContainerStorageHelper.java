@@ -340,6 +340,19 @@ public final class ContainerStorageHelper {
         }
     }
 
+    /** Confirms both stale container names are removed before their owner starts a replacement. */
+    public static void removeStaleContainerStrict(
+            EmulatorConfig config,
+            ContainerLifecycleManager lifecycleManager,
+            String containerName,
+            boolean removeAnonymousVolumes) {
+        lifecycleManager.removeIfExistsStrict(containerName, removeAnonymousVolumes);
+        String legacyName = legacyDockerName(config, containerName);
+        if (!legacyName.equals(containerName)) {
+            lifecycleManager.removeIfExistsStrict(legacyName, removeAnonymousVolumes);
+        }
+    }
+
     /** Mounts a persisted, exact Docker volume name without applying namespace rules again. */
     public static void applyNamedVolume(
             ContainerBuilder.Builder builder,
@@ -389,7 +402,19 @@ public final class ContainerStorageHelper {
             EmulatorConfig config,
             ContainerLifecycleManager lifecycleManager,
             String volumeName) {
-        boolean isMemory = "memory".equals(config.storage().mode());
+        removeNamedVolume(config, lifecycleManager, volumeName, config.storage().mode());
+    }
+
+    /**
+     * {@link #removeNamedVolume(EmulatorConfig, ContainerLifecycleManager, String)} for a service whose own storage
+     * mode, {@code storageMode}, is the one its records are kept under, rather than the global mode.
+     */
+    public static void removeNamedVolume(
+            EmulatorConfig config,
+            ContainerLifecycleManager lifecycleManager,
+            String volumeName,
+            String storageMode) {
+        boolean isMemory = "memory".equals(storageMode);
         if (isMemory || config.storage().pruneVolumesOnDelete()) {
             lifecycleManager.removeVolume(volumeName);
         } else {

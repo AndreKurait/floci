@@ -218,6 +218,13 @@ public final class ReplacementCleanup {
         }
     }
 
+    /** Current rollback work, distinct from deletes a skipped earlier attempt still owes. */
+    static boolean hasRollbackState(StackResource r) {
+        ObjectNode cleanup = read(r);
+        return cleanup != null && (cleanup.path("priorPhysicalId").asText(null) != null
+                || cleanup.path("undeletedReplacement").asText(null) != null);
+    }
+
     static boolean hasReplacement(StackResource r) {
         ObjectNode cleanup = read(r);
         return cleanup != null && cleanup.path("displaced").size() > 0;
@@ -296,6 +303,22 @@ public final class ReplacementCleanup {
         cleanup.set("displaced", kept);
         cleanup.remove("priorPhysicalId");
         cleanup.remove("priorAttributes");
+        write(r, cleanup);
+    }
+
+    /** Keeps failed-create orphans eligible for a later operation after this cleanup's bounded retries. */
+    static void retainExhaustedOrphansForRetry(StackResource r, String ownedResourceType) {
+        ObjectNode cleanup = read(r);
+        if (cleanup == null) {
+            return;
+        }
+        for (JsonNode node : cleanup.path("displaced")) {
+            if (ownedResourceType.equals(node.path("resourceType").asText(null))
+                    && !node.path("retainable").asBoolean(false)
+                    && node.path("cleanupAttempts").asInt(0) >= MAX_ATTEMPTS) {
+                ((ObjectNode) node).put("cleanupAttempts", 0);
+            }
+        }
         write(r, cleanup);
     }
 

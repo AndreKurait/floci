@@ -190,7 +190,7 @@ class ElbV2IntegrationTest {
 
     @Test
     @Order(4)
-    void duplicateLoadBalancerNameThrows() {
+    void repeatedLoadBalancerCreateReturnsTheExistingResource() {
         given()
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "my-test-lb")
@@ -200,8 +200,9 @@ class ElbV2IntegrationTest {
             .when()
                 .post("/")
             .then()
-                .statusCode(400)
-                .body("ErrorResponse.Error.Code", equalTo("DuplicateLoadBalancerName"));
+                .statusCode(200)
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn",
+                        equalTo(lbArn));
     }
 
     @Test
@@ -796,6 +797,100 @@ class ElbV2IntegrationTest {
                         equalTo(Ec2Service.defaultVpcId("us-east-1", "000000000000")))
                 .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult.LoadBalancers.member.AvailabilityZones.member.SubnetId",
                         contains(Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"), Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000")));
+    }
+
+    @Test
+    @Order(15)
+    void setSubnetsPreservesCustomVpc() {
+        String customVpcId = given()
+                .formParam("Action", "CreateVpc")
+                .formParam("CidrBlock", "10.2.0.0/16")
+                .header("Authorization", EC2_AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract()
+                .path("CreateVpcResponse.vpc.vpcId");
+
+        String customSubnetAId = given()
+                .formParam("Action", "CreateSubnet")
+                .formParam("VpcId", customVpcId)
+                .formParam("CidrBlock", "10.2.1.0/24")
+                .formParam("AvailabilityZone", "us-east-1b")
+                .header("Authorization", EC2_AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract()
+                .path("CreateSubnetResponse.subnet.subnetId");
+
+        String customSubnetBId = given()
+                .formParam("Action", "CreateSubnet")
+                .formParam("VpcId", customVpcId)
+                .formParam("CidrBlock", "10.2.2.0/24")
+                .formParam("AvailabilityZone", "us-east-1c")
+                .header("Authorization", EC2_AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract()
+                .path("CreateSubnetResponse.subnet.subnetId");
+
+        String customSubnetCId = given()
+                .formParam("Action", "CreateSubnet")
+                .formParam("VpcId", customVpcId)
+                .formParam("CidrBlock", "10.2.3.0/24")
+                .formParam("AvailabilityZone", "us-east-1a")
+                .header("Authorization", EC2_AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract()
+                .path("CreateSubnetResponse.subnet.subnetId");
+
+        String subnetLbArn = given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "custom-vpc-subnets-lb")
+                .formParam("Type", "application")
+                .formParam("Subnets.member.1", customSubnetAId)
+                .formParam("Subnets.member.2", customSubnetBId)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract()
+                .path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
+
+        given()
+                .formParam("Action", "SetSubnets")
+                .formParam("LoadBalancerArn", subnetLbArn)
+                .formParam("Subnets.member.1", customSubnetAId)
+                .formParam("Subnets.member.2", customSubnetCId)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+
+        given()
+                .formParam("Action", "DescribeLoadBalancers")
+                .formParam("LoadBalancerArns.member.1", subnetLbArn)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult.LoadBalancers.member.VpcId",
+                        equalTo(customVpcId))
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult.LoadBalancers.member.AvailabilityZones.member.size()",
+                        equalTo(2))
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult.LoadBalancers.member.AvailabilityZones.member.SubnetId",
+                        hasItems(customSubnetAId, customSubnetCId));
     }
 
     @Test

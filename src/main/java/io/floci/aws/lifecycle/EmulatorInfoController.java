@@ -11,6 +11,7 @@ import io.floci.aws.core.common.ServiceRegistry;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.lifecycle.inithook.InitializationHook;
 import io.floci.aws.services.dynamodb.backend.DynamoDbBackendSelector;
+import io.floci.aws.services.ec2.Ec2NativePeerDependencies;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
@@ -48,6 +49,19 @@ public class EmulatorInfoController {
     private final FlociCertificateAuthority certificateAuthority;
     private final EmulatorConfig config;
     private final DynamoDbBackendSelector dynamoDbBackendSelector;
+    private final Ec2NativePeerDependencies nativePeerDependencies;
+
+    public EmulatorInfoController(ServiceRegistry serviceRegistry,
+                                  InitLifecycleState initLifecycleState,
+                                  StorageFactory storageFactory,
+                                  Instance<Resettable> resettables,
+                                  Instance<ContainerTeardown> containerTeardowns,
+                                  FlociCertificateAuthority certificateAuthority,
+                                  EmulatorConfig config,
+                                  DynamoDbBackendSelector dynamoDbBackendSelector) {
+        this(serviceRegistry, initLifecycleState, storageFactory, resettables, containerTeardowns,
+                certificateAuthority, config, dynamoDbBackendSelector, new Ec2NativePeerDependencies("[]"));
+    }
 
     @Inject
     public EmulatorInfoController(ServiceRegistry serviceRegistry,
@@ -57,7 +71,8 @@ public class EmulatorInfoController {
                                   Instance<ContainerTeardown> containerTeardowns,
                                   FlociCertificateAuthority certificateAuthority,
                                   EmulatorConfig config,
-                                  DynamoDbBackendSelector dynamoDbBackendSelector) {
+                                  DynamoDbBackendSelector dynamoDbBackendSelector,
+                                  Ec2NativePeerDependencies nativePeerDependencies) {
         this.serviceRegistry = serviceRegistry;
         this.initLifecycleState = initLifecycleState;
         this.storageFactory = storageFactory;
@@ -66,6 +81,7 @@ public class EmulatorInfoController {
         this.certificateAuthority = certificateAuthority;
         this.config = config;
         this.dynamoDbBackendSelector = dynamoDbBackendSelector;
+        this.nativePeerDependencies = nativePeerDependencies;
         this.version = FlociVersion.current();
     }
 
@@ -114,6 +130,7 @@ public class EmulatorInfoController {
         body.put("edition", "community");
         body.put("original_edition", "floci-always-free");
         body.put("dynamodb_backend", dynamoDbBackendSelector.selected());
+        body.put("ec2_native_peer_dependencies", nativePeerDependencies.attestation());
         body.put("endpoint", config.effectiveBaseUrl());
         body.put("health_url", "/_floci/health");
         body.put("tls", Map.of("enabled", config.tls().enabled()));
@@ -219,6 +236,25 @@ public class EmulatorInfoController {
         return reset();
     }
 
+    private static void checkReset(List<Resettable> services) {
+        List<Resettable> checked = new ArrayList<>();
+        try {
+            for (Resettable service : services) {
+                checked.add(service);
+                service.checkReset();
+            }
+        } catch (RuntimeException refusal) {
+            for (Resettable service : checked.reversed()) {
+                try {
+                    service.cancelResetCheck();
+                } catch (RuntimeException cleanupFailure) {
+                    refusal.addSuppressed(cleanupFailure);
+                }
+            }
+            throw refusal;
+        }
+    }
+
     private synchronized void performReset() {
         // Resolve live instances before taking any storage locks. Serialize resets so one reset
         // cannot resume a publisher while another is still wiping its storage.
@@ -226,10 +262,7 @@ public class EmulatorInfoController {
         for (Resettable service : resettables) {
             services.add(service);
         }
-        // Every service may refuse before the first destructive step, so a refusal changes nothing.
-        for (Resettable service : services) {
-            service.checkReset();
-        }
+        checkReset(services);
         // Containers next: they are tracked independently of StorageBackend, so this can run
         // in any order relative to the storage wipe below, but stopping them here means a
         // client's reset actually reflects a clean slate instead of leaving Batch, CodeBuild,

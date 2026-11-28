@@ -1,19 +1,26 @@
 package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.services.cloudformation.model.StackEvent;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.LambdaService;
+import io.floci.aws.services.lambda.ProvisionedConcurrencyPool;
 import io.floci.aws.services.lambda.model.LambdaAlias;
 import io.floci.aws.services.lambda.model.LambdaFunction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /**
  * CloudFormation provisioning for {@code AWS::Lambda::Version} and {@code AWS::Lambda::Alias}.
@@ -31,17 +38,62 @@ import java.util.Set;
 public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner {
 
     private static final Logger LOG = Logger.getLogger(LambdaVersionAliasCfnProvisioner.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String SNAPSHOT_ATTR = "__FlociLambdaAliasUpdateSnapshot";
+    /** How long an alias waits for its provisioned concurrency to initialize, and how often it looks. */
+    private static final Duration READINESS_TIMEOUT = Duration.ofMinutes(5);
+    private static final Duration READINESS_POLL = Duration.ofMillis(200);
 
     private final LambdaService lambdaService;
+    private final ProvisionedConcurrencyPool provisionedConcurrency;
+    private final LambdaAliasDeployment deployments;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
 
     @Inject
-    public LambdaVersionAliasCfnProvisioner(LambdaService lambdaService) {
+    public LambdaVersionAliasCfnProvisioner(LambdaService lambdaService,
+                                           ProvisionedConcurrencyPool provisionedConcurrency,
+                                           LambdaAliasDeployment deployments) {
+        this(lambdaService, provisionedConcurrency, deployments, System::nanoTime, Thread::sleep);
+    }
+
+    /** For tests that put the wait for provisioned concurrency on a timeline they control. */
+    LambdaVersionAliasCfnProvisioner(LambdaService lambdaService,
+                                     ProvisionedConcurrencyPool provisionedConcurrency,
+                                     LambdaAliasDeployment deployments,
+                                     LongSupplier nanoTime, Sleeper sleeper) {
         this.lambdaService = lambdaService;
+        this.provisionedConcurrency = provisionedConcurrency;
+        this.deployments = deployments;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(Duration delay) throws InterruptedException;
     }
 
     @Override
     public Set<String> resourceTypes() {
         return Set.of("AWS::Lambda::Version", "AWS::Lambda::Alias");
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return "AWS::Lambda::Alias".equals(resource.getResourceType())
+                ? ReplacementCleanup.cleanupPhysicalId(resource) : null;
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return "AWS::Lambda::Alias".equals(resource.getResourceType()) && ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        return "AWS::Lambda::Alias".equals(resource.getResourceType())
+                ? ReplacementCleanup.complete(resource, this::delete) : UpdateCleanupResult.notApplicable();
     }
 
     @Override
@@ -73,6 +125,9 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
         try {
             lambdaService.deleteAlias(region, ref.name(), ref.qualifier());
         } catch (AwsException e) {
+            if (e.getHttpStatus() != 404 || !"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
             // Already gone (function deleted first, or a partial rollback) — deleting a stack
             // must stay idempotent.
             LOG.debugv("Alias {0} already absent: {1}", physicalId, e.getMessage());
@@ -149,11 +204,33 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
         String description = ctx.resolveOptional(props, "Description");
 
         Map<String, Double> routingConfig = parseRoutingConfig(props, ctx);
+        Integer provisionedCount = provisionedCount(props, ctx);
+        JsonNode policy = LambdaAliasDeployment.policy(ctx);
+        LambdaAlias current = currentAlias(ctx, functionName, aliasName);
+        if (current != null) {
+            snapshotAlias(r, current, ctx);
+            CfnRollback.guarded(r, ctx, false, () -> {}, () -> restoreAlias(r, ctx.progress()), () -> {
+                deployments.shift(r, ctx.region(), current, functionVersion, policy, ctx.progress());
+                LambdaAlias updated = lambdaService.updateAlias(ctx.region(), functionName, aliasName,
+                        functionVersion, description,
+                        routingConfig != null ? routingConfig : Map.of());
+                if (description == null && ctx.droppedProperties(props).contains("Description")) {
+                    updated = lambdaService.replaceAliasDescription(ctx.region(), functionName, aliasName, null);
+                }
+                r.setPhysicalId(updated.getAliasArn());
+                r.getAttributes().put("AliasArn", updated.getAliasArn());
+                reconcileProvisionedConcurrency(functionName, aliasName, provisionedCount, ctx);
+            });
+            return;
+        }
 
         LambdaAlias alias;
+        boolean created = false;
         try {
             alias = lambdaService.createAlias(ctx.region(), functionName, aliasName,
                     functionVersion, description, routingConfig);
+            created = true;
+            r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
         } catch (AwsException e) {
             // An alias surviving from a prior deploy makes create conflict; converge on it rather
             // than failing the stack, so a redeploy is idempotent.
@@ -172,6 +249,172 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
 
         r.setPhysicalId(alias.getAliasArn());
         r.getAttributes().put("AliasArn", alias.getAliasArn());
+        Runnable reconcileCapacity = () ->
+                reconcileProvisionedConcurrency(functionName, aliasName, provisionedCount, ctx);
+        if (created && ctx.isUpdate()) {
+            CfnRollback.guarded(r, ctx, true,
+                    () -> delete("AWS::Lambda::Alias", r.getPhysicalId(), ctx.region()),
+                    () -> { }, reconcileCapacity);
+        } else {
+            reconcileCapacity.run();
+        }
+        r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
+    }
+
+    private LambdaAlias currentAlias(ProvisionContext ctx, String functionName, String aliasName) {
+        if (!ctx.isUpdate()) {
+            return null;
+        }
+        try {
+            LambdaAlias alias = lambdaService.getAlias(ctx.region(), functionName, aliasName);
+            return ctx.priorPhysicalId().equals(alias.getAliasArn()) ? alias : null;
+        } catch (AwsException failure) {
+            if (!"ResourceNotFoundException".equals(failure.getErrorCode())) {
+                throw failure;
+            }
+            LOG.debugv("Alias {0} is absent on {1}; creating it", aliasName, functionName);
+            return null;
+        }
+    }
+
+    private void reconcileProvisionedConcurrency(String functionName, String aliasName, Integer provisionedCount,
+                                                  ProvisionContext ctx) {
+        if (provisionedCount != null) {
+            ProvisionedConcurrencyPool.Status requested = provisionedConcurrency.put(
+                    ctx.region(), functionName, aliasName, provisionedCount, ctx.accountId());
+            awaitProvisionedConcurrency(functionName, aliasName, provisionedCount, requested,
+                    ctx.region(), ctx.accountId());
+        } else if (ctx.previouslyDeclared("ProvisionedConcurrencyConfig")) {
+            provisionedConcurrency.delete(ctx.region(), functionName, aliasName, ctx.accountId());
+        }
+    }
+
+    private void snapshotAlias(StackResource resource, LambdaAlias alias, ProvisionContext ctx) {
+        ObjectNode snapshot = MAPPER.createObjectNode();
+        snapshot.put("region", ctx.region()).put("account", ctx.accountId());
+        snapshot.set("alias", MAPPER.valueToTree(alias));
+        snapshot.set("policy", LambdaAliasDeployment.resolvedPolicy(ctx.priorUpdatePolicy()));
+        try {
+            ProvisionedConcurrencyPool.Status prior = provisionedConcurrency.get(
+                    ctx.region(), alias.getFunctionName(), alias.getName(), ctx.accountId());
+            snapshot.put("provisionedCount", prior.requested());
+        } catch (AwsException failure) {
+            if (!"ProvisionedConcurrencyConfigNotFoundException".equals(failure.getErrorCode())) {
+                throw failure;
+            }
+            LOG.debugv("Alias {0} has no prior provisioned concurrency", alias.getAliasArn());
+        }
+        resource.getAttributes().put(SNAPSHOT_ATTR, snapshot.toString());
+        resource.getAttributes().remove(LambdaAliasDeployment.DEPLOYMENT_ATTR);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource, Consumer<StackEvent> progress) {
+        if (!"AWS::Lambda::Alias".equals(resource.getResourceType())) {
+            return false;
+        }
+        restoreAlias(resource, progress);
+        return true;
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(SNAPSHOT_ATTR);
+        resource.getAttributes().remove(LambdaAliasDeployment.DEPLOYMENT_ATTR);
+        if ("AWS::Lambda::Alias".equals(resource.getResourceType())) {
+            ReplacementCleanup.retainExhaustedOrphansForRetry(resource, "AWS::Lambda::Alias");
+            ReplacementCleanup.clear(resource);
+        }
+    }
+
+    @Override
+    public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        if (attempted.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR)) {
+            for (String key : Set.of(SNAPSHOT_ATTR, LambdaAliasDeployment.DEPLOYMENT_ATTR)) {
+                if (attempted.getAttributes().containsKey(key)) {
+                    previous.getAttributes().put(key, attempted.getAttributes().get(key));
+                }
+            }
+        }
+    }
+
+    private void restoreAlias(StackResource resource, Consumer<StackEvent> progress) {
+        JsonNode snapshot = CfnRollback.updateSnapshot(resource, SNAPSHOT_ATTR);
+        if (snapshot == null) {
+            return;
+        }
+        String region = snapshot.path("region").asText();
+        String account = snapshot.path("account").asText();
+        LambdaAlias prior = MAPPER.convertValue(snapshot.get("alias"), LambdaAlias.class);
+        Consumer<StackEvent> rollbackProgress = event -> {
+            event.setResourceStatus("UPDATE_ROLLBACK_IN_PROGRESS");
+            progress.accept(event);
+        };
+        deployments.stopBeforeRestore(resource, region, rollbackProgress);
+        LambdaAlias current = lambdaService.getAlias(region, prior.getFunctionName(), prior.getName());
+        JsonNode policy = snapshot.get("policy");
+        if (policy != null && policy.isNull()) {
+            policy = null;
+        }
+        deployments.shift(resource, region, current, prior.getFunctionVersion(), policy, rollbackProgress);
+        lambdaService.updateAlias(region, prior.getFunctionName(), prior.getName(), prior.getFunctionVersion(),
+                prior.getDescription() != null ? prior.getDescription() : "",
+                prior.getRoutingConfig() != null ? prior.getRoutingConfig() : Map.of());
+        if (snapshot.has("provisionedCount")) {
+            int count = snapshot.path("provisionedCount").asInt();
+            ProvisionedConcurrencyPool.Status status = provisionedConcurrency.put(
+                    region, prior.getFunctionName(), prior.getName(), count, account);
+            awaitProvisionedConcurrency(prior.getFunctionName(), prior.getName(), count, status,
+                    region, account);
+        } else {
+            provisionedConcurrency.delete(region, prior.getFunctionName(), prior.getName(), account);
+        }
+        resource.getAttributes().remove(SNAPSHOT_ATTR);
+        resource.getAttributes().remove(LambdaAliasDeployment.DEPLOYMENT_ATTR);
+    }
+
+    private Integer provisionedCount(JsonNode props, ProvisionContext ctx) {
+        JsonNode raw = props.get("ProvisionedConcurrencyConfig");
+        if (raw == null || raw.isNull()) {
+            return null;
+        }
+        JsonNode config = ctx.engine().resolveNodeOmittingNoValue(raw);
+        if (config == null || config.isNull() || config.isMissingNode()) {
+            return null;
+        }
+        if (!config.isObject()) {
+            throw new AwsException("ValidationError", "ProvisionedConcurrencyConfig must be an object.", 400);
+        }
+        Integer count = ctx.resolveOptionalInt(config, "ProvisionedConcurrentExecutions");
+        if (count == null || count < 1) {
+            throw new AwsException("ValidationError",
+                    "ProvisionedConcurrencyConfig requires a positive ProvisionedConcurrentExecutions.", 400);
+        }
+        return count;
+    }
+
+    private void awaitProvisionedConcurrency(String functionName, String aliasName, int requested,
+                                            ProvisionedConcurrencyPool.Status status, String region, String account) {
+        long started = nanoTime.getAsLong();
+        while (true) {
+            if ("READY".equals(status.status()) && status.requested() == requested
+                    && status.allocated() == requested) {
+                return;
+            }
+            if ("FAILED".equals(status.status()) || nanoTime.getAsLong() - started >= READINESS_TIMEOUT.toNanos()) {
+                throw new AwsException("InternalFailure", "Provisioned concurrency for alias " + aliasName
+                        + " did not become READY (status " + status.status() + "): "
+                        + (status.reason() == null ? "initialization deadline exceeded" : status.reason()), 500);
+            }
+            try {
+                sleeper.sleep(READINESS_POLL);
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new AwsException("InternalFailure",
+                        "Interrupted while initializing provisioned concurrency for alias " + aliasName, 500);
+            }
+            status = provisionedConcurrency.get(region, functionName, aliasName, account);
+        }
     }
 
     /**

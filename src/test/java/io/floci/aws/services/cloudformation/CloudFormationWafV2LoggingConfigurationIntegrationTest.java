@@ -83,9 +83,12 @@ class CloudFormationWafV2LoggingConfigurationIntegrationTest {
             .header("Authorization", CFN_AUTH)
             .formParam("ChangeSetName", changeSetName)
         .when().post("/").then().statusCode(200).extract().asString();
+        // Both ACLs already exist, so their stored GetAtt values prove the ResourceArn replacement.
         assertEquals("True", XmlPath.from(changeSetXml).getString(
                 "DescribeChangeSetResponse.DescribeChangeSetResult.Changes.member"
                 + ".find { it.ResourceChange.LogicalResourceId == 'Logging' }.ResourceChange.Replacement"));
+        assertStored(aclA, logA);
+        assertMissing(aclB);
 
         cfn("UpdateStack", stackName, template(suffix, "AclA", "LogGroupB", false));
         assertStatus(stackName, "UPDATE_COMPLETE");

@@ -37,6 +37,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -78,13 +79,16 @@ public class BatchService {
     private final EmulatorConfig config;
     private final ObjectMapper objectMapper;
     private final BatchDockerRunner dockerRunner;
+    private final Clock clock;
+    private final JobThreads jobThreads;
 
     @Inject
     public BatchService(StorageFactory storageFactory,
                         RegionResolver regionResolver,
                         EmulatorConfig config,
                         ObjectMapper objectMapper,
-                        BatchDockerRunner dockerRunner) {
+                        BatchDockerRunner dockerRunner,
+                        Clock clock) {
         this(
                 storageFactory.create("batch", "batch-job-definitions.json",
                         new TypeReference<Map<String, BatchJobDefinition>>() {}),
@@ -97,8 +101,30 @@ public class BatchService {
                 regionResolver,
                 config,
                 objectMapper,
-                dockerRunner
+                dockerRunner,
+                clock,
+                JobThreads.SYSTEM
         );
+    }
+
+    /** Where job runs execute and how they pause between job states. Tests pass a controlled one. */
+    interface JobThreads {
+        JobThreads SYSTEM = new JobThreads() {
+            @Override
+            public void start(Runnable jobRun) {
+                Thread.startVirtualThread(jobRun);
+            }
+
+            @Override
+            public void sleepMillis(long millis) throws InterruptedException {
+                Thread.sleep(millis);
+            }
+        };
+
+        /** Runs {@code jobRun} on a thread of its own. */
+        void start(Runnable jobRun);
+
+        void sleepMillis(long millis) throws InterruptedException;
     }
 
     BatchService(StorageBackend<String, BatchJobDefinition> jobDefinitionStore,
@@ -108,7 +134,9 @@ public class BatchService {
                  RegionResolver regionResolver,
                  EmulatorConfig config,
                  ObjectMapper objectMapper,
-                 BatchDockerRunner dockerRunner) {
+                 BatchDockerRunner dockerRunner,
+                 Clock clock,
+                 JobThreads jobThreads) {
         this.jobDefinitionStore = jobDefinitionStore;
         this.jobQueueStore = jobQueueStore;
         this.computeEnvironmentStore = computeEnvironmentStore;
@@ -117,6 +145,8 @@ public class BatchService {
         this.config = config;
         this.objectMapper = objectMapper;
         this.dockerRunner = dockerRunner;
+        this.clock = clock;
+        this.jobThreads = jobThreads;
     }
 
     public synchronized ObjectNode createComputeEnvironment(JsonNode request, String region) {
@@ -159,7 +189,7 @@ public class BatchService {
         int offset = parseNextToken(textOrNull(request, "nextToken"));
         List<BatchComputeEnvironment> envs;
         if (refs.isEmpty()) {
-            envs = computeEnvironmentStore.scan(k -> true).stream()
+            envs = computeEnvironmentsInRegion().stream()
                     .sorted(Comparator.comparing(BatchComputeEnvironment::getComputeEnvironmentName))
                     .toList();
         } else {
@@ -169,7 +199,7 @@ public class BatchService {
                     .toList();
         }
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(envs.size(), offset + maxResults);
+        int end = (int) Math.min(envs.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(computeEnvironmentDetail(envs.get(i)));
         }
@@ -215,7 +245,7 @@ public class BatchService {
             throw client("Cannot delete compute environment in " + target.getState() + " state: "
                     + target.getComputeEnvironmentName());
         }
-        boolean stillAttached = jobQueueStore.scan(k -> true).stream()
+        boolean stillAttached = jobQueuesInRegion().stream()
                 .flatMap(q -> q.getComputeEnvironmentOrder().stream())
                 .anyMatch(order -> resolveComputeEnvironmentOptional(order.getComputeEnvironment())
                         .map(BatchComputeEnvironment::getComputeEnvironmentArn)
@@ -269,21 +299,24 @@ public class BatchService {
 
     public synchronized ObjectNode updateJobQueue(JsonNode request) {
         BatchJobQueue queue = resolveJobQueue(requiredText(request, "jobQueue"));
-        if (request.hasNonNull("state")) {
-            queue.setState(request.path("state").asText());
-        }
-        if (request.hasNonNull("priority")) {
-            queue.setPriority(request.path("priority").asInt());
-        }
+        // Checked before anything is applied: the stored queue is live, so a refused update must not touch it.
+        List<BatchComputeEnvironmentOrder> orders = null;
         if (request.hasNonNull("computeEnvironmentOrder")) {
-            List<BatchComputeEnvironmentOrder> orders =
-                    computeEnvironmentOrder(request.path("computeEnvironmentOrder"));
+            orders = computeEnvironmentOrder(request.path("computeEnvironmentOrder"));
             for (BatchComputeEnvironmentOrder order : orders) {
                 BatchComputeEnvironment env = resolveComputeEnvironment(order.getComputeEnvironment());
                 if (!"VALID".equals(env.getStatus())) {
                     throw client("Compute environment is not VALID: " + order.getComputeEnvironment());
                 }
             }
+        }
+        if (request.hasNonNull("state")) {
+            queue.setState(request.path("state").asText());
+        }
+        if (request.hasNonNull("priority")) {
+            queue.setPriority(request.path("priority").asInt());
+        }
+        if (orders != null) {
             queue.setComputeEnvironmentOrder(orders);
         }
         jobQueueStore.put(queue.getJobQueueArn(), queue);
@@ -434,7 +467,7 @@ public class BatchService {
         }
         if (resource.startsWith("job/")) {
             String jobId = resource.substring("job/".length());
-            BatchJob job = jobStore.get(jobId).orElseThrow(() -> client("Job not found: " + resourceArn));
+            BatchJob job = getJob(jobId).orElseThrow(() -> client("Job not found: " + resourceArn));
             return new Taggable(tagsOf(job.getTags()), tags -> {
                 job.setTags(tags);
                 jobStore.put(job.getJobId(), job);
@@ -456,7 +489,7 @@ public class BatchService {
         int offset = parseNextToken(textOrNull(request, "nextToken"));
         List<BatchJobQueue> queues;
         if (refs.isEmpty()) {
-            queues = jobQueueStore.scan(k -> true).stream()
+            queues = jobQueuesInRegion().stream()
                     .sorted(Comparator.comparing(BatchJobQueue::getJobQueueName))
                     .toList();
         } else {
@@ -466,7 +499,7 @@ public class BatchService {
                     .toList();
         }
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(queues.size(), offset + maxResults);
+        int end = (int) Math.min(queues.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(jobQueueDetail(queues.get(i)));
         }
@@ -546,7 +579,7 @@ public class BatchService {
         }
         int maxResults = describeMaxResults(request);
         int offset = parseNextToken(textOrNull(request, "nextToken"));
-        List<BatchJobDefinition> definitions = jobDefinitionStore.scan(k -> true).stream()
+        List<BatchJobDefinition> definitions = jobDefinitionsInRegion().stream()
                 .filter(def -> status == null || status.equals(def.getStatus()))
                 .filter(def -> name == null || name.equals(def.getJobDefinitionName()))
                 .filter(def -> refs.isEmpty() || refs.stream().anyMatch(ref -> matchesJobDefinition(def, ref)))
@@ -554,7 +587,7 @@ public class BatchService {
                         .thenComparing(BatchJobDefinition::getRevision))
                 .toList();
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(definitions.size(), offset + maxResults);
+        int end = (int) Math.min(definitions.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(jobDefinitionDetail(definitions.get(i)));
         }
@@ -621,7 +654,7 @@ public class BatchService {
             BatchJob job = getJob(jobId).orElseThrow(() -> client("Job not found: " + jobId));
             if (job.getArraySize() != null) {
                 boolean changed = false;
-                List<BatchJob> children = jobStore.scan(k -> true).stream()
+                List<BatchJob> children = jobsInRegion().stream()
                         .filter(child -> jobId.equals(child.getArrayJobId()))
                         .toList();
                 for (BatchJob child : children) {
@@ -753,7 +786,7 @@ public class BatchService {
 
         putJob(job);
         if (shouldRunDocker()) {
-            Thread.startVirtualThread(() -> runMultiNodeJob(job.getAccountId(), job.getJobId()));
+            jobThreads.start(() -> runMultiNodeJob(job.getAccountId(), job.getJobId()));
         } else {
             runMultiNodeJob(job.getAccountId(), job.getJobId());
         }
@@ -838,7 +871,7 @@ public class BatchService {
 
     private void dispatchRun(BatchJob job) {
         if (shouldRunDocker()) {
-            Thread.startVirtualThread(() -> runJob(job.getAccountId(), job.getJobId()));
+            jobThreads.start(() -> runJob(job.getAccountId(), job.getJobId()));
         } else {
             runJob(job.getAccountId(), job.getJobId());
         }
@@ -908,7 +941,7 @@ public class BatchService {
         int offset = parseNextToken(textOrNull(request, "nextToken"));
 
         // A queue-level listing shows one entry per array job (the parent), matching AWS.
-        List<BatchJob> jobs = jobStore.scan(k -> true).stream()
+        List<BatchJob> jobs = jobsInRegion().stream()
                 .filter(job -> queue.getJobQueueArn().equals(job.getJobQueue()))
                 .filter(job -> job.getArrayIndex() == null)
                 .filter(job -> (filter != null && !"SHARE_IDENTIFIER".equals(filter.name()))
@@ -921,7 +954,7 @@ public class BatchService {
                 .toList();
 
         ArrayNode summaries = objectMapper.createArrayNode();
-        int end = Math.min(jobs.size(), offset + maxResults);
+        int end = (int) Math.min(jobs.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             summaries.add(jobSummary(jobs.get(i)));
         }
@@ -941,14 +974,14 @@ public class BatchService {
                 : FILTERED_MAX_RESULTS;
         int offset = parseNextToken(textOrNull(request, "nextToken"));
 
-        List<BatchJob> children = jobStore.scan(k -> true).stream()
+        List<BatchJob> children = jobsInRegion().stream()
                 .filter(job -> arrayJobId.equals(job.getArrayJobId()))
                 .filter(job -> status == null || status.equals(job.getStatus()))
                 .sorted(Comparator.comparingInt(BatchJob::getArrayIndex))
                 .toList();
 
         ArrayNode summaries = objectMapper.createArrayNode();
-        int end = Math.min(children.size(), offset + maxResults);
+        int end = (int) Math.min(children.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             summaries.add(jobSummary(children.get(i)));
         }
@@ -996,7 +1029,7 @@ public class BatchService {
         if (!retry.isEmpty()) {
             request.set("retryStrategy", retry);
         }
-        submitJob(request, region);
+        RequestScopes.runAs(regionResolver.getAccountId(), region, () -> submitJob(request, region));
     }
 
     private ObjectNode eventBridgeRetryStrategy(JsonNode retryStrategy) {
@@ -1305,7 +1338,7 @@ public class BatchService {
 
     private void sleepQuietly() {
         try {
-            Thread.sleep(10);
+            jobThreads.sleepMillis(10);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -1319,11 +1352,11 @@ public class BatchService {
         if (ref == null || ref.isBlank()) {
             return Optional.empty();
         }
-        Optional<BatchJobQueue> byArn = jobQueueStore.get(ref);
+        Optional<BatchJobQueue> byArn = jobQueueStore.get(ref).filter(q -> inRequestRegion(q.getRegion()));
         if (byArn.isPresent()) {
             return byArn;
         }
-        return jobQueueStore.scan(k -> true).stream()
+        return jobQueuesInRegion().stream()
                 .filter(q -> ref.equals(q.getJobQueueName()) || ref.equals(q.getJobQueueArn()))
                 .findFirst();
     }
@@ -1337,11 +1370,12 @@ public class BatchService {
         if (ref == null || ref.isBlank()) {
             return Optional.empty();
         }
-        Optional<BatchComputeEnvironment> byArn = computeEnvironmentStore.get(ref);
+        Optional<BatchComputeEnvironment> byArn = computeEnvironmentStore.get(ref)
+                .filter(env -> inRequestRegion(env.getRegion()));
         if (byArn.isPresent()) {
             return byArn;
         }
-        return computeEnvironmentStore.scan(k -> true).stream()
+        return computeEnvironmentsInRegion().stream()
                 .filter(env -> ref.equals(env.getComputeEnvironmentName()) || ref.equals(env.getComputeEnvironmentArn()))
                 .findFirst();
     }
@@ -1355,7 +1389,7 @@ public class BatchService {
         if (ref == null || ref.isBlank()) {
             return Optional.empty();
         }
-        Optional<BatchJobDefinition> byArn = jobDefinitionStore.get(ref);
+        Optional<BatchJobDefinition> byArn = jobDefinitionStore.get(ref).filter(def -> inRequestRegion(def.getRegion()));
         if (byArn.isPresent() && (includeInactive || "ACTIVE".equals(byArn.get().getStatus()))) {
             return byArn;
         }
@@ -1363,6 +1397,9 @@ public class BatchService {
         if (AwsArnUtils.looksLikeArn(ref)) {
             try {
                 String resource = AwsArnUtils.parse(ref).resource();
+                if (!regionResolver.inRequestRegion(ref)) {
+                    return Optional.empty();
+                }
                 if (resource.startsWith("job-definition/")) {
                     logical = resource.substring("job-definition/".length());
                 }
@@ -1383,7 +1420,7 @@ public class BatchService {
         }
         String finalName = name;
         Integer finalRevision = revision;
-        return jobDefinitionStore.scan(k -> true).stream()
+        return jobDefinitionsInRegion().stream()
                 .filter(def -> finalName.equals(def.getJobDefinitionName()))
                 .filter(def -> finalRevision == null || finalRevision == def.getRevision())
                 .filter(def -> includeInactive || "ACTIVE".equals(def.getStatus()))
@@ -1401,7 +1438,7 @@ public class BatchService {
         if (AwsArnUtils.looksLikeArn(ref)) {
             try {
                 String resource = AwsArnUtils.parse(ref).resource();
-                if (!resource.startsWith("job-definition/")) {
+                if (!regionResolver.inRequestRegion(ref) || !resource.startsWith("job-definition/")) {
                     return false;
                 }
                 logical = resource.substring("job-definition/".length());
@@ -1423,7 +1460,7 @@ public class BatchService {
     }
 
     private int nextRevision(String name) {
-        return jobDefinitionStore.scan(k -> true).stream()
+        return jobDefinitionsInRegion().stream()
                 .filter(def -> name.equals(def.getJobDefinitionName()))
                 .mapToInt(BatchJobDefinition::getRevision)
                 .max()
@@ -1788,7 +1825,7 @@ public class BatchService {
 
     // Computed live from children on every read, rather than an incrementally updated counter, to avoid races.
     private ArrayRollup arrayRollup(String parentJobId) {
-        List<BatchJob> children = jobStore.scan(k -> true).stream()
+        List<BatchJob> children = jobsInRegion().stream()
                 .filter(job -> parentJobId.equals(job.getArrayJobId()))
                 .toList();
         Map<String, Integer> statusSummary = new LinkedHashMap<>();
@@ -2080,8 +2117,41 @@ public class BatchService {
         return Math.max(1, Math.min(DESCRIBE_JOBS_LIMIT, request.path("maxResults").asInt()));
     }
 
+    /** The request's Region's job {@code jobId}: job ids are unique, but a job is visible only in its own Region. */
     private Optional<BatchJob> getJob(String jobId) {
-        return jobStore.get(jobId);
+        return jobStore.get(jobId).filter(job -> inRequestRegion(job.getRegion()));
+    }
+
+    /*
+     * The four stores are shared by every Region, keyed by ARN or job id, and each record carries the Region it was
+     * created in, records stored before this filter included, so a request sees only its own Region's records.
+     */
+    private List<BatchComputeEnvironment> computeEnvironmentsInRegion() {
+        return computeEnvironmentStore.scan(k -> true).stream()
+                .filter(env -> inRequestRegion(env.getRegion()))
+                .toList();
+    }
+
+    private List<BatchJobQueue> jobQueuesInRegion() {
+        return jobQueueStore.scan(k -> true).stream()
+                .filter(queue -> inRequestRegion(queue.getRegion()))
+                .toList();
+    }
+
+    private List<BatchJobDefinition> jobDefinitionsInRegion() {
+        return jobDefinitionStore.scan(k -> true).stream()
+                .filter(def -> inRequestRegion(def.getRegion()))
+                .toList();
+    }
+
+    private List<BatchJob> jobsInRegion() {
+        return jobStore.scan(k -> true).stream()
+                .filter(job -> inRequestRegion(job.getRegion()))
+                .toList();
+    }
+
+    private boolean inRequestRegion(String region) {
+        return regionResolver.getRegion().equals(region != null ? region : regionResolver.getDefaultRegion());
     }
 
     @SuppressWarnings("unchecked")
@@ -2167,7 +2237,7 @@ public class BatchService {
     }
 
     private long now() {
-        return System.currentTimeMillis();
+        return clock.millis();
     }
 
     private AwsException client(String message) {

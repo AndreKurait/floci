@@ -92,7 +92,7 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
      * returns point back through Floci's proxy.
      */
     public String ensureReady(String npmRepositoryId, String publicUrl) {
-        return pool.ensureReady(npmRepositoryId, () -> startContainer(npmRepositoryId, publicUrl));
+        return lease.ensureReady(npmRepositoryId, () -> startContainer(npmRepositoryId, publicUrl));
     }
 
     /** Stops and removes the container for one npm repository, if one was ever started. */
@@ -157,7 +157,7 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
             LOG.infov("Verdaccio sidecar for npm repository {0} is ready at {1}", npmRepositoryId, url);
             return new PerKeyContainerPool.StartedContainer(containerId, url);
         } catch (RuntimeException e) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            pool.removeFailedStart(npmRepositoryId, containerId, e);
             throw e;
         }
     }

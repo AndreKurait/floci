@@ -14,6 +14,7 @@ import org.jboss.logging.Logger;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -58,11 +59,51 @@ public class CfnResourceDispatcher {
         return registry.isCustomResourceType(resourceType);
     }
 
+    public Map<String, CfnReplacement> conditionalReplacements(String resourceType, JsonNode properties) {
+        return registry.forType(resourceType)
+                .map(owner -> owner.conditionalReplacements(resourceType, properties)).orElse(Map.of());
+    }
+
+    public String referenceValue(String resourceType, String physicalId) {
+        return registry.forType(resourceType).map(owner -> owner.referenceValue(physicalId)).orElse(physicalId);
+    }
+
+    /** Projects response IDs without changing the identity used by lifecycle operations. */
+    public String publicPhysicalId(String resourceType, String physicalId) {
+        if (physicalId == null) {
+            return null;
+        }
+        return registry.forType(resourceType).map(owner -> owner.publicPhysicalId(physicalId)).orElse(physicalId);
+    }
+
     /** Resolve an attribute using its resource owner's declared type. */
     public JsonNode attributeValue(String resourceType, String attributeName, String value) {
         return registry.forType(resourceType)
                 .map(owner -> owner.attributeValue(resourceType, attributeName, value))
                 .orElseGet(() -> objectMapper.getNodeFactory().textNode(value));
+    }
+
+    public Set<String> importIdentifiers(String resourceType) {
+        return registry.forType(resourceType).map(owner -> owner.importIdentifiers(resourceType)).orElse(Set.of());
+    }
+
+    public void importResource(StackResource resource, JsonNode properties, Map<String, String> identifiers,
+                               ProvisionContext ctx) {
+        CfnResourceProvisioner owner = registry.forType(resource.getResourceType()).orElseThrow(() ->
+                new AwsException("ValidationError",
+                        "Resource import is not supported for " + resource.getResourceType(), 400));
+        owner.importResource(resource, properties, identifiers, ctx);
+    }
+
+    public boolean requiresOwnershipRecovery(StackResource resource) {
+        return !isStub(resource.getPhysicalId(), resource.getAttributes())
+                && registry.forType(resource.getResourceType())
+                .map(owner -> owner.requiresOwnershipRecovery(resource)).orElse(false);
+    }
+
+    public void recoverOwnership(StackResource resource, JsonNode properties, ProvisionContext context) {
+        registry.forType(resource.getResourceType())
+                .ifPresent(owner -> owner.recoverOwnership(resource, properties, context));
     }
 
     /**
@@ -126,6 +167,28 @@ public class CfnResourceDispatcher {
                                    Map<String, String> existingAttributes, Consumer<StackEvent> progress,
                                    JsonNode priorProperties, PropertyChanges changes,
                                    String delegatedRoleBoundaryArn, CloudFormationTemplateEngine priorEngine) {
+        return provision(logicalId, resourceType, properties, engine, region, accountId, stackName,
+                existingPhysicalId, existingAttributes, progress, priorProperties, changes,
+                delegatedRoleBoundaryArn, priorEngine, null, null);
+    }
+
+    public StackResource provision(String logicalId, String resourceType, JsonNode properties,
+                                   CloudFormationTemplateEngine engine, String region, String accountId,
+                                   String stackName, String existingPhysicalId,
+                                   Map<String, String> existingAttributes, Consumer<StackEvent> progress,
+                                   JsonNode priorProperties, JsonNode updatePolicy, JsonNode priorUpdatePolicy) {
+        return provision(logicalId, resourceType, properties, engine, region, accountId, stackName,
+                existingPhysicalId, existingAttributes, progress, priorProperties, null,
+                null, null, updatePolicy, priorUpdatePolicy);
+    }
+
+    public StackResource provision(String logicalId, String resourceType, JsonNode properties,
+                                   CloudFormationTemplateEngine engine, String region, String accountId,
+                                   String stackName, String existingPhysicalId,
+                                   Map<String, String> existingAttributes, Consumer<StackEvent> progress,
+                                   JsonNode priorProperties, PropertyChanges changes,
+                                   String delegatedRoleBoundaryArn, CloudFormationTemplateEngine priorEngine,
+                                   JsonNode updatePolicy, JsonNode priorUpdatePolicy) {
         StackResource resource = new StackResource();
         resource.setLogicalId(logicalId);
         resource.setResourceType(resourceType);
@@ -137,7 +200,8 @@ public class CfnResourceDispatcher {
             if (owner != null) {
                 owner.provision(resource, properties,
                         new ProvisionContext(engine, region, accountId, stackName, existingPhysicalId, progress,
-                                priorProperties, changes, delegatedRoleBoundaryArn, priorEngine));
+                                priorProperties, changes, delegatedRoleBoundaryArn, priorEngine,
+                                updatePolicy, priorUpdatePolicy));
                 // A provisioner that migrated a stub without writing its own Arn would leave the
                 // stub's, and the real resource would read as a stub on its next update.
                 String arn = resource.getAttributes().get("Arn");
@@ -280,6 +344,9 @@ public class CfnResourceDispatcher {
      * beats the {@code Custom::} fallback the registry applies.
      */
     public void delete(StackResource resource, String region) {
+        if (isStub(resource.getPhysicalId(), resource.getAttributes())) {
+            return;
+        }
         String resourceType = resource.getResourceType();
         CfnResourceProvisioner owner = registry.forType(resourceType).orElse(null);
         if (owner != null) {

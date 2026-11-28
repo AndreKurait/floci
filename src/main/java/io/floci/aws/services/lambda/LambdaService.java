@@ -697,7 +697,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             }
         }
 
-        saveHoldingSubnets(region, fn, vpcConfig != null);
+        saveHoldingSubnets(region, fn, vpcConfig != null, true);
         LOG.infov("Created Lambda function: {0} in region {1}", functionName, region);
         if (Boolean.TRUE.equals(request.get("Publish"))) {
             return publishVersion(region, functionName, null);
@@ -710,6 +710,71 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         return functionStore.get(region, canonical)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Function not found: " + functionName, 404));
+    }
+
+    public String getFunctionRecursionConfig(String region, String functionName) {
+        String account = regionResolver.getAccountId();
+        String name = recursionFunctionName(region, account, functionName);
+        String arn = AwsArnUtils.Arn.of("lambda", region, account, "function:" + name).toString();
+        synchronized (lockForConcurrencyOp(arn)) {
+            return recursionFunction(account, region, name).getRecursiveLoop();
+        }
+    }
+
+    /** Live resource tags for the same strictly scoped target as the recursion settings APIs. */
+    public Map<String, String> recursionResourceTags(String region, String functionName) {
+        String accountId = regionResolver.getAccountId();
+        String name = recursionFunctionName(region, accountId, functionName);
+        String arn = AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        synchronized (lockForConcurrencyOp(arn)) {
+            Map<String, String> tags = recursionFunction(accountId, region, name).getTags();
+            return tags == null ? Map.of() : new HashMap<>(tags);
+        }
+    }
+
+    public String putFunctionRecursionConfig(String region, String functionName, String recursiveLoop) {
+        validateRecursiveLoop(recursiveLoop);
+        String account = regionResolver.getAccountId();
+        String name = recursionFunctionName(region, account, functionName);
+        String arn = AwsArnUtils.Arn.of("lambda", region, account, "function:" + name).toString();
+        synchronized (lockForConcurrencyOp(arn)) {
+            LambdaFunction function = recursionFunction(account, region, name);
+            String previous = function.getRecursiveLoop();
+            function.setRecursiveLoop(recursiveLoop);
+            try {
+                functionStore.saveForAccount(account, region, function);
+            } catch (RuntimeException e) {
+                function.setRecursiveLoop(previous);
+                throw e;
+            }
+            return recursiveLoop;
+        }
+    }
+
+    public static void validateRecursiveLoop(String recursiveLoop) {
+        if (recursiveLoop == null) {
+            throw SmithyValidationErrors.validationException(
+                    "Value null at 'recursiveLoop' failed to satisfy constraint: Member must not be null");
+        }
+        validateEnum(recursiveLoop, "recursiveLoop", List.of("Allow", "Terminate"));
+    }
+
+    private LambdaFunction recursionFunction(String account, String region, String name) {
+        return functionStore.getForAccount(account, region, name)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Function not found: " + name, 404));
+    }
+
+    private String recursionFunctionName(String region, String account, String functionName) {
+        LambdaArnUtils.ResolvedFunctionRef reference =
+                LambdaArnUtils.resolveUnqualifiedFunctionName(functionName);
+        if ((reference.region() != null && !region.equals(reference.region()))
+                || (reference.account() != null && !account.equals(reference.account()))
+                || (AwsArnUtils.isArn(functionName) && !regionResolver.partitionForRegion(region)
+                        .equals(AwsArnUtils.parse(functionName).partition()))) {
+            throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
+        }
+        return reference.name();
     }
 
     /** Resolves the $LATEST record that owns the code-signing attachment. */
@@ -1292,7 +1357,9 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         String name = fn.getFunctionName();
         List<String> referencing = aliasStore == null ? List.of()
                 : aliasStore.list(region, name).stream()
-                        .filter(alias -> qualifier.equals(alias.getFunctionVersion()))
+                        .filter(alias -> qualifier.equals(alias.getFunctionVersion())
+                                || (alias.getRoutingConfig() != null
+                                && alias.getRoutingConfig().containsKey(qualifier)))
                         .map(LambdaAlias::getName)
                         .toList();
         if (!referencing.isEmpty()) {
@@ -1308,6 +1375,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             warmPool.deleteProvisionedQualifier(fn, qualifier);
             warmPool.drainEnvironment(version.get());
             functionStore.deleteVersion(region, name, qualifier);
+            warmPool.retireFunctionCode(List.of(version.get()));
             reclaimVersionCodeDirectory(region, fn, qualifier, version.get());
             // The snapshot may still share $LATEST's code directory, so this only reclaims once no
             // remaining version references it.
@@ -1326,7 +1394,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         if (executorService != null) {
             executorService.dropPending(fn);
         }
-        warmPool.drainFunction(functionName);
+        warmPool.drainFunction(fn);
         // Take the same per-function lock used by Put/DeleteFunctionConcurrency
         // so a concurrent concurrency mutation cannot interleave with the
         // limiter reset and store delete and leave the two views out of sync.
@@ -1335,12 +1403,14 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         // object, letting a follow-up request allocate a fresh lock and run
         // in parallel — the very serialization this map exists to prevent.
         synchronized (lockForConcurrencyOp(arn)) {
+            List<LambdaFunction> deletedVersions = functionStore.listVersions(region, functionName);
             warmPool.deleteProvisionedFunction(fn);
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
             }
             codeStore.delete(ownerAccount(fn), region, functionName);
             functionStore.delete(region, functionName);
+            warmPool.retireFunctionCode(deletedVersions);
             // Again now the function is gone, for an Event invoke that read the count after the first call.
             if (executorService != null) {
                 executorService.dropPending(fn);
@@ -1349,6 +1419,16 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             versionCounters.remove(versionCounterKey(region, fn));
             versionCounters.remove(legacyVersionCounterKey(region, functionName));
             failedReactiveSyncs.remove(arn);
+            // Asynchronous invocation settings belong to the function: a function created later under
+            // the same name must not inherit them.
+            String eventInvokePrefix = region + ":" + arn + ":";
+            List<String> eventInvokeKeys = new ArrayList<>();
+            for (Map.Entry<String, FunctionEventInvokeConfig> entry : eventInvokeConfigs.entrySet()) {
+                if (entry.getKey().startsWith(eventInvokePrefix)) {
+                    eventInvokeKeys.add(entry.getKey());
+                }
+            }
+            eventInvokeKeys.forEach(eventInvokeConfigs::remove);
             if (aliasStore != null) {
                 for (LambdaAlias alias : aliasStore.list(region, functionName)) {
                     aliasStore.delete(region, functionName, alias.getName());
@@ -2902,14 +2982,26 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
      * @param vpcConfigSet whether this request set the function's VpcConfig
      */
     private void saveHoldingSubnets(String region, LambdaFunction fn, boolean vpcConfigSet) {
+        saveHoldingSubnets(region, fn, vpcConfigSet, false);
+    }
+
+    private void saveHoldingSubnets(String region, LambdaFunction fn, boolean vpcConfigSet, boolean creating) {
         Object subnets = fn.getVpcConfig() == null ? null : fn.getVpcConfig().get("SubnetIds");
         if (ec2Service != null && subnets instanceof List<?> list && !list.isEmpty()) {
             ec2Service.runWithSubnetReferencesHeld(region, () -> {
                 if (vpcConfigSet) {
                     fn.setVpcId(resolveVpcId(region, fn.getVpcConfig()));
                 }
-                functionStore.save(region, fn);
+                persistFunction(region, fn, creating);
             });
+        } else {
+            persistFunction(region, fn, creating);
+        }
+    }
+
+    private void persistFunction(String region, LambdaFunction fn, boolean creating) {
+        if (creating) {
+            functionStore.create(region, fn);
         } else {
             functionStore.save(region, fn);
         }
@@ -2927,23 +3019,30 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
                     "VpcConfig requires both subnet IDs and security group IDs", 400);
         }
         if (ec2Service == null) {
-            return null;
+            throw new IllegalStateException("Lambda VPC configuration requires EC2");
         }
         List<Subnet> subnets = ec2Service.describeSubnets(region, subnetIds, Map.of());
-        List<SecurityGroup> groups = ec2Service.describeSecurityGroups(region, groupIds, List.of(), Map.of());
-        Set<String> knownVpcIds = subnets.stream().map(Subnet::getVpcId).collect(Collectors.toSet());
-        groups.stream().map(SecurityGroup::getVpcId).forEach(knownVpcIds::add);
-        if (knownVpcIds.contains(null) || knownVpcIds.size() > 1) {
-            throw new AwsException("InvalidParameterValueException",
-                    "All known subnets and security groups in VpcConfig must belong to the same VPC", 400);
-        }
         if (!Set.copyOf(subnetIds).equals(
-                subnets.stream().map(Subnet::getSubnetId).collect(Collectors.toSet()))
-                || !Set.copyOf(groupIds).equals(
-                groups.stream().map(SecurityGroup::getGroupId).collect(Collectors.toSet()))) {
-            return null;
+                subnets.stream().map(Subnet::getSubnetId).collect(Collectors.toSet()))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "One or more subnet IDs in VpcConfig do not exist", 400);
         }
-        return knownVpcIds.stream().findFirst().orElse(null);
+        String vpcId = subnets.getFirst().getVpcId();
+        if (vpcId == null || subnets.stream().anyMatch(subnet -> !vpcId.equals(subnet.getVpcId()))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "All subnets in VpcConfig must belong to the same VPC", 400);
+        }
+        List<SecurityGroup> groups = ec2Service.describeSecurityGroups(region, groupIds, List.of(), Map.of());
+        if (!Set.copyOf(groupIds).equals(
+                groups.stream().map(SecurityGroup::getGroupId).collect(Collectors.toSet()))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "One or more security group IDs in VpcConfig do not exist", 400);
+        }
+        if (groups.stream().anyMatch(group -> !vpcId.equals(group.getVpcId()))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "All subnets and security groups in VpcConfig must belong to the same VPC", 400);
+        }
+        return vpcId;
     }
 
     private static List<String> vpcResourceIds(Map<String, Object> vpcConfig, String member) {
@@ -3436,8 +3535,10 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         }
         LambdaFunction fn = getFunction(region, functionName); // throws 404 if not found
         synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            Optional<LambdaFunction> deletedVersion = functionStore.get(region, fn.getFunctionName(), version);
             warmPool.deleteProvisionedQualifier(fn, version);
             functionStore.deleteVersion(region, fn.getFunctionName(), version);
+            deletedVersion.ifPresent(snapshot -> warmPool.retireFunctionCode(List.of(snapshot)));
         }
         LOG.infov("Deleted version {0} of function {1}", version, fn.getFunctionName());
     }
@@ -3459,7 +3560,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         alias.setFunctionName(functionName);
         alias.setFunctionVersion(functionVersion != null ? functionVersion : "$LATEST");
         alias.setDescription(description);
-        alias.setRoutingConfig(routingConfig);
+        alias.setRoutingConfig(routingConfig == null || routingConfig.isEmpty() ? null : routingConfig);
         alias.setAliasArn(fn.getFunctionArn() + ":" + aliasName);
         long now = System.currentTimeMillis() / 1000L;
         alias.setCreatedDate(now);
@@ -3520,6 +3621,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             alias.setLastModifiedDate(System.currentTimeMillis() / 1000L);
             alias.setRevisionId(UUID.randomUUID().toString());
             if (aliasStore != null) aliasStore.save(region, alias);
+            warmPool.provisionedAliasUpdated();
             return alias;
         }
     }
@@ -3812,6 +3914,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         // sync, regardless of which call acquires the reservedLock first.
         synchronized (lockForConcurrencyOp(arn)) {
             warmPool.validateProvisionedReservation(fn, reservedConcurrentExecutions);
+            Integer previousFunctionReserved = fn.getReservedConcurrentExecutions();
             Integer previousReserved = null;
             boolean limiterUpdated = false;
             if (concurrencyLimiter != null) {
@@ -3823,6 +3926,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             try {
                 functionStore.save(region, fn);
             } catch (RuntimeException e) {
+                fn.setReservedConcurrentExecutions(previousFunctionReserved);
                 if (limiterUpdated) {
                     concurrencyLimiter.rollbackReservedIfExpected(
                             arn, reservedConcurrentExecutions, previousReserved);
@@ -3855,7 +3959,8 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         int concurrencyLimit = config != null
                 ? config.services().lambda().regionConcurrencyLimit()
                 : 1000;
-        long unreserved = Math.max(0, concurrencyLimit - reserved);
+        long unreserved = concurrencyLimiter == null ? Math.max(0, concurrencyLimit - reserved)
+                : concurrencyLimiter.unreservedCapacity(regionResolver.getAccountId(), region);
         return new AccountSettings(totalCodeSize, functions.size(), concurrencyLimit, unreserved);
     }
 
@@ -3867,6 +3972,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         LambdaFunction fn = getFunction(region, functionName);
         String arn = fn.getFunctionArn();
         synchronized (lockForConcurrencyOp(arn)) {
+            Integer previousFunctionReserved = fn.getReservedConcurrentExecutions();
             Integer previousReserved = null;
             boolean limiterCleared = false;
             if (concurrencyLimiter != null) {
@@ -3877,6 +3983,7 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             try {
                 functionStore.save(region, fn);
             } catch (RuntimeException e) {
+                fn.setReservedConcurrentExecutions(previousFunctionReserved);
                 if (limiterCleared && previousReserved != null) {
                     concurrencyLimiter.rollbackReservedIfExpected(
                             arn, null, previousReserved);
@@ -4357,6 +4464,22 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         }
     }
 
+    /** Runtime-management authorization must not migrate the function before IAM can deny the request. */
+    public List<Map<String, Object>> runtimeManagementPolicyStatements(
+            String accountId, String region, String functionName) {
+        Optional<LambdaFunction> observed = functionStore.getReadOnlyForAccount(accountId, region, functionName, "$LATEST");
+        if (observed.isEmpty()) {
+            return List.of();
+        }
+        synchronized (lockForPolicyMutation(observed.get().getFunctionArn())) {
+            return functionStore.getReadOnlyForAccount(accountId, region, functionName, "$LATEST")
+                    .map(fn -> fn.getPolicies().stream()
+                            .<Map<String, Object>>map(LinkedHashMap::new)
+                            .toList())
+                    .orElse(List.of());
+        }
+    }
+
     /**
      * Reads the function, version or alias a full ARN names, in the ARN's own account and Region,
      * where an invoke of that ARN runs it. {@link #getFunction(String, String)} reads a name in the
@@ -4747,18 +4870,27 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             return;
         }
         LOG.debugv("Observing S3 update: {0}/{1}", event.bucketName(), event.key());
-        // For simplicity, we scan all functions in the default region
-        // Most local dev setups use a single region.
-        // This runs on the CDI event thread with no RequestContext, so an ambient scan
-        // would only ever see the default account's partition — a function owned by any
-        // other account would silently never hot-reload from S3.
-        String region = regionResolver.getDefaultRegion();
-        List<LambdaFunction> functions = functionStore.listAllAccounts(region);
+        // This runs on the CDI event thread with no RequestContext, so an ambient scan would only
+        // see the default account's functions in the default Region. Every function is scanned
+        // instead, and each one syncs in its own Region and account.
+        List<LambdaFunction> functions = functionStore.listAllAccounts();
         boolean async = reactiveS3SyncAsync();
+        // The event fires on the uploader's request, so the bucket written is the one that name resolves to in
+        // the uploader's account; buckets are per account unless the global bucket namespace is on.
+        String writtenOwner = bucketOwner(event.bucketName());
         for (LambdaFunction fn : functions) {
             if (!event.bucketName().equals(fn.getS3Bucket()) || !event.key().equals(fn.getS3Key())) {
                 continue;
             }
+            // A function reads its code from the bucket its name resolves to in the function's own account, so
+            // only a function whose bucket is the one written redeploys: another account's same-named bucket
+            // must not replace its code.
+            String ownerAccountId = ownerAccount(fn);
+            if (writtenOwner == null
+                    || !writtenOwner.equals(RequestScopes.callAs(ownerAccountId, () -> bucketOwner(event.bucketName())))) {
+                continue;
+            }
+            String region = regionResolver.regionOf(fn.getFunctionArn());
             if (!async) {
                 syncFromS3(fn, event.bucketName(), event.key(), region);
                 continue;
@@ -4771,10 +4903,21 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
             PendingReactiveSync source = new PendingReactiveSync(regionResolver.getAccountId(),
                     event.bucketName(), event.key());
             if (pendingReactiveSyncs.put(functionArn, source) == null) {
-                String ownerAccountId = ownerAccount(fn);
                 String functionName = fn.getFunctionName();
                 REACTIVE_SYNC_THREADS.execute(() -> syncQueued(ownerAccountId, region, functionName, functionArn));
             }
+        }
+    }
+
+    /** The account that owns the bucket {@code bucketName} names for the current caller, or null when none does. */
+    private String bucketOwner(String bucketName) {
+        if (s3Service == null) {
+            return null;
+        }
+        try {
+            return s3Service.getBucketOwnerAccountId(bucketName);
+        } catch (AwsException noSuchBucket) {
+            return null;
         }
     }
 

@@ -124,7 +124,7 @@ class SsmParameterReadIamEnforcementIntegrationTest {
                         .contentType("application/x-amz-json-1.1")
                         .body("{\"Path\":\"" + other + "\",\"Names\":[\"" + allowed + "\"]}")
                 .when().post("/")
-                .then().statusCode(400).body(containsString("AccessDeniedException"));
+                .then().statusCode(403).body(containsString("AccessDeniedException"));
             } finally {
                 root.deleteParameter(r -> r.name(allowed));
                 root.deleteParameter(r -> r.name(other + "/key"));
@@ -288,7 +288,7 @@ class SsmParameterReadIamEnforcementIntegrationTest {
                 .contentType("application/x-amz-json-1.1")
                 .body("{\"Recursive\":true}")
         .when().post("/")
-        .then().statusCode(400).body(containsString("AccessDeniedException"));
+        .then().statusCode(403).body(containsString("AccessDeniedException"));
     }
 
     private EnforcementFixtures.UserCredentials user(String policy) {

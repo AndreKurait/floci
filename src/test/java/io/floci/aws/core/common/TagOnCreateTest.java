@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.floci.aws.core.common.TagOnCreate.TagSet;
 import io.floci.aws.core.common.TagOnCreate.Tagging;
+import io.floci.aws.testing.MockQueryRequests;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,19 @@ class TagOnCreateTest {
                     TagOnCreate.requestTagContexts(tagging));
             assertFalse(TagOnCreate.of("controltower:" + operation, json("{\"tags\":{}}")).isPresent());
         }
+    }
+
+    @Test
+    void assumeRoleUsesOnlyConsumedSessionTagsAndRetainsGeneratedAuthorization() {
+        Tagging tags = TagOnCreate.of("sts:AssumeRole", form("Action=AssumeRole"
+                + "&Tags.member.3.Key=Project&Tags.member.3.Value=session"
+                + "&tags.member.1.Key=Other&tags.member.1.Value=unused")).orElseThrow();
+        assertEquals("sts:TagSession", tags.action());
+        assertEquals(List.of(set(Map.of("Project", "session"))), tags.checked());
+        assertEquals(List.of(Map.of("aws:RequestTag/Project", List.of("session"),
+                "aws:TagKeys", List.of("Project"))), TagOnCreate.requestTagContexts(tags));
+        assertEquals(Optional.empty(), TagOnCreate.of("sts:AssumeRole", form("Action=AssumeRole"
+                + "&tags.member.1.Key=Project&tags.member.1.Value=unused")));
     }
 
     @Test
@@ -289,7 +303,8 @@ class TagOnCreateTest {
     }
 
     private static ContainerRequestContext form(String body) {
-        return request("application/x-www-form-urlencoded", body.getBytes(StandardCharsets.UTF_8));
+        return MockQueryRequests.postedToRoot(request("application/x-www-form-urlencoded",
+                body.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static ContainerRequestContext request(String mediaType, byte[] bytes) {

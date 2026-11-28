@@ -11,12 +11,14 @@ import io.floci.aws.lifecycle.inithook.InitializationHooksRunner;
 import io.floci.aws.services.amazonmq.AmazonMqService;
 import io.floci.aws.services.amazonmq.container.RabbitMqManager;
 import io.floci.aws.services.appsync.graphql.SchemaCreationWorker;
+import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsExportService;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.codeartifact.CodeArtifactService;
 import io.floci.aws.services.docdb.DocDbService;
 import io.floci.aws.services.docdb.container.DocDbContainerManager;
 import io.floci.aws.services.dynamodb.DynamoDbRuntime;
 import io.floci.aws.services.ec2.Ec2MetadataServer;
+import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecs.EcsService;
 import io.floci.aws.services.ecs.container.EcsTaskRoleCredentialsServer;
@@ -40,6 +42,7 @@ import io.floci.aws.services.memorydb.MemoryDbService;
 import io.floci.aws.services.memorydb.container.MemoryDbContainerManager;
 import io.floci.aws.services.memorydb.proxy.MemoryDbProxyManager;
 import io.floci.aws.services.mwaa.MwaaService;
+import io.floci.aws.services.neptune.NeptuneService;
 import io.floci.aws.services.neptune.container.NeptuneContainerManager;
 import io.floci.aws.services.neptune.proxy.NeptuneProxyManager;
 import io.floci.aws.services.opensearch.OpenSearchService;
@@ -72,6 +75,9 @@ import java.util.concurrent.CompletableFuture;
 
 @ApplicationScoped
 public class EmulatorLifecycle {
+
+    @Inject
+    CloudWatchLogsExportService logsExportService;
 
     private static final Logger LOG = Logger.getLogger(EmulatorLifecycle.class);
 
@@ -108,6 +114,7 @@ public class EmulatorLifecycle {
     private final DocDbService docDbService;
     private final NeptuneContainerManager neptuneContainerManager;
     private final NeptuneProxyManager neptuneProxyManager;
+    private final NeptuneService neptuneService;
     private final RabbitMqManager rabbitMqManager;
     private final AmazonMqService amazonMqService;
     private final FlinkContainerManager flinkContainerManager;
@@ -126,6 +133,7 @@ public class EmulatorLifecycle {
     private final DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     private final PipesService pipesService;
     private final Ec2MetadataServer ec2MetadataServer;
+    private final Ec2Service ec2Service;
     private final EcsTaskRoleCredentialsServer ecsTaskRoleCredentialsServer;
     private final EcrRegistryManager ecrRegistryManager;
     private final FlociUiManager flociUiManager;
@@ -162,6 +170,7 @@ public class EmulatorLifecycle {
                              DocDbService docDbService,
                              NeptuneContainerManager neptuneContainerManager,
                              NeptuneProxyManager neptuneProxyManager,
+                             NeptuneService neptuneService,
                              RabbitMqManager rabbitMqManager,
                              AmazonMqService amazonMqService,
                              FlinkContainerManager flinkContainerManager,
@@ -180,6 +189,7 @@ public class EmulatorLifecycle {
                              DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
                              PipesService pipesService,
                              Ec2MetadataServer ec2MetadataServer,
+                             Ec2Service ec2Service,
                              EcsTaskRoleCredentialsServer ecsTaskRoleCredentialsServer,
                              EcrRegistryManager ecrRegistryManager,
                              FlociUiManager flociUiManager,
@@ -213,6 +223,7 @@ public class EmulatorLifecycle {
         this.docDbService = docDbService;
         this.neptuneContainerManager = neptuneContainerManager;
         this.neptuneProxyManager = neptuneProxyManager;
+        this.neptuneService = neptuneService;
         this.rabbitMqManager = rabbitMqManager;
         this.amazonMqService = amazonMqService;
         this.flinkContainerManager = flinkContainerManager;
@@ -231,6 +242,7 @@ public class EmulatorLifecycle {
         this.dynamodbStreamsPoller = dynamodbStreamsPoller;
         this.pipesService = pipesService;
         this.ec2MetadataServer = ec2MetadataServer;
+        this.ec2Service = ec2Service;
         this.ecsTaskRoleCredentialsServer = ecsTaskRoleCredentialsServer;
         this.ecrRegistryManager = ecrRegistryManager;
         this.flociUiManager = flociUiManager;
@@ -276,6 +288,13 @@ public class EmulatorLifecycle {
         serviceRegistry.logEnabledServices();
         storageFactory.loadAll();
         cloudWatchMetricsService.buildMetricKeyIndex();
+        if (logsExportService != null) {
+            logsExportService.recoverAfterRestart();
+        }
+        if (config.services().ec2().enabled() && !config.services().ec2().mock()) {
+            // ALB and ECS runtime restoration needs the persisted VPC and subnet address plans.
+            ec2Service.restoreVpcNetworks();
+        }
         int sweptSessions = iamService.sweepOrphanedLambdaExecutionRoleSessions();
         if (sweptSessions > 0) {
             LOG.infov("Removed {0} orphaned Lambda execution-role session(s)", sweptSessions);
@@ -363,6 +382,13 @@ public class EmulatorLifecycle {
             // Starts the clusters' containers in the background, failing the future with the ones it could not.
             docDbService.restorePersistedRuntime().exceptionally(ex -> {
                 LOG.error("Failed to restore persisted DocumentDB clusters at startup", ex);
+                return null;
+            });
+        }
+        if (config.services().neptune().enabled()) {
+            // Starts the clusters' containers and proxies in the background, failing the future with the ones it could not.
+            neptuneService.restorePersistedRuntime().exceptionally(ex -> {
+                LOG.error("Failed to restore persisted Neptune clusters at startup", ex);
                 return null;
             });
         }
@@ -497,8 +523,12 @@ public class EmulatorLifecycle {
         runCleanup("DynamoDB Streams poller", dynamodbStreamsPoller::shutdown);
         runCleanup("Kinesis poller", kinesisPoller::shutdown);
         runCleanup("Redshift zero-ETL consumer", redshiftZeroEtlConsumer::shutdown);
+        if (logsExportService != null) {
+            runCleanup("Logs export worker", logsExportService::shutdown);
+        }
         runCleanup("storage flush", storageFactory::flushAll);
         List<ContainerTeardown> prepared = ContainerTeardowns.prepareAll(containerTeardowns, LOG);
+        runCleanup("RDS instance starts", rdsService::shutdownInstanceStarts);
         runCleanup("EC2 metadata server", () -> {
             if (isMetadataServerNeeded()) {
                 ec2MetadataServer.stop();

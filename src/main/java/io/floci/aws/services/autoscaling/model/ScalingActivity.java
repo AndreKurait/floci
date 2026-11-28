@@ -15,13 +15,26 @@ public class ScalingActivity {
     private String cause;
     private Instant startTime;
     private Instant endTime;
-    private String statusCode;  // InProgress | Successful | Failed | Cancelled
+    private String statusCode;  // PreInService | InProgress | Successful | Failed | Cancelled
     private String statusMessage;
     private int progress;       // 0-100
     // The Auto Scaling group's region; null for activities persisted before it was recorded.
     private String region;
 
     public ScalingActivity() {}
+
+    public ScalingActivity(ScalingActivity source) {
+        this.activityId = source.activityId;
+        this.autoScalingGroupName = source.autoScalingGroupName;
+        this.description = source.description;
+        this.cause = source.cause;
+        this.startTime = source.startTime;
+        this.endTime = source.endTime;
+        this.statusCode = source.statusCode;
+        this.statusMessage = source.statusMessage;
+        this.progress = source.progress;
+        this.region = source.region;
+    }
 
     public String getActivityId() { return activityId; }
     public void setActivityId(String v) { this.activityId = v; }

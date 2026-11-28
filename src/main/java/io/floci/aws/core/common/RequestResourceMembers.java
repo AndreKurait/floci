@@ -11,6 +11,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -42,13 +43,15 @@ final class RequestResourceMembers {
     /** An ARN may be nested in structures, array elements or map values. */
     private static final Pattern ARN_MEMBER = Pattern.compile(
             "[A-Za-z][A-Za-z0-9_]*(\\[])?(\\.[A-Za-z][A-Za-z0-9_]*(\\[])?)?"
+                    + "|[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*){2}"
                     + "|[A-Za-z][A-Za-z0-9_]*\\{\\}(\\.[A-Za-z][A-Za-z0-9_]*){1,2}");
     /**
-     * A member filling a variable may also be a field of a structure, or of each of a list's structures, or of a field
-     * of each of them, or of a map's structure values, one value for each, or a map's keys ({@code Name{}}).
+     * A member filling a variable may also be a field of a structure or of a structure inside one, or of each of a
+     * list's structures, or of a field of each of them, or of a map's structure values, one value for each, or a map's
+     * keys ({@code Name{}}).
      */
     private static final Pattern FILL_MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[]|\\[]\\.[A-Za-z][A-Za-z0-9_]*"
-            + "(\\.[A-Za-z][A-Za-z0-9_]*)?|\\{}|\\{}\\.[A-Za-z][A-Za-z0-9_]*|\\.[A-Za-z][A-Za-z0-9_]*)?");
+            + "(\\.[A-Za-z][A-Za-z0-9_]*)?|\\{}|\\{}\\.[A-Za-z][A-Za-z0-9_]*|(\\.[A-Za-z][A-Za-z0-9_]*){1,2})?");
     /**
      * A member a service finds a resource by: one list, or a value at any depth of structures, as a lookup's request
      * gives it ({@code AlternateIdentifier.ExternalId.Id}).
@@ -75,6 +78,8 @@ final class RequestResourceMembers {
     private static final Pattern APPENDED_ID = Pattern.compile("[/:]\\$\\{\\w+}");
     /** A word of a child type's own and one id, which its format appends to its parent's whole resource. */
     private static final Pattern NESTED_ID = Pattern.compile("[/:][A-Za-z][A-Za-z0-9-]*[/:]\\$\\{\\w+}");
+    /** An API a row is read for: a protocol botocore gives a client and its API version ({@code query/2010-12-01}). */
+    private static final Pattern API = Pattern.compile("[a-z0-9-]+/\\d{4}-\\d{2}-\\d{2}");
     /** The keys a resource found by members does not take: it is read no other way. */
     private static final List<String> FOUND_ONLY = List.of("arnOf", "fixed");
     /** The keys of a resource read from a member holding its ARN. */
@@ -133,10 +138,10 @@ final class RequestResourceMembers {
      * secret's {@code -??????}), or null.
      */
     record ArnFormat(String format, Pattern pattern, boolean unqualified, boolean minted, Pattern integers,
-                     String mintedSuffix) {
+                     String mintedSuffix, Pattern lowercase) {
 
         ArnFormat(String format, Pattern pattern, boolean unqualified, boolean minted) {
-            this(format, pattern, unqualified, minted, null, null);
+            this(format, pattern, unqualified, minted, null, null, null);
         }
 
         ArnFormat(String format, Pattern pattern, boolean unqualified) {
@@ -158,6 +163,23 @@ final class RequestResourceMembers {
                 }
             }
             return arn.substring(0, at);
+        }
+
+        String named(String arn) {
+            if (lowercase == null) {
+                return checked(arn);
+            }
+            Matcher values = lowercase.matcher(arn);
+            if (!values.matches()) {
+                return checked(arn);
+            }
+            StringBuilder normalized = new StringBuilder();
+            int at = 0;
+            for (int group = 1; group <= values.groupCount(); group++) {
+                normalized.append(arn, at, values.start(group)).append(values.group(group).toLowerCase(Locale.ROOT));
+                at = values.end(group);
+            }
+            return checked(normalized.append(arn.substring(at)).toString());
         }
 
         private String normalizeIntegers(String arn) {
@@ -262,14 +284,35 @@ final class RequestResourceMembers {
      * {@code renames} is the resource the member it names gives, as its service holds it, with the name and the path
      * the request gives each in place of its own (UpdateUser's {@code UserName}, renamed {@code NewUserName}, moved
      * {@code NewPath}). A {@code signer} resource is the user whose access key signs the request, which its service
-     * gives, {@code when} the request leaves out the members that would name another.
+     * gives, {@code when} the request leaves out the members that would name another. Each resource names the
+     * {@code apis} it is read for, each a protocol botocore gives a client of the operation with its API version
+     * ({@code query/2010-12-01}): one some of the operation's clients read applies to the requests of their APIs alone
+     * (SES v1's {@code SourceArn}, which no v2 request has); none for every request.
      */
     record Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
                     Map<String, List<String>> unless, Map<String, String> arnOf, Member account,
                     Map<String, String> fixed, boolean made, List<Member> find, String endpoint, Member through,
                     boolean byDefault, Map<String, String> whenDefault, Map<String, String> unlessDefault,
                     Map<String, String> defaults, boolean partialArn, Member statement, String verb,
-                    Map<String, String> names, Member path, Member renames, boolean signer) {
+                    Map<String, String> names, Member path, Member renames, boolean signer, List<String> apis) {
+
+        Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
+                 Map<String, List<String>> unless, Map<String, String> arnOf, Member account,
+                 Map<String, String> fixed, boolean made, List<Member> find, String endpoint, Member through,
+                 boolean byDefault, Map<String, String> whenDefault, Map<String, String> unlessDefault,
+                 Map<String, String> defaults, boolean partialArn, Member statement, String verb,
+                 Map<String, String> names, Member path, Member renames, boolean signer) {
+            this(types, arn, fill, when, unless, arnOf, account, fixed, made, find, endpoint, through, byDefault,
+                    whenDefault, unlessDefault, defaults, partialArn, statement, verb, names, path, renames, signer,
+                    List.of());
+        }
+
+        /** This resource, read for those APIs alone. */
+        Resource withApis(List<String> read) {
+            return new Resource(types, arn, fill, when, unless, arnOf, account, fixed, made, find, endpoint, through,
+                    byDefault, whenDefault, unlessDefault, defaults, partialArn, statement, verb, names, path, renames,
+                    signer, List.copyOf(read));
+        }
 
         Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
                  Map<String, List<String>> unless, Map<String, String> arnOf, Member account,
@@ -422,7 +465,8 @@ final class RequestResourceMembers {
             throw new IllegalStateException(RESOURCE_NAME + " carries no operations");
         }
         Set<String> namespaces = Set.copyOf(document.path("namespaces").propertyStream().map(Map.Entry::getKey).toList());
-        validateIntegerVariables(document.path("integerVariables"), document.path("arnFormats"));
+        validateVariables("integerVariables", document.path("integerVariables"), document.path("arnFormats"));
+        validateVariables("lowercaseVariables", document.path("lowercaseVariables"), document.path("arnFormats"));
         Map<String, Map<String, ArnFormat>> formats = new LinkedHashMap<>();
         // A route type the developer guide gives a path of is a resource type as the Service Reference's are.
         for (String section : List.of("arnFormats", "pathFormats")) {
@@ -439,9 +483,11 @@ final class RequestResourceMembers {
                     }
                     Set<String> integers = names(document.path("integerVariables").path(namespace.getKey())
                             .path(type.getKey()));
+                    Set<String> lowercase = names(document.path("lowercaseVariables").path(namespace.getKey())
+                            .path(type.getKey()));
                     types.put(type.getKey(), new ArnFormat(format, pattern(format), unqualified.contains(type.getKey()),
                             minted.contains(type.getKey()), integers.isEmpty() ? null : pattern(format, integers),
-                            suffixes.path(type.getKey()).asText(null)));
+                            suffixes.path(type.getKey()).asText(null), lowercase.isEmpty() ? null : pattern(format, lowercase)));
                 });
                 formats.put(namespace.getKey(), Map.copyOf(types));
             });
@@ -531,7 +577,7 @@ final class RequestResourceMembers {
                     throw new IllegalStateException(RESOURCE_NAME + " checks a resource of " + operation.getKey()
                             + " as " + action + ", none of the actions it records for the operation");
                 }
-                (action == null ? resources : byAction.get(action)).add(resource(operation.getKey(),
+                (action == null ? resources : byAction.get(action)).add(readRow(operation.getKey(),
                         action == null ? resource : ((ObjectNode) resource.deepCopy()).without("action"),
                         formats.getOrDefault(namespace, Map.of())));
             }
@@ -783,6 +829,21 @@ final class RequestResourceMembers {
         return Set.copyOf(list.valueStream().map(JsonNode::asText).toList());
     }
 
+    /** A row of the resources an operation reads, with the APIs it names it is read for ({@code apis}), if any. */
+    private static Resource readRow(String operation, JsonNode row, Map<String, ArnFormat> formats) {
+        if (!row.has("apis")) {
+            return resource(operation, row, formats);
+        }
+        JsonNode apis = row.path("apis");
+        if (!apis.isArray() || apis.isEmpty()
+                || !apis.valueStream().allMatch(api -> api.isTextual() && API.matcher(api.asText()).matches())) {
+            throw new IllegalStateException(RESOURCE_NAME + " reads a resource of " + operation + " for " + apis
+                    + ", which is no list of protocols with their API versions");
+        }
+        return resource(operation, ((ObjectNode) row.deepCopy()).without("apis"), formats)
+                .withApis(apis.valueStream().map(JsonNode::asText).toList());
+    }
+
     private static Resource resource(String operation, JsonNode resource, Map<String, ArnFormat> formats) {
         if (resource.has("made") && !(resource.path("made").isBoolean() && resource.path("made").booleanValue())) {
             throw new IllegalStateException(RESOURCE_NAME + " marks a resource of " + operation + " made by "
@@ -848,11 +909,12 @@ final class RequestResourceMembers {
             fill.put(variable.getKey(), fillMember(operation, variable.getValue().asText("")));
         });
         Map<String, String> fixed = new LinkedHashMap<>();
+        // A fixed value may be empty: AWS writes a CodeArtifact package with no namespace with its namespace empty.
         resource.path("fixed").properties().forEach(variable -> {
             if (!variables.contains(variable.getKey()) || fill.containsKey(variable.getKey())
-                    || !variable.getValue().isTextual() || variable.getValue().asText().isEmpty()) {
+                    || !variable.getValue().isTextual()) {
                 throw new IllegalStateException(RESOURCE_NAME + " fixes " + variable.getKey() + " for " + operation
-                        + ", no variable of " + type + "'s format that no member fills, or to no value");
+                        + ", no variable of " + type + "'s format that no member fills, or to no text");
             }
             fixed.put(variable.getKey(), variable.getValue().asText());
         });
@@ -1115,17 +1177,17 @@ final class RequestResourceMembers {
         return new Member(outer.name(), outer.list(), arnMember(operation, path.substring(dot + 1)), outer.map());
     }
 
-    /** Reject integer metadata that does not identify a resource variable in a known ARN format. */
-    private static void validateIntegerVariables(JsonNode integers, JsonNode formats) {
+    /** Reject normalization metadata that does not identify a resource variable in a known ARN format. */
+    private static void validateVariables(String property, JsonNode integers, JsonNode formats) {
         if (integers.isMissingNode()) {
             return;
         }
         if (!integers.isObject()) {
-            throw new IllegalStateException(RESOURCE_NAME + " integerVariables must be an object");
+            throw new IllegalStateException(RESOURCE_NAME + " " + property + " must be an object");
         }
         integers.properties().forEach(namespace -> {
             if (!namespace.getValue().isObject() || !formats.has(namespace.getKey())) {
-                throw new IllegalStateException(RESOURCE_NAME + " integerVariables has no formats for " + namespace.getKey());
+                throw new IllegalStateException(RESOURCE_NAME + " " + property + " has no formats for " + namespace.getKey());
             }
             namespace.getValue().properties().forEach(type -> {
                 String format = formats.path(namespace.getKey()).path(type.getKey()).asText("");
@@ -1135,7 +1197,7 @@ final class RequestResourceMembers {
                 JsonNode names = type.getValue();
                 if (!names.isArray() || names.isEmpty() || !names.valueStream().allMatch(
                         name -> name.isTextual() && variables.contains(name.asText()))) {
-                    throw new IllegalStateException(RESOURCE_NAME + " integerVariables names no variables for "
+                    throw new IllegalStateException(RESOURCE_NAME + " " + property + " names no variables for "
                             + namespace.getKey() + ":" + type.getKey());
                 }
             });

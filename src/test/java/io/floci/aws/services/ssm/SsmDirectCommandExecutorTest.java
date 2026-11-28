@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
@@ -123,7 +124,8 @@ class SsmDirectCommandExecutorTest {
     void timeoutAppliesOnlyToUserScriptBeforeDiagnosticsRun() {
         String command = SsmDirectCommandExecutor.timeoutWrappedScript("sleep 100", 30);
 
-        assertTrue(command.contains("setsid sh -c 'sleep 100'"));
+        assertTrue(command.contains("setsid sh -c"));
+        assertTrue(command.contains("sleep 100"));
         assertFalse(command.contains("floci_ssm_redact"));
     }
 
@@ -246,8 +248,9 @@ class SsmDirectCommandExecutorTest {
         assertEquals(7, result.get().responseCode());
     }
 
-    @Test
-    void timeoutClosesDockerExecCallback() throws Exception {
+    @ParameterizedTest
+    @CsvSource(value = {"true, 0", "false, null", "null, 0"}, nullValues = "null")
+    void unfinishedOrUnknownExecKeepsHostTimeoutAndClosesCallback(Boolean running, Long exitCode) throws Exception {
         DockerClient dockerClient = mock(DockerClient.class);
         Ec2Service ec2Service = mock(Ec2Service.class);
         Instance instance = instance("i-container", "container-1");
@@ -265,6 +268,13 @@ class SsmDirectCommandExecutorTest {
         ResultCallback<Frame> callback = mock(ResultCallback.class);
         when(execStart.exec(any())).thenReturn(callback);
         when(dockerClient.execStartCmd("exec-1")).thenReturn(execStart);
+
+        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+        InspectExecResponse inspectExecResponse = mock(InspectExecResponse.class);
+        when(inspectExecResponse.isRunning()).thenReturn(running);
+        when(inspectExecResponse.getExitCodeLong()).thenReturn(exitCode);
+        when(inspectExec.exec()).thenReturn(inspectExecResponse);
+        when(dockerClient.inspectExecCmd("exec-1")).thenReturn(inspectExec);
 
         SsmDirectCommandExecutor executor = new SsmDirectCommandExecutor(dockerClient, dockerClient, ec2Service);
         Optional<SsmDirectCommandExecutor.ExecutionResult> result = executor.executeIfSupported(

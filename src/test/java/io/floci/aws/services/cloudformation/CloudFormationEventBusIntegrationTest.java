@@ -1,5 +1,8 @@
 package io.floci.aws.services.cloudformation;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testing.RestAssuredJsonUtils;
@@ -10,11 +13,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -366,21 +372,15 @@ class CloudFormationEventBusIntegrationTest {
     }
 
     private void awaitStackStatus(String stackName, String expectedStatus) throws InterruptedException {
-        String lastBody = null;
-        for (int i = 0; i < 100; i++) {
-            lastBody = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackName)
-            .when().post("/").then().extract().asString();
-            if (lastBody.contains("<StackStatus>" + expectedStatus + "</StackStatus>")) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        throw new AssertionError("Timed out waiting for stack " + stackName + " to reach "
-                + expectedStatus + ". Last response: " + lastBody);
+            .when().post("/").then().extract().asString(),
+                body -> body.contains("<StackStatus>" + expectedStatus + "</StackStatus>"),
+                body -> "Timed out waiting for stack " + stackName + " to reach "
+                        + expectedStatus + ". Last response: " + body);
     }
 
     @Test
@@ -883,6 +883,44 @@ class CloudFormationEventBusIntegrationTest {
         return callEventBridge("AWSEvents.DescribeEventBus", "{\"Name\":\"" + busName + "\"}", 200).getMap("");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"object", "string", "substitution"})
+    void eventBusPolicyJsonSurvivesResolutionAndNoOpUpdate(String form) throws Exception {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String busName = "resolved-policy-bus-" + suffix;
+        String stackName = "resolved-policy-stack-" + suffix;
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode template = (ObjectNode) mapper.readTree(eventBusWithPolicyTemplate(busName, "AllowEvents"));
+        ObjectNode properties = (ObjectNode) template.path("Resources").path("Bus").path("Properties");
+        JsonNode policy = properties.get("Policy");
+        if ("string".equals(form)) {
+            properties.put("Policy", policy.toString());
+        } else if ("substitution".equals(form)) {
+            ((ObjectNode) policy.path("Statement").get(0)).put("Resource",
+                    "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/" + busName);
+            properties.set("Policy", mapper.createObjectNode().put("Fn::Sub", policy.toString()));
+        }
+        String body = template.toString();
+
+        createStack(stackName, body);
+        try {
+            assertStackStatus(stackName, "CREATE_COMPLETE");
+            JsonNode stored = mapper.readTree((String) describeBus(busName).get("Policy"));
+            assertEquals("AllowEvents", stored.path("Statement").get(0).path("Sid").asText());
+            if ("substitution".equals(form)) {
+                assertEquals("arn:aws:events:us-east-1:000000000000:event-bus/" + busName,
+                        stored.path("Statement").get(0).path("Resource").asText());
+            }
+            updateStack(stackName, CfnUpdates.forceUpdate(body));
+            assertStackStatus(stackName, "UPDATE_COMPLETE");
+            assertEquals(stored, mapper.readTree((String) describeBus(busName).get("Policy")));
+        } finally {
+            deleteStack(stackName);
+            CfnStackWaits.awaitStackDeleted(stackName);
+        }
+        callEventBridge("AWSEvents.DescribeEventBus", "{\"Name\":\"" + busName + "\"}", 400);
+    }
+
     @Test
     void mutableEventBusPolicyUpdateRollsBackWithoutChangingPolicy() {
         String suffix = Long.toString(System.nanoTime(), 36);
@@ -1002,7 +1040,11 @@ class CloudFormationEventBusIntegrationTest {
         createStack(stackName, template);
         assertStackStatus(stackName, "CREATE_COMPLETE");
         callEventBridge("AWSEvents.DeleteEventBus", "{\"Name\":\"" + busName + "\"}", 200);
-        Thread.sleep(2);
+        // The engine tells the recreated bus from its own by the creation time, which EventBridge reads
+        // from the wall clock: the new bus has to be created at a later instant than the old one was.
+        Instant deleted = Instant.now();
+        await().atMost(Duration.ofSeconds(1)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> Instant.now().isAfter(deleted));
         callEventBridge("AWSEvents.CreateEventBus",
                 "{\"Name\":\"" + busName + "\",\"Description\":\"external\"}", 200);
 

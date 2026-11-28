@@ -119,6 +119,57 @@ class EcrRegistryDataPlaneTest {
         assertEquals("/v2/123456789012/eu-west-1/team/app/tags/list", requestNoPort.backendUri());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "us-east-1,amazonaws.com",
+            "eu-west-1,amazonaws.com",
+            "us-gov-west-1,amazonaws.com",
+            "cn-north-1,amazonaws.com.cn",
+            "us-iso-east-1,c2s.ic.gov",
+            "us-isob-east-1,sc2s.sgov.gov",
+            "eu-isoe-west-1,cloud.adc-e.uk",
+            "us-isof-south-1,csp.hci.ic.gov",
+            "eusc-de-east-1,amazonaws.eu"
+    })
+    void nativeRegistryHostPreservesAccountRegionAndUploadContinuation(String region, String suffix) {
+        String host = "123456789012.dkr.ecr." + region + "." + suffix;
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
+                host, "/v2/team/app/blobs/uploads/", "mount=sha256:abc", "hostname").orElseThrow();
+
+        assertEquals("123456789012", request.accountId());
+        assertEquals(region, request.region());
+        assertEquals("team/app", request.repositoryName());
+        assertEquals("/v2/123456789012/" + region + "/team/app/blobs/uploads/?mount=sha256:abc",
+                request.backendUri());
+        assertEquals("/v2/team/app/blobs/uploads/upload-id",
+                EcrRegistryDataPlane.externalLocation(
+                        "/v2/123456789012/" + region + "/team/app/blobs/uploads/upload-id", request));
+        assertEquals("/v2/", EcrRegistryDataPlane.requestFor(
+                host + ":443", "/v2/", null, "hostname").orElseThrow().backendUri());
+        assertEquals(request.backendUri(), EcrRegistryDataPlane.requestFor(
+                "floci:4566", "/v2/team/app/blobs/uploads/",
+                "ns=" + host + "&mount=sha256:abc", "hostname").orElseThrow().backendUri());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "12345.dkr.ecr.us-east-1.amazonaws.com",
+            "abcdefghijkl.dkr.ecr.us-east-1.amazonaws.com",
+            "123456789012.dkr.ecr.cn-north-1.amazonaws.com",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com.cn",
+            "123456789012.dkr.ecr.us-isob-east-1.c2s.ic.gov",
+            "123456789012.dkr.ecr.not-a-region.amazonaws.com",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com.example.com",
+            "123456789012.api.ecr.us-east-1.amazonaws.com",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com:invalid"
+    })
+    void invalidNativeRegistryHostCannotSelectAnAccountNamespace(String host) {
+        assertTrue(EcrRegistryDataPlane.requestFor(
+                host, "/v2/team/app/manifests/v1", null, "hostname").isEmpty());
+        assertTrue(EcrRegistryDataPlane.requestFor(
+                "floci:4566", "/v2/team/app/manifests/v1", "ns=" + host, "hostname").isEmpty());
+    }
+
     @Test
     void aMirrorRequestForAnAccountsAwsRegistryHostIsServedFromThatAccountsRepository() {
         EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("172.17.0.1:4566",
@@ -138,7 +189,7 @@ class EcrRegistryDataPlaneTest {
     }
 
     @Test
-    void anAwsRegistryHostIsServedOnlyAsAMirrorRequestsNamespaceInItsRegionsPartition() {
+    void awsRegistryHostChecksPartitionAndAllowsStandardNativeEndpoint() {
         // A region under another partition's suffix names no registry.
         assertFalse(EcrRegistryDataPlane.requestFor("172.17.0.1:4566", "/v2/app/manifests/v1",
                 "ns=111122223333.dkr.ecr.cn-north-1.amazonaws.com", "hostname").isPresent());
@@ -147,8 +198,8 @@ class EcrRegistryDataPlaneTest {
         // Another registry's namespace, such as a public registry's, is not Floci's.
         assertFalse(EcrRegistryDataPlane.requestFor("172.17.0.1:4566", "/v2/library/nginx/manifests/1",
                 "ns=docker.io", "hostname").isPresent());
-        // A request sent to the AWS host itself is not a mirror request.
-        assertFalse(EcrRegistryDataPlane.requestFor("111122223333.dkr.ecr.us-east-1.amazonaws.com",
+        // Native registry endpoints support the fork's AWS-shaped image paths.
+        assertTrue(EcrRegistryDataPlane.requestFor("111122223333.dkr.ecr.us-east-1.amazonaws.com",
                 "/v2/app/manifests/v1", null, "hostname").isPresent());
     }
 
@@ -336,8 +387,13 @@ class EcrRegistryDataPlaneTest {
         }
     }
 
-    @Test
-    void immutableTagRejectsReplacementBeforeItReachesTheRegistry() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "000000000000.dkr.ecr.us-east-1.amazonaws.com",
+            "000000000000.dkr.ecr.us-east-1.amazonaws.com:443"
+    })
+    void immutableTagRejectsReplacementBeforeItReachesTheRegistry(String host) throws Exception {
         String digest = "sha256:" + "b".repeat(64);
         AtomicBoolean tagExists = new AtomicBoolean();
         AtomicInteger manifestWrites = new AtomicInteger();
@@ -373,9 +429,9 @@ class EcrRegistryDataPlaneTest {
                     .when(ecrService).recordImagePush(eq("000000000000"), eq("us-east-1"),
                             eq("platform/api"), eq(digest), any());
 
-            assertEquals(201, putManifest(dataPlane.actualPort()).statusCode());
+            assertEquals(201, putManifest(dataPlane.actualPort(), host).statusCode());
 
-            ManifestResponse rejected = putManifest(dataPlane.actualPort());
+            ManifestResponse rejected = putManifest(dataPlane.actualPort(), host);
             assertEquals(400, rejected.statusCode());
             JsonObject json = new JsonObject(rejected.body());
             JsonArray errors = json.getJsonArray("errors");
@@ -1233,14 +1289,7 @@ class EcrRegistryDataPlaneTest {
      * end, and with it its lock release, runs on the event loop after its answer is seen.
      */
     private static boolean acquiredWithin(Semaphore semaphore, long millis) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + millis;
-        while (!semaphore.tryAcquire()) {
-            if (System.currentTimeMillis() >= deadline) {
-                return false;
-            }
-            Thread.sleep(10);
-        }
-        return true;
+        return semaphore.tryAcquire(millis, TimeUnit.MILLISECONDS);
     }
 
     private ManifestResponse putManifest(int port) throws Exception {
@@ -1278,4 +1327,40 @@ class EcrRegistryDataPlaneTest {
     }
 
     private record RegistryResponse(int status, String contentType, String apiVersion, String body) {}
+    @Test
+    void nativeRegistryPortRestrictionPreservesLocalPortsAndNamespaceFallback() {
+        String path = "/v2/team/image/manifests/latest";
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.amazonaws.com:443",
+                path, null, "hostname").isPresent());
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.amazonaws.com:4566",
+                path, null, "hostname").isEmpty());
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.localhost:4566",
+                path, null, "hostname").isPresent());
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.localhost.floci.io:4566",
+                path, null, "hostname").isPresent());
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com:4566", path,
+                "ns=123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn:443", "hostname").orElseThrow();
+        assertEquals("cn-north-1", request.region());
+    }
+
+    @Test
+    void nativeRegistryHostAndMirrorNamespaceKeepAccountRegionRouting() {
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
+                "/v2/team/image/manifests/latest", null, "hostname").orElseThrow();
+        assertEquals("/v2/123456789012/cn-north-1/team/image/manifests/latest", request.backendUri());
+        EcrRegistryDataPlane.RegistryRequest mirror = EcrRegistryDataPlane.requestFor("localhost:4566", "/v2/team/image/manifests/latest",
+                "ns=123456789012.dkr.ecr.us-east-1.amazonaws.com", "hostname").orElseThrow();
+        assertEquals("/v2/123456789012/us-east-1/team/image/manifests/latest", mirror.backendUri());
+    }
+
+    @Test
+    void nativeRegistryRoutingRejectsForeignSuffixAndWrongPartition() {
+        for (String host : List.of("123456789012.dkr.ecr.cn-north-1.amazonaws.com",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com.evil.example",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com:1234")) {
+            assertTrue(EcrRegistryDataPlane.requestFor(host, "/v2/team/image/manifests/latest", null, "hostname").isEmpty());
+        }
+    }
+
 }

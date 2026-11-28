@@ -116,6 +116,32 @@ class AccountAwareStorageBackendTest {
     }
 
     @Test
+    void explicitReadRetainsDefaultLegacyEntryAndPrefersScopedEntry() {
+        InMemoryStorage<String, String> delegate = new InMemoryStorage<>();
+        AccountAwareStorageBackend<String> storage =
+                new AccountAwareStorageBackend<>(delegate, null, "111111111111");
+        delegate.put("key", "legacy");
+
+        assertEquals(Optional.of("legacy"), AccountAwareStorageBackend.readInAccount(storage, "111111111111", "key"));
+        assertEquals(Set.of("key"), delegate.keys());
+        assertEquals(Optional.empty(), AccountAwareStorageBackend.readInAccount(storage, "222222222222", "key"));
+        delegate.put("111111111111/key", "scoped");
+        assertEquals(Optional.of("scoped"), AccountAwareStorageBackend.readInAccount(storage, "111111111111", "key"));
+        assertEquals(Optional.of("legacy"), delegate.get("key"));
+    }
+
+    @Test
+    void explicitReadFallsBackToOrdinaryStorageOrCurrentAccount() {
+        InMemoryStorage<String, String> delegate = new InMemoryStorage<>();
+        delegate.put("key", "plain");
+        assertEquals(Optional.of("plain"), AccountAwareStorageBackend.readInAccount(delegate, "111111111111", "key"));
+        AccountAwareStorageBackend<String> storage =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "111111111111");
+        storage.putForAccount("111111111111", "key", "scoped");
+        assertEquals(Optional.of("scoped"), AccountAwareStorageBackend.readInAccount(storage, null, "key"));
+    }
+
+    @Test
     void accountIdReturnsDefaultOutsideRequestScope() {
         AccountAwareStorageBackend<String> storage =
                 new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "111111111111");
@@ -600,6 +626,24 @@ class AccountAwareStorageBackendTest {
         }
         assertTrue(storage.findAnyAccountEntry("MISSING").isEmpty());
 
+        verify(raw, never()).keys();
+    }
+
+    @Test
+    void exactLookupFindsAllOwnersAndLegacyEntriesWithoutRescanning() {
+        InMemoryStorage<String, String> raw = spy(new InMemoryStorage<String, String>());
+        AccountAwareStorageBackend<String> storage =
+                new AccountAwareStorageBackend<>(raw, null, "111111111111");
+        raw.put("KEY", "legacy");
+        storage.putForAccount("111111111111", "KEY", "own");
+        storage.putForAccount("222222222222", "KEY", "foreign");
+        assertEquals(3, storage.findAllAccountEntries("KEY").size());
+        clearInvocations(raw);
+        storage.putForAccount("333333333333", "KEY", "new");
+        assertEquals(Set.of("legacy", "own", "foreign", "new"), Set.copyOf(
+                storage.findAllAccountEntries("KEY").stream()
+                        .map(AccountAwareStorageBackend.AccountEntry::value).toList()));
+        assertTrue(storage.findAllAccountEntries("MISSING").isEmpty());
         verify(raw, never()).keys();
     }
 

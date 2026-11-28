@@ -74,4 +74,16 @@ class AthenaStoredResourceArnsTest {
         when(athena.findQueryExecutionRegion("q-old")).thenReturn(Optional.empty());
         assertEquals(List.of(), stored.through("QueryExecutionId", "q-old", REGION));
     }
+    @Test
+    void onlyALegacyExecutionMayResolveItsConfiguredOriginalRegion() {
+        QueryExecution execution = new QueryExecution();
+        execution.setWorkGroup("legacy");
+        when(athena.findQueryExecution("q-legacy")).thenReturn(Optional.of(execution));
+        when(athena.findQueryExecutionRegion("q-legacy")).thenReturn(Optional.empty());
+        when(athena.findLegacyQueryExecutionRegion("q-legacy")).thenReturn(Optional.of("us-east-1"));
+
+        assertEquals(List.of("arn:aws:athena:us-east-1:000000000000:workgroup/legacy"),
+                stored.through("QueryExecutionId", "q-legacy", REGION));
+    }
+
 }

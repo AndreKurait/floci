@@ -25,11 +25,15 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -39,6 +43,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -83,7 +88,7 @@ class AthenaServiceTest {
         when(services.athena()).thenReturn(athena);
         when(athena.mock()).thenReturn(false);
 
-        regionResolver = mock(RegionResolver.class);
+        regionResolver = spy(new RegionResolver("us-east-1", "000000000000"));
         service = new AthenaService(storageFactory, duckClient, glueService, s3Service,
                 config, vertx, ddlBuilder, regionResolver, icebergStatements,
                 mock(IamEnforcementFilter.class));
@@ -245,7 +250,12 @@ class AthenaServiceTest {
     void getQueryResultsRefusesAnUnsucceededQueryAsAthenaWordsIt() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger executions = new AtomicInteger();
+        // Stubbed once: re-stubbing the mock while the first worker may still call it races Mockito.
         doAnswer(invocation -> {
+            if (executions.getAndIncrement() > 0) {
+                throw new IllegalStateException("duck failed");
+            }
             started.countDown();
             release.await(10, TimeUnit.SECONDS);
             return null;
@@ -258,9 +268,6 @@ class AthenaServiceTest {
         release.countDown();
         assertEquals("Could not find results", resultsRefusal(id));
 
-        doAnswer(invocation -> {
-            throw new IllegalStateException("duck failed");
-        }).when(duckClient).execute(anyString(), any(), any(), any());
         String failed = service.startQueryExecution("SELECT 1", "primary", null, null);
         awaitState(failed, QueryExecutionState.FAILED);
         assertEquals("Query did not finish successfully. Final query state: FAILED", resultsRefusal(failed));
@@ -476,14 +483,8 @@ class AthenaServiceTest {
         return service.getQueryResults(REGION, id);
     }
 
-    private void awaitState(String id, QueryExecutionState expected) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (System.nanoTime() < deadline) {
-            if (service.getQueryExecution(REGION, id).getStatus().getState() == expected) {
-                return;
-            }
-            Thread.sleep(10);
-        }
-        assertEquals(expected, service.getQueryExecution(REGION, id).getStatus().getState());
+    private void awaitState(String id, QueryExecutionState expected) {
+        await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> service.getQueryExecution(REGION, id).getStatus().getState(), equalTo(expected));
     }
 }

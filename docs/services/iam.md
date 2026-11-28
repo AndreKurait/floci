@@ -9,6 +9,28 @@ Responses retain the catalog's canonical ARN and policy name. Attachments and
 permissions boundaries use that same identity, so alternate spellings do not create
 duplicate attachments or prevent removal. Unknown policies still return `NoSuchEntity`.
 
+## REST management authentication
+
+With `floci.services.iam.enforcement-enabled=true`, registered REST management routes require
+AWS credentials before dispatch. Authentication ownership is explicit controller metadata in the
+service catalog, independent of the route's IAM action mapping. Public or alternatively
+authenticated controllers retain their own authentication, including S3 bucket-policy reads,
+CloudFront serving, CodeArtifact package downloads and Cognito OAuth/discovery.
+
+The declarations cover REST controllers whose AWS operations require signed credentials, including
+Lambda's separate account, layer, concurrency, code-signing, tagging and function-URL management
+controllers. Shared tag and security-admin dispatchers also require credentials. S3 Control uses its
+own XML error namespace. Credential validity is checked even when no IAM action rule maps a required
+management route; the existing permissive authorization for an unmapped action remains unchanged.
+
+Mixed controllers can retain endpoint-owned authentication on specific resource methods. IoT job
+data routes remain separate from IoT management calls. Bedrock bearer authentication, AgentCore
+runtime OAuth, IoT certificate/custom authorization, SSO token flows, function URL invocation and
+application execution routes retain their endpoint-specific contracts. These declarations do not
+establish complete authentication for those alternative transports. Contested paths still follow
+the existing signed-service routing rules; an unsigned path can deliberately resolve to S3.
+Disabling IAM enforcement preserves local unsigned management access.
+
 ## AWS Sign-In login credentials
 
 Floci also implements the AWS Sign-In data-plane flow used by the AWS CLI login credentials
@@ -127,6 +149,28 @@ An operation AWS starts paging later needs `make aws-data-sync`, not new handler
 `UpdateRoleDescription` is the description half of `UpdateRole`, which is what AWS's own reference tells callers to use instead. Both of its members are required, so a request without `Description` answers `ValidationError` rather than leaving the role as it is, an empty `Description` is a value that clears the description, and the modified role comes back in the response, which `UpdateRole` does not answer at all.
 
 A role `Description` is held to the shape AWS publishes for it on every action that takes one, `CreateRole`, `UpdateRole`, `UpdateRoleDescription` and `CreateServiceLinkedRole`: at most 1000 characters of `[\u0009\u000A\u000D\u0020-\u007E\u00A1-\u00FF]`, which admits tab, newline and carriage return and no other control character, otherwise `ValidationError`. The check runs before the role is looked up or created, so a refused description never reaches a stored role, and the `Role` these actions and `GetRole` answer always stays parsable XML.
+
+`CreateRole` and `UpdateAssumeRolePolicy` bind role and user entries in `Principal.AWS`
+to the identity's immutable ID. The principal must exist at its exact partition, account, path and name, in the target role's
+partition; an explicit live role or user ID from that partition is also accepted. A missing ARN or stale ID returns
+`MalformedPolicyDocument` (HTTP 400) before the target policy changes. An existing target
+still returns `EntityAlreadyExists` for `CreateRole`, and a missing update target returns
+`NoSuchEntity`, before principal admission.
+
+IAM role responses, including `ListRoles` and `GetAccountAuthorizationDetails`, display a
+live identity's current ARN. Deleting it exposes the saved ID. Recreating the same name and
+path produces a different ID and does not restore the old trust; an explicit policy update
+is needed. User renames retain the ID and display the new ARN. These IDs persist in the
+existing trust-policy field across storage reloads.
+
+Only `Principal.AWS` role and user identities are bound. ARN strings in conditions such as
+`aws:PrincipalArn` keep matching the ARN, including after recreation. Account, root, service,
+federated and explicit session principals retain their existing behavior. Historical policy
+rows containing ARNs keep ARN matching until a new policy save; reading does not migrate
+them. CloudFormation saves use the same admission rules, so referenced identities must be
+created first. Compensation can restore a captured historical policy without rebinding it,
+while checking that the target role still has the expected ID. This is trust-policy binding;
+resource-policy principal strings and general policy grammar behavior are unchanged.
 
 ### Role Templates
 
@@ -796,8 +840,14 @@ reading "Active | Inactive | Expired" as well.
 
 An account holds one alias, and AWS enforces that by replacement rather than rejection:
 `CreateAccountAlias` with a new value silently swaps the current one. `EntityAlreadyExists` means
-the requested name is taken — on AWS that includes names held by other accounts, since aliases are
-globally unique, but the store here is per-account so only "you already hold this one" arises.
+the requested name is taken, including by another local account. A rejected claim preserves
+both accounts' existing aliases. Replacing or deleting an alias releases its old name for reuse.
+Concurrent claims are serialized so only one account obtains a name.
+
+Alias ownership comes from the existing IAM store, including after a restart. Legacy aliases
+without an account prefix belong to the configured default account. They cannot be migrated
+into another account by a read or a conflicting claim. Internal alias resolution rejects
+ambiguous ownership in older stored data instead of selecting an arbitrary account.
 
 `DeleteAccountAlias` must name the current alias; a mismatch returns `NoSuchEntity`. Both verbs
 apply the same pattern constraint, so a malformed value returns `ValidationError` on either.
@@ -813,6 +863,45 @@ skipped when an alias is already stored, so under `storage.mode: persistent` a c
 no effect on later starts — the skip is logged at debug with both values. `/_floci/state/reset`
 clears the alias without re-seeding it, as it does the optional deployer principal; the seed
 returns on restart.
+
+### Local service-account memberships
+
+Floci already evaluates `Principal.Service` for calls its emulated services generate.
+To test a service running as an IAM user or role in a local account, supply a JSON file
+mapping account-root ARNs to service-principal names:
+
+```json
+{
+  "arn:aws:iam::111122223333:root": ["example.amazonaws.com"],
+  "arn:aws:iam::444455556666:root": ["example.amazonaws.com"]
+}
+```
+
+Mount the file read-only into Floci and set
+`FLOCI_SERVICES_IAM_SERVICE_PRINCIPAL_MEMBERSHIPS_PATH` to its container path
+(`floci.services.iam.service-principal-memberships-path` in YAML).
+Enable IAM policy enforcement and SigV4 verification with
+`FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and `FLOCI_AUTH_VALIDATE_SIGNATURES=true`.
+
+The fixture is optional and read once at startup. Missing or malformed configured files
+prevent startup; the size limit is 1 MiB. An unset path supplies no memberships.
+An account may have multiple names, and a name may cover multiple accounts. Account roots
+include their partition; names match exactly, without wildcard, case or regional folding.
+
+A matching `Principal.Service` delegates to the authenticated caller's account in resource
+and role-trust policies. It does not issue credentials or grant an action by itself:
+identity permissions, session policies, boundaries, SCPs and explicit denies still apply.
+EC2 instance-role credentials obtained through IMDS can use the membership. Assuming a
+role in another account uses that new account's memberships, not the original caller's.
+Existing generated service calls retain their behavior.
+
+This is local fixture configuration, not an AWS API or an IAM account alias. Public AWS
+customers cannot turn an account alias into an arbitrary service principal. The fixture
+models policy principal matching only: it does not model account opt-in region filtering,
+service-principal visibility, forwarded access sessions, or populate service-specific
+condition keys for IAM callers. It does not replace the credentials of customer service roles.
+See [AWS service principals](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_principal.html#principal-services)
+and [account aliases](https://docs.aws.amazon.com/IAM/latest/UserGuide/console_account-alias.html).
 
 ### Account Password Policy
 
@@ -1039,8 +1128,9 @@ keys, inline policies, attached managed policies, group memberships, an
 [service-specific credential](#service-specific-credentials): remove those first. That is every
 item on AWS's own list of what to delete before deleting a user programmatically. Renaming a user
 with `UpdateUser` carries all of them to the new name, along with its login profile, access keys and
-group membership. Unlike AWS, Floci does not rewrite policy documents that name the user's ARN, so a
-resource or trust policy that referred to the old name still refers to it after a rename.
+group membership. Bound trust principals follow the user's immutable ID and display its new ARN.
+Floci does not rewrite other policy strings naming the old ARN, including historical trust-policy
+ARN entries and resource-policy entries.
 
 ### What a session's token costs, and when it is refused
 
@@ -1111,6 +1201,13 @@ declare none of the three, their tokens carrying nothing but themselves.
 | SimulateCustomPolicy | Evaluates requested actions and resources against a standalone set of policy documents, with an optional permissions boundary. |
 | GetContextKeysForCustomPolicy | Lists the context keys referenced across a set of policy documents. |
 | GetContextKeysForPrincipalPolicy | Lists the context keys referenced across a resolved principal's policies, plus any additional documents supplied. |
+
+Both simulation operations populate `aws:ResourceArn` and `aws:ARN` for each evaluated
+resource, including the default `*` when `ResourceArns` is omitted. Each action/resource pair
+gets its own condition context, including when results are paginated. Explicit `ContextEntries`
+override `aws:ResourceArn` case-insensitively. Overrides of `aws:ARN` require the lowercase
+`aws:` namespace, while the `ARN` suffix is case-insensitive. Other missing condition keys
+remain absent.
 
 `GetContextKeysForCustomPolicy` and `GetContextKeysForPrincipalPolicy` return every Condition
 operator's key, and every `${...}` policy variable found in a Resource pattern or a Condition
@@ -2565,11 +2662,13 @@ Policy evaluation follows the standard AWS precedence:
 5. If a permission boundary is present, it must also explicitly allow the request
 6. No matching effective allow results in an implicit deny
 
-IAM authorization denials return HTTP 400 `AccessDeniedException` for AWS JSON 1.0/1.1
-requests. REST-JSON requests return HTTP 403 `AccessDeniedException`; AWS Query and S3
+IAM authorization denials return HTTP 403 `AccessDeniedException` for KMS, SSM, and
+REST-JSON requests. Other AWS JSON 1.0/1.1 requests return HTTP 400 `AccessDeniedException`; AWS Query and S3
 requests retain HTTP 403 XML `AccessDenied` responses, except SNS's, which return HTTP 403
 `AuthorizationError`, the error every SNS operation lists for a caller denied access, whichever
-action is denied. The routed protocol determines the status, not just the request's content type.
+action is denied, and EC2's, which return HTTP 403 `UnauthorizedOperation` in EC2's own
+`<Response><Errors><Error>` envelope with a `<RequestID>`, the format EC2's query protocol parses.
+The routed protocol determines the status, not just the request's content type.
 
 A request is checked against the resources it names. For S3, DynamoDB, SSM, KMS, IAM, API Gateway,
 Secrets Manager, Elastic Load Balancing, ECR,
@@ -2580,7 +2679,7 @@ AWS Data Exports, AWS Pricing Calculator, Cost Explorer, CloudTrail, Global Acce
 Timestream for InfluxDB, Amazon Redshift, the Amazon Redshift Data API, AWS Payment Cryptography, AWS DataSync, Amazon EMR,
 Amazon Rekognition, IAM Identity Center, Amazon Inspector, Amazon Macie, AWS Fault Injection Service, AWS Resource
 Access Manager, CloudWatch Observability Access Manager, AWS Resource Explorer, AWS Account Management, AWS Control
-Catalog, Amazon OpenSearch Service, IAM Access Analyzer, AWS Security Hub, Amazon GuardDuty, Lambda, AWS Glue, Amazon SQS, Amazon SNS, Amazon Kinesis Data Streams, Amazon EventBridge Pipes, Aurora DSQL, STS, Amazon EKS, AWS Resource Groups, Amazon CloudWatch Logs, Amazon CloudWatch, Amazon Comprehend, AWS Config, AWS DMS, Amazon ElastiCache, AWS Identity Store, Amazon MemoryDB, Amazon Route 53 Resolver, Amazon SageMaker, Amazon Transcribe, AWS Transfer Family and Amazon EFS they come from a table generated from AWS's Service Reference and botocore, `src/main/resources/aws/iam-request-resources.json`, which gives each
+Catalog, Amazon OpenSearch Service, IAM Access Analyzer, AWS Security Hub, Amazon GuardDuty, Lambda, AWS Glue, Amazon SQS, Amazon SNS, Amazon Kinesis Data Streams, Amazon EventBridge Pipes, Aurora DSQL, STS, Amazon EKS, AWS Resource Groups, Amazon CloudWatch Logs, Amazon CloudWatch, Amazon Comprehend, AWS Config, AWS DMS, Amazon ElastiCache, AWS Identity Store, Amazon MemoryDB, Amazon Route 53 Resolver, Amazon SageMaker, Amazon Transcribe, AWS Transfer Family, Amazon EFS, Amazon SES, AWS AppConfig, AWS CodeArtifact and Amazon CodeGuru Reviewer they come from a table generated from AWS's Service Reference and botocore, `src/main/resources/aws/iam-request-resources.json`, which gives each
 operation's action, the resource types that action acts on with their ARN formats, and the request
 members that name them: a member holding a resource's ARN, which counts when it matches the format
 of a type the action acts on, or members filling the variables of a type's format. Nothing in it is
@@ -2604,8 +2703,19 @@ JSON `X-Amz-Target`, or the operation in a Smithy RPC v2 path), so an `X-Amz-Tar
 request also carries names nothing, and as its handler reads them: a list only from a list, so
 `DescribeRepositories` with a single name for `repositoryNames`, which ECR's handler reads as none
 and answers with every repository, names no repository, and a number or a null as its text. A
-member whose botocore shape is an account id gives the account the type is in: ECR's `registryId`
-selects the registry its handler acts in, so `repository/<name>` is checked in that account, and a
+member whose botocore shape is an account id, in the body or in a REST request's path or query, gives the account
+the type is in: ECR's `registryId` selects the registry its handler acts in, so `repository/<name>` is checked in that
+account, as CodeArtifact's `domain-owner` is the account of the domain and what is in it. A resource that member
+puts in another account than the caller's is checked as an ARN of another account is, as the caller's resource of that
+name too, unless its service acts on it in that account: CodeArtifact, ECR, Redshift and Signer do, for the domain, the
+repository, the snapshot and the profile or job a request names by its owner, so those are checked on that account's
+resource, as AWS checks them, and read there. A request reaching another account's CodeArtifact domain, repository or
+package, or Signer profile or job, needs the owner's grant beside the caller's own policy, as AWS requires of a
+cross-account request: the domain's or repository's policy, or a profile permission `AddProfilePermission` adds,
+each of which CodeArtifact and Signer give IAM as the resource's policy. A resource a request names by another
+spelling than the one its service stores it under is checked as the service reads it: an AppConfig environment or
+configuration profile named by its name by its id, a CodeArtifact PyPI or NuGet package by its normalized name, as
+AWS writes it in the ARN, and a package group by the ARN CodeArtifact stores for it, however its pattern is encoded. A
 `registryId` that is no account id names no repository, while a null one is the caller's, as ECR
 reads it. Step Functions Local's `<stateMachineArn>#<test case>`, which `StartExecution` and
 `StartSyncExecution` take and run the machine before the `#` of, is checked as given: it is no ARN AWS has,
@@ -2692,7 +2802,14 @@ AWS does not document which resource a request naming a session is authorized on
 target is Floci's inference: a session runs on the cluster or workgroup named by the statement that
 opened it.
 EventBridge V2's requests are read beside EventBridge's, each checked on the resources the API serving
-it names (an EventBridge V2 `PutEvents` on the bus its `EventBusArn` names). A
+it names (an EventBridge V2 `PutEvents` on the bus its `EventBusArn` names). Every row of the table names
+the APIs it is read for (`apis`), each a protocol botocore gives a client of the operation with its API
+version, and a request is read for the rows of its own API: a Query request's by the `Version` it names,
+a REST request's by the version of the model whose route it matched. So clients that share an operation
+and an endpoint are told apart by the request itself, never by a member a caller adds: an SES v2
+`SendEmail` is not read for SES v1's `SourceArn`, nor an Elastic Load Balancing v2 request for a classic
+one's members. A request whose API neither gives, a JSON or CBOR request among them, is read for every
+row, as one no row names is. A
 state machine's version or alias
 (`stateMachine:<name>:<qualifier>`) is checked on the state machine's ARN, as Step Functions
 authorizes it, so a grant or a deny on `stateMachine:<name>` covers its versions and aliases, and
@@ -2733,7 +2850,7 @@ serves, and OAM's on `/tags/<arn>` whether the ARN's slash is encoded or not. A 
 tags needs `oam:TagResource` on the sink it names, where the operation is checked, since it acts on no
 link.
 
-The REST routes mapped to an action are those of S3, Lambda, API Gateway, SES v2, RDS Data,
+The REST routes mapped to an action are those of S3, Lambda, API Gateway, RDS Data,
 Kinesis, EKS, EventBridge Scheduler, EventBridge Pipes and Aurora DSQL. In EKS that is every route,
 including those Floci does not serve yet, each checked as the action of its own name, except an
 access entry's access policy routes: Floci takes the entry's principal as the rest of the path, so a
@@ -2887,7 +3004,35 @@ Formation and Amazon Inspector is one AWS authorizes on no resource type, as is 
 account's members, `member/*`, as nothing botocore or the Service Reference says names the member it makes by its
 `account.accountId`, and needs `macie2:TagResource` when it carries tags. Amazon EFS's routes are checked on the
 resources the table of request resources reads: a file system by its id, and a mount target's operations and the tag
-calls on the file system or access point EFS answers their `MountTargetId` or `ResourceId` reaches. API Gateway's
+calls on the file system or access point EFS answers their `MountTargetId` or `ResourceId` reaches. Amazon SES v2's
+and Amazon Pinpoint Email's routes are checked by their routes, on the resources the table reads, as SES v1's Query
+requests are by their `Action`. Two `GET` routes an SDK built before botocore moved `ListConfigurationSets` and
+`ListEmailIdentities` to `POST /v2/email/list-configuration-sets` and `POST /v2/email/list-identities` still sends,
+`GET /v2/email/configuration-sets` and `GET /v2/email/identities`, are served but match no route of the model, so
+they are not checked.
+AWS AppConfig (with its data plane),
+AWS CodeArtifact and Amazon CodeGuru Reviewer are checked by their routes on the resources the table of request
+resources reads. Nine of AppConfig's operations act on a type the Service Authorization Reference marks required that
+the table reads no member for (a deployment, a hosted configuration version, an experiment run, a configuration
+profile named as `Configuration`), so those are checked on the types it does read. AppConfig Data's
+`GetLatestConfiguration` is checked on the configuration of the session its `ConfigurationToken` names, the token
+`StartConfigurationSession` answers, which AppConfig Data finds; `StartConfigurationSession` is checked on the
+application its `ApplicationIdentifier` names by its id or its name, from a measured entry quoting AWS's own refusal
+of it on `application/<app_id>`. A request Floci serves under `appconfigdata`, the model's own name, is checked as one
+signed `appconfig`, the signing name botocore gives that model, as is any request signed with the name of a vendored
+model the routes do not route (`sesv2` as `ses`). A tagged create is checked for tagging on what it makes, which
+botocore's response gives where its name does not: `CreateEnvironment` answers an `Environment` whose `Id` is the
+new environment's, so its tags go on `application/<app>/environment/*`, and `AssociateRepository` answers the
+`RepositoryAssociation` whose `AssociationArn` is the association it makes, `association:*`. A CodeArtifact request
+is checked in the account its `domain-owner` names, where its handler looks the domain up. `CopyPackageVersions` is
+checked as the CodeArtifact user guide says, which its own script vendors (`tools/aws/fetch_codeartifact_permissions.py`):
+`codeartifact:ReadFromRepository` on its source repository and `codeartifact:CopyPackageVersions` on its destination
+repository. A package a request names with no `namespace` is checked with its namespace empty, as the guide writes
+such an ARN (`package/my_domain/my_repo/npm//react`), and a package group by its pattern percent-encoded as
+CodeArtifact writes it into the group's ARN (`/npm/team/*` is `/npm/team/%2a`): a variable the reference names
+`Encoded` and a botocore shape's name is filled from the member of that shape and encoded as its service encodes it.
+A condition on `aws:ResourceTag` reads the tags AppConfig keeps on an application, CodeArtifact on a domain,
+repository or package group, and CodeGuru Reviewer on an association. CodeArtifact's package endpoints are Floci's own paths, not botocore routes, and are not changed. API Gateway's
 routes are checked by their routes alone too, on the path Floci builds the ARN from, and the authorized
 actions list the operations AWS checks as the action their HTTP method names (above). A route whose action AWS checks on a
 resource Floci neither builds nor reads would not be checked, since checked on `*` a grant scoped to
@@ -2996,6 +3141,13 @@ permissions to pass the role to the service." It is checked with `iam:PassedToSe
 service the role goes to, the value AWS's Service Reference gives for the operation, so a grant to
 pass a role to EC2 does not let the same role be passed to Lambda. The operations checked, and the
 role each passes:
+- **API Gateway:** direct REST `PutIntegration`, `UpdateIntegration`, `CreateAuthorizer` and
+  `UpdateAuthorizer`, and V2 `CreateIntegration`, `UpdateIntegration`, `CreateAuthorizer` and
+  `UpdateAuthorizer` pass assigned credential role ARNs to `apigateway.amazonaws.com`. REST patch
+  operations check each `add` or `replace` of `/credentials` or `/authorizerCredentials` before
+  mutation. Role removal, omitted credentials and the integration caller-identity sentinel do
+  not pass a role. OpenAPI imports, quick-create API credentials and account settings are not
+  covered by this check.
 - **Lambda:** `CreateFunction` and `UpdateFunctionConfiguration` (`Role`, when the request sets
   it), `CreateWebFunction` and `CreateWebFunctionRevision` (the service configuration's
   `executionRoleArn`), `CreateMicrovmImage` and `UpdateMicrovmImage` (`buildRoleArn`),
@@ -3028,13 +3180,53 @@ role each passes:
   `UpdatePipe` pass `RoleArn` to `pipes.amazonaws.com`.
 - **EKS:** `CreateCluster` passes `roleArn`, `CreateNodegroup` `nodeRole`, `CreateFargateProfile`
   `podExecutionRoleArn`, and `CreateAddon` and `UpdateAddon` `serviceAccountRoleArn` and each of
-  their `podIdentityAssociations`' `roleArn`, to `eks.amazonaws.com`. `CreatePodIdentityAssociation`
+  their `podIdentityAssociations`' `roleArn`, to `eks.amazonaws.com`, all read from the table below.
+  `CreateCluster` and `UpdateClusterConfig` pass EKS Auto Mode's `computeConfig.nodeRoleArn` to
+  `ec2.amazonaws.com`. The Service Reference passes both operations' roles to `ec2.amazonaws.com` and
+  `eks.amazonaws.com` without saying which member's goes where, so a vendored source,
+  `tools/aws/sources/eks-roles.json`, written by `tools/aws/fetch_eks_roles.py` from the EKS API
+  reference and user guide, gives each member's role and the service its trust policy is for:
+  `roleArn` is the cluster IAM role ("The Amazon Resource Name (ARN) of the IAM role that provides
+  permissions for the Kubernetes control plane", trusted by `eks.amazonaws.com`), and `nodeRoleArn`
+  "the IAM Role EKS will assign to EC2 Managed Instances", the node IAM role (trusted by
+  `ec2.amazonaws.com`). `CreatePodIdentityAssociation`
   and `UpdatePodIdentityAssociation` pass `roleArn` to `pods.eks.amazonaws.com`, but not
   `targetRoleArn`, which the association's role assumes. `CreateAccessEntry` passes `principalArn`
   to `ec2.amazonaws.com` when its `type` is `EC2_LINUX` or `EC2_WINDOWS`: "If you create an access
   entry with type EC2_LINUX or EC2_WINDOWS, the IAM principal creating the access entry must have
   the iam:PassRole permission." `CreateCapability`, `UpdateCapability` and `RegisterCluster`, which
   Floci does not serve, are checked from the table below.
+- **EMR:** `RunJobFlow` passes `ServiceRole` to `elasticmapreduce.amazonaws.com`, `AutoScalingRole`
+  to `application-autoscaling.amazonaws.com`, each by its name or its ARN, and the roles of the
+  instance profile `JobFlowRole` names, by its name or its ARN, to `ec2.amazonaws.com`, all read from
+  the table below. The Service Reference passes its roles to the three services without saying which
+  member's goes where, so a vendored source, `tools/aws/sources/emr-roles.json`, written by
+  `tools/aws/fetch_emr_roles.py` from the EMR API reference, management guide and the AWS CLI
+  reference, gives each member's role: the guide's page of each role names its default role ("The
+  default role name is EMR_EC2_DefaultRole"), the full access policy it gives users passes each
+  default role to one service (`"iam:PassedToService": "ec2.amazonaws.com*"`), the API reference
+  calls `JobFlowRole` an instance profile ("Also called instance profile and Amazon EC2 role"), and
+  the CLI reference's examples give the roles by name (`--service-role EMR_DefaultRole`). The steps'
+  runtime role, `StepExecutionRoleArn`, is not passed: "You can control access to the runtime role
+  with the condition key elasticmapreduce:ExecutionRoleArn."
+- **API Gateway:** authorized by HTTP method, its roles are checked for the operation its route
+  resolves to, each passed to `apigateway.amazonaws.com`, all read from the table below: an
+  integration's `credentials` and an authorizer's `authorizerCredentials`, REST APIs' and HTTP APIs'
+  (`credentialsArn`, `authorizerCredentialsArn`) alike, and over the JSON 1.1 endpoint Floci also
+  serves HTTP APIs at by botocore's names (`CredentialsArn`, `Body`); the value of a REST API update's patch
+  operation whose path names one of those, or the account's `/cloudwatchRoleArn`; and, in an import's
+  OpenAPI definition, JSON or YAML, each Operation object's (the ANY method's included)
+  `x-amazon-apigateway-integration` `credentials` and each security scheme's
+  `x-amazon-apigateway-authorizer` `authorizerCredentials`, the definition read as API Gateway takes
+  and reads it: a REST API's whole body, its `${AWS::Region}`, `${AWS::AccountId}` and
+  `${AWS::Partition}` resolved, and an HTTP API's from its body's `body` or `Body`, or else the whole
+  body, as the REST route also takes one. No
+  member's name says it takes a role, so a vendored source, `tools/aws/sources/apigateway-roles.json`,
+  written by `tools/aws/fetch_apigateway_roles.py` from the API references and developer guide,
+  gives each: "To specify an IAM role for API Gateway to assume, use the role's Amazon Resource Name
+  (ARN)"; "the path for this property is /name"; "only OpenAPI definition JSON/YAML files are
+  supported"; and each extension, what it extends and its property "in the form of an ARN of an IAM
+  execution role".
 - **CloudFormation:** `CreateStack`, `UpdateStack`, `DeleteStack`, `CreateChangeSet` and
   `ContinueUpdateRollback` pass `RoleARN` to `cloudformation.amazonaws.com` when the request names
   one. `CreateStackSet` and `UpdateStackSet` pass `AdministrationRoleARN`, or, for a self-managed
@@ -3101,8 +3293,17 @@ authorized as operations, is checked from a table generated from the Service Ref
 botocore's models, `src/main/resources/aws/iam-passed-roles.json`. A request member names a role
 when its name ends in `Role`, `RoleArn` or `RoleName` (or a plural, or one of those followed by
 `Update` or `Override`) and it holds a string, or a list or map of them; it is read from a JSON or
-CBOR body or from Query form parameters, in either list form, and its role is passed to the service
-the Service Reference names. That covers Athena, CloudTrail, CloudWatch metric streams (to
+CBOR body, from Query form parameters, in either list form, or from a REST-XML body by the elements
+botocore names, and its role is passed to the service the Service Reference names. A JSON number or
+Boolean in such a member is read as the text a handler reads it as, so `"JobFlowRole":123456` names
+the instance profile `123456`, as EMR takes it. Form parameters
+are read only from a request the Query protocol dispatches, a form posted to the root path, so a
+request to another protocol's route is read as its handler reads it whatever `Content-Type` it is
+sent with: an S3 replication configuration sent as a form is still read as its XML. The table is keyed
+by operation, as the Service Reference lists it, so S3's `PutBucketReplication`, which is authorized as
+`s3:PutReplicationConfiguration`, needs `iam:PassRole` for `s3.amazonaws.com` on the `Role` its
+`ReplicationConfiguration` names, and S3 Access Grants' `CreateAccessGrantsLocation` on its
+`IAMRoleArn`, with no `iam:PassedToService`. That covers Athena, CloudTrail, CloudWatch metric streams (to
 `streams.metrics.cloudwatch.amazonaws.com`), CodeBuild, CodeDeploy, CodePipeline, Cognito, Config,
 DataSync, ECR, Firehose, Glue, Kinesis Analytics, CloudWatch Logs, SageMaker, Secrets Manager,
 Budgets actions, SES, SSM, Service Catalog, SWF, Textract, Transcribe and Transfer Family, among
@@ -3138,14 +3339,13 @@ when the caller may not pass the role.
 - Not read: an operation whose request names no role (SSM `CreateDocument` and CloudWatch Logs
   `StartQuery`, for two); one whose role is a parameter of the runbook it runs (SSM
   `StartAutomationExecution`, Config `PutRemediationConfigurations`); one the Service Reference
-  passes roles from to several services without saying which member goes where (EMR `RunJobFlow`,
-  whose `JobFlowRole` also names an instance profile, EKS `UpdateClusterConfig`, CloudWatch Logs
-  `CreateImportTask`); one whose body is XML (S3 `PutBucketReplication`); and one the botocore
+  passes roles from to several services without saying which member goes where (CloudWatch Logs
+  `CreateImportTask`); and one the botocore
   models Floci is pinned to do not have yet (SSM `RegisterDefaultHostManagementConfiguration`,
   Kinesis Analytics `ImportSnapshot`, Secrets Manager `AssociateCrossAccountReplica`), whose role
   the generator reads as soon as a release that has it is pinned. EC2's `RequestSpotFleet` names
   its roles in EC2's own protocol, one of them as an instance profile. The REST services whose
-  routes no rule maps yet, and API Gateway, which is authorized by HTTP method, are not read either.
+  routes no rule maps yet are not read either.
 
 A request that names a Lambda network connector also needs `lambda:PassNetworkConnector` on it. The
 Lambda developer guide has "The caller must have `lambda:PassNetworkConnector` on the referenced
@@ -3474,6 +3674,28 @@ is generated from the Service Reference and botocore, as it is for every EC2 ope
 a request is checked on the resources its members name, each EC2 Query list read under the
 wire name botocore serializes it with, and an operation whose request names none stays on `*`.
 
+An absent role still has a named authorization target for `GetRole`: its requested name in the
+caller's account and partition, without a path. Scoped allows can reach `NoSuchEntity`, and explicit
+denies still return `AccessDenied`. Once the role exists, its stored path remains part of the target.
+`GetRole` has no `Path` parameter, so supplying one cannot change that target.
+
+Which type each action takes is vendored, not written out in Java:
+`src/main/resources/aws/iam-action-resources.json` is generated by
+`tools/aws/regen_iam_action_resources.py` from AWS's Service Reference Information for IAM, and
+carries every published action with the resource types it is authorized against, plus the ARN
+format of each type. `make iam-action-resources-check` gates its shape offline on every pull
+request and `make iam-action-resources-verify` checks every claim in it against AWS weekly, so a
+type that drifts from what AWS publishes fails in CI rather than authorizing against the wrong
+resource. What stays in Java is the half that is Floci's: the request parameter each type's name
+arrives in, the creates, the actions whose request carries an ARN, the four whose request names
+the resource some other way, and the resource types that belong only to actions Floci does not
+dispatch. `GenerateOrganizationsAccessReport` is one of the four: the reference spells its type as
+`access-report/${EntityPath}`, so the Organizations entity path goes into the ARN whole, its
+slashes being the organization's tree rather than an IAM path. `IamActionResourcesTest` checks the
+one against the other, so a regeneration that introduces a resource type nothing resolves fails a
+test naming
+it rather than quietly putting that action back on `*`.
+
 `ec2:CreateSubnet`, `ec2:CreateRouteTable`, `ec2:CreateSecurityGroup`, and
 `ec2:CreateVpcEndpoint` authorize
 both the new resource ARN and the existing parent VPC. `ec2:CreateInternetGateway`
@@ -3681,6 +3903,11 @@ trust policy and the value it sits in matches nothing.
 A `Condition` operator can only match a key floci actually places in the request context.
 floci populates:
 
+- `aws:SecureTransport`: whether the incoming connection uses TLS, for both the
+  primary operation and its additional resource checks. Client-supplied forwarding
+  headers do not set this key. Signed S3 bucket-policy checks receive the same TLS
+  state, including copy sources and browser POST uploads. Internal service calls
+  retain their own condition context rather than inheriting the outer connection's TLS state.
 - The `iam:` keys an IAM request carries in its own parameters, from
   `src/main/resources/aws/iam-condition-keys.json`. `tools/aws/regen_iam_condition_keys.py`
   generates it: for each action and `iam:` key the AWS Service Reference lists, the key is read
@@ -3823,6 +4050,12 @@ floci populates:
   and botocore by `tools/aws/regen_iam_request_resources.py`; network interfaces are read so far, and a
   key of a type EC2 does not yet answer for stays absent. A batch is evaluated once per resource, each
   with its own keys.
+
+  `logs:CreateLogStream`, `logs:DeleteLogStream`, `logs:TagResource`, `logs:UntagResource`,
+  `logs:ListTagsForResource`, `logs:DeleteLogGroup`, `logs:PutRetentionPolicy` and
+  `logs:DeleteRetentionPolicy` use the owning log group's tags.
+  EC2 security-group deletion and authorize/revoke ingress/egress requests read the
+  current tags of the group named by `GroupId`, including revocations that also name rule IDs.
 - `s3:ExistingObjectTag/<key>`: the tags already on the target object version, for
   `s3:GetObject`, `s3:GetObjectTagging`, `s3:GetObjectAcl`, `s3:PutObjectAcl`,
   `s3:DeleteObjectTagging`, `s3:PutObjectTagging` and the annotation actions, and for their
@@ -3901,6 +4134,9 @@ floci populates:
   whatever its case; [STS](sts.md#session-tags) has where each operation takes its session tags
   from, and [Transitive tags](sts.md#transitive-tags) how a chained session inherits the ones the
   calling session passes down, which are its own tags from then on.
+  A session bound to a deleted role does not borrow tags from a same-named replacement.
+  Transitive inheritance reads a live local session with its matching issued token, and inherited
+  tags do not become that request's `aws:RequestTag` values.
 - `aws:PrincipalType` and `aws:userid`: resolved from the same lookup as `aws:PrincipalArn`, so
   they always describe the same credential. The values follow the user guide's principal key
   values list: `Account` with the account id for the account-root principal and for a session
@@ -4165,18 +4401,19 @@ flows and the two web-identity and SAML `AssumeRole` calls. A Cognito `Admin*` o
 The refusal arrives in the encoding the request used: XML for Query, CBOR for a CBOR request, JSON
 otherwise.
 
-**REST requests are not checked.** The same filter sees the API Gateway execute path, Lambda
-function URLs, CloudFront serving, the Cognito OIDC endpoints and Floci's own health endpoint, all
-of which are unsigned by design, and a REST request does not say which service will serve it. An
-unsigned REST call therefore still reaches the service, including an unsigned S3 call.
+**REST management ownership is explicit.** The matched controller and, for mixed controllers, its
+resource method determine whether AWS credentials are required. A declared management request is
+refused before dispatch. Public S3 policy access, API Gateway execution, Lambda function URLs,
+CloudFront serving, Cognito OIDC and local health routes retain their own authentication contracts.
+Neither an IAM action mapping nor a client-supplied signing scope establishes authentication ownership.
 
 **A header with no readable credential does not get around this.** An `Authorization` header that
 names no access key (a Bearer token, SigV2, a credential without the SigV4 scheme or without its
 key), or whose SigV4 scope is missing a part, is refused on the same management calls with
-`400 IncompleteSignature`, the error AWS gives a header it cannot read. A REST request carrying one
-is refused only when the header claims SigV4 and the route maps to an IAM action. Otherwise it is
-treated as unsigned, because AppSync, CodeArtifact's package endpoints, Identity Store's SCIM
-endpoint and API Gateway's authorizers take Bearer and Basic tokens of their own. An empty header
+`400 IncompleteSignature`, the error AWS gives a header it cannot read. A declared REST management request is refused even if the header claims Basic or Bearer.
+Endpoint-owned AppSync execution, CodeArtifact package endpoints, Identity Store SCIM and API
+Gateway authorizers continue to handle their own tokens. Other REST requests claiming SigV4 keep
+the existing mapped-route checks. An empty header
 is refused the same way, unless a presigned URL's `X-Amz-Credential` is there to read instead.
 
 ## Bypass rules
@@ -4186,14 +4423,14 @@ the emulator cannot reason about:
 
 | Case | Behaviour |
 | --- | --- |
-| Unresolvable action | Allowed. An action the registry cannot resolve is not evaluated. The credential is still checked on an RPC call, as in the rows below. A REST request is left alone, as an unsigned one is: the filter cannot tell it from the API Gateway execute path, Lambda function URLs and the other paths it sees that are unsigned by design. |
+| Unresolvable action | Allowed. An action the registry cannot resolve is not evaluated. The credential is still checked on an RPC call, as in the rows below. A credential-required REST management route still checks credential validity. Endpoint-owned execution and public routes retain their existing behavior. |
 | No `Authorization` header, RPC protocol | **Rejected** with `403 MissingAuthenticationToken`, unless the operation is one AWS itself serves without credentials. |
-| No `Authorization` header, REST protocol | Allowed. This filter also sees the API Gateway execute path, Lambda function URLs, CloudFront serving and the Cognito OIDC endpoints, which are unsigned by design. |
+| No `Authorization` header, REST protocol | Refused on explicitly declared management routes unless a presigned credential is supplied. Endpoint-owned public, execution and alternative-authentication routes keep their contracts. |
 | `sts:GetCallerIdentity` | No policy is evaluated: AWS returns caller identity even when a policy denies it. The credential is still checked: a key that exists nowhere or is inactive, an expired session, or a header with no readable credential is refused as below. |
 | Access key that exists nowhere | **Rejected** with `403`, in each protocol's own vocabulary: `InvalidAccessKeyId` for S3, `InvalidClientTokenId` for Query services, `UnrecognizedClientException` for JSON services. Allowing it would let any string authorize the request. A presigned POST is the exception: its credential is in the form body, so a key that exists nowhere, or a credential that cannot be read, is left to S3's own presigned-POST check, and uploads as an unsigned request would when that check is off. An inactive key or an expired session is refused there as everywhere else. |
 | Inactive access key | **Rejected** the same way: a deactivated key can no longer be used by API calls until it is activated again. |
 | Expired session credentials | **Rejected** with `403 ExpiredTokenException`, or `400 ExpiredToken` for S3. Once Floci has removed an expired session it no longer knows the key, and answers as for one that exists nowhere. |
-| `Authorization` header with no readable credential | **Rejected** with `400`, in each protocol's own vocabulary: `AuthorizationHeaderMalformed` for S3 (`AuthorizationQueryParametersError` when the credential is a presigned URL's `X-Amz-Credential`), `IncompleteSignature` for Query services, `IncompleteSignatureException` for JSON services. Without a key or a scope there is nothing to check, so allowing it would skip enforcement altogether. As with no header, an operation AWS serves without credentials is left alone, and a REST request is rejected only when the header claims SigV4. |
+| `Authorization` header with no readable credential | **Rejected** with `400`, in each protocol's own vocabulary: `AuthorizationHeaderMalformed` for S3 (`AuthorizationQueryParametersError` when the credential is a presigned URL's `X-Amz-Credential`), `IncompleteSignature` for Query services, `IncompleteSignatureException` for JSON services. Without a key or a scope there is nothing to check, so allowing it would skip enforcement altogether. As with no header, an operation AWS serves without credentials is left alone, and a declared REST management route also rejects unreadable Basic or Bearer headers. Endpoint-owned alternative authentication remains separate. |
 | Known credential with no mappable caller context | Allowed. A stored session carrying no role ARN is a real credential, so it is not treated as unauthenticated. |
 | Bare account-id key with no SCP ceiling | Allowed. With no organization or SCP enforcement off, the account root keeps the historical bypass. |
 | Bare account-id key **with** an SCP ceiling | Enforced as the account root, bounded by the SCP chain. |
@@ -4211,6 +4448,18 @@ so does an `UpdateRole` carrying only a `Description`; `UpdateRole` answers `Unm
 once it carries `MaxSessionDuration`, and then writes neither field. `TagRole` and `UntagRole` are
 allowed, as on AWS. Within the IAM API `DeleteServiceLinkedRole` is the only way to remove such a
 role — the emulator's own `/_floci/state/reset` still clears it along with everything else.
+
+IAM attaches the linked service's AWS managed permissions policy to the role it creates, and so
+does the emulator for the services whose policy is known. Amazon OpenSearch Service's
+`opensearchservice.amazonaws.com` role carries `AmazonOpenSearchServiceRolePolicy`, as the OpenSearch
+Service developer guide's service-linked role page documents. The policy is under
+`arn:<partition>:iam::aws:policy/aws-service-role/` and is read from the bundled managed policy
+catalog, so `ListAttachedRolePolicies` lists it and a session on the role is authorized by it under
+IAM enforcement. The network interface and VPC endpoint actions the policy scopes to EC2 resource
+ARNs are checked on those ARNs (see the EC2 service doc), and its `ec2:ModifyVpcEndpoint` and
+`ec2:DeleteVpcEndpoints` statements, conditioned on `aws:ResourceTag/OpenSearchManaged`, reach
+exactly the endpoints tagged `OpenSearchManaged=true`. A role for any other
+service is created with its trust policy alone.
 
 Four deviations to be aware of:
 
@@ -4315,3 +4564,256 @@ aws iam create-access-key --user-name alice --endpoint-url $AWS_ENDPOINT_URL
 # List roles
 aws iam list-roles --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+API Gateway account logging-role assignments also require `iam:PassRole`, with
+`iam:PassedToService` set to the API Gateway service principal. This applies to
+`UpdateAccount` replacements of `/cloudwatchRoleArn` before account state changes.
+Floci retains its existing add/remove patch compatibility, although AWS documents
+only replace for this field; locally accepted additions also require PassRole.
+
+API Gateway HTTP API quick-create Lambda integrations check an assigned execution role through `iam:PassRole` before creating the API. Absent targets, HTTP URL targets and caller credentials pass no role. Credential retention is a separate prerequisite; this check does not implement integration execution authorization.
+
+REST API OpenAPI and Swagger integration imports check each assigned IAM role through `iam:PassRole` before creating, merging or overwriting API resources. The service parser resolves AWS variables and ANY-method operations; unused extensions, ignored integration types and caller credentials pass no role. Authorizer and HTTP API import credential checks remain separate follow-ups.
+
+REST API import role checks also cover explicitly assigned Lambda authorizer credentials in OpenAPI and Swagger documents. Omitted credentials on a merge retain the existing assignment; null credentials clear it without passing a new role.
+
+### Temporary credential issue time
+
+New local temporary credentials record their issuance time. Shared IAM principal context
+exposes this timestamp as `aws:TokenIssueTime` for policy conditions, preserving it across
+storage serialization and later requests. Long-term access keys do not include this key.
+Older persisted session records without an issuance timestamp leave it absent; Floci does
+not derive a replacement timestamp from expiration or restart time.
+
+Attached IAM user and role tags are available as `aws:PrincipalTag/<key>` in resolved caller policy contexts, including existing local STS user and role sessions. Federated sessions also carry their issuing user's attached tags while retaining the federated principal's identity. Each resolution reads current identity tags and retains an immutable snapshot for that evaluation. Policy simulation still requires explicitly supplied tag context. Session tags and transitive role chaining follow the STS rules described in [STS](sts.md).
+
+
+### Service execution-role authorization sessions
+
+The shared execution-role authorizer checks service trust before registering a temporary local role credential. It resolves that credential through IAM for policy evaluation, including the full role ARN, session ARN, role ID and `aws:userid`. Conditions on session identity therefore apply to both Allow and Deny statements.
+
+The credential is revoked when authorization evaluation ends, including denied and failed evaluations. It has a 15-minute expiration as a fallback and is not injected into the Lambda workload. Its locally selected session name is not a claim about AWS service-selected session names or credential caching. Session-tag overrides and the complete service trust condition context remain separate limitations.
+
+## Local issued-session management
+
+`FLOCI_SERVICES_IAM_ISSUED_SESSION_VERIFICATION_ENABLED=true` enables two local
+management operations. They are disabled by default and are not AWS API operations.
+Keep this management interface on a trusted local network: exact-selector lookup
+returns issuer metadata without authenticating the selector's holder. Neither
+operation grants authorization or evaluates IAM policies.
+
+Both accept JSON over POST, reject unknown/duplicate fields, and return
+`Cache-Control: no-store`. Request bodies are limited to 16,384 bytes.
+
+* `/_floci/iam/issued-sessions/verify` requires `correlationId`, `accessKeyId`,
+  `sessionToken`, `stringToSign` and `signature`. It checks the original four-line
+  `AWS4-HMAC-SHA256` string to sign, token, HMAC, current issuer role and finite
+  expiry. Timestamps may be at most 900 seconds old or 300 seconds ahead. A SigV4A
+  string to sign (`AWS4-ECDSA-P256-SHA256`, scope `date/service/aws4_request`) is
+  checked the same way, with the DER ECDSA P-256 signature verified against the key
+  pair derived from the session's secret and access key, as AWS verifies SigV4A.
+  The `signature` shape follows the string to sign: 64 hex digits (the HMAC-SHA256)
+  for `AWS4-HMAC-SHA256`, and the hex DER encoding of the ECDSA signature (8 to 72
+  bytes) for `AWS4-ECDSA-P256-SHA256`; any other shape is `InvalidIssuedSessionRequest`.
+  The Lambda issued-identity endpoint stays SigV4 only.
+* `/_floci/iam/issued-sessions/lookup` requires `correlationId` and exactly one of
+  `accessKeyId`, `principalArn` or `principalId`. There is no listing, account-only
+  selector or wildcard. Matching issuances must agree on identity, origin account
+  and restriction presence; the earliest current expiry is returned.
+
+Success returns `correlationId`, `operation` (`Verify` or `Lookup`),
+`kind` (`ASSUMED_ROLE` or `EC2_INSTANCE_PROFILE`), `accountId`, `originAccountId`, `roleArn`, `roleId`,
+`roleSessionName`, `principalArn`, `principalId`, `expiresAt` and the explicit
+boolean `sessionPolicyPresent`. Only `Lookup` selected by `accessKeyId` also returns
+`accessKeyId`, bound to the current selected issuer record. `Verify` and principal
+lookups omit `accessKeyId`. Tokens, secrets and signing keys are never returned. Inline `Policy` or any supplied managed `PolicyArns` marks restrictions
+present; this flag does not claim those policies were evaluated. Consumers must
+apply their own authorization and inspect current public IAM policies and
+permissions boundaries.
+
+Normal AssumeRole sessions and EC2 instance-profile sessions issued in this process qualify.
+An EC2 response keeps its distinct kind, instance ID as session name, and instance-profile
+principal ID. The stored EC2 role ID and origin account must match the current IAM role.
+Instance identity-role credentials do not qualify. EC2 sessions are removed when the instance
+is unregistered and are discarded on process restart.
+The AssumeRole provenance marker is not persisted; restored sessions, WebIdentity, SAML, other workload credentials,
+GetSessionToken, federation and long-term credentials refuse. Removing or replacing
+the issuer role invalidates admission. The role and registry are checked again
+before returning. Registry scans are bounded to 4,096 entries and 128 matches.
+
+Errors contain only `{"code":"..."}`: disabled operations return HTTP 404 with
+`IssuedSessionVerificationDisabled`; malformed requests return HTTP 400 with
+`InvalidIssuedSessionRequest`; unknown/stale credentials or failed proofs return
+HTTP 403 with `IssuedSessionVerificationFailed`. Tokens and proof inputs are not
+logged or echoed. Posting `{}` distinguishes an enabled handler from an older or
+disabled implementation without sending any credential material.
+
+## Local derived signing keys
+
+`POST /_floci/iam/derived-signing-keys/derive` returns the SigV4 derived signing key of a session
+this Floci issued, so a request verifier running outside Floci can check that session's
+signatures itself. It never returns a secret access key. It is disabled by default, is not an AWS
+API operation, and answers exactly one configured caller.
+
+Settings (`floci.services.iam.derived-signing-keys.*`):
+
+| Setting | Meaning |
+|---|---|
+| `enabled` | Off by default. While off, nothing else is read and the endpoint answers 404. |
+| `caller-access-key-id` | The one access key ID allowed to call, `[A-Z0-9]{16,128}`. It is not an IAM key: it exists only for this endpoint and must never name a Floci credential. |
+| `caller-secret-access-key-file` | A file holding that caller's secret (40-128 printable ASCII characters, at least 16 distinct). It must grant no group or other permission (that refuses startup), so it must be owned by and readable by the user Floci runs as (uid 1001 in the Floci image). A symlink is judged by its target. A Kubernetes secret volume (root-owned, or group-readable with `fsGroup`) does not meet this as mounted; copy the secret into an owner-only file first, for example in an init container. Generate it with, for example, `openssl rand -base64 30`, and give the same file to the caller. Rotating it means a restart. |
+| `allowed-regions` | Exact regions a key may be derived for. |
+| `allowed-services` | Exact SigV4 signing names a key may be derived for. A name Floci itself serves is refused at startup. |
+| `allowed-levels` | `signing` (default; the `kSigning` key) and/or `service` (the `kService` key one step earlier, for verifiers that derive further keys from it). |
+
+When enabled, an invalid setting refuses startup with a message naming the setting.
+
+**Caller authentication.** Every request must carry an `Authorization: AWS4-HMAC-SHA256` header
+for the configured key, scoped `<date>/<region>/floci/aws4_request`, signing at least `host` and
+`x-amz-date`, within 15 minutes of Floci's clock. The body hash is always checked; an
+`x-amz-content-sha256` header, if sent, must be its lowercase hex. Query-string signatures,
+SigV4a, unsigned payloads, `Content-Encoding`, session tokens and repeated `Authorization`,
+`Host` or `x-amz-date` headers are refused. Each accepted signature works once: a repeat is
+refused, so give every request a fresh `correlationId` and re-sign retries. The replay set
+holds up to 10,000 signatures, each until its `x-amz-date` plus 15 minutes (the last moment it
+could be accepted); when it is full, new requests get 429 `DerivedSigningKeyRateExceeded` until
+entries expire. It uses the host clock, so keep that clock monotonic. This check applies
+whatever `floci.auth.validate-signatures` is.
+
+The path is exactly `/_floci/iam/derived-signing-keys/derive`, with no trailing slash.
+The replay set lives in memory, so a restart forgets it: keep the transport private.
+
+**Request.** A JSON body of at most 16,384 bytes with exactly these string fields:
+`correlationId` (`[A-Za-z0-9_-]{1,128}`), `accessKeyId` (`ASIA` plus 16 characters),
+`sessionToken` (the session's token), `date` (`YYYYMMDD`), `region`, `service` and `level`.
+The date must be the current UTC date, or the neighbouring one within 15 minutes of midnight.
+
+**Eligible sessions.** The ones the issued-session endpoints above admit, issued in this
+process: AssumeRole sessions (including those chained from a Lambda execution role) and EC2
+instance-profile sessions minted through IMDS. IAM user keys, ECS task-role, Lambda execution,
+GetSessionToken, federation, web-identity, SAML and identity-role credentials, and any session
+restored after a restart, are refused.
+
+**Response.** `correlationId`, `accessKeyId`, `credentialKind`, `date`, `region`, `service`,
+`level`, `derivedKey` (base64, 32 bytes) and `credentialExpiresAt`, with `Cache-Control: no-store`.
+A derived key stays a valid HMAC key for its whole date, so a verifier must stop using it at
+`credentialExpiresAt`. This endpoint does not return identity: for the principal, call
+`/_floci/iam/issued-sessions/lookup` (its own setting) as a second step.
+
+Errors contain only `{"code":"..."}`: 404 `DerivedSigningKeysDisabled`; 400
+`InvalidDerivedSigningKeyRequest`; 403 `DerivedSigningKeyCallerRefused`,
+`DerivedSigningKeyReplayed`, `DerivedSigningKeyScopeNotAllowed` or `DerivedSigningKeyRefused`;
+429 `DerivedSigningKeyRateExceeded`.
+A wrong method or content type gets the framework's own 405 or 415, without key material.
+Nothing on this path is logged; do not enable `quarkus.http.access-log` or Quarkus's own
+`quarkus.http.cors` with it (Floci's CORS filter never grants this path; Quarkus's would).
+
+**Security notes.**
+
+* Whoever holds the caller secret can sign requests as any eligible session for the listed
+  services. List only the signing names your verifier fronts.
+* Keep Floci on loopback, or on a private network with `floci.tls.enabled`. Startup warns when the
+  endpoint is enabled on a non-loopback listener without TLS.
+* Never log the caller's `Authorization` header.
+* Give each Floci instance its own caller secret.
+
+## Local Lambda execution identity
+
+`FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED=true` enables
+`POST /_floci/lambda/issued-identities/lookup` and `/verify`. The existing IAM
+issued-session endpoints retain their original contract. These observations
+are identity evidence, not IAM authorization decisions, and never contain
+credentials. Both operations use the same strict request fields as the IAM
+issued-session protocol above.
+
+The response contains `correlationId`, `operation`, `kind`, `accountId`, `roleArn`,
+`roleId`, `principalArn`, `principalId`, `sessionPolicyPresent`, and `expiresAt`.
+`kind` is `LAMBDA_EXECUTION` for the native execution-role session and
+`LAMBDA_ASSUMED_ROLE` for one directly derived STS session. The nested `lambda`
+object always identifies the original execution: `accountId`, `functionArn`,
+`functionVersion`, `roleArn`, `principalArn`, `principalId`, `codeSha256`,
+`containerId`, and `containerStartedAt`.
+
+The issuer binds its generated credential to its native launch record. Every
+observation checks the current role ID, function version/code/revision, exact
+credential record, and running container/start time before and after proof
+verification. A stopped or restarted container, retired credential, replaced
+role, changed function, or ambiguous principal lookup is refused. A lookup
+selects records but does not authenticate the caller or confer lineage. Only an
+`accessKeyId`-selected `Lookup` returns `accessKeyId`, taken from the selected
+current root or derived session; principal lookups and `Verify` omit the field.
+
+`Verify` checks the session token and SigV4 `StringToSign` signature. Its signing
+time must be at most 60 seconds old and at most 5 seconds in the future. Its
+observation expires at the earliest of observation time plus 60 seconds, signed
+time plus 60 seconds, and the current/root credential expiry. Replaying an old
+proof cannot renew that deadline; retries inside the original window are not
+single-use nonce enforcement. `Lookup` returns a fresh observation lasting at
+most 60 seconds and still requires the current execution to be running.
+
+One-hop lineage is recorded only by normal `AssumeRole` after the native SigV4
+request verifier authenticates the parent key, token and complete request.
+The Lambda identity flag activates the existing signature verifier for native
+execution-role and one-hop credentials; it does not require globally enabling
+`FLOCI_AUTH_VALIDATE_SIGNATURES`. Other credentials retain their existing
+behavior, and no unknown-key secret fallback is added. Enabling the global flag
+still requires valid known credentials for all other signed AWS requests. Header-only calls, manually registered/restored sessions,
+second-hop sessions, Kubernetes executions, hot reload, external AWS credential
+mounts, and executions without a complete native start/code seal are not
+supported by this identity facility. Generic STS issuance retains its normal
+behavior even when no Lambda lineage can be established.
+
+
+## Explicit local account bootstrap
+
+For an emulator that must preserve existing account IDs while authenticating real SDK calls,
+set `FLOCI_SERVICES_IAM_BOOTSTRAP_PRINCIPALS_FILE` to a private local JSON file. This is startup
+configuration, not an AWS endpoint. Organizations `CreateAccount` remains the native way to
+create generated account IDs and its management-account access role.
+
+This option requires `FLOCI_AUTH_VALIDATE_SIGNATURES=true`,
+`FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, IAM enabled, and
+`FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL=false`. No numeric-key, unknown-key, or public
+credential authentication exception is added. Each declared identity receives the explicit
+`AdministratorAccess` managed-policy grant in its declared partition. Use these administrators
+to provision normal scoped IAM users or roles through the AWS SDK, including CloudFormation.
+
+The file contains an array of objects with exactly these string fields:
+
+| Field | Meaning |
+| --- | --- |
+| `accountId` | Exact 12-digit local account ID |
+| `partition` | Published AWS partition, such as `aws` or `aws-us-gov` |
+| `userName` | IAM user name, 1 to 64 supported characters |
+| `accessKeyId` | Unique local long-term key ID: `AKIA` followed by 16 uppercase letters/digits |
+| `secretAccessKey` | Locally generated secret: 40 to 128 printable non-space ASCII characters, at least 16 distinct |
+| `grant` | Must explicitly equal `AdministratorAccess` |
+
+Supply locally generated credentials through a secret file; do not place secret values in an
+application YAML, environment-variable value, source repository, or command line. The local key
+is an emulator credential, not a real AWS access key. Give the SDK caller the same key and secret
+using its normal credentials-provider mechanism. Mount the file read-only, owned by the Floci
+runtime user, with mode `0600` or `0400`. Symlinks, group/other permissions, non-regular files,
+unknown fields, duplicate identities, invalid partitions, and malformed input refuse startup.
+The file is bounded to 64 KiB and 32 principals, including the bytes read after opening it without
+following a symbolic link. Accepted partition spellings are stored as canonical partition IDs.
+JSON parsing errors do not echo its contents.
+
+The whole configuration and all existing identity conflicts are validated before seeding.
+An active public `floci` deployer key in any stored account also refuses startup. Remove or
+deactivate that key before enabling private bootstrap; disabling its seed flag alone does not
+remove a key persisted by an earlier run.
+Users, keys, and bootstrap identity markers use the ordinary account-aware IAM stores and their
+configured persistence mode. Repeating identical configuration preserves IDs, secrets, dates,
+and grants. An existing unrelated user/key is never adopted or overwritten. A bootstrap user
+or key deleted through IAM, an inactive key, a removed administrator grant, or a changed secret
+causes startup to fail rather than silently recreate, reactivate, regrant, or rotate it. Remove
+the declaration before retiring an identity. Durable markers remain to prevent accidental
+recreation. An interrupted initial write can leave partial records; startup fails closed on
+that conflict rather than guessing how to repair operator-owned state. This option is not a
+credential rotation or account reconciliation API.
+
+Account IDs still identify local emulator storage namespaces. The option does not create an
+Organizations membership, grant another account access, or alter AWS API wire behavior. Keep the
+emulator listener private. A bootstrap administrator is powerful within its account; native IAM
+explicit-deny policies and SigV4 signature validation still apply.

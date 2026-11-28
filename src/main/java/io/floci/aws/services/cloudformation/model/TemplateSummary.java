@@ -14,7 +14,12 @@ public record TemplateSummary(
         List<String> declaredTransforms,
         List<String> capabilities,
         String capabilitiesReason,
-        String metadata) {
+        String metadata,
+        List<ResourceIdentifierSummary> resourceIdentifierSummaries) {
+
+    public record ResourceIdentifierSummary(String resourceType, List<String> resourceIdentifiers,
+                                            List<String> logicalResourceIds) {
+    }
 
     /** One entry from the template's top level Parameters section. */
     public record ParameterDeclaration(
@@ -22,6 +27,7 @@ public record TemplateSummary(
             String defaultValue,
             boolean noEcho,
             String description,
-            String parameterType) {
+            String parameterType,
+            List<String> allowedValues) {
     }
 }

@@ -3,6 +3,7 @@ package io.floci.aws.services.cloudformation.provisioners;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.JsonNodeType;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
@@ -19,6 +20,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -27,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /**
  * CloudFormation provisioning for {@code AWS::EC2::Instance}. It delegates to {@link Ec2Service} so
@@ -44,6 +47,8 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
     // an auto-assigned address. The __Floci prefix keeps them off the published Fn::GetAtt attributes.
     private static final String DECLARED_PRIVATE_IP_ATTR = "__FlociDeclaredPrivateIpAddress";
     private static final String DECLARED_AZ_ATTR = "__FlociDeclaredAvailabilityZone";
+    // Keep the resolved primary interface so removal and parameter-only changes replace it too.
+    private static final String DECLARED_PRIMARY_INTERFACE_ATTR = "__FlociDeclaredPrimaryNetworkInterface";
     // The instance profile declared last time, the instance's own or its launch template's, so an
     // update that drops it can be told from one that never declared one (the profile may have been
     // associated outside the stack).
@@ -65,14 +70,29 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
     private static final String DECLARED_PREFIX = "__FlociDeclared";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** How long {@link #delete} waits for a terminated instance, and how often it looks. */
+    private static final Duration TERMINATE_TIMEOUT = Duration.ofSeconds(90);
+    private static final Duration TERMINATE_POLL = Duration.ofMillis(250);
+
     private final Ec2Service ec2Service;
-    /** How long {@link #delete} waits for a terminated instance; package-visible so tests can shorten it. */
-    long terminateTimeoutMillis = 90_000L;
-    long terminatePollMillis = 250L;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
 
     @Inject
     public Ec2InstanceCfnProvisioner(Ec2Service ec2Service) {
+        this(ec2Service, System::nanoTime, Thread::sleep);
+    }
+
+    /** For tests that put the wait for termination on a timeline they control. */
+    Ec2InstanceCfnProvisioner(Ec2Service ec2Service, LongSupplier nanoTime, Sleeper sleeper) {
         this.ec2Service = ec2Service;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(Duration delay) throws InterruptedException;
     }
 
     @Override
@@ -128,8 +148,23 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         if (instanceType == null || instanceType.isBlank()) {
             instanceType = "t3.micro";
         }
-        String subnetId = ctx.resolveOptional(props, "SubnetId");
-        List<String> securityGroupIds = resolveSecurityGroupIds(props, engine);
+        String subnetId = ctx.resolveOptional(engine.omitNoValue(props), "SubnetId");
+        JsonNode primaryInterface = primaryNetworkInterface(props, engine);
+        if (primaryInterface != null && subnetId != null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Network interfaces and an instance-level subnet ID may not be specified on the same request", 400);
+        }
+        Boolean associatePublicIp = null;
+        if (primaryInterface != null) {
+            // The primary interface places the launch. Resolve it before the update check so a
+            // changed interface subnet replaces the instance just as an instance-level subnet does.
+            subnetId = ctx.resolveOptional(primaryInterface, "SubnetId");
+            String assocRaw = ctx.resolveOptional(primaryInterface, "AssociatePublicIpAddress");
+            if (assocRaw != null && !assocRaw.isBlank()) {
+                associatePublicIp = Boolean.parseBoolean(assocRaw);
+            }
+        }
+        List<String> securityGroupIds = resolveSecurityGroupIds(props, primaryInterface, engine);
         String privateIpAddress = ctx.resolveOptional(props, "PrivateIpAddress");
         String availabilityZone = ctx.resolveOptional(props, "AvailabilityZone");
         String userData = ctx.resolveOptional(props, "UserData");
@@ -153,6 +188,7 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         // it supplies changed, which replaces the instance as above.
         Instance prior = ctx.isUpdate() ? findInstance(region, ctx.priorPhysicalId()) : null;
         if (prior != null && !createOnlyChanged(prior, imageId, subnetId, keyName)
+                && !primaryInterfaceChanged(attributesBefore, primaryInterface, ctx)
                 && !declaredCreateOnlyChanged(attributesBefore, privateIpAddress, availabilityZone)) {
             // A reused instance still has its mutable properties reconciled to the template rather
             // than left at their prior values; re-read it so the published attributes reflect them.
@@ -189,24 +225,13 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
             r.setPhysicalId(current.getInstanceId());
             publishInstanceAttributes(r, current);
             storeDeclaredCreateOnly(r, privateIpAddress, availabilityZone);
+            putOrRemove(r, DECLARED_PRIMARY_INTERFACE_ATTR,
+                    primaryInterface == null ? null : primaryInterface.toString());
             putOrRemove(r, DECLARED_IAM_PROFILE_ATTR, iamInstanceProfileArn);
             putOrRemove(r, DECLARED_METADATA_OPTIONS_ATTR, Ec2CfnMetadataOptions.declaredMembers(metadataOptions));
             Ec2Tags.recordKeys(r, DECLARED_TAG_KEYS_ATTR, desiredTags);
             ReplacementCleanup.record(r, ctx, attributesBefore);
             return;
-        }
-
-        // The launch-time public-IP override rides on the primary network
-        // interface spec; absent means the subnet's MapPublicIpOnLaunch default.
-        Boolean associatePublicIp = null;
-        if (props != null) {
-            JsonNode networkInterfaces = props.path("NetworkInterfaces");
-            if (networkInterfaces.isArray() && !networkInterfaces.isEmpty()) {
-                String assocRaw = engine.resolve(networkInterfaces.get(0).path("AssociatePublicIpAddress"));
-                if (assocRaw != null && !assocRaw.isBlank()) {
-                    associatePublicIp = Boolean.parseBoolean(assocRaw);
-                }
-            }
         }
 
         r.getAttributes().remove(PRIOR_IN_PLACE_ATTR);
@@ -233,6 +258,8 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         Instance launched = findInstance(region, instance.getInstanceId());
         publishInstanceAttributes(r, launched != null ? launched : instance);
         storeDeclaredCreateOnly(r, privateIpAddress, availabilityZone);
+        putOrRemove(r, DECLARED_PRIMARY_INTERFACE_ATTR,
+                primaryInterface == null ? null : primaryInterface.toString());
         putOrRemove(r, DECLARED_IAM_PROFILE_ATTR, iamInstanceProfileArn);
         putOrRemove(r, DECLARED_METADATA_OPTIONS_ATTR, Ec2CfnMetadataOptions.declaredMembers(metadataOptions));
         Ec2Tags.recordKeys(r, DECLARED_TAG_KEYS_ATTR, desiredTags);
@@ -281,14 +308,87 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
         return declared != null && !declared.equals(actual);
     }
 
-    private List<String> resolveSecurityGroupIds(JsonNode props, CloudFormationTemplateEngine engine) {
+    private static JsonNode primaryNetworkInterface(JsonNode props, CloudFormationTemplateEngine engine) {
+        JsonNode interfaces = props != null ? engine.resolveNodeOmittingNoValue(props.get("NetworkInterfaces")) : null;
+        if (interfaces == null || interfaces.isNull() || interfaces.isMissingNode()) {
+            return null;
+        }
+        if (!interfaces.isArray()) {
+            throw new AwsException("InvalidParameterValue", "NetworkInterfaces must be a list", 400);
+        }
+        if (interfaces.isEmpty()) {
+            return null;
+        }
+        JsonNode primary = null;
+        for (JsonNode networkInterface : interfaces) {
+            CfnPropertyTypes.requireType("NetworkInterfaces", networkInterface, JsonNodeType.OBJECT);
+            if (!networkInterface.hasNonNull("DeviceIndex")) {
+                throw new AwsException("InvalidParameterValue",
+                        "Each network interface must specify a device index", 400);
+            }
+            if ("0".equals(networkInterface.path("DeviceIndex").asText())) {
+                if (primary != null) {
+                    throw new AwsException("InvalidParameterValue",
+                            "Network interfaces must have unique device indices", 400);
+                }
+                primary = networkInterface;
+            }
+        }
+        if (primary == null) {
+            throw new AwsException("InvalidParameterValue",
+                    "Network interfaces must include a primary interface with device index 0", 400);
+        }
+        return primary;
+    }
+
+    private static boolean primaryInterfaceChanged(Map<String, String> priorAttributes,
+                                                   JsonNode primaryInterface, ProvisionContext ctx) {
+        String previous = priorAttributes.get(DECLARED_PRIMARY_INTERFACE_ATTR);
+        if (previous != null) {
+            try {
+                return !MAPPER.readTree(previous).equals(primaryInterface);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Cannot read the previously declared primary network interface", e);
+            }
+        }
+        // A stack created before this declaration was recorded still exposes property presence.
+        JsonNode prior = ctx.priorProperties();
+        if (prior == null) {
+            return false;
+        }
+        JsonNode interfaces = prior.get("NetworkInterfaces");
+        boolean previouslyPresent = interfaces != null && !interfaces.isNull()
+                && !(interfaces.isArray() && interfaces.isEmpty());
+        return previouslyPresent != (primaryInterface != null);
+    }
+
+    private List<String> resolveSecurityGroupIds(JsonNode props, JsonNode primaryInterface,
+                                                 CloudFormationTemplateEngine engine) {
+        JsonNode instanceGroups = props == null ? null
+                : engine.resolveNodeOmittingNoValue(props.get("SecurityGroupIds"));
+        if (primaryInterface != null) {
+            JsonNode instanceGroupNames = props == null ? null
+                    : engine.resolveNodeOmittingNoValue(props.get("SecurityGroups"));
+            if (hasGroups(instanceGroups) || hasGroups(instanceGroupNames)) {
+                throw new AwsException("InvalidParameterCombination",
+                        "Network interfaces and instance-level security groups may not be specified on the same request",
+                        400);
+            }
+        }
+        JsonNode groups = primaryInterface == null ? instanceGroups : primaryInterface.get("GroupSet");
         List<String> securityGroupIds = new ArrayList<>();
-        if (props != null && props.has("SecurityGroupIds") && props.get("SecurityGroupIds").isArray()) {
-            for (JsonNode sg : props.get("SecurityGroupIds")) {
+        if (groups != null && !groups.isNull() && !groups.isMissingNode()) {
+            CfnPropertyTypes.requireType(primaryInterface == null ? "SecurityGroupIds" : "GroupSet",
+                    groups, JsonNodeType.ARRAY);
+            for (JsonNode sg : groups) {
                 securityGroupIds.add(engine.resolve(sg));
             }
         }
         return securityGroupIds;
+    }
+
+    private static boolean hasGroups(JsonNode groups) {
+        return groups != null && !groups.isNull() && !groups.isMissingNode() && !groups.isEmpty();
     }
 
     /**
@@ -661,17 +761,17 @@ public class Ec2InstanceCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void awaitTerminated(String region, String instanceId) {
-        long deadline = System.currentTimeMillis() + terminateTimeoutMillis;
+        long started = nanoTime.getAsLong();
         while (true) {
             if (isTerminatedOrGone(region, instanceId)) {
                 return;
             }
-            if (System.currentTimeMillis() >= deadline) {
+            if (nanoTime.getAsLong() - started >= TERMINATE_TIMEOUT.toNanos()) {
                 throw new AwsException("ValidationError", "Instance " + instanceId
-                        + " did not reach terminated within " + (terminateTimeoutMillis / 1000) + "s", 400);
+                        + " did not reach terminated within " + TERMINATE_TIMEOUT.toSeconds() + "s", 400);
             }
             try {
-                Thread.sleep(terminatePollMillis);
+                sleeper.sleep(TERMINATE_POLL);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AwsException("ValidationError",

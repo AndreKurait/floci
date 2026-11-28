@@ -61,9 +61,10 @@ import java.util.Optional;
  *
  * <h2>Deliberate deviations from real AWS</h2>
  * <ul>
- *   <li>The credential scope's region is not checked against the bucket's region. Floci resolves
- *       a request's region <em>from</em> that scope, so pinning it would be circular. Whether the
- *       label is a region at all is checked upstream, in {@code AccountContextFilter}.</li>
+ *   <li>The credential scope's region is not checked against the bucket's region here:
+ *       {@link S3RegionRedirectFilter} answers a mismatch with {@code PermanentRedirect} before this
+ *       filter runs, unless {@code floci.services.s3.region-redirect} is off. Whether the label is
+ *       a region at all is checked upstream, in {@code AccountContextFilter}.</li>
  *   <li>The per-chunk signatures of an {@code aws-chunked} upload are not verified; only the seed
  *       signature over the headers is. The controller strips the chunk framing itself.</li>
  *   <li>The well-known local-dev {@code test}/{@code test} credential pair is honoured, mirroring
@@ -82,6 +83,11 @@ import java.util.Optional;
 @Provider
 @Priority(Priorities.AUTHENTICATION)
 public class S3HeaderSignatureFilter implements ContainerRequestFilter {
+
+    static final String VERIFIED_SIGV4_PROPERTY = S3HeaderSignatureFilter.class.getName() + ".verifiedSigV4";
+
+    /** Request-local evidence of successful HMAC header and declared-payload verification. */
+    record VerifiedSigV4(String accessKeyId) { }
 
     private static final Logger LOG = Logger.getLogger(S3HeaderSignatureFilter.class);
 
@@ -121,6 +127,7 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
+        ctx.removeProperty(VERIFIED_SIGV4_PROPERTY);
         if (!S3SignatureFilterScope.routedToS3(resourceInfo)
                 || !S3SignatureFilterScope.verifiesSignatures(s3Service, presignGenerator)) {
             return;
@@ -231,6 +238,10 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
         if (SigV4RequestValidator.isSha256Hex(declaredHash) && !bodyMatches(ctx, declaredHash)) {
             abort(ctx, 400, "XAmzContentSHA256Mismatch",
                     "The provided 'x-amz-content-sha256' header does not match what was computed.");
+            return;
+        }
+        if (!asymmetric) {
+            ctx.setProperty(VERIFIED_SIGV4_PROPERTY, new VerifiedSigV4(accessKeyId));
         }
     }
 

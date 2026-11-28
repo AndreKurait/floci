@@ -8,7 +8,10 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.Network;
 import com.github.dockerjava.api.model.Ports;
+import io.floci.aws.config.EmulatorConfig;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -48,6 +51,22 @@ class CurrentContainerNetworkResolverTest {
 
         assertEquals(Optional.of("avoxx-network"), resolver.resolveNetworkName());
         assertEquals(Optional.of("172.24.0.2"), resolver.resolveContainerIp());
+    }
+
+    @Test
+    void resolveContainerIpOn_givesFlocisAddressOnThatNetworkOnly() {
+        Map<String, ContainerNetwork> networks = networks(
+                "floci_default", "172.19.0.2",
+                "rds-net", "172.30.0.5");
+        CurrentContainerNetworkResolver resolver = resolverOn(networks);
+
+        assertEquals(Optional.of("172.30.0.5"), resolver.resolveContainerIpOn("rds-net"));
+        assertEquals(Optional.empty(), resolver.resolveContainerIpOn("other-net"));
+        assertEquals(Optional.empty(), resolver.resolveContainerIpOn(null));
+
+        // Floci joins networks as it runs, so the next call sees one it joined.
+        networks.put("other-net", network("172.31.0.7"));
+        assertEquals(Optional.of("172.31.0.7"), resolver.resolveContainerIpOn("other-net"));
     }
 
     @Test
@@ -123,6 +142,76 @@ class CurrentContainerNetworkResolverTest {
         CurrentContainerNetworkResolver resolver =
                 new TestResolver(dockerClient, containerDetector, "floci-container");
 
+        assertTrue(resolver.resolveNetworkName().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"services-network", "services-network-id"})
+    void configuredNetworkWinsOverFirstAttachedNetwork(String selection) {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ContainerDetector detector = mock(ContainerDetector.class);
+        when(detector.isRunningInContainer()).thenReturn(true);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.of(selection));
+        InspectContainerCmd command = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspect = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        Map<String, ContainerNetwork> attached = networks(
+                "egress-network", "172.25.0.2", "services-network", "172.26.0.2");
+        when(attached.get("services-network").getNetworkID()).thenReturn("services-network-id");
+        when(dockerClient.inspectContainerCmd("floci-container")).thenReturn(command);
+        when(command.exec()).thenReturn(inspect);
+        when(inspect.getNetworkSettings().getNetworks()).thenReturn(attached);
+        when(inspect.getHostConfig().getNetworkMode()).thenReturn("egress-network");
+        CurrentContainerNetworkResolver resolver =
+                new TestResolver(dockerClient, detector, "floci-container", config);
+
+        assertEquals(Optional.of("services-network"), resolver.resolveNetworkName());
+        assertEquals(Optional.of("172.26.0.2"), resolver.resolveContainerIp());
+        verify(command, times(1)).exec();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"services-network", "services-network-id", "bridge", "default"})
+    void creationNetworkRemainsSelectedAfterVpcAttachment(String selection) {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ContainerDetector detector = mock(ContainerDetector.class);
+        when(detector.isRunningInContainer()).thenReturn(true);
+        InspectContainerCmd command = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspect = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        String networkName = "bridge".equals(selection) || "default".equals(selection) ? "bridge" : "services-network";
+        Map<String, ContainerNetwork> attached = networks(
+                "managed-vpc-network", "10.86.0.2", networkName, "172.26.0.2");
+        when(attached.get(networkName).getNetworkID()).thenReturn("services-network-id");
+        when(dockerClient.inspectContainerCmd("floci-container")).thenReturn(command);
+        when(command.exec()).thenReturn(inspect);
+        when(inspect.getNetworkSettings().getNetworks()).thenReturn(attached);
+        when(inspect.getHostConfig().getNetworkMode()).thenReturn(selection);
+        CurrentContainerNetworkResolver resolver =
+                new TestResolver(dockerClient, detector, "floci-container");
+
+        assertEquals(Optional.of(networkName), resolver.resolveNetworkName());
+        assertEquals(Optional.of("172.26.0.2"), resolver.resolveContainerIp());
+        verify(command, times(1)).exec();
+    }
+
+    @Test
+    void missingConfiguredNetworkDoesNotSelectAnotherAttachment() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ContainerDetector detector = mock(ContainerDetector.class);
+        when(detector.isRunningInContainer()).thenReturn(true);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.of("missing-network"));
+        InspectContainerCmd command = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspect = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectContainerCmd("floci-container")).thenReturn(command);
+        when(command.exec()).thenReturn(inspect);
+        Map<String, ContainerNetwork> attached =
+                networks("egress-network", "172.25.0.2", "other-network", "172.26.0.2");
+        when(inspect.getNetworkSettings().getNetworks()).thenReturn(attached);
+        CurrentContainerNetworkResolver resolver =
+                new TestResolver(dockerClient, detector, "floci-container", config);
+
+        assertTrue(resolver.resolveContainerIp().isEmpty());
         assertTrue(resolver.resolveNetworkName().isEmpty());
     }
 
@@ -276,7 +365,12 @@ class CurrentContainerNetworkResolverTest {
         private final String containerId;
 
         TestResolver(DockerClient dockerClient, ContainerDetector containerDetector, String containerId) {
-            super(dockerClient, containerDetector);
+            this(dockerClient, containerDetector, containerId, null);
+        }
+
+        TestResolver(DockerClient dockerClient, ContainerDetector containerDetector, String containerId,
+                     EmulatorConfig config) {
+            super(dockerClient, containerDetector, config);
             this.containerId = containerId;
         }
 

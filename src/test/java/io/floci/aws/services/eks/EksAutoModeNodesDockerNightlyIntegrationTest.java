@@ -13,6 +13,7 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.InstanceProfile;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.EksTestNode;
+import io.floci.aws.testing.MutableClock;
 import io.floci.aws.testing.RdsMockProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -25,6 +26,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -38,7 +40,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * cluster's own node isn't, is unschedulable, so a pass launches an instance for it, tagged as Auto Mode tags its
  * instances, with the node role's instance profile. Once it has joined, as an instance launched with EKS bootstrap
  * user data does, its node gets the pool's labels and the pod is scheduled on it. Turning compute off terminates
- * the instance and takes its node out, and deleting the cluster deletes the profile. Each pass is called directly,
+ * the instance and takes its node out, and deleting the cluster deletes the profile. A node whose pod is gone is
+ * removed once it has been empty for its pool's consolidateAfter. Each pass is called directly,
  * one at a time with the reconciler's own interval, which makes the same choices; the join EKS makes on the
  * instance's launch, from its user data, is made here, as the instance isn't launched through a request.
  */
@@ -69,7 +72,12 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
     @Inject
     EksService eksService;
 
+    @Inject
+    MutableClock clock;
+
     private Cluster cluster;
+    private String role;
+    private String subnet;
 
     @BeforeEach
     void requireDocker() {
@@ -96,18 +104,21 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
         }
     }
 
-    @Test
-    void anUnschedulablePodGetsANodeOfItsPoolWhichGoesWithCompute() {
+    /**
+     * Starts a cluster in a VPC of {@code cidr} with compute on and the {@code general-purpose} pool, whose node
+     * role exists, and runs a pod selecting that pool, which the cluster's own node isn't, so it is unschedulable.
+     */
+    private EksTestNode clusterWithAnUnschedulablePod(String cidr) {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String role = "auto-node-" + suffix;
+        role = "auto-node-" + suffix;
         cluster = EksTestNode.cluster(ACCOUNT, "nodes-" + suffix);
         cluster.setVersion(EksService.DEFAULT_K8S_VERSION);
         cluster.setComputeConfig(new ComputeConfig(true, List.of("general-purpose"),
                 "arn:aws:iam::" + ACCOUNT + ":role/" + role));
-        String subnet = RequestScopes.callAs(ACCOUNT, REGION, () -> {
+        subnet = RequestScopes.callAs(ACCOUNT, REGION, () -> {
             iam.createRole(role, "/", "{\"Version\":\"2012-10-17\",\"Statement\":[]}", null, 3600, Map.of());
-            String vpc = ec2.createVpc(REGION, "10.71.0.0/16", false).getVpcId();
-            return ec2.createSubnet(REGION, vpc, "10.71.1.0/24", "us-east-1a").getSubnetId();
+            String vpc = ec2.createVpc(REGION, cidr + ".0.0/16", false).getVpcId();
+            return ec2.createSubnet(REGION, vpc, cidr + ".1.0/24", "us-east-1a").getSubnetId();
         });
         ResourcesVpcConfig network = new ResourcesVpcConfig();
         network.setSubnetIds(List.of(subnet));
@@ -118,6 +129,11 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
         await("the default NodeClass").atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofSeconds(3))
                 .ignoreExceptions().until(() -> subnet.equals(node.kubectlOutput("get", "nodeclass", "default",
                         "-o", "jsonpath={.spec.subnetSelectorTerms[0].id}")));
+        // k3s applies the built-in pools from the same manifest, maybe after the NodeClass: a pass before then has no
+        // pool to launch from.
+        await("the general-purpose NodePool").atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofSeconds(3))
+                .ignoreExceptions().until(() -> "general-purpose".equals(node.kubectlOutput("get", "nodepool",
+                        "general-purpose", "-o", "jsonpath={.metadata.name}")));
 
         node.kubectl("run", "web", "--image=rancher/mirrored-pause:3.6", "--restart=Never", "--overrides="
                 + "{\"spec\":{\"nodeSelector\":{\"karpenter.sh/nodepool\":\"general-purpose\"},\"containers\":[{"
@@ -127,6 +143,13 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
                 .ignoreExceptions().until(() -> "Unschedulable".equals(node.kubectlOutput("get", "pod", "web",
                         "-o", "jsonpath={.status.conditions[?(@.type==\"PodScheduled\")].reason}")));
 
+        return node;
+    }
+
+    @Test
+    void anUnschedulablePodGetsANodeOfItsPoolWhichGoesWithCompute() {
+        EksTestNode node = clusterWithAnUnschedulablePod("10.71");
+
         RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
 
         List<Instance> launched = RequestScopes.callAs(ACCOUNT, REGION, () -> compute.instancesOf(cluster, REGION, "pending", "running"));
@@ -134,16 +157,26 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
         Instance instance = launched.getFirst();
         assertEquals(subnet, instance.getSubnetId());
         Map<String, String> tags = instance.getTags().stream().collect(Collectors.toMap(Tag::getKey, Tag::getValue));
+        // Tagged with its NodeClaim's name too, as Karpenter tags the instances it launches.
+        String claim = EksAutoModeNodeClaims.name("general-purpose", instance.getInstanceId());
         assertEquals(Map.of("eks:eks-cluster-name", cluster.getName(), "eks:kubernetes-node-pool-name", "general-purpose",
                 "eks:kubernetes-node-class-name", "default", "kubernetes.io/cluster/" + cluster.getName(), "owned",
-                "aws:ec2:managed-launch", "eks-auto"), tags);
+                "aws:ec2:managed-launch", "eks-auto", EksAutoModeCompute.NODECLAIM_TAG, claim), tags);
         InstanceProfile profile = RequestScopes.callAs(ACCOUNT, REGION, () -> iam.listInstanceProfiles(
                 "/eks/" + REGION + "/" + cluster.getName() + "/")).getFirst();
         assertEquals(List.of(role), profile.getRoleNames());
         assertEquals(profile.getArn(), instance.getIamInstanceProfileArn());
+        // Its NodeClaim, launched, owned by the pool.
+        assertEquals("True NodePool general-purpose", node.kubectlOutput("get", "nodeclaim", claim, "-o",
+                "jsonpath={.status.conditions[?(@.type==\"Launched\")].status} "
+                        + "{.metadata.ownerReferences[0].kind} {.metadata.labels.karpenter\\.sh/nodepool}"));
         // A second pass while the node hasn't joined launches no other.
         RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
-        assertEquals(1, RequestScopes.callAs(ACCOUNT, REGION, () -> compute.instancesOf(cluster, REGION, "pending", "running")).size());
+        List<Instance> waiting = RequestScopes.callAs(ACCOUNT, REGION,
+                () -> compute.instancesOf(cluster, REGION, "pending", "running"));
+        assertEquals(List.of(instance.getInstanceId()), waiting.stream().map(Instance::getInstanceId).toList(),
+                () -> "A newly launched node must retain its registration window: launched=" + instance.getLaunchTime()
+                        + ", now=" + Instant.now());
 
         RequestScopes.runAs(ACCOUNT, REGION, () -> eksClusterManager.joinInstance(cluster, instance));
         RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
@@ -158,6 +191,13 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
         await("the pod is scheduled on the new node").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
                 .ignoreExceptions().until(() -> nodeName.equals(node.kubectlOutput("get", "pod", "web",
                         "-o", "jsonpath={.spec.nodeName}")));
+        // The NodeClaim says its node joined, as its node is.
+        await("the NodeClaim is ready").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
+                .ignoreExceptions().until(() -> {
+                    RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
+                    return (nodeName + " True").equals(node.kubectlOutput("get", "nodeclaim", claim, "-o",
+                            "jsonpath={.status.nodeName} {.status.conditions[?(@.type==\"Ready\")].status}"));
+                });
 
         cluster.setComputeConfig(new ComputeConfig(false, List.of(), null));
         RequestScopes.runAs(ACCOUNT, REGION, () -> compute.removeNodes(cluster, REGION));
@@ -165,6 +205,8 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
         assertEquals(List.of(), RequestScopes.callAs(ACCOUNT, REGION, () -> compute.instancesOf(cluster, REGION, "pending", "running")));
         await("the node is gone").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
                 .ignoreExceptions().until(() -> node.kubectl("get", "node", nodeName).exitCode() != 0);
+        await("the NodeClaim is gone").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
+                .ignoreExceptions().until(() -> node.kubectl("get", "nodeclaim", claim).exitCode() != 0);
 
         // DeleteCluster runs the Auto Mode cleanups, compute's among them.
         Cluster deleted = cluster;
@@ -172,5 +214,45 @@ class EksAutoModeNodesDockerNightlyIntegrationTest {
         RequestScopes.runAs(ACCOUNT, REGION, () -> eksService.deleteCluster(deleted.getName()));
         assertEquals(List.of(), RequestScopes.callAs(ACCOUNT, REGION, () -> iam.listInstanceProfiles(
                 "/eks/" + REGION + "/" + deleted.getName() + "/")));
+    }
+
+    /**
+     * As Auto Mode consolidates: once the pod is gone and its node has run no workload for the pool's
+     * consolidateAfter, the node is removed and its instance terminated.
+     */
+    @Test
+    void aNodeLeftEmptyGoesAfterItsPoolsConsolidateAfter() {
+        EksTestNode node = clusterWithAnUnschedulablePod("10.72");
+        RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
+        Instance instance = RequestScopes.callAs(ACCOUNT, REGION,
+                () -> compute.instancesOf(cluster, REGION, "pending", "running")).getFirst();
+        RequestScopes.runAs(ACCOUNT, REGION, () -> eksClusterManager.joinInstance(cluster, instance));
+        String nodeName = eksClusterManager.deriveInstanceNodeName(instance, REGION);
+        await("the pod is scheduled on the new node").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
+                .ignoreExceptions().until(() -> {
+                    RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
+                    return nodeName.equals(node.kubectlOutput("get", "pod", "web", "-o", "jsonpath={.spec.nodeName}"));
+                });
+        node.kubectl("patch", "nodepool", "general-purpose", "--type=merge",
+                "-p", "{\"spec\":{\"disruption\":{\"consolidateAfter\":\"2s\"}}}");
+        // Running its workload, the node stays.
+        RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
+        assertEquals(1, RequestScopes.callAs(ACCOUNT, REGION,
+                () -> compute.instancesOf(cluster, REGION, "pending", "running")).size());
+
+        node.kubectl("delete", "pod", "web", "--grace-period=0", "--force");
+        await("the workload pod is gone").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
+                .ignoreExceptions().until(() -> node.kubectl("get", "pod", "web").exitCode() != 0);
+        RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
+        clock.advance(Duration.ofSeconds(2));
+
+        await("the empty node is removed").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
+                .ignoreExceptions().until(() -> {
+                    RequestScopes.runAs(ACCOUNT, REGION, () -> compute.reconcile(cluster, REGION));
+                    return RequestScopes.callAs(ACCOUNT, REGION,
+                            () -> compute.instancesOf(cluster, REGION, "pending", "running")).isEmpty();
+                });
+        await("the node is gone").atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(2))
+                .ignoreExceptions().until(() -> node.kubectl("get", "node", nodeName).exitCode() != 0);
     }
 }

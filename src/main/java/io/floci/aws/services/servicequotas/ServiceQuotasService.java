@@ -17,9 +17,11 @@ import jakarta.inject.Inject;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
@@ -60,13 +62,25 @@ public class ServiceQuotasService {
             Map.entry("vpc", "Amazon Virtual Private Cloud (Amazon VPC)"),
             Map.entry("dynamodb", "Amazon DynamoDB"),
             Map.entry("logs", "Amazon CloudWatch Logs"),
+            Map.entry("monitoring", "Amazon CloudWatch"),
             Map.entry("events", "Amazon EventBridge (CloudWatch Events)"));
 
     private static final Map<String, List<QuotaDefinition>> CURATED_QUOTAS = Map.of(
             "codebuild", List.of(
                     new QuotaDefinition("L-2DC20C30", "Concurrently running builds", GENERIC_QUOTA_VALUE, false)),
             "lambda", List.of(
-                    new QuotaDefinition("L-B99A9384", "Concurrent executions", GENERIC_QUOTA_VALUE, false)),
+                    new QuotaDefinition("L-B99A9384", "Concurrent executions", GENERIC_QUOTA_VALUE, false,
+                            "ACCOUNT", new UsageMetric("AWS/Lambda", "ConcurrentExecutions", Map.of(), null))),
+            // CloudWatch quotas: "Rate of PutMetricData requests", 500 per second, adjustable
+            // (CloudWatch User Guide, "CloudWatch service quotas"). Its usage metric: "the CallCount
+            // metric with the dimensions "Service": "CloudWatch", "Type": "API" and "Resource":
+            // "PutMetricData" indicates the number of times the CloudWatch PutMetricData API operation
+            // has been called"; "The most useful statistic for the metric is SUM" (CloudWatch User
+            // Guide, "CloudWatch usage metrics").
+            "monitoring", List.of(
+                    new QuotaDefinition("L-8BC498D4", "Rate of PutMetricData requests", 500.0, false, "ACCOUNT",
+                            new UsageMetric("AWS/Usage", "CallCount", Map.of("Service", "CloudWatch", "Type", "API",
+                                    "Resource", "PutMetricData"), "Sum"))),
             "organizations", List.of(
                     new QuotaDefinition("L-E619E033", "Maximum number of accounts", 50.0, true)),
             "ec2", List.of(
@@ -218,9 +232,49 @@ public class ServiceQuotasService {
         node.put("Unit", "None");
         node.put("Adjustable", true);
         node.put("GlobalQuota", quota.globalQuota());
+        if (quota.usageMetric() != null) {
+            UsageMetric metric = quota.usageMetric();
+            ObjectNode usage = node.putObject("UsageMetric");
+            usage.put("MetricNamespace", metric.namespace());
+            usage.put("MetricName", metric.name());
+            ObjectNode dimensions = usage.putObject("MetricDimensions");
+            metric.dimensions().entrySet().stream().sorted(Map.Entry.comparingByKey())
+                    .forEach(dimension -> dimensions.put(dimension.getKey(), dimension.getValue()));
+            if (metric.statisticRecommendation() != null) {
+                usage.put("MetricStatisticRecommendation", metric.statisticRecommendation());
+            }
+        }
         node.put("QuotaAppliedAtLevel", quota.appliedAtLevel());
         return node;
     }
+
+    /**
+     * The quota whose {@code UsageMetric} is this metric: the same namespace, name and dimensions.
+     * CloudWatch's {@code SERVICE_QUOTA(metric)} "Returns the service quota for the given usage
+     * metric" (CloudWatch User Guide, "Using metric math"). A {@code Class} dimension of
+     * {@code None} names no class ("CloudWatch API usage metrics use this dimension with a value of
+     * None", "CloudWatch usage metrics"), so the metric matches with or without it.
+     */
+    public static Optional<QuotaReference> quotaForUsageMetric(String namespace, String metricName,
+                                                               Map<String, String> metricDimensions) {
+        Map<String, String> dimensions = new HashMap<>(metricDimensions);
+        dimensions.remove("Class", "None");
+        return CURATED_QUOTAS.entrySet().stream()
+                .flatMap(service -> service.getValue().stream()
+                        .filter(quota -> quota.usageMetric() != null
+                                && quota.usageMetric().namespace().equals(namespace)
+                                && quota.usageMetric().name().equals(metricName)
+                                && quota.usageMetric().dimensions().equals(dimensions))
+                        .map(quota -> new QuotaReference(service.getKey(), quota.quotaCode())))
+                .findFirst();
+    }
+
+    /** A quota's service and quota codes. */
+    public record QuotaReference(String serviceCode, String quotaCode) {}
+
+    /** The Service Quotas {@code MetricInfo} shape: the CloudWatch metric that reflects a quota's usage. */
+    record UsageMetric(String namespace, String name, Map<String, String> dimensions,
+                       String statisticRecommendation) {}
 
     /**
      * Unknown-but-well-formed service codes deliberately generate a quota catalog, which makes the
@@ -304,9 +358,10 @@ public class ServiceQuotasService {
         return response;
     }
 
-    record QuotaDefinition(String quotaCode, String quotaName, double value, boolean globalQuota, String appliedAtLevel) {
+    record QuotaDefinition(String quotaCode, String quotaName, double value, boolean globalQuota, String appliedAtLevel,
+                           UsageMetric usageMetric) {
         public QuotaDefinition(String quotaCode, String quotaName, double value, boolean globalQuota) {
-            this(quotaCode, quotaName, value, globalQuota, "ACCOUNT");
+            this(quotaCode, quotaName, value, globalQuota, "ACCOUNT", null);
         }
     }
 

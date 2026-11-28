@@ -30,6 +30,7 @@ import java.util.zip.GZIPOutputStream;
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -96,6 +97,169 @@ class IamPassRoleEnforcementIntegrationTest {
         user.lambda().body(body).post("/2015-03-31/functions").then().statusCode(201);
         cleanup.register(() -> admin("lambda").contentType("application/json")
                 .delete("/2015-03-31/functions/{name}", name));
+    }
+
+    @Test
+    void replicatingABucketNeedsPassRoleOnTheRoleItsConfigurationNamesForS3() {
+        // S3 authorizes PutBucketReplication as s3:PutReplicationConfiguration, and its role is the Role of the
+        // ReplicationConfiguration its XML body is.
+        String role = role("replication");
+        String bucket = "passrole-replication-" + suffix();
+        admin("s3").put("/" + bucket).then().statusCode(200);
+        cleanup.register(() -> EnforcementFixtures.removeBucket(baseUri.getPort(), auth(ADMIN, "s3"), bucket));
+        User user = user("passrole-replication");
+        String configuration = """
+                <ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Role>%s</Role>\
+                <Rule><ID>r</ID><Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::%s-target</Bucket>\
+                </Destination></Rule></ReplicationConfiguration>""".formatted(role, bucket);
+
+        user.policy(allow("s3:PutReplicationConfiguration", "*"));
+        denied(user.s3().body(configuration).put("/" + bucket + "?replication").then());
+        // Addressed by its virtual host, with the role set off by whitespace, which S3 accepts, and sent as a form,
+        // which S3 still reads as its XML.
+        denied(user.s3().header("Host", bucket + ".localhost").body(configuration).put("/?replication").then());
+        denied(user.s3().body(configuration.replace(role, "\n  " + role + "\n"))
+                .put("/" + bucket + "?replication").then());
+        denied(user.s3().contentType("application/x-www-form-urlencoded").body(configuration)
+                .put("/" + bucket + "?replication").then());
+        // A second Role that is not one text element leaves the first unread, and S3 refuses the document.
+        user.s3().body(configuration.replace("</Role>", "</Role><Role><x/></Role>"))
+                .put("/" + bucket + "?replication").then().statusCode(400).body(containsString("MalformedXML"));
+
+        user.policy(allow("s3:PutReplicationConfiguration", "*") + "," + passRole(role, "ec2.amazonaws.com"));
+        denied(user.s3().body(configuration).put("/" + bucket + "?replication").then());
+
+        user.policy(allow("s3:PutReplicationConfiguration", "*") + "," + passRole(role, "s3.amazonaws.com"));
+        user.s3().body(configuration).put("/" + bucket + "?replication").then().statusCode(200);
+    }
+
+    @Test
+    void anEmrClusterNeedsPassRoleOnItsServiceRoleForEmrAndItsInstanceProfilesRoleForEc2() {
+        // ServiceRole is given by name and goes to EMR; JobFlowRole names an instance profile, whose role goes to EC2.
+        String service = role("emr-service");
+        String instance = role("emr-instance");
+        String profile = instanceProfile(instance.substring(instance.lastIndexOf('/') + 1));
+        User user = user("passrole-emr");
+        String body = """
+                {"Name":"passrole-emr-%s","ReleaseLabel":"emr-7.5.0","ServiceRole":"%s","JobFlowRole":"%s",
+                 "Instances":{"KeepJobFlowAliveWhenNoSteps":true,"InstanceGroups":[{"Name":"master",
+                 "InstanceRole":"MASTER","InstanceType":"m5.xlarge","InstanceCount":1}]}}"""
+                .formatted(suffix(), service.substring(service.lastIndexOf('/') + 1), profile);
+        String runJobFlow = "ElasticMapReduce.RunJobFlow";
+
+        user.policy(allow("elasticmapreduce:RunJobFlow", "*"));
+        deniedJson(user.json("elasticmapreduce", runJobFlow).body(body).post("/").then());
+        user.policy(allow("elasticmapreduce:RunJobFlow", "*") + "," + passRole(service, "elasticmapreduce.amazonaws.com")
+                + "," + passRole(instance, "elasticmapreduce.amazonaws.com"));
+        deniedJson(user.json("elasticmapreduce", runJobFlow).body(body).post("/").then());
+        // The service role, named by its name, is checked on the role IAM holds under it.
+        user.policy(allow("elasticmapreduce:RunJobFlow", "*") + "," + passRole(instance, "ec2.amazonaws.com"));
+        deniedJson(user.json("elasticmapreduce", runJobFlow).body(body).post("/").then());
+
+        user.policy(allow("elasticmapreduce:RunJobFlow", "*") + "," + passRole(service, "elasticmapreduce.amazonaws.com")
+                + "," + passRole(instance, "ec2.amazonaws.com"));
+        // A profile named by a JSON number is the one EMR reads it as.
+        String numbered = Long.toString(System.nanoTime());
+        admin("iam").formParam("Action", "CreateInstanceProfile").formParam("InstanceProfileName", numbered)
+                .post("/").then().statusCode(200);
+        cleanup.register(() -> EnforcementFixtures.removeInstanceProfile(baseUri.getPort(), auth(ADMIN, "iam"),
+                numbered));
+        admin("iam").formParam("Action", "AddRoleToInstanceProfile").formParam("InstanceProfileName", numbered)
+                .formParam("RoleName", instance.substring(instance.lastIndexOf('/') + 1)).post("/").then()
+                .statusCode(200);
+        user.policy(allow("elasticmapreduce:RunJobFlow", "*") + "," + passRole(service, "elasticmapreduce.amazonaws.com"));
+        deniedJson(user.json("elasticmapreduce", runJobFlow)
+                .body(body.replace("\"JobFlowRole\":\"" + profile + "\"", "\"JobFlowRole\":" + numbered)).post("/")
+                .then());
+
+        user.policy(allow("elasticmapreduce:RunJobFlow", "*") + "," + passRole(service, "elasticmapreduce.amazonaws.com")
+                + "," + passRole(instance, "ec2.amazonaws.com"));
+        String clusterId = user.json("elasticmapreduce", runJobFlow).body(body).post("/").then().statusCode(200)
+                .extract().path("JobFlowId");
+        cleanup.register(() -> admin("elasticmapreduce").header("X-Amz-Target", "ElasticMapReduce.TerminateJobFlows")
+                .contentType("application/x-amz-json-1.1").body("{\"JobFlowIds\":[\"" + clusterId + "\"]}")
+                .post("/"));
+    }
+
+    @Test
+    void apiGatewayNeedsPassRoleOnTheRolesAnIntegrationAnUpdateOrAnImportNames() {
+        // API Gateway is authorized by HTTP method, and its roles are checked for the operation its route resolves:
+        // PutIntegration's credentials, the role an UpdateIntegration's patch operation sets, and an imported
+        // definition's integration credentials.
+        String role = role("apigw-integration");
+        String apiId = admin("apigateway").contentType("application/json").body("{\"name\":\"passrole-" + suffix() + "\"}")
+                .post("/restapis").then().statusCode(201).extract().path("id");
+        cleanup.register(() -> admin("apigateway").delete("/restapis/" + apiId));
+        String rootId = admin("apigateway").get("/restapis/" + apiId + "/resources").then().statusCode(200)
+                .extract().path("item[0].id");
+        String method = "/restapis/" + apiId + "/resources/" + rootId + "/methods/GET";
+        admin("apigateway").contentType("application/json").body("{\"authorizationType\":\"NONE\"}").put(method)
+                .then().statusCode(201);
+        String integration = """
+                {"type":"AWS","integrationHttpMethod":"POST","credentials":"%s",
+                 "uri":"arn:aws:apigateway:us-east-1:sqs:path/%s/passrole-queue"}""".formatted(role, ACCOUNT);
+        String patch = "{\"patchOperations\":[{\"op\":\"replace\",\"path\":\"/credentials\",\"value\":\"" + role
+                + "\"}]}";
+        String definition = """
+                {"openapi":"3.0.1","info":{"title":"passrole-import-%s","version":"1"},"paths":{"/things":{"get":{
+                 "x-amazon-apigateway-integration":{"type":"aws","httpMethod":"POST","credentials":"%s",
+                 "uri":"arn:aws:apigateway:us-east-1:sqs:path/%s/passrole-queue"}}}}}""".formatted(suffix(), role, ACCOUNT);
+        User user = user("passrole-apigw");
+
+        user.policy(allow("apigateway:*", "*"));
+        denied(user.rest("apigateway").body(integration).put(method + "/integration").then());
+        denied(user.rest("apigateway").body(definition).post("/restapis?mode=import").then());
+        // The definition is read as API Gateway reads it, its AWS variables resolved.
+        denied(user.rest("apigateway").body(definition.replace(role, "arn:${AWS::Partition}:iam::${AWS::AccountId}:"
+                + role.substring(role.indexOf(":role/") + 1))).post("/restapis?mode=import").then());
+        user.policy(allow("apigateway:*", "*") + "," + passRole(role, "lambda.amazonaws.com"));
+        denied(user.rest("apigateway").body(integration).put(method + "/integration").then());
+
+        user.policy(allow("apigateway:*", "*") + "," + passRole(role, "apigateway.amazonaws.com"));
+        user.rest("apigateway").body(integration).put(method + "/integration").then().statusCode(201);
+        String imported = user.rest("apigateway").body(definition).post("/restapis?mode=import").then().statusCode(201)
+                .extract().path("id");
+        cleanup.register(() -> admin("apigateway").delete("/restapis/" + imported));
+        user.policy(allow("apigateway:*", "*"));
+        denied(user.rest("apigateway").body(patch).patch(method + "/integration").then());
+        // With the permission the update reaches API Gateway, which answers it on its own terms.
+        user.policy(allow("apigateway:*", "*") + "," + passRole(role, "apigateway.amazonaws.com"));
+        user.rest("apigateway").body(patch).patch(method + "/integration").then().statusCode(not(403));
+    }
+
+    @Test
+    void apiGatewayV2OverJson11NeedsPassRoleOnTheRolesItsBodyNames() {
+        // HTTP APIs are served over JSON 1.1 too, whose bodies name the members as botocore does.
+        String role = role("apigw-v2-json");
+        String apiId = admin("apigateway").header("X-Amz-Target", "AmazonApiGatewayV2.CreateApi")
+                .contentType("application/x-amz-json-1.1")
+                .body("{\"Name\":\"passrole-v2-" + suffix() + "\",\"ProtocolType\":\"HTTP\"}")
+                .post("/").then().statusCode(201).extract().path("ApiId");
+        cleanup.register(() -> admin("apigateway").header("X-Amz-Target", "AmazonApiGatewayV2.DeleteApi")
+                .contentType("application/x-amz-json-1.1").body("{\"ApiId\":\"" + apiId + "\"}").post("/"));
+        String integration = """
+                {"ApiId":"%s","IntegrationType":"AWS_PROXY","IntegrationSubtype":"SQS-SendMessage",
+                 "PayloadFormatVersion":"1.0","CredentialsArn":"%s",
+                 "RequestParameters":{"QueueUrl":"https://sqs.us-east-1.amazonaws.com/%s/q","MessageBody":"$request.body"}}"""
+                .formatted(apiId, role, ACCOUNT);
+        String definition = """
+                {"openapi":"3.0.1","info":{"title":"passrole-v2-import","version":"1"},"paths":{"/things":{"get":{
+                 "x-amazon-apigateway-integration":{"type":"aws_proxy","httpMethod":"POST","payloadFormatVersion":"1.0",
+                 "credentials":"%s","uri":"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/x/invocations"}}}}}"""
+                .formatted(role);
+        String importApi = new ObjectMapper().createObjectNode().put("Body", definition).toString();
+        User user = user("passrole-apigw-v2");
+
+        user.policy(allow("apigateway:*", "*"));
+        deniedJson(user.json("apigateway", "AmazonApiGatewayV2.CreateIntegration").body(integration).post("/").then());
+        deniedJson(user.json("apigateway", "AmazonApiGatewayV2.ImportApi").body(importApi).post("/").then());
+        // The REST route takes the definition in its restJson1 envelope, or as the whole body.
+        denied(user.rest("apigateway").body(importApi.replace("\"Body\"", "\"body\"")).put("/v2/apis").then());
+        denied(user.rest("apigateway").body(definition).put("/v2/apis").then());
+
+        user.policy(allow("apigateway:*", "*") + "," + passRole(role, "apigateway.amazonaws.com"));
+        user.json("apigateway", "AmazonApiGatewayV2.CreateIntegration").body(integration).post("/").then()
+                .statusCode(not(400));
     }
 
     @Test
@@ -567,6 +731,31 @@ class IamPassRoleEnforcementIntegrationTest {
     }
 
     /** Creates an EKS cluster as the account's admin, removed afterwards, and returns its name. */
+    @Test
+    void anEksAutoModeClusterNeedsPassRoleOnItsNodeRoleForEc2AndItsClusterRoleForEks() {
+        // The node role is the role EKS Auto Mode's EC2 Managed Instances run as, so it is passed to EC2; the
+        // cluster role, the control plane's, to EKS.
+        String cluster = role("auto-cluster");
+        String node = role("auto-node");
+        User user = user("passrole-eks-auto");
+        String body = """
+                {"name":"passrole-auto-%s","roleArn":"%s","computeConfig":{"enabled":true,"nodePools":["general-purpose"],
+                 "nodeRoleArn":"%s"},"kubernetesNetworkConfig":{"elasticLoadBalancing":{"enabled":true}},
+                 "storageConfig":{"blockStorage":{"enabled":true}}}""".formatted(suffix(), cluster, node);
+
+        user.policy(allow("eks:CreateCluster", "*") + "," + passRole(cluster, "eks.amazonaws.com"));
+        denied(user.rest("eks").body(body).post("/clusters").then());
+        user.policy(allow("eks:CreateCluster", "*") + "," + passRole(cluster, "eks.amazonaws.com") + ","
+                + passRole(node, "eks.amazonaws.com"));
+        denied(user.rest("eks").body(body).post("/clusters").then());
+
+        user.policy(allow("eks:CreateCluster", "*") + "," + passRole(cluster, "eks.amazonaws.com") + ","
+                + passRole(node, "ec2.amazonaws.com"));
+        String name = user.rest("eks").body(body).post("/clusters").then().statusCode(200)
+                .extract().path("cluster.name");
+        cleanup.register(() -> admin("eks").delete("/clusters/" + name));
+    }
+
     private String eksCluster() {
         String name = "passrole-cluster-" + suffix();
         admin("eks").contentType("application/json")
@@ -616,7 +805,11 @@ class IamPassRoleEnforcementIntegrationTest {
 
     @Test
     void aStackNeedsPassRoleOnAServiceRoleTheRequestNames() {
-        String role = role("cloudformation");
+        String role = EnforcementFixtures.createRole(cleanup, baseUri.getPort(), ACCOUNT, "/",
+                "cloudformation-" + suffix(), """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                          "Principal":{"Service":"cloudformation.amazonaws.com"}}]}""", """
+                        {"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}""");
         User user = user("passrole-stack");
         String stack = "passrole-stack-" + suffix();
         String stacks = allow("cloudformation:CreateStack", "*") + "," + allow("cloudformation:DeleteStack", "*");
@@ -708,6 +901,47 @@ class IamPassRoleEnforcementIntegrationTest {
                 .formParam("InstanceId", instanceId).post("/").then().statusCode(200);
         cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteLaunchConfiguration")
                 .formParam("LaunchConfigurationName", name).post("/"));
+    }
+
+    @Test
+    void omittedLaunchTemplateVersionChecksTheDefaultProfileBeforeCreatingAGroup() {
+        String role = role("asg-default");
+        String templateId = launchTemplate(instanceProfile(roleName(role)), null);
+        User user = user("passrole-asg-default");
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*"));
+        String name = "passrole-default-" + suffix();
+        cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteAutoScalingGroup")
+                .formParam("AutoScalingGroupName", name).formParam("ForceDelete", "true").post("/"));
+
+        denied(group(user, "CreateAutoScalingGroup", name)
+                .formParam("LaunchTemplate.LaunchTemplateId", templateId).post("/").then());
+        String mixed = "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.";
+        denied(group(user, "CreateAutoScalingGroup", name)
+                .formParam(mixed + "LaunchTemplateId", templateId).post("/").then());
+        admin("autoscaling").formParam("Action", "DescribeAutoScalingGroups")
+                .formParam("AutoScalingGroupNames.member.1", name).post("/").then().statusCode(200)
+                .body("DescribeAutoScalingGroupsResponse.DescribeAutoScalingGroupsResult.AutoScalingGroups.member.size()",
+                        equalTo(0));
+
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*") + "," + passRole(role, "ec2.amazonaws.com"));
+        group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .post("/").then().statusCode(200);
+    }
+
+    @Test
+    void omittedLaunchTemplateVersionDoesNotCheckAnUnselectedLatestProfile() {
+        String role = role("asg-latest-only");
+        String templateId = launchTemplate(null, instanceProfile(roleName(role)));
+        User user = user("passrole-asg-plain-default");
+        user.policy(allow("autoscaling:CreateAutoScalingGroup", "*"));
+        String name = "passrole-plain-default-" + suffix();
+        cleanup.register(() -> admin("autoscaling").formParam("Action", "DeleteAutoScalingGroup")
+                .formParam("AutoScalingGroupName", name).formParam("ForceDelete", "true").post("/"));
+
+        denied(group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .formParam("LaunchTemplate.Version", "$Latest").post("/").then());
+        group(user, "CreateAutoScalingGroup", name).formParam("LaunchTemplate.LaunchTemplateId", templateId)
+                .post("/").then().statusCode(200);
     }
 
     @Test
@@ -814,7 +1048,19 @@ class IamPassRoleEnforcementIntegrationTest {
     @Test
     void aScalableTargetNeedsPassRoleOnTheRoleItNamesForApplicationAutoScaling() {
         String role = role("scalable-target");
-        String table = "table/passrole-" + suffix();
+        String tableName = "passrole-" + suffix();
+        String table = "table/" + tableName;
+        cleanup.register(() -> given().header("Authorization", auth(ADMIN, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+                .contentType("application/x-amz-json-1.0")
+                .body("{\"TableName\":\"" + tableName + "\"}").post("/"));
+        given().header("Authorization", auth(ADMIN, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+                .contentType("application/x-amz-json-1.0").body("""
+                        {"TableName":"%s","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                         "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                         "ProvisionedThroughput":{"ReadCapacityUnits":3,"WriteCapacityUnits":3}}
+                        """.formatted(tableName)).post("/").then().statusCode(200);
         String target = "AnyScaleFrontendService.RegisterScalableTarget";
         String body = """
                 {"ServiceNamespace":"dynamodb","ResourceId":"%s","ScalableDimension":"dynamodb:table:ReadCapacityUnits",
@@ -1161,9 +1407,12 @@ class IamPassRoleEnforcementIntegrationTest {
 
         // A grant to pass the role to Lambda does not cover SSM.
         user.policy(actions + "," + passRole(role, LAMBDA));
-        deniedJson(ssm(user, "CreateAssociation").body(association).post("/").then());
-        deniedJson(ssm(user, "UpdateAssociation").body(update).post("/").then());
-        deniedJson(ssm(user, "SendCommand").body(command).post("/").then());
+        ssm(user, "CreateAssociation").body(association).post("/").then()
+                .statusCode(403).body(containsString("AccessDeniedException")).body(containsString("iam:PassRole"));
+        ssm(user, "UpdateAssociation").body(update).post("/").then()
+                .statusCode(403).body(containsString("AccessDeniedException")).body(containsString("iam:PassRole"));
+        ssm(user, "SendCommand").body(command).post("/").then()
+                .statusCode(403).body(containsString("AccessDeniedException")).body(containsString("iam:PassRole"));
 
         user.policy(actions + "," + passRole(role, SSM));
         ssm(user, "CreateAssociation").body(association).post("/").then()
@@ -1600,6 +1849,10 @@ class IamPassRoleEnforcementIntegrationTest {
 
         RequestSpecification lambda() {
             return given().header("Authorization", auth(accessKeyId, "lambda")).contentType("application/json");
+        }
+
+        RequestSpecification s3() {
+            return given().header("Authorization", auth(accessKeyId, "s3")).contentType("application/xml");
         }
 
         RequestSpecification ec2(String action) {

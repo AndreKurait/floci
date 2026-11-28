@@ -86,13 +86,13 @@ class CloudFormationRdsDbInstanceIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"Second, first, UPDATE_ROLLBACK_COMPLETE", "First, replaced, UPDATE_ROLLBACK_FAILED"})
+    @CsvSource({"Second, first, UPDATE_ROLLBACK_COMPLETE", "First, replaced, UPDATE_ROLLBACK_COMPLETE"})
     void aMembersGroupsChangedOnlyThroughAParameterOrAReplacedGroupFailTheUpdate(String group, String firstDescription,
                                                                                String status) {
         String id = output(stack.create(memberTemplate("First", "first")), "MemberId");
         List<String> groups = vpcSecurityGroupIds(rds(), id);
 
-        // A replaced security group is not rolled back, so that update's rollback fails at First.
+        // Replacement cleanup restores the original security group before the failed member update rolls back.
         stack.update(memberTemplate(group, firstDescription), status);
         String reason = failedResourceReason(stack.name());
         assertTrue(reason.contains("Modify vpc security group for the DB Cluster"), reason);

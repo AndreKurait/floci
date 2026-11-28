@@ -1,5 +1,6 @@
 package io.floci.aws.core.common;
 
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -93,6 +94,15 @@ public interface StoredResourceArns {
     Optional<String> find(String type, List<String> names, String region);
 
     /**
+     * A named resource whose owner depends on the operation's own resolution rules, such as a built-in
+     * command document. Empty when ordinary name lookup applies. This does not select the resource types
+     * an operation authorizes, which remain the generated table's responsibility.
+     */
+    default Optional<String> resolveNamedForOperation(String operation, String type, String name, String region) {
+        return Optional.empty();
+    }
+
+    /**
      * The resource resolved by an ARN in its own account and Region, without substituting the caller's
      * coordinates (a layer version), or as the service's handler reads the ARN where it reads it first as the
      * caller's (a secret a full or partial ARN names, in the ARN's Region, before one another account holds under
@@ -101,6 +111,15 @@ public interface StoredResourceArns {
      */
     default Optional<String> resolveStoredArn(String arn) {
         return Optional.empty();
+    }
+
+    /**
+     * Resolves names filling an ARN's variables, including compound identities such as an AppConfig profile
+     * under its application. Single-variable resources retain the existing name lookup.
+     */
+    default Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+        return variables.size() == 1
+                ? find(type, List.of(variables.values().iterator().next()), region) : Optional.empty();
     }
 
     /**
@@ -139,6 +158,34 @@ public interface StoredResourceArns {
      * {@code tags} as {@link #storedTags} answers them: in their order, a copy the caller may keep, and a tag without
      * a value as an empty one, as a resource-tag condition key reads it.
      */
+    /**
+     * The value a request gives a variable the table names {@code Encoded} and a botocore shape's name, as the service
+     * writes it into its ARNs: by default percent-encoded as RFC 3986 encodes a URI's path, every byte but its
+     * unreserved characters and {@code /}, its hex digits in upper case. A service whose ARNs encode it otherwise
+     * says so (CodeArtifact's package group patterns, in lower case).
+     */
+    default String encoded(String variable, String value) {
+        return percentEncoded(value, false);
+    }
+
+    /**
+     * The value percent-encoded as RFC 3986 encodes a URI's path: every UTF-8 byte but its unreserved characters
+     * ({@code A-Z a-z 0-9 - . _ ~}) and {@code /}, the hex digits in lower case when {@code lowerCase}.
+     */
+    static String percentEncoded(String value, boolean lowerCase) {
+        StringBuilder encoded = new StringBuilder();
+        for (byte b : value.getBytes(StandardCharsets.UTF_8)) {
+            int c = b & 0xff;
+            if (c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+                    || c == '-' || c == '.' || c == '_' || c == '~' || c == '/') {
+                encoded.append((char) c);
+            } else {
+                encoded.append('%').append(String.format(lowerCase ? "%02x" : "%02X", c));
+            }
+        }
+        return encoded.toString();
+    }
+
     static Map<String, String> withEmptyValues(Map<String, String> tags) {
         Map<String, String> copy = new LinkedHashMap<>();
         tags.forEach((key, value) -> copy.put(key, value == null ? "" : value));
@@ -217,12 +264,13 @@ public interface StoredResourceArns {
     }
 
     /**
-     * Whether an ARN naming another account than the caller's, {@code accountId}, names a resource the service holds
-     * in that account and acts on there, never as the caller's resource of that name (the sink an OAM link is made
-     * to, a RAM invitation sent to the caller, a share another account owns or a role STS assumes in its account), so
-     * a request naming it is checked on that ARN alone; false when that account holds no such resource. Whether the
-     * caller may use it is the handler's to answer after the check. Read by the ARN alone, as it runs on every such
-     * request.
+     * Whether an ARN naming another account than the caller's, {@code accountId}, names a resource the service acts on
+     * in that account, never as the caller's resource of that name (the sink an OAM link is made to, a RAM invitation
+     * sent to the caller, a share another account owns or a role STS assumes in its account; a CodeArtifact domain, an
+     * ECR repository, a Redshift snapshot or a Signer profile a request names by its owner), so a request naming it
+     * is checked on that ARN alone, as AWS checks it; false when the service may act on the caller's resource of that
+     * name, or holds none such there where it acts only on those it holds. Whether the caller may use it is the
+     * handler's to answer after the check. Read by the ARN alone, as it runs on every such request.
      */
     default boolean reachedInItsAccount(String arn, String accountId) {
         return false;

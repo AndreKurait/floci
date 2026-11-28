@@ -3,6 +3,7 @@ package io.floci.aws.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.s3.S3Service;
@@ -56,6 +57,7 @@ class S3CfnProvisionerTest {
             return node == null || node.isMissingNode() || node.isNull() ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(i -> i.getArgument(0));
+        when(engine.resolveJsonAttribute(any())).thenCallRealMethod();
         when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(i -> i.getArgument(0));
         // A bucket carrying a configuration no test declares, so every declared one is a change.
         when(s3.getBucketNotificationConfiguration(anyString())).thenReturn(queueNotification("existing"));
@@ -82,6 +84,34 @@ class S3CfnProvisionerTest {
         StackResource r = resource("Bucket", "AWS::S3::Bucket");
         provisioner.provision(r, props(json), ctx);
         return r;
+    }
+
+    @Test
+    void loggingDefaultsToTheSourceBucketAndEscapesThePrefix() {
+        provisionBucket("""
+                {"BucketName":"source","LoggingConfiguration":{"LogFilePrefix":"logs/&<",
+                  "TargetObjectKeyFormat":{"PartitionedPrefix":{}}}}
+                """);
+        ArgumentCaptor<String> xml = ArgumentCaptor.forClass(String.class);
+        verify(s3).putBucketLogging(eq("source"), xml.capture());
+        assertEquals("source", XmlParser.extractFirst(xml.getValue(), "TargetBucket", null));
+        assertEquals("logs/&<", XmlParser.extractFirst(xml.getValue(), "TargetPrefix", null));
+        assertEquals("EventTime", XmlParser.extractFirst(xml.getValue(), "PartitionDateSource", null));
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            {"TargetObjectKeyFormat":{"SimplePrefix":{},"PartitionedPrefix":{}}} | Only one
+            {"TargetObjectKeyFormat":{"PartitionedPrefix":{"PartitionDateSource":"Other"}}} | PartitionDateSource
+            {"TargetObjectKeyFormat":{"SimplePrefix":{"unexpected":true}}} | extraneous key
+            {"DestinationBucketName":[]} | expected type: String
+            """)
+    void malformedLoggingDoesNotCreateOrChangeABucket(String logging, String reason) {
+        AwsException failure = assertThrows(AwsException.class, () -> provisionBucket(
+                "{\"BucketName\":\"source\",\"LoggingConfiguration\":" + logging + "}"));
+        assertTrue(failure.getMessage().contains(reason), failure.getMessage());
+        verify(s3, never()).createBucket(anyString(), anyString());
+        verify(s3, never()).putBucketLogging(anyString(), anyString());
     }
 
     @ParameterizedTest
@@ -879,6 +909,20 @@ class S3CfnProvisionerTest {
 
         assertEquals("b", r.getPhysicalId());
         assertTrue(r.getAttributes().isEmpty());
+    }
+
+    @Test
+    void aBucketPolicyIntrinsicReturningJsonTextIsNotEncodedTwice() {
+        JsonNode document = props("""
+                {"Fn::Sub": "{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[]}"}
+                """);
+        String resolved = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        when(ctx.engine().resolveNode(document)).thenReturn(MAPPER.getNodeFactory().textNode(resolved));
+        JsonNode properties = MAPPER.createObjectNode().put("Bucket", "b").set("PolicyDocument", document);
+
+        provisioner.provision(resource("Policy", "AWS::S3::BucketPolicy"), properties, ctx);
+
+        verify(s3).putBucketPolicy("b", resolved);
     }
 
     /**

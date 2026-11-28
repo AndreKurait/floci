@@ -14,6 +14,7 @@ import io.floci.aws.core.common.CertificateMaterialException;
 import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.Pem;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.SmithyValidationErrors;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
@@ -80,7 +81,9 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
+import static io.floci.aws.core.storage.AccountAwareStorageBackend.deleteInAccount;
 import static io.floci.aws.core.storage.AccountAwareStorageBackend.getInAccount;
+import static io.floci.aws.core.storage.AccountAwareStorageBackend.putInAccount;
 
 @ApplicationScoped
 public class IotService {
@@ -95,6 +98,9 @@ public class IotService {
     private static final Pattern THING_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9:_-]{1,128}");
     private static final Pattern THING_TYPE_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9:_-]+");
     private static final Pattern SHADOW_NAME_PATTERN = Pattern.compile("[$a-zA-Z0-9:_-]{1,64}");
+    private static final Pattern JOB_ID_PATTERN = Pattern.compile("[a-zA-Z0-9_-]{1,64}");
+    private static final Set<String> TERMINAL_JOB_EXECUTION_STATES =
+            Set.of("SUCCEEDED", "FAILED", "TIMED_OUT", "REJECTED", "REMOVED", "CANCELED");
     /** The {@code FirehoseSeparator} shape of the IoT API model. */
     private static final Pattern FIREHOSE_SEPARATOR = Pattern.compile("([\\n\\t])|(\\r\\n)|(,)");
     public static final int MAX_POLICY_VERSIONS = 5;
@@ -108,6 +114,8 @@ public class IotService {
     private final Object shadowWriteLock = new Object();
     /** One lock for every UpdateThing and DeleteThing, so a merge, a version check and the write are one step. */
     private final Object thingWriteLock = new Object();
+    /** Serializes job creation, execution writes and deletion across their two stores. */
+    private final Object jobWriteLock = new Object();
 
     /** certificateId to the partition and key it was last found under; see {@link #findRegisteredCertificate}. */
     private final Map<String, CertificateLocation> certificateLocations = new ConcurrentHashMap<>();
@@ -947,7 +955,12 @@ public class IotService {
      * one, the stored metadata, the version and the current time. Publishes nothing.
      */
     public JsonNode getThingShadow(String thingName, String shadowName, String region) {
-        IotShadow shadow = shadowStore.get(shadowKey(region, thingName, shadowName))
+        return getThingShadow(thingName, shadowName, regionResolver.getAccountId(), region);
+    }
+
+    /** The shadow as {@link #getThingShadow(String, String, String)} returns it, read in {@code accountId}. */
+    JsonNode getThingShadow(String thingName, String shadowName, String accountId, String region) {
+        IotShadow shadow = shadowIn(accountId, shadowKey(region, thingName, shadowName))
                 .orElseThrow(() -> shadowNotFound(thingName));
         ObjectNode document = storedShadowDocument(shadow);
         ObjectNode state = (ObjectNode) document.get("state");
@@ -964,7 +977,7 @@ public class IotService {
     }
 
     public JsonNode updateThingShadow(String thingName, String shadowName, JsonNode request, String region) {
-        return updateThingShadow(thingName, shadowName, request, region, Runnable::run);
+        return updateThingShadow(thingName, shadowName, request, regionResolver.getAccountId(), region, Runnable::run);
     }
 
     /**
@@ -972,46 +985,47 @@ public class IotService {
      * UpdateThingShadow response, after publishing accepted, documents and, when desired and
      * reported differ, delta, each handing its rule evaluation to {@code ruleRunner}.
      */
-    JsonNode updateThingShadow(String thingName, String shadowName, JsonNode request, String region,
+    JsonNode updateThingShadow(String thingName, String shadowName, JsonNode request, String accountId, String region,
                                Executor ruleRunner) {
         ShadowUpdate update;
         synchronized (shadowWriteLock) {
-            update = writeShadowUpdate(thingName, shadowName, request, region);
+            update = writeShadowUpdate(thingName, shadowName, request, accountId, region);
         }
         ReservedShadowTopic topics = new ReservedShadowTopic(thingName, shadowName, "update");
-        publishShadowEvent(topics.acceptedTopic(), update.accepted(), region, ruleRunner);
-        publishShadowEvent(topics.documentsTopic(), update.documents(), region, ruleRunner);
+        publishShadowEvent(topics.acceptedTopic(), update.accepted(), accountId, region, ruleRunner);
+        publishShadowEvent(topics.documentsTopic(), update.documents(), accountId, region, ruleRunner);
         if (update.delta() != null) {
-            publishShadowEvent(topics.deltaTopic(), update.delta(), region, ruleRunner);
+            publishShadowEvent(topics.deltaTopic(), update.delta(), accountId, region, ruleRunner);
         }
         return update.accepted();
     }
 
     public JsonNode deleteThingShadow(String thingName, String shadowName, String region) {
-        return deleteThingShadow(thingName, shadowName, null, region, Runnable::run);
+        return deleteThingShadow(thingName, shadowName, null, regionResolver.getAccountId(), region, Runnable::run);
     }
 
     /** Deletes the shadow and returns the delete/accepted document after publishing it. */
-    JsonNode deleteThingShadow(String thingName, String shadowName, String clientToken, String region,
-                               Executor ruleRunner) {
+    JsonNode deleteThingShadow(String thingName, String shadowName, String clientToken, String accountId,
+                               String region, Executor ruleRunner) {
         ObjectNode accepted = objectMapper.createObjectNode();
         synchronized (shadowWriteLock) {
             String key = shadowKey(region, thingName, shadowName);
-            IotShadow shadow = shadowStore.get(key).orElseThrow(() -> shadowNotFound(thingName));
-            shadowStore.delete(key);
+            IotShadow shadow = shadowIn(accountId, key).orElseThrow(() -> shadowNotFound(thingName));
+            deleteInAccount(shadowStore, accountId, key);
             accepted.put("version", shadow.getVersion());
         }
         accepted.put("timestamp", Instant.now().getEpochSecond());
         withClientToken(accepted, clientToken);
-        publishShadowEvent(new ReservedShadowTopic(thingName, shadowName, "delete").acceptedTopic(), accepted, region,
-                ruleRunner);
+        publishShadowEvent(new ReservedShadowTopic(thingName, shadowName, "delete").acceptedTopic(), accepted, accountId,
+                region, ruleRunner);
         return accepted;
     }
 
     /** The read-modify-write of one update; the caller holds {@link #shadowWriteLock}. */
-    private ShadowUpdate writeShadowUpdate(String thingName, String shadowName, JsonNode request, String region) {
+    private ShadowUpdate writeShadowUpdate(String thingName, String shadowName, JsonNode request, String accountId,
+                                           String region) {
         String key = shadowKey(region, thingName, shadowName);
-        IotShadow existing = shadowStore.get(key).orElse(null);
+        IotShadow existing = shadowIn(accountId, key).orElse(null);
         long currentVersion = existing == null ? 0 : existing.getVersion();
         if (request.hasNonNull("version") && request.path("version").asLong() != currentVersion) {
             throw new AwsException("ConflictException", "Version conflict", 409);
@@ -1034,7 +1048,7 @@ public class IotService {
         shadow.setShadowName(blankToNull(shadowName));
         shadow.setVersion(version);
         shadow.setDocument(document.toString());
-        shadowStore.put(key, shadow);
+        putInAccount(shadowStore, accountId, key, shadow);
 
         ObjectNode accepted = objectMapper.createObjectNode();
         if (!requestState.isMissingNode()) {
@@ -1168,12 +1182,16 @@ public class IotService {
 
     /**
      * Publishes one shadow response: fanned out to MQTT subscribers once, recorded once and
-     * evaluated once against the topic rules of the shadow's region, as a message with no MQTT client.
+     * evaluated once against the topic rules of the account and region that own the shadow, as a
+     * message with no MQTT client. The rules and their actions run as that account in that region,
+     * since a broker worker has no request of its own.
      */
-    private void publishShadowEvent(String topic, JsonNode payload, String region, Executor ruleRunner) {
+    private void publishShadowEvent(String topic, JsonNode payload, String accountId, String region,
+                                    Executor ruleRunner) {
         byte[] bytes = payload.toString().getBytes(StandardCharsets.UTF_8);
-        mqttBrokerService.publish(topic, bytes);
-        handlePublish(topic, bytes, true, region, null, ruleRunner);
+        mqttBrokerService.publishInAccount(accountId, region, topic, bytes);
+        handlePublish(topic, bytes, true, region, null,
+                rules -> ruleRunner.execute(() -> RequestScopes.runAs(accountId, region, rules)));
     }
 
     public List<String> listNamedShadowsForThing(String thingName, String region) {
@@ -1405,58 +1423,126 @@ public class IotService {
     }
 
     public IotJob createJob(String jobId, JsonNode request, String region) {
-        startMqttIfEnabled();
-        if (jobStore.get(jobKey(region, jobId)).isPresent()) {
-            throw new AwsException("ResourceAlreadyExistsException", "Job already exists: " + jobId, 409);
-        }
-        JsonNode targetsNode = request.path("targets");
-        if (!targetsNode.isArray() || targetsNode.isEmpty()) {
-            throw new AwsException("InvalidRequestException", "targets is required", 400);
-        }
-
-        Instant now = Instant.now();
-        IotJob job = new IotJob();
-        job.setJobId(jobId);
-        job.setJobArn(regionResolver.buildArn("iot", region, "job/" + jobId));
-        job.setDocument(request.path("document").asText(null));
-        job.setDocumentSource(request.path("documentSource").asText(null));
-        job.setDescription(request.path("description").asText(null));
-        job.setTargetSelection(request.path("targetSelection").asText("SNAPSHOT"));
-        job.setCreatedAt(now);
-        job.setLastUpdatedAt(now);
-
-        List<String> targets = new ArrayList<>();
-        Set<String> thingNames = new TreeSet<>();
-        targetsNode.forEach(target -> {
-            String value = target.asText();
-            if (value != null && !value.isBlank()) {
-                targets.add(value);
-                thingNames.addAll(thingNamesForJobTarget(value, region));
+        synchronized (jobWriteLock) {
+            startMqttIfEnabled();
+            if (findJob(jobId, region).isPresent()) {
+                throw new AwsException("ResourceAlreadyExistsException", "Job already exists: " + jobId, 409);
             }
-        });
-        if (thingNames.isEmpty()) {
-            throw new AwsException("ResourceNotFoundException", "No job targets found", 404);
-        }
-        job.setTargets(targets);
-        jobStore.put(jobKey(region, jobId), job);
+            JsonNode targetsNode = request.path("targets");
+            if (!targetsNode.isArray() || targetsNode.isEmpty()) {
+                throw new AwsException("InvalidRequestException", "targets is required", 400);
+            }
 
-        for (String thingName : thingNames) {
-            Thing thing = describeThing(thingName, region);
-            IotJobExecution execution = new IotJobExecution();
-            execution.setJobId(jobId);
-            execution.setThingName(thingName);
-            execution.setThingArn(thing.getThingArn());
-            execution.setStatus("QUEUED");
-            execution.setQueuedAt(now);
-            execution.setLastUpdatedAt(now);
-            jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
+            Instant now = Instant.now();
+            IotJob job = new IotJob();
+            job.setJobId(jobId);
+            job.setJobArn(regionResolver.buildArn("iot", region, "job/" + jobId));
+            job.setDocument(request.path("document").asText(null));
+            job.setDocumentSource(request.path("documentSource").asText(null));
+            job.setDescription(request.path("description").asText(null));
+            job.setTargetSelection(request.path("targetSelection").asText("SNAPSHOT"));
+            job.setCreatedAt(now);
+            job.setLastUpdatedAt(now);
+
+            List<String> targets = new ArrayList<>();
+            Set<String> thingNames = new TreeSet<>();
+            targetsNode.forEach(target -> {
+                String value = target.asText();
+                if (value != null && !value.isBlank()) {
+                    targets.add(value);
+                    thingNames.addAll(thingNamesForJobTarget(value, region));
+                }
+            });
+            if (thingNames.isEmpty()) {
+                throw new AwsException("ResourceNotFoundException", "No job targets found", 404);
+            }
+            job.setTargets(targets);
+            jobStore.put(jobKey(region, jobId), job);
+
+            for (String thingName : thingNames) {
+                Thing thing = describeThing(thingName, region);
+                IotJobExecution execution = new IotJobExecution();
+                execution.setJobId(jobId);
+                execution.setThingName(thingName);
+                execution.setThingArn(thing.getThingArn());
+                execution.setStatus("QUEUED");
+                execution.setQueuedAt(now);
+                execution.setLastUpdatedAt(now);
+                jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
+            }
+            return job;
         }
-        return job;
     }
 
     public IotJob describeJob(String jobId, String region) {
-        return jobStore.get(jobKey(region, jobId))
+        return findJob(jobId, region)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Job not found: " + jobId, 404));
+    }
+
+    private Optional<IotJob> findJob(String jobId, String region) {
+        String key = jobKey(region, jobId);
+        if (jobStore instanceof AccountAwareStorageBackend<IotJob> aware) {
+            aware.migrateLegacyEntries(regionResolver.getDefaultAccountId(), key::equals,
+                    job -> key, job -> true);
+            return aware.getForAccount(aware.accountId(), key);
+        }
+        return jobStore.get(key);
+    }
+
+    private void migrateJobExecutions(String jobId, String region) {
+        if (jobExecutionStore instanceof AccountAwareStorageBackend<IotJobExecution> aware) {
+            String prefix = "job-execution:" + region + ":";
+            String suffix = ":" + jobId;
+            String defaultAccount = regionResolver.getDefaultAccountId();
+            for (AccountAwareStorageBackend.AccountEntry<IotJobExecution> entry : aware.scanAllAccountEntries(
+                    key -> key.startsWith(prefix) && key.endsWith(suffix))) {
+                if (defaultAccount.equals(entry.accountId())
+                        && matchesJobExecution(entry.key(), entry.value(), jobId, region)) {
+                    aware.getForAccountMigratingLegacyKeys(defaultAccount, entry.key(), List.of(),
+                            execution -> matchesJobExecution(entry.key(), execution, jobId, region), true);
+                }
+            }
+        }
+    }
+
+    private boolean matchesJobExecution(String key, IotJobExecution execution, String jobId, String region) {
+        return jobId.equals(execution.getJobId()) && execution.getThingName() != null
+                && key.equals(jobExecutionKey(region, execution.getThingName(), jobId));
+    }
+
+    private Optional<IotJobExecution> findJobExecution(String key) {
+        return jobExecutionStore instanceof AccountAwareStorageBackend<IotJobExecution> aware
+                ? aware.getForAccount(aware.accountId(), key) : jobExecutionStore.get(key);
+    }
+
+    private Map<String, IotJobExecution> executionsForJob(String jobId, String region) {
+        migrateJobExecutions(jobId, region);
+        String prefix = "job-execution:" + region + ":";
+        String suffix = ":" + jobId;
+        Map<String, IotJobExecution> executions = new LinkedHashMap<>();
+        for (String key : jobExecutionStore.keys()) {
+            if (key.startsWith(prefix) && key.endsWith(suffix)) {
+                findJobExecution(key).filter(execution -> matchesJobExecution(key, execution, jobId, region))
+                        .ifPresent(execution -> executions.put(key, execution));
+            }
+        }
+        return executions;
+    }
+
+    public void deleteJob(String jobId, boolean force, String region) {
+        if (jobId == null || !JOB_ID_PATTERN.matcher(jobId).matches()) {
+            throw new AwsException("InvalidRequestException", "Invalid job ID", 400);
+        }
+        synchronized (jobWriteLock) {
+            IotJob job = describeJob(jobId, region);
+            boolean terminal = "COMPLETED".equals(job.getStatus()) || "CANCELED".equals(job.getStatus());
+            if (!terminal && !(force && "IN_PROGRESS".equals(job.getStatus()))) {
+                throw new AwsException("InvalidStateTransitionException",
+                        "The job must be terminal, or IN_PROGRESS with force enabled, before deletion.", 409);
+            }
+            executionsForJob(jobId, region).keySet().forEach(jobExecutionStore::delete);
+            jobStore.delete(jobKey(region, jobId));
+        }
     }
 
     public Page<IotJob> listJobs(String region, Integer maxResults, String nextToken) {
@@ -1477,49 +1563,79 @@ public class IotService {
     public IotJobExecution describeJobExecution(String thingName, String jobId, String region) {
         describeThing(thingName, region);
         describeJob(jobId, region);
-        return jobExecutionStore.get(jobExecutionKey(region, thingName, jobId))
+        migrateJobExecutions(jobId, region);
+        String key = jobExecutionKey(region, thingName, jobId);
+        return findJobExecution(key)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Job execution not found: " + jobId, 404));
     }
 
     public IotJobExecution startNextPendingJobExecution(String thingName, Map<String, String> statusDetails, String region) {
-        IotJobExecution execution = listJobExecutionsForThing(thingName, region, null, null).items().stream()
-                .filter(item -> "QUEUED".equals(item.getStatus()) || "IN_PROGRESS".equals(item.getStatus()))
-                .findFirst()
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "No pending job executions for thing: " + thingName, 404));
-        if ("QUEUED".equals(execution.getStatus())) {
-            execution.setStatus("IN_PROGRESS");
-            execution.setStartedAt(Instant.now());
-            execution.setVersionNumber(execution.getVersionNumber() + 1);
+        synchronized (jobWriteLock) {
+            IotJobExecution execution = listJobExecutionsForThing(thingName, region, null, null).items().stream()
+                    .filter(item -> "QUEUED".equals(item.getStatus()) || "IN_PROGRESS".equals(item.getStatus()))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException", "No pending job executions for thing: " + thingName, 404));
+            if ("QUEUED".equals(execution.getStatus())) {
+                execution.setStatus("IN_PROGRESS");
+                execution.setStartedAt(Instant.now());
+                execution.setVersionNumber(execution.getVersionNumber() + 1);
+            }
+            if (statusDetails != null && !statusDetails.isEmpty()) {
+                execution.setStatusDetails(statusDetails);
+            }
+            execution.setLastUpdatedAt(Instant.now());
+            jobExecutionStore.put(jobExecutionKey(region, thingName, execution.getJobId()), execution);
+            return execution;
         }
-        if (statusDetails != null && !statusDetails.isEmpty()) {
-            execution.setStatusDetails(statusDetails);
-        }
-        execution.setLastUpdatedAt(Instant.now());
-        jobExecutionStore.put(jobExecutionKey(region, thingName, execution.getJobId()), execution);
-        return execution;
     }
 
     public IotJobExecution updateJobExecution(String thingName, String jobId, String status, Map<String, String> statusDetails,
                                              Long expectedVersion, String region) {
-        IotJobExecution execution = describeJobExecution(thingName, jobId, region);
-        validateJobExecutionStatus(status);
-        if (expectedVersion != null && execution.getVersionNumber() != expectedVersion) {
-            throw new AwsException("VersionConflictException", "Job execution version does not match expectedVersion", 409);
+        synchronized (jobWriteLock) {
+            IotJobExecution execution = describeJobExecution(thingName, jobId, region);
+            validateJobExecutionStatus(status);
+            if (expectedVersion != null && execution.getVersionNumber() != expectedVersion) {
+                throw new AwsException("VersionConflictException", "Job execution version does not match expectedVersion", 409);
+            }
+            if (TERMINAL_JOB_EXECUTION_STATES.contains(execution.getStatus())) {
+                throw new AwsException("InvalidStateTransitionException", "Job execution is already terminal", 409);
+            }
+            execution.setStatus(status);
+            if ("IN_PROGRESS".equals(status) && execution.getStartedAt() == null) {
+                execution.setStartedAt(Instant.now());
+            }
+            if (statusDetails != null) {
+                execution.setStatusDetails(statusDetails);
+            }
+            execution.setVersionNumber(execution.getVersionNumber() + 1);
+            execution.setLastUpdatedAt(Instant.now());
+            jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
+            completeSnapshotJob(jobId, region);
+            return execution;
         }
-        if (Set.of("SUCCEEDED", "FAILED", "TIMED_OUT", "REJECTED", "REMOVED", "CANCELED").contains(execution.getStatus())) {
-            throw new AwsException("InvalidStateTransitionException", "Job execution is already terminal", 409);
+    }
+
+    private void completeSnapshotJob(String jobId, String region) {
+        IotJob job = describeJob(jobId, region);
+        if (!"SNAPSHOT".equals(job.getTargetSelection()) || !"IN_PROGRESS".equals(job.getStatus())) {
+            return;
         }
-        execution.setStatus(status);
-        if ("IN_PROGRESS".equals(status) && execution.getStartedAt() == null) {
-            execution.setStartedAt(Instant.now());
+        Map<String, IotJobExecution> executions = executionsForJob(jobId, region);
+        if (!executions.isEmpty() && executions.values().stream()
+                .allMatch(execution -> TERMINAL_JOB_EXECUTION_STATES.contains(execution.getStatus()))) {
+            IotJob completed = new IotJob();
+            completed.setJobId(job.getJobId());
+            completed.setJobArn(job.getJobArn());
+            completed.setDocument(job.getDocument());
+            completed.setDocumentSource(job.getDocumentSource());
+            completed.setDescription(job.getDescription());
+            completed.setTargetSelection(job.getTargetSelection());
+            completed.setTargets(job.getTargets());
+            completed.setCreatedAt(job.getCreatedAt());
+            completed.setStatus("COMPLETED");
+            completed.setLastUpdatedAt(Instant.now());
+            jobStore.put(jobKey(region, jobId), completed);
         }
-        if (statusDetails != null) {
-            execution.setStatusDetails(statusDetails);
-        }
-        execution.setVersionNumber(execution.getVersionNumber() + 1);
-        execution.setLastUpdatedAt(Instant.now());
-        jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
-        return execution;
     }
 
     public IotTopicRule createTopicRule(String ruleName, JsonNode payload, String region) {
@@ -1672,51 +1788,56 @@ public class IotService {
     }
 
     /**
-     * Answers a device shadow request published on an MQTT reserved topic. Every response goes
-     * through {@link #publishShadowEvent}, and a failure after the request parsed keeps its clientToken.
+     * Answers a device shadow request published on an MQTT reserved topic by a session of
+     * {@code accountId} in {@code region}, which own the shadow. Every response goes through
+     * {@link #publishShadowEvent}, and a failure after the request parsed keeps its clientToken.
      */
-    void handleReservedMqttPublish(String topic, byte[] payload, Executor ruleRunner) {
+    void handleReservedMqttPublish(String topic, byte[] payload, String accountId, String region,
+                                   Executor ruleRunner) {
         ReservedShadowTopic shadowTopic = parseReservedShadowTopic(topic);
         if (shadowTopic == null) {
             return;
         }
-        String region = config.defaultRegion();
         JsonNode request;
         try {
             request = objectMapper.readTree(payload == null || payload.length == 0 ? "{}".getBytes(StandardCharsets.UTF_8) : payload);
         } catch (IOException e) {
             LOG.debugv("IoT shadow request on {0} is not JSON: {1}", topic, e.getMessage());
-            publishShadowRejected(shadowTopic, 400, "Invalid JSON", null, region, ruleRunner);
+            publishShadowRejected(shadowTopic, 400, "Invalid JSON", null, accountId, region, ruleRunner);
             return;
         }
         String clientToken = request.path("clientToken").asText(null);
         try {
             switch (shadowTopic.operation()) {
-                case "update" -> updateThingShadow(shadowTopic.thingName(), shadowTopic.shadowName(), request, region, ruleRunner);
-                case "get" -> publishShadowEvent(shadowTopic.acceptedTopic(),
-                        withClientToken(getThingShadow(shadowTopic.thingName(), shadowTopic.shadowName(), region), clientToken),
+                case "update" -> updateThingShadow(shadowTopic.thingName(), shadowTopic.shadowName(), request, accountId,
                         region, ruleRunner);
-                case "delete" -> deleteThingShadow(shadowTopic.thingName(), shadowTopic.shadowName(), clientToken, region,
-                        ruleRunner);
+                case "get" -> publishShadowEvent(shadowTopic.acceptedTopic(),
+                        withClientToken(getThingShadow(shadowTopic.thingName(), shadowTopic.shadowName(), accountId, region),
+                                clientToken),
+                        accountId, region, ruleRunner);
+                case "delete" -> deleteThingShadow(shadowTopic.thingName(), shadowTopic.shadowName(), clientToken,
+                        accountId, region, ruleRunner);
                 default -> publishShadowRejected(shadowTopic, 400,
-                        "Unsupported shadow operation: " + shadowTopic.operation(), clientToken, region, ruleRunner);
+                        "Unsupported shadow operation: " + shadowTopic.operation(), clientToken, accountId, region,
+                        ruleRunner);
             }
         } catch (AwsException e) {
-            publishShadowRejected(shadowTopic, e.getHttpStatus(), e.getMessage(), clientToken, region, ruleRunner);
+            publishShadowRejected(shadowTopic, e.getHttpStatus(), e.getMessage(), clientToken, accountId, region,
+                    ruleRunner);
         } catch (RuntimeException e) {
             LOG.warnv(e, "IoT shadow request on {0} failed", topic);
             publishShadowRejected(shadowTopic, 400, Objects.requireNonNullElse(e.getMessage(), e.getClass().getSimpleName()),
-                    clientToken, region, ruleRunner);
+                    clientToken, accountId, region, ruleRunner);
         }
     }
 
     private void publishShadowRejected(ReservedShadowTopic topic, int code, String message, String clientToken,
-                                       String region, Executor ruleRunner) {
+                                       String accountId, String region, Executor ruleRunner) {
         ObjectNode rejected = objectMapper.createObjectNode();
         rejected.put("code", code);
         rejected.put("message", message);
         withClientToken(rejected, clientToken);
-        publishShadowEvent(topic.rejectedTopic(), rejected, region, ruleRunner);
+        publishShadowEvent(topic.rejectedTopic(), rejected, accountId, region, ruleRunner);
     }
 
     private void validateThingName(String thingName) {
@@ -1787,6 +1908,19 @@ public class IotService {
     private String policyKey(String region, String policyName) { return "policy:" + region + ":" + policyName; }
     private String policyAttachmentKey(String region, String policyName) { return "policy-attachment:" + region + ":" + policyName; }
     private String thingPrincipalKey(String region, String thingName) { return "thing-principal:" + region + ":" + thingName; }
+    /**
+     * The shadow at {@code key} in {@code accountId}. A shadow saved before stores kept accounts apart sits under
+     * its bare key and belongs to the default account only, so only the default account finds it, and moves it
+     * under its own key on that first read; any other account finds nothing there.
+     */
+    private Optional<IotShadow> shadowIn(String accountId, String key) {
+        if (accountId != null && shadowStore instanceof AccountAwareStorageBackend<IotShadow> aware) {
+            return aware.getForAccountMigratingLegacy(accountId, key,
+                    legacy -> aware.getLegacyForAccount(accountId, key).isPresent());
+        }
+        return shadowStore.get(key);
+    }
+
     private String shadowKey(String region, String thingName, String shadowName) {
         if (shadowName == null || shadowName.isEmpty()) {
             return "shadow:" + region + ":" + thingName + ":";

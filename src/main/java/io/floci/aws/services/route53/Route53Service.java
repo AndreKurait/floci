@@ -7,6 +7,7 @@ import io.floci.aws.core.common.DomainNames;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestConditionSpelling;
 import io.floci.aws.core.common.Resettable;
+import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.floci.aws.core.common.dns.DnsLookupHelper;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
@@ -30,15 +31,19 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class Route53Service implements Resettable, RequestConditionSpelling {
@@ -52,6 +57,8 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
     private static final int MAX_VPC_ASSOCIATION_AUTHORIZATIONS = 1000;
 
     public record CreateZoneResult(HostedZone zone, ChangeInfo change) {}
+    public record TestDnsAnswerResult(String nameserver, String protocol, String recordName, String recordType,
+                                      String responseCode, List<String> recordData) {}
     private record OwnedZone(String accountId, HostedZone zone) {}
 
     private final StorageBackend<String, HostedZone> zoneStore;
@@ -71,6 +78,7 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
     private final Map<String, Long> authorizationMutationBusyUntilNanos = new ConcurrentHashMap<>();
     private final Map<String, Integer> privateZoneNameCounts = new ConcurrentHashMap<>();
     private final Map<String, Integer> publicZoneNameCounts = new ConcurrentHashMap<>();
+    private final Map<String, List<PublicAliasZone>> publicAliasZones = new ConcurrentHashMap<>();
 
     @Inject
     public Route53Service(StorageFactory factory, EmulatorConfig config, RegionResolver regionResolver,
@@ -112,7 +120,20 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
             zoneNameCounts(owned.zone().isPrivateZone()).merge(
                     normalizeName(owned.zone().getName()).toLowerCase(), 1, Integer::sum);
+            indexPublicAliases(owned.zone(), owned.accountId(),
+                    getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId()));
         }
+    }
+
+    public TestDnsAnswerResult testDnsAnswer(String hostedZoneId, String recordName, String recordType,
+                                             String resolverIp, String subnetIp, String subnetMask) {
+        String id = Route53TestDnsAnswer.validate(hostedZoneId, recordName, recordType, resolverIp, subnetIp, subnetMask);
+        HostedZone zone = getHostedZoneOwnedByCaller(id);
+        if (zone.isPrivateZone()) {
+            throw new AwsException("InvalidInput", "TestDNSAnswer supports public hosted zones only.", 400);
+        }
+        return Route53TestDnsAnswer.answer(zone, recordStore.get(id).orElse(List.of()),
+                assignedNameServers(zone), recordName, recordType);
     }
 
     public synchronized DelegationSet createReusableDelegationSet(String callerReference, String hostedZoneId) {
@@ -281,7 +302,9 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         }
         zoneNameCounts(zone.isPrivateZone()).merge(normalizedName.toLowerCase(), 1, Integer::sum);
         zoneStore.put(id, zone);
-        recordStore.put(id, buildDefaultRecords(normalizedName, zone.getDelegationNameServers()));
+        List<ResourceRecordSet> records = buildDefaultRecords(normalizedName, zone.getDelegationNameServers());
+        recordStore.put(id, records);
+        indexPublicAliases(zone, callerAccountId, records);
         ChangeInfo change = newChange(null);
         return new CreateZoneResult(zone, change);
     }
@@ -332,6 +355,11 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         vpcAuthorizationStore.delete(id);
         zoneNameCounts(zone.isPrivateZone()).computeIfPresent(normalizeName(zone.getName()).toLowerCase(),
                 (k, v) -> v > 1 ? v - 1 : null);
+        publicAliasZones.computeIfPresent(normalizeRecordName(zone.getName()), (name, zones) -> {
+            List<PublicAliasZone> remaining = zones.stream()
+                    .filter(candidate -> !candidate.ownedBy(ownerAccountId(zone), zone.getId())).toList();
+            return remaining.isEmpty() ? null : remaining;
+        });
         return newChange(null);
     }
 
@@ -635,6 +663,7 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         zone.setResourceRecordSetCount(current.size());
         zoneStore.put(zoneId, zone);
         recordStore.put(zoneId, current);
+        indexPublicAliases(zone, ownerAccountId(zone), current);
         return newChange(comment);
     }
 
@@ -806,39 +835,48 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
                 .toList();
     }
 
-    public boolean isCoveredByPrivateZone(String qname) {
-        if (qname == null || qname.isBlank()) {
-            return false;
-        }
-        String normalizedQname = normalizeName(qname).toLowerCase();
-        if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
-            return false;
-        }
-        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
-            HostedZone zone = owned.zone();
-            if (!zone.isPrivateZone()) {
-                continue;
-            }
-            String zoneName = normalizeName(zone.getName()).toLowerCase();
-            if (DomainNames.isWithin(normalizedQname, zoneName)) {
-                return true;
-            }
-        }
-        return false;
+    public boolean isCoveredByPrivateZone(String qname, ClientVpc origin) {
+        return !privateDnsZones(qname, origin).isEmpty();
     }
 
-    public List<ResourceRecordSet> findPrivateRecordsForName(String qname) {
-        if (qname == null || qname.isBlank()) {
+    /** Includes only the most specific private zones associated with the querying VPC. */
+    public Set<String> privateDnsZoneIds(String qname, ClientVpc origin) {
+        return privateDnsZones(qname, origin).stream()
+                .map(owned -> owned.zone().getId()).collect(Collectors.toSet());
+    }
+
+    public List<ResourceRecordSet> findPrivateRecordsForName(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        return zones.isEmpty() ? List.of() : findRecordsForName(normalizeName(qname).toLowerCase(),
+                zones.stream().map(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId())).toList());
+    }
+
+    public boolean hasPrivateRecordsBeneath(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        if (zones.isEmpty()) {
+            return false;
+        }
+        String suffix = "." + normalizeName(qname).toLowerCase();
+        return zones.stream().flatMap(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId()).stream())
+                .anyMatch(record -> normalizeName(record.getName()).toLowerCase().endsWith(suffix));
+    }
+
+    private List<OwnedZone> privateDnsZones(String qname, ClientVpc origin) {
+        if (origin == null || qname == null || qname.isBlank()) {
             return List.of();
         }
-        return findRecordsForName(normalizeName(qname).toLowerCase(),
-                mostSpecificZones(normalizeName(qname).toLowerCase(), true).stream()
-                        .map(owned -> getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId()))
-                        .toList());
+        return mostSpecificZones(normalizeName(qname).toLowerCase(), true, owned ->
+                owned.zone().getVpcAssociations().stream().anyMatch(association ->
+                        origin.vpcId().equals(association.getVpcId())
+                                && origin.region().equals(association.getVpcRegion())
+                                && origin.accountId().equals(association.getOwnerAccountId() != null
+                                ? association.getOwnerAccountId()
+                                : resolveVpcOwnerAccount(association).orElse(owned.accountId()))));
     }
 
-    private static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
+    static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
                                                               List<List<ResourceRecordSet>> zoneRecords) {
         List<ResourceRecordSet> nameMatches = new ArrayList<>();
         List<ResourceRecordSet> wildcardMatches = new ArrayList<>();
@@ -900,27 +938,29 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         return shared;
     }
 
-    /**
-     * Whether a private zone holds records beneath {@code qname} although none at it: an empty
-     * non-terminal, which exists in DNS and so answers NOERROR rather than NXDOMAIN.
-     */
-    public boolean hasPrivateRecordsBeneath(String qname) {
-        if (qname == null || qname.isBlank()) {
-            return false;
-        }
-        String normalizedQname = normalizeName(qname).toLowerCase();
-        String suffix = "." + normalizedQname;
-        for (OwnedZone owned : mostSpecificZones(normalizedQname, true)) {
-            for (ResourceRecordSet rrs : getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId())) {
-                if (normalizeName(rrs.getName()).toLowerCase().endsWith(suffix)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     record PublicDnsZone(String name, List<ResourceRecordSet> matchingRecords, List<ResourceRecordSet> records) {}
+
+    /** A service registration can fill a missing record only inside one undelegated public zone. */
+    public Optional<String> publicDnsRegistrationZoneId(String qname, String recordType) {
+        if (qname == null || qname.isBlank()) {
+            return Optional.empty();
+        }
+        String normalized = normalizeName(qname).toLowerCase(Locale.ROOT);
+        List<OwnedZone> zones = mostSpecificZones(normalized, false);
+        if (zones.size() != 1) {
+            return Optional.empty();
+        }
+        OwnedZone owned = zones.getFirst();
+        String apex = normalizeName(owned.zone().getName()).toLowerCase(Locale.ROOT);
+        List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(
+                owned.accountId(), owned.zone().getId());
+        boolean delegated = records.stream().anyMatch(record -> "NS".equals(record.getType())
+                && !normalizeName(record.getName()).equalsIgnoreCase(apex)
+                && DomainNames.isWithin(normalized, normalizeName(record.getName())));
+        boolean stored = findRecordsForName(normalized, List.of(records)).stream()
+                .anyMatch(record -> "CNAME".equals(record.getType()) || record.getType().equals(recordType));
+        return delegated || stored ? Optional.empty() : Optional.of(owned.zone().getId());
+    }
 
     List<PublicDnsZone> publicDnsZones(String qname) {
         String normalized = normalizeName(qname).toLowerCase();
@@ -934,12 +974,163 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
                 .toList();
     }
 
+    /**
+     * A configured public DNS answer. A null target means that DNS claims the name but its
+     * answer cannot select a service, so consumers must not fall back to an unrelated listener.
+     */
+    public record PublicAlias(String dnsName, String hostedZoneId) {}
+
+    private static final PublicAlias UNRESOLVED_PUBLIC_ALIAS = new PublicAlias(null, null);
+
+    private record PublicAliasZone(String accountId, String id, String name,
+                                   Map<String, PublicAlias> targets, Set<String> names, Set<String> delegations) {
+        boolean ownedBy(String account, String zoneId) {
+            return accountId.equals(account) && id.equals(zoneId);
+        }
+
+        PublicAlias lookup(String qname) {
+            for (String ancestor = qname; !ancestor.equals(name); ancestor = parentName(ancestor)) {
+                if (delegations.contains(ancestor)) {
+                    return UNRESOLVED_PUBLIC_ALIAS;
+                }
+            }
+            if (names.contains(qname)) {
+                return targets.getOrDefault(qname, UNRESOLVED_PUBLIC_ALIAS);
+            }
+            for (String ancestor = parentName(qname); !ancestor.isEmpty(); ancestor = parentName(ancestor)) {
+                if (names.contains(ancestor)) {
+                    String wildcard = normalizeRecordName("*." + ancestor);
+                    return names.contains(wildcard) ? targets.getOrDefault(wildcard, UNRESOLVED_PUBLIC_ALIAS) : null;
+                }
+            }
+            return null;
+        }
+    }
+
+    /** Derived, immutable DNS indexes are published on writes, never built on the HTTP event loop. */
+    private void indexPublicAliases(HostedZone zone, String accountId, List<ResourceRecordSet> records) {
+        if (zone.isPrivateZone()) {
+            return;
+        }
+        String zoneName = normalizeRecordName(zone.getName());
+        Map<String, PublicAlias> targets = new LinkedHashMap<>();
+        Set<String> names = new HashSet<>();
+        Set<String> delegations = new HashSet<>();
+        for (ResourceRecordSet record : records) {
+            String name = normalizeRecordName(record.getName());
+            for (String ancestor = name; DomainNames.isWithin(ancestor, zoneName); ancestor = parentName(ancestor)) {
+                names.add(ancestor);
+                if (ancestor.equals(zoneName)) {
+                    break;
+                }
+            }
+            if ("NS".equals(record.getType()) && !name.equals(zoneName)) {
+                delegations.add(name);
+            }
+            if ("A".equals(record.getType()) || "AAAA".equals(record.getType()) || "CNAME".equals(record.getType())) {
+                PublicAlias target = publicAliasTarget(record);
+                targets.merge(name, target, (left, right) -> left.equals(right) ? left : UNRESOLVED_PUBLIC_ALIAS);
+            }
+        }
+        PublicAliasZone indexed = new PublicAliasZone(accountId, zone.getId(), zoneName,
+                Map.copyOf(targets), Set.copyOf(names), Set.copyOf(delegations));
+        publicAliasZones.compute(zoneName, (name, previous) -> {
+            List<PublicAliasZone> updated = new ArrayList<>();
+            if (previous != null) {
+                previous.stream().filter(candidate -> !candidate.ownedBy(accountId, zone.getId())).forEach(updated::add);
+            }
+            updated.add(indexed);
+            return List.copyOf(updated);
+        });
+    }
+
+    private static PublicAlias publicAliasTarget(ResourceRecordSet record) {
+        if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null) {
+            return UNRESOLVED_PUBLIC_ALIAS;
+        }
+        AliasTarget alias = record.getAliasTarget();
+        if (("A".equals(record.getType()) || "AAAA".equals(record.getType())) && alias != null
+                && alias.getDnsName() != null && !alias.getDnsName().isBlank()) {
+            String zoneId = alias.getHostedZoneId();
+            if (zoneId != null && zoneId.startsWith("/hostedzone/")) {
+                zoneId = zoneId.substring("/hostedzone/".length());
+            }
+            return new PublicAlias(normalizeRecordName(alias.getDnsName()), zoneId);
+        }
+        if ("CNAME".equals(record.getType()) && record.getRecords() != null && record.getRecords().size() == 1) {
+            String target = record.getRecords().getFirst().getValue();
+            if (target != null && !target.isBlank()) {
+                return new PublicAlias(normalizeRecordName(target), null);
+            }
+        }
+        return UNRESOLVED_PUBLIC_ALIAS;
+    }
+
+    private static String parentName(String name) {
+        int dot = name.indexOf('.');
+        return dot < 0 ? "" : name.substring(dot + 1);
+    }
+
+    private List<PublicAliasZone> publicAliasZonesFor(String name) {
+        for (String ancestor = name; !ancestor.isEmpty(); ancestor = parentName(ancestor)) {
+            List<PublicAliasZone> zones = publicAliasZones.get(ancestor);
+            if (zones != null) {
+                return zones;
+            }
+        }
+        return List.of();
+    }
+
+    /**
+     * Follows unambiguous public A/AAAA aliases and CNAMEs without upstream DNS or storage scans.
+     * Null means no configured answer claims the name. An unresolved configured answer has a
+     * null DNS target. Consumers must match a resolved target to their own resource before routing.
+     */
+    public PublicAlias lookupPublicAlias(String name) {
+        String current = normalizeRecordName(name);
+        Set<String> visited = new HashSet<>();
+        String targetZoneId = null;
+        boolean followed = false;
+        for (int depth = 0; depth < 8; depth++) {
+            if (!visited.add(current)) {
+                break;
+            }
+            List<PublicAliasZone> zones = publicAliasZonesFor(current);
+            if (zones.isEmpty()) {
+                return followed ? new PublicAlias(current, targetZoneId) : null;
+            }
+            if (zones.size() != 1) {
+                break;
+            }
+            PublicAliasZone zone = zones.getFirst();
+            if (targetZoneId != null && !zone.id().equals(targetZoneId)) {
+                break;
+            }
+            PublicAlias next = zone.lookup(current);
+            if (next == null) {
+                return followed ? UNRESOLVED_PUBLIC_ALIAS : null;
+            }
+            if (next.dnsName() == null) {
+                break;
+            }
+            followed = true;
+            current = next.dnsName();
+            targetZoneId = next.hostedZoneId();
+        }
+        return UNRESOLVED_PUBLIC_ALIAS;
+    }
+
     private Map<String, Integer> zoneNameCounts(boolean privateZone) {
         return privateZone ? privateZoneNameCounts : publicZoneNameCounts;
     }
 
     /** The longest containing zones, so a parent never answers for a more specific child. */
     private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone) {
+        return mostSpecificZones(normalizedQname, privateZone, owned -> true);
+    }
+
+    private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone,
+                                             Predicate<OwnedZone> visible) {
         Map<String, Integer> names = zoneNameCounts(privateZone);
         if (names.isEmpty() || names.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
             return List.of();
@@ -948,7 +1139,7 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         int maxZoneLength = -1;
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
             HostedZone zone = owned.zone();
-            if (zone.isPrivateZone() != privateZone) {
+            if (zone.isPrivateZone() != privateZone || !visible.test(owned)) {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();
@@ -1311,6 +1502,7 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         authorizationMutationBusyUntilNanos.clear();
         privateZoneNameCounts.clear();
         publicZoneNameCounts.clear();
+        publicAliasZones.clear();
     }
 
     /** The namespace whose request members this spells, as the generated condition key table names it. */

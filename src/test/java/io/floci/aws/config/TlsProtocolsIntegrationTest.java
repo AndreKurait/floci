@@ -20,7 +20,9 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.X509Certificate;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -36,8 +38,20 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 @QuarkusTest
-@TestProfile(SelfSignedTlsProfile.class)
+@TestProfile(TlsProtocolsIntegrationTest.ProxyTlsProfile.class)
 class TlsProtocolsIntegrationTest {
+
+    public static final class ProxyTlsProfile extends SelfSignedTlsProfile {
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            Map<String, String> overrides = new HashMap<>(super.getConfigOverrides());
+            // Profile overrides do not reach TlsConfigSource. This fixture uses the public
+            // proxy, so its private backend must accept the same preface as a normal TLS boot.
+            overrides.put("quarkus.http.proxy.use-proxy-protocol", "true");
+            overrides.put("quarkus.http.host", "127.0.0.1");
+            return overrides;
+        }
+    }
 
     @ConfigProperty(name = "quarkus.http.test-port", defaultValue = "0")
     int httpPort;

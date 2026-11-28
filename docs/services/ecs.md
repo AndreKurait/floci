@@ -443,6 +443,14 @@ timestamps, `AvailabilityZone`, `LaunchType`, `ServiceName` for a service's task
 EC2 task, and, for Fargate, `ClockDrift` and `EphemeralStorageMetrics`. Floci has no clock drift to
 report and does not meter the disk, so those two report a synchronized clock and zero usage.
 
+Every task container carries the Docker labels the ECS agent sets: `com.amazonaws.ecs.task-arn`,
+`com.amazonaws.ecs.container-name`, `com.amazonaws.ecs.task-definition-family`,
+`com.amazonaws.ecs.task-definition-version` (the revision) and `com.amazonaws.ecs.cluster`, so
+`docker ps --filter label=com.amazonaws.ecs.task-arn=<task ARN>` finds a task's containers as on an
+ECS host. As on ECS they override the same keys in the definition's `dockerLabels`; Floci's own
+`io.floci.*` labels still win. The cluster label is the cluster ARN (the agent writes its configured
+`ECS_CLUSTER`, a name or an ARN). A container's metadata reports the same labels under `Labels`.
+
 An `awsvpc` container's `Networks` object describes the task ENI and the subnet it sits in:
 `NetworkMode`, `IPv4Addresses`, `AttachmentIndex`, `MACAddress`, `PrivateDNSName`,
 `IPv4SubnetCIDRBlock`, `SubnetGatewayIpv4Address`, `DomainNameServers` and `DomainNameSearchList`.
@@ -724,6 +732,10 @@ Known differences from AWS:
 
 #### Restarts
 
+Before shared container teardown, Floci pauses ECS reconciliation and waits for its current
+pass to finish. Replacement tasks cannot start while another service retires their credentials
+or networking. A state reset starts a fresh reconciler after the old tasks have been drained.
+
 Task state is memory-only, so a restarted Floci knows no task and the service scheduler starts
 new ones to reach each service's desired count. Floci therefore clears what the previous run's
 tasks left behind before it starts their replacements, so a service is never served by a task
@@ -840,6 +852,12 @@ agent registers with, so it names the EC2 instance the agent runs on, as on AWS.
 without a document gets a generated `i-floci-...` id; one whose document is not JSON or names no
 `instanceId` fails with `InvalidParameterException`. Floci does not check
 `instanceIdentityDocumentSignature`.
+
+The emulator-specific `floci.iam-instance-profile` registration attribute names the
+EC2 instance profile used by the container instance's IMDS. It must be an IAM
+instance-profile ARN in the registering account and the request region's partition,
+with an empty ARN region. Registration validates that identity; IMDS checks that
+the profile exists in IAM when serving credentials.
 
 `DeregisterContainerInstance` leaves the instance in the cluster as `INACTIVE` rather than
 dropping it, so a later `DescribeContainerInstances` still answers for it, as on AWS. A cluster's
@@ -995,6 +1013,11 @@ resource type in the Service Authorization Reference (`ListClusters`, `ListServi
 
 Every `awsvpc` task receives an ENI in its subnet. With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, a Docker-backed task's containers additionally share one protected network namespace built around that ENI, and packets are filtered against its security groups. Without enforcement, `FLOCI_SERVICES_ECS_SHARED_TASK_NETWORK=true` gives them one namespace with no filtering; see [Same-task localhost for awsvpc tasks](#same-task-localhost-for-awsvpc-tasks). A task without explicit security groups uses its subnet VPC's default group. Containers in the same task can communicate over localhost. Bridge and host task networking do not attach task-level `awsvpc` security groups. Mock mode reports control-plane state, including the ENI, and does not enforce packet filtering.
 
+With native VPC networking enabled, Floci attaches that protected namespace to the
+task ENI's subnet and private address before registering its security-group policy.
+A failed attachment stops the task before any workload container starts. This lets
+VPC peers reach the task at the private address reported by `DescribeTasks`.
+
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ECS_ENABLED` | `true` | Enable or disable the ECS service |
@@ -1012,6 +1035,27 @@ Every `awsvpc` task receives an ENI in its subnet. With `FLOCI_NETWORK_SECURITY_
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` | `21600` | Lifetime of the vended credentials |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` | `51679` | Floci-side port serving the credentials endpoint |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PROXY_IMAGE` | `floci/network-helper:local` | Image for the per-network credentials proxy |
+| `FLOCI_SERVICES_ECS_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to every task container's `/etc/hosts` (the ip may be `host-gateway`); see [Hosts entries](#hosts-entries) |
+
+### Hosts entries
+
+As the ECS agent does, Floci adds `/etc/hosts` entries to a task container only from the
+`extraHosts` its container definition declares, in declared order. Each `HostEntry` needs a
+`hostname` and an `ipAddress`; the `ipAddress` may be Docker's `host-gateway`. As on ECS, an
+`awsvpc` task does not take `extraHosts`. `FLOCI_SERVICES_ECS_EXTRA_HOSTS` adds operator entries to
+every task container after the declared ones; with security-group enforcement an `awsvpc` task's
+containers share one network namespace, and these entries (and `--add-host` entries in
+`FLOCI_SERVICES_ECS_DOCKER_FLAGS`) go on that namespace. A definition that maps
+`host.docker.internal` itself keeps its own mapping.
+
+Floci does not add `host.docker.internal` to task containers. When Floci runs directly on a Linux
+host with Docker Engine, tasks are handed the default bridge network's gateway address in
+`AWS_ENDPOINT_URL`, `FLOCI_ENDPOINT`, `FLOCI_HOSTNAME`, the task metadata URI and the Firelens
+endpoint instead of the `host.docker.internal` name. Docker Desktop and Podman resolve that name
+themselves, so it is kept there. If Docker does not say what the gateway is, Floci keeps the
+`host.docker.internal:host-gateway` entry rather than guess. Task code that used
+`host.docker.internal` to reach other services on the host can restore the entry with
+`FLOCI_SERVICES_ECS_EXTRA_HOSTS=host.docker.internal:host-gateway`.
 
 ### Image pulls
 

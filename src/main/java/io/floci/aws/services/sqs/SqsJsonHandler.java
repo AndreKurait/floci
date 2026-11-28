@@ -169,7 +169,8 @@ public class SqsJsonHandler {
 
     private Response handleGetQueueUrl(JsonNode request, String region) {
         String queueName = request.path("QueueName").asText(null);
-        String queueUrl = sqsService.getQueueUrl(queueName, region);
+        String owner = request.path("QueueOwnerAWSAccountId").asText(null);
+        String queueUrl = sqsService.getQueueUrl(queueName, region, owner);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("QueueUrl", queueUrl);
         return Response.ok(response).build();
@@ -386,12 +387,14 @@ public class SqsJsonHandler {
                            Map<String, MessageAttributeValue> attributes, String awsTraceHeader) {}
 
         List<ParsedEntry> parsedEntries = new ArrayList<>();
+        List<Integer> entryDelays = new ArrayList<>();
         int totalSize = 0;
         for (JsonNode entry : entries) {
             String id = entry.path("Id").asText();
             String messageBody = entry.path("MessageBody").asText(null);
             JsonNode entryDelayNode = entry.path("DelaySeconds");
             Integer delaySeconds = parseOptionalInteger(entryDelayNode, "DelaySeconds");
+            entryDelays.add(delaySeconds);
             String messageGroupId = entry.path("MessageGroupId").asText(null);
             String messageDeduplicationId = entry.path("MessageDeduplicationId").asText(null);
 
@@ -418,6 +421,7 @@ public class SqsJsonHandler {
         }
 
         sqsService.validateBatchPayloadSize(queueUrl, region, totalSize);
+        sqsService.validateBatchDelaySeconds(queueUrl, region, entryDelays);
 
         String senderId = sqsService.resolveCallerSenderId(queueUrl);
         for (ParsedEntry parsed : parsedEntries) {

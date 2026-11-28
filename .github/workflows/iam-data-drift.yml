@@ -52,6 +52,15 @@ on:
       - 'src/main/resources/aws/iam-passed-roles.json'
       - 'tools/aws/regen_iam_passed_roles.py'
       - 'tools/aws/test_regen_iam_passed_roles.py'
+      - 'tools/aws/sources/eks-roles.json'
+      - 'tools/aws/fetch_eks_roles.py'
+      - 'tools/aws/test_fetch_eks_roles.py'
+      - 'tools/aws/sources/emr-roles.json'
+      - 'tools/aws/fetch_emr_roles.py'
+      - 'tools/aws/test_fetch_emr_roles.py'
+      - 'tools/aws/sources/apigateway-roles.json'
+      - 'tools/aws/fetch_apigateway_roles.py'
+      - 'tools/aws/test_fetch_apigateway_roles.py'
       - 'src/main/resources/aws/iam-passed-network-connectors.json'
       - 'tools/aws/regen_iam_passed_network_connectors.py'
       - 'tools/aws/test_regen_iam_passed_network_connectors.py'
@@ -133,7 +142,7 @@ jobs:
         run: pip install -r tools/aws/requirements.txt
 
       # A pull request checks the files it changes; the weekly and manual runs check every file. A
-      # diff that cannot be read leaves CHANGED empty, which checks every file too.
+      # unreadable diff fails the step; an empty manifest checks every file too.
       - name: Check the vendored IAM files still match upstream
         env:
           EVENT_NAME: ${{ github.event_name }}

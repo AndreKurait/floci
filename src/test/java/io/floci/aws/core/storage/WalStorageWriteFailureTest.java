@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -144,7 +145,10 @@ class WalStorageWriteFailureTest {
             assertEquals(1, failure.getCause().getSuppressed().length);
             assertOldValue(store);
             assertThrows(IllegalStateException.class, () -> store.put("later", "unsafe"));
+            UncheckedIOException flushFailure = assertThrows(UncheckedIOException.class, store::flushOrThrow);
+            assertNotNull(flushFailure.getCause());
             store.flush();
+            assertThrows(UncheckedIOException.class, store::flushOrThrow);
             assertTrue(Files.notExists(directory.resolve("snapshot.json")));
             assertArrayEquals(committedLog, Files.readAllBytes(retained));
         } finally {
@@ -174,6 +178,8 @@ class WalStorageWriteFailureTest {
             assertSame(original, failure.getCause());
             assertOldValue(store);
             assertThrows(IllegalStateException.class, () -> store.put("later", "unsafe"));
+            UncheckedIOException flushFailure = assertThrows(UncheckedIOException.class, store::flushOrThrow);
+            assertNotNull(flushFailure.getCause());
         } finally {
             store.shutdown();
         }
@@ -303,7 +309,7 @@ class WalStorageWriteFailureTest {
         }
     }
 
-    enum AtomicMutation { PUT_ALL, DELETE_ALL }
+    enum AtomicMutation { PUT_ALL, DELETE_ALL, MIXED }
 
     @ParameterizedTest
     @EnumSource(AtomicMutation.class)
@@ -331,6 +337,8 @@ class WalStorageWriteFailureTest {
                     directory.resolve("data.wal"), STRINGS);
             if (mutation == AtomicMutation.DELETE_ALL) {
                 assertTrue(replayed.isEmpty());
+            } else if (mutation == AtomicMutation.MIXED) {
+                assertEquals(Map.of("added", "value"), replayed);
             } else {
                 assertEquals("new", replayed.get("keep"));
             }
@@ -359,7 +367,10 @@ class WalStorageWriteFailureTest {
             assertEquals(1, failure.getCause().getSuppressed().length);
             assertOldValue(store);
             assertThrows(IllegalStateException.class, () -> store.put("later", "unsafe"));
+            UncheckedIOException flushFailure = assertThrows(UncheckedIOException.class, store::flushOrThrow);
+            assertNotNull(flushFailure.getCause());
             store.flush();
+            assertThrows(UncheckedIOException.class, store::flushOrThrow);
             assertArrayEquals(committedLog, Files.readAllBytes(directory.resolve("data.wal")));
             assertTrue(Files.notExists(directory.resolve("snapshot.json")));
         } finally {
@@ -398,6 +409,7 @@ class WalStorageWriteFailureTest {
         switch (mutation) {
             case PUT_ALL -> store.putAllAtomically(Map.of("keep", "new", "added", "value"));
             case DELETE_ALL -> store.deleteAllAtomically(Set.of("keep"));
+            case MIXED -> store.applyAtomically(Map.of("keep", "new", "added", "value"), Set.of("keep"));
         }
     }
 

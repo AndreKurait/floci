@@ -123,6 +123,51 @@ class EmbeddedDnsServerTest {
         assertTrue(dns.resolveEc2PrivateDnsName("ip-172-16-128-300.ec2.internal").isEmpty());
     }
 
+    // ── EC2 public DNS names ─────────────────────────────────────────────────
+
+    @Test
+    void resolveEc2PublicDnsName_decodesTheNamesEc2Gives() {
+        assertEquals("172.16.5.5", dns.resolveEc2PublicDnsName("ec2-172-16-5-5.compute-1.amazonaws.com").orElseThrow());
+        assertEquals("172.16.5.5", dns.resolveEc2PublicDnsName(
+                "ec2-172-16-5-5.eu-west-1.compute.amazonaws.com").orElseThrow());
+        assertEquals("54.222.0.9", dns.resolveEc2PublicDnsName(
+                "ec2-54-222-0-9.cn-north-1.compute.amazonaws.com.cn").orElseThrow());
+        assertEquals("54.222.0.9", dns.resolveEc2PublicDnsName(
+                "EC2-54-222-0-9.CN-NORTH-1.COMPUTE.AMAZONAWS.COM.CN").orElseThrow());
+        assertEquals("10.42.32.17", dns.resolveEc2PublicDnsName(
+                "EC2-10-42-32-17.COMPUTE-1.AMAZONAWS.COM").orElseThrow());
+    }
+
+    @Test
+    void resolveEc2PublicDnsName_rejectsNamesEc2DoesNotGive() {
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-300.compute-1.amazonaws.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.eu-west-1.compute.amazonaws.com.cn").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.cn-north-1.compute.amazonaws.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.invalid.compute.amazonaws.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.my-cd-1.compute.amazonaws.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.eu-team-2.compute.amazonaws.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.compute-1.example.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.compute-1.amazonaws.com.evil.example").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName(null).isEmpty());
+    }
+
+    @Test
+    void resolveARecord_answersEc2PublicDnsNameWithItsAddress() {
+        assertEquals(List.of("172.16.5.5"), dns.resolveARecord("ec2-172-16-5-5.compute-1.amazonaws.com", "172.16.4.0"));
+        assertEquals(List.of("172.16.5.5"), dns.resolveARecord(
+                "ec2-172-16-5-5.us-west-2.compute.amazonaws.com", "172.16.4.0"));
+    }
+
+    @Test
+    void resolveARecord_answersEc2PublicDnsNameAheadOfAwsEndpointSpoofing() {
+        EmbeddedDnsServer spoofing = new EmbeddedDnsServer(List.of(), true);
+        assertEquals(List.of("172.16.5.5"),
+                spoofing.resolveARecord("ec2-172-16-5-5.compute-1.amazonaws.com", "172.19.0.2"));
+        assertEquals(Optional.of("172.16.5.5"),
+                spoofing.emulatorAddress("ec2-172-16-5-5.compute-1.amazonaws.com", null));
+        assertEquals(List.of("172.19.0.2"), spoofing.resolveARecord("ec2.us-east-1.amazonaws.com", "172.19.0.2"));
+    }
+
     @Test
     void resolveARecord_prefersEc2PrivateDnsAddressOverFlociWildcard() {
         assertEquals(
@@ -312,6 +357,33 @@ class EmbeddedDnsServerTest {
 
         assertEquals(EmbeddedDnsServer.QueryPlan.UPSTREAM,
                 dns.planQuery("db.corp.internal", CLIENT, MY_IP, 1));
+    }
+
+    @Test
+    void planQueryDoesNotChooseBetweenConflictingRuntimeOrigins() {
+        for (DnsClientVpcSource.ClientVpc other : List.of(
+                new DnsClientVpcSource.ClientVpc("111111111111", REGION, "vpc-a"),
+                new DnsClientVpcSource.ClientVpc(ACCOUNT, "us-west-2", "vpc-a"),
+                new DnsClientVpcSource.ClientVpc(ACCOUNT, REGION, "vpc-other"))) {
+            DnsClientVpcSource conflicting = address -> Optional.of(other);
+            for (List<DnsClientVpcSource> sources : List.of(List.of(clientVpc("vpc-a"), conflicting),
+                    List.of(conflicting, clientVpc("vpc-a")))) {
+                EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(),
+                        List.of(source("db.corp.internal", List.of("192.0.2.17"))),
+                        List.of(rules("vpc-a", forward("corp.internal", "10.1.0.53"))), sources);
+                assertEquals(EmbeddedDnsServer.QueryPlan.answering(DnsAnswer.refused()),
+                        server.planQuery("db.corp.internal", CLIENT, MY_IP, 1));
+            }
+        }
+    }
+
+    @Test
+    void planQueryAcceptsMatchingRuntimeOrigins() {
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(),
+                List.of(rules("vpc-a", forward("corp.internal", "10.1.0.53"))),
+                List.of(clientVpc("vpc-a"), clientVpc("vpc-a")));
+        assertEquals(List.of(new DnsForwardingRule.Target("10.1.0.53", 53)),
+                server.planQuery("db.corp.internal", CLIENT, MY_IP, 1).ruleTargets());
     }
 
     @Test

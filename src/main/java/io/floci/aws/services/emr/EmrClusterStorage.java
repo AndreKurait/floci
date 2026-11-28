@@ -190,7 +190,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
     private static final String FLOCI_ALIAS = "floci";
     // How long a cluster's HDFS and metastore may take to start, the NameNode formatted the first time, before a step
     // gives up.
-    private static final Duration HDFS_START_TIMEOUT = Duration.ofSeconds(120);
+    static final Duration HDFS_START_TIMEOUT = Duration.ofSeconds(120);
     private static final Duration HDFS_POLL_INTERVAL = Duration.ofMillis(500);
     // How long Trino's coordinator has to answer once its container starts: it took 18 s on a laptop, its image's
     // catalogs loaded.
@@ -585,6 +585,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
     private final Map<String, Function<String, Instance>> identities = new ConcurrentHashMap<>();
     // The link-local address each node's container this process started was given, by container name.
     private final Map<String, String> nodeAddresses = new ConcurrentHashMap<>();
+    private final Pause pause;
     // How many teardowns, by a reset or a shutdown, have run: a step waiting for its cluster's HDFS through one stops.
     private final AtomicLong teardowns = new AtomicLong();
 
@@ -621,6 +622,16 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                       CurrentContainerNetworkResolver currentContainer, EmulatorConfig config, S3Service s3Service,
                       Duration hdfsStartTimeout, LongSupplier nanoTime, Executor decommissions,
                       Duration decommissionPoll, EmrMetadataRelays relays) {
+        this(lifecycleManager, containerBuilder, awsEnv, roleCredentials, currentContainer, config, s3Service,
+                hdfsStartTimeout, nanoTime, decommissions, decommissionPoll, relays,
+                interval -> Thread.sleep(interval.toMillis()));
+    }
+
+    EmrClusterStorage(ContainerLifecycleManager lifecycleManager, ContainerBuilder containerBuilder,
+                      LaunchedContainerAwsEnv awsEnv, LambdaExecutionRoleCredentials roleCredentials,
+                      CurrentContainerNetworkResolver currentContainer, EmulatorConfig config, S3Service s3Service,
+                      Duration hdfsStartTimeout, LongSupplier nanoTime, Executor decommissions,
+                      Duration decommissionPoll, EmrMetadataRelays relays, Pause pause) {
         this.relays = relays;
         this.decommissions = decommissions;
         this.decommissionPoll = decommissionPoll;
@@ -633,6 +644,13 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
         this.s3Service = s3Service;
         this.hdfsStartTimeout = hdfsStartTimeout;
         this.nanoTime = nanoTime;
+        this.pause = pause;
+    }
+
+    /** The wait between two looks at a starting HDFS: {@link Thread#sleep} outside tests. */
+    @FunctionalInterface
+    interface Pause {
+        void between(Duration interval) throws InterruptedException;
     }
 
     @Override
@@ -1499,6 +1517,11 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                 spec.withLinkLocalIp(address);
             }
         }
+        if (hiveMetastore != null && hiveMetastore.trino() != null && !shared) {
+            // Its Trino's port, as Trino's container shares its network, which clients outside the cluster reach
+            // through Floci (see trinoInterface), as they do its web interfaces.
+            spec.withLoopbackPortBinding(EmrTrino.port(hiveMetastore.trino().config()), 0);
+        }
         if (yarn != null && !shared) {
             // Its web interfaces, which Floci's application UI links reach, published on the host's loopback interface
             // alone, as Floci on the host reaches them there, and they take no credentials.
@@ -1598,19 +1621,29 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
             // Known before it starts, so a teardown while it starts removes it.
             runningTrino.add(name);
             try {
-                lifecycleManager.createAndStart(containerBuilder.newContainer(imageId)
+                ContainerBuilder.Builder spec = containerBuilder.newContainer(imageId)
                         .withName(name)
                         .withNetworkMode(network)
                         .withMemoryMb(trino.memoryMb())
                         .withEntrypoint(List.of("/bin/bash", "-c", EmrTrino.ENTRYPOINT))
                         .withEnv(awsEnv.sdkBaselineEnv(region, Optional.empty(), endpoint, credentials, accountId))
-                        .withEnv(EmrTrino.CONFIG_VARIABLE, EmrTrino.CONFIG)
-                        .withEnv(EmrTrino.CATALOG_VARIABLE,
-                                EmrTrino.properties(EmrTrino.hiveCatalog(trino.hiveConnector(), endpoint, region)))
+                        // After Floci's AWS settings, which an export may change as its trino-env.sh would, and before
+                        // the files Floci writes, which it may not: Docker keeps the last of a variable given twice.
+                        .withEnv(trino.environment().entrySet().stream()
+                                .map(variable -> variable.getKey() + "=" + variable.getValue()).toList())
+                        .withEnv(EmrTrino.CONFIG_VARIABLE, EmrTrino.properties(EmrTrino.config(trino.config())))
+                        .withEnv(EmrTrino.NODE_VARIABLE, EmrTrino.properties(trino.node()))
+                        .withEnv(EmrTrino.LOG_VARIABLE, EmrTrino.properties(trino.log()))
                         .withJavaTrustStore()
                         .withLogRotation()
-                        .withLabels(labels(clusterId, accountId, region, EmrTrino.COMPONENT))
-                        .build());
+                        .withLabels(labels(clusterId, accountId, region, EmrTrino.COMPONENT));
+                EmrTrino.catalogs(trino.connectors(), endpoint, region).forEach((catalog, properties) ->
+                        spec.withEnv(EmrTrino.CATALOG_PREFIX + catalog, EmrTrino.properties(properties)));
+                if (trino.exchangeManager() != null) {
+                    spec.withEnv(EmrTrino.EXCHANGE_VARIABLE, EmrTrino.properties(EmrTrino.exchangeManager(
+                            trino.exchangeManager(), endpoint, region)));
+                }
+                lifecycleManager.createAndStart(spec.build());
             } catch (RuntimeException e) {
                 releaseSession(name);
                 throw e;
@@ -1619,7 +1652,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
             stopIfStopped(clusterId, teardown, stopped);
             LOG.infov("Started the Trino of EMR cluster {0}", clusterId);
         }
-        awaitTrino(clusterId, name, teardown, stopped);
+        awaitTrino(clusterId, name, EmrTrino.port(trino.config()), teardown, stopped);
         readyTrino.add(name);
     }
 
@@ -1658,10 +1691,10 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
         }
     }
 
-    // Waits for the Trino container named so to have run a query for TRINO_SETTLE, within TRINO_START_TIMEOUT: until
-    // its node manager has learnt that it serves its catalogs, a query that reads one fails "No nodes available to run
-    // query", one with none running already.
-    private void awaitTrino(String clusterId, String name, long teardown, BooleanSupplier stopped) {
+    // Waits for the Trino container named so to have run a query on port for TRINO_SETTLE, within TRINO_START_TIMEOUT:
+    // until its node manager has learnt that it serves its catalogs, a query that reads one fails "No nodes available
+    // to run query", one with none running already.
+    private void awaitTrino(String clusterId, String name, int port, long teardown, BooleanSupplier stopped) {
         long deadline = nanoTime.getAsLong() + TRINO_START_TIMEOUT.toNanos();
         long answering = Long.MIN_VALUE;
         while (teardowns.get() == teardown && !stopped.getAsBoolean()) {
@@ -1674,7 +1707,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
             ContainerExec.Result query;
             try {
                 query = ContainerExec.run(lifecycleManager.getDockerClient(), name,
-                        EmrTrino.READY_QUERY.toArray(String[]::new), 30);
+                        EmrTrino.readyQuery(port).toArray(String[]::new), 30);
             } catch (RuntimeException e) {
                 // It may have stopped after it was looked at, which makes Docker refuse the exec: the next look
                 // says so.
@@ -1832,6 +1865,25 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                     e.getMessage());
             return Optional.empty();
         }
+    }
+
+    /**
+     * Where Floci reaches the cluster's Trino on {@code port}, once it has answered queries and while it runs: at the
+     * port its primary node's container publishes for it, as for the node's web interfaces ({@link #webInterface}).
+     */
+    @Override
+    public Optional<ContainerLifecycleManager.EndpointInfo> trinoInterface(String clusterId, int port) {
+        String name = trinoName(clusterId);
+        try {
+            if (!readyTrino.contains(name) || lifecycleManager.probeContainer(name) != ContainerLiveness.RUNNING) {
+                return Optional.empty();
+            }
+        } catch (RuntimeException e) {
+            // Docker did not answer: as for a node not running, the client is told to try again.
+            LOG.debugv(e, "The Trino of EMR cluster {0} could not be looked at: {1}", clusterId, e.getMessage());
+            return Optional.empty();
+        }
+        return webInterface(clusterId, port);
     }
 
     @Override
@@ -2067,7 +2119,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                         + hdfsStartTimeout.toSeconds() + " seconds");
             }
             try {
-                Thread.sleep(HDFS_POLL_INTERVAL.toMillis());
+                pause.between(HDFS_POLL_INTERVAL);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Stopped waiting for the HDFS of EMR cluster " + clusterId, e);
@@ -2264,7 +2316,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                     .exec()) {
                 Map<String, String> labels = container.getLabels() != null ? container.getLabels() : Map.of();
                 String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
-                if (!kept.contains(clusterId)) {
+                if (clusterId == null || !kept.contains(clusterId)) {
                     // Known first, so one Docker refuses to remove stays for the next reset or shutdown to remove.
                     String name = clusterId != null ? hdfsName(clusterId) : container.getId();
                     running.add(name);
@@ -2301,7 +2353,9 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                             ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config)))
                     .exec()) {
                 Map<String, String> labels = network.getLabels() != null ? network.getLabels() : Map.of();
-                if (!kept.contains(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))) {
+                // An immutable set refuses a null lookup, which would end the sweep at an object without the label.
+                String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+                if (clusterId == null || !kept.contains(clusterId)) {
                     detachFloci(network.getName());
                     lifecycleManager.removeNetwork(network.getName());
                 }
@@ -2318,7 +2372,8 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                     ? response.getVolumes() : List.of();
             for (InspectVolumeResponse volume : volumes) {
                 Map<String, String> labels = volume.getLabels() != null ? volume.getLabels() : Map.of();
-                if (!kept.contains(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))) {
+                String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+                if (clusterId == null || !kept.contains(clusterId)) {
                     lifecycleManager.removeVolume(volume.getName());
                 }
             }

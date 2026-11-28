@@ -464,7 +464,8 @@ def vendored(script) -> tuple[str, ...]:
 
 
 @pytest.mark.parametrize("script", [
-    regen_apigateway_documentation_shapes, regen_ecr_shapes, regen_iam_shapes, regen_logs_delivery_shapes,
+    regen_apigateway_documentation_shapes, regen_cloudfront_keyvaluestore_shapes,
+    regen_ecr_shapes, regen_iam_shapes, regen_logs_delivery_shapes, regen_payment_cryptography_shapes,
     regen_resource_groups_shapes, regen_sts_shapes,
     regen_securityhub_shapes,
     regen_kinesis_shapes,
@@ -596,8 +597,8 @@ def test_eventbridgev2_shapes_keep_the_measured_orders_and_the_sensitive_mark():
     shapes = doc["shapes"]
 
     assert sorted(doc["operations"]) == ["CreateEventSource", "DeleteEventSource", "DescribeEventSource",
-                                         "ListEventSources", "RotateWebhookCredentials",
-                                         "UpdateEventSource"]
+                                         "ListEventSources", "RevokeResource",
+                                         "RotateWebhookCredentials", "UpdateEventSource"]
     assert shapes["WebhookSecretValue"] == {"type": "string", "min": 6, "max": 512, "sensitive": True}
     assert shapes["WebhookMetadataHttpHeaderList"]["max"] == 20
     assert shapes["TagMap"]["max"] == 200
@@ -620,6 +621,8 @@ def test_eventbridgev2_shapes_list_members_in_the_order_aws_walks_them():
     assert list(shapes["UpdateEventSourceRequest"]["members"]) == ["Configuration", "EventSourceArn", "Description"]
     assert list(shapes["ListEventSourcesRequest"]["members"]) == [
         "MaxResults", "NextToken", "NamePrefix", "EventBusArn"]
+    assert list(shapes["RevokeResourceRequest"]["members"]) == ["Arn"]
+    assert shapes["RevocableResourceArn"]["max"] == 1011
     assert list(shapes["RotateWebhookCredentialsRequest"]["members"]) == [
         "Credential", "EventSourceArn", "ClientToken"]
     assert list(shapes["WebhookCredential"]["members"]) == [

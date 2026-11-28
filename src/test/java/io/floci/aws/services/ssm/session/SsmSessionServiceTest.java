@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -30,6 +31,33 @@ import static org.mockito.Mockito.when;
 
 @ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class SsmSessionServiceTest {
+    @Test
+    void describesBothPersistedKeyFormatsWithinTheCallersAccountAndRegion() {
+        String account = "123456789012";
+        String region = "us-east-1";
+        AccountAwareStorageBackend<SsmSession> storage = AccountAwareStorageBackend.inMemory(account);
+        Clock clock = Clock.systemUTC();
+        SsmSessionService service = new SsmSessionService(storage, mock(SsmMessageGateway.class),
+                mock(SessionDocumentResolver.class), new RegionResolver(region, account), mock(RequestContext.class),
+                mock(IamService.class), clock, URI.create("http://localhost:4566"));
+        for (String separator : List.of("|", "::")) {
+            String suffix = separator.equals("|") ? "gateway" : "agent";
+            SsmSession active = new SsmSession("active-" + suffix, "i-fedcba98765432100", "operator", "document",
+                    null, SsmMessageGateway.SessionState.CONNECTED, clock.instant(), null);
+            SsmSession history = new SsmSession("history-" + suffix, "i-fedcba98765432100", "operator", "document",
+                    null, SsmMessageGateway.SessionState.TERMINATED, clock.instant(), clock.instant());
+            storage.putForAccount(account, region + separator + active.sessionId(), active);
+            storage.putForAccount(account, region + separator + history.sessionId(), history);
+            storage.putForAccount(account, "us-west-2" + separator + "other-region", active);
+            storage.putForAccount("999999999999", region + separator + "other-account", active);
+        }
+
+        assertEquals(Set.of("active-gateway", "active-agent"), service.describe(region, "Active", List.of(), null, null)
+                .items().stream().map(SsmSession::sessionId).collect(Collectors.toSet()));
+        assertEquals(Set.of("history-gateway", "history-agent"), service.describe(region, "History", List.of(), null, null)
+                .items().stream().map(SsmSession::sessionId).collect(Collectors.toSet()));
+    }
+
     @Test
     void resolvedCallerInAnotherAccountCannotFallBackToRoot() {
         String account = "123456789012";

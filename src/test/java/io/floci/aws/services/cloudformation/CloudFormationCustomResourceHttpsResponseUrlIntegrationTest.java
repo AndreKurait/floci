@@ -11,6 +11,8 @@ import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.RestAssured;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -82,13 +84,22 @@ class CloudFormationCustomResourceHttpsResponseUrlIntegrationTest {
         Assumptions.assumeTrue(nodeAvailable(), "node must be on the PATH to run the custom resource handler");
     }
 
+    private int originalPort;
+
     @BeforeEach
     void handlerRunsInNode() {
+        originalPort = RestAssured.port;
+        RestAssured.port = FLOCI_PORT;
         when(lambdaService.invoke(any(), eq(SERVICE_TOKEN), any(), eq(InvocationType.RequestResponse)))
                 .thenAnswer(inv -> {
                     runHandler((byte[]) inv.getArgument(2));
                     return new InvokeResult(200, null, "null".getBytes(StandardCharsets.UTF_8), null, "req-1");
                 });
+    }
+
+    @AfterEach
+    void restoreRequestPort() {
+        RestAssured.port = originalPort;
     }
 
     @Test
@@ -183,6 +194,8 @@ class CloudFormationCustomResourceHttpsResponseUrlIntegrationTest {
             Map<String, String> overrides = new HashMap<>(new SelfSignedTlsProfile().getConfigOverrides());
             overrides.put("quarkus.http.test-port", "4510");
             overrides.put("quarkus.http.test-ssl-port", "4511");
+            // Profile overrides do not reach TlsConfigSource; accept the public proxy's preface.
+            overrides.put("quarkus.http.proxy.use-proxy-protocol", "true");
             overrides.put("floci.port", String.valueOf(FLOCI_PORT));
             overrides.put("floci.services.lambda.docker-host-override", "localhost");
             return overrides;

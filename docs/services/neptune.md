@@ -28,6 +28,10 @@ The proxy is a transparent byte relay, so the host-facing proxy port range is un
 | `DescribeDBClusters` | List clusters and their connection details |
 | `DeleteDBCluster` | Stop and remove a cluster |
 | `ModifyDBCluster` | Update cluster settings, including deletion protection, backup retention, log exports and security groups |
+| `CreateDBClusterSnapshot` | Capture a manual snapshot of a Gremlin cluster, including its graph data |
+| `DescribeDBClusterSnapshots` | Read manual snapshot metadata by identifier, ARN or source cluster |
+| `DeleteDBClusterSnapshot` | Delete a snapshot and its stored graph archive |
+| `RestoreDBClusterFromSnapshot` | Restore an independent Gremlin cluster from a stored snapshot |
 | `AddRoleToDBCluster` | Associate an IAM role with a cluster (listed under `AssociatedRoles`) |
 | `RemoveRoleFromDBCluster` | Disassociate an IAM role from a cluster |
 | `DescribeGlobalClusters` | Always an empty list; global clusters are not modelled |
@@ -39,6 +43,36 @@ The proxy is a transparent byte relay, so the host-facing proxy port range is un
 | `AddTagsToResource` | Add or overwrite tags on a cluster or instance |
 | `RemoveTagsFromResource` | Remove tags from a cluster or instance by key |
 <!-- floci:actions:end -->
+
+## Cluster snapshots
+
+Manual snapshots of the default TinkerGraph backend preserve vertices, edges, identifiers, labels
+and properties in a GraphSON archive. The archive and captured settings are stored together in one
+atomic storage record. A restore loads that archive into a new backend before publishing the target
+cluster as available. Deleting or changing the source does not change an existing snapshot.
+
+Pause graph writes while creating a snapshot: this is a graph export, with no transaction spanning
+concurrent native client writes. Snapshots are limited to 64 MiB of GraphSON. Neo4j snapshots,
+automated backups, point-in-time recovery and snapshot sharing are not implemented. Listing returns
+the stored manual snapshots; pagination and additional snapshot filters are not modeled.
+
+Snapshot identifiers and ARNs are scoped to the caller's account and region. RDS-family requests
+select the store that owns the snapshot; ambiguous identifiers in legacy stores are refused.
+The snapshot retains backup, placement, encryption and log settings. Restore request values can
+override supported cluster settings; deletion protection defaults to false and restore tags come
+from the request. Restoring creates no DB instances.
+
+`FLOCI_SERVICES_NEPTUNE_MOCK=true` explicitly enables metadata-only snapshots without Docker.
+Such snapshots can only be restored in mock mode. With mock mode disabled, capture requires a
+working Gremlin backend, and a missing or failed restore backend produces an error and invokes
+target cleanup instead of returning an empty available cluster.
+
+With IAM enforcement enabled, Neptune snapshot calls use `rds` actions and resource ARNs.
+Creation checks the named source cluster and new snapshot; read and delete check the snapshot
+named by the request. Restore checks the named target cluster, source snapshot, and parameter
+or subnet groups explicitly supplied by the request. An unfiltered family listing requires `*`.
+This covers Neptune's snapshot requests; it does not change other RDS-family authorization paths
+or model permissions on unspecified default groups.
 
 ## Terraform and the `aws_neptune_cluster` resource
 
@@ -71,12 +105,59 @@ A requested `Port` is honoured when it is free and inside the proxy port range (
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLOCI_SERVICES_NEPTUNE_ENABLED` | `true` | Enable or disable Neptune |
+| `FLOCI_SERVICES_NEPTUNE_MOCK` | `false` | Explicit metadata-only clusters and snapshots without a graph backend |
 | `FLOCI_SERVICES_NEPTUNE_PROXY_BASE_PORT` | `8182` | First host port in the Gremlin proxy range |
 | `FLOCI_SERVICES_NEPTUNE_PROXY_MAX_PORT` | `8282` | Last host port in the proxy range |
 | `FLOCI_SERVICES_NEPTUNE_DB_TYPE` | `gremlin` | Backend engine: `gremlin` (Gremlin/WebSocket) or `neo4j` (openCypher/Bolt) |
 | `FLOCI_SERVICES_NEPTUNE_DEFAULT_IMAGE` | `tinkerpop/gremlin-server:3.7.3` | Image used when `db-type=gremlin` |
 | `FLOCI_SERVICES_NEPTUNE_DEFAULT_NEO4J_IMAGE` | `neo4j:5-community` | Image used when `db-type=neo4j` |
 | `FLOCI_SERVICES_NEPTUNE_DOCKER_NETWORK` | _(host default)_ | Docker network for container connectivity |
+
+### Graph data
+
+When Neptune's records are kept, with `FLOCI_STORAGE_MODE` (or `FLOCI_STORAGE_SERVICES_NEPTUNE_MODE`)
+set to `persistent`, `hybrid` or `wal`, each cluster keeps its graph in a Docker volume of its own,
+`floci-aws-neptune-<volume-id>` (`floci-aws-<namespace>-neptune-<volume-id>` when
+`FLOCI_DOCKER_RESOURCE_NAMESPACE` is set), so the graph outlives the cluster's container. When
+`FLOCI_STORAGE_HOST_PERSISTENT_PATH` is an absolute path, the graph goes in
+`<host-path>/[<namespace>/]neptune/<volume-id>` on the Docker host instead.
+
+- **`neo4j`:** the volume is Neo4j's data directory, `/data`.
+- **`gremlin`:** the volume is the image's `/opt/gremlin-server/data`, and the server's TinkerGraph
+  saves the graph there, to `floci-graph.kryo`, when the server stops, and loads it from there when
+  it starts. The graph is written only when the server stops, which Floci gives a container 30
+  seconds to do before Docker kills it, so a container that is killed rather than stopped loses
+  what changed since it started. Under the host path the server runs as
+  root, since the directory there belongs to whoever created it rather than to the image's
+  `gremlin` user. Floci writes the graph settings into the image's
+  `/opt/gremlin-server/conf/tinkergraph-empty.properties`, so an image configured in place of the
+  default needs the same layout; one laid out otherwise keeps its graph in memory, and Floci logs a
+  warning.
+
+Deleting the cluster keeps its volume, for you to remove with `docker volume rm`, unless
+`FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE=true`; a directory under the host path is always kept. A
+create that fails leaves no volume behind. A cluster created again under a deleted one's identifier
+starts on a new, empty volume. In `memory` mode a cluster's graph lasts only as long as its
+container.
+
+### Restarts
+
+When Neptune's records are kept, Floci's shutdown stops each cluster's proxy and container and
+keeps its volume, and the next start brings them back. Each cluster's port is held for it at once,
+so a cluster created meanwhile is never handed it. While its container starts again in the
+background, the cluster reports `maintenance` and its instances `starting`. The new container runs
+in the engine the cluster's graph was kept in, on its volume, so the graph is there. Its proxy then
+listens on the same port again, so clients reconnect to the endpoint they had, and the cluster and
+its instances report `available`. With no Docker daemon reachable they come back `available` with
+no container, as a cluster created then does. A cluster whose container or proxy does not start is
+left with none and its instances `failed`, and is tried again at the next start. A
+`DeleteDBCluster` during the restore leaves the cluster `deleting` until its container has started,
+and removes it then. `CreateDBInstance` is refused with `InvalidDBClusterStateFault` for a cluster
+that is not `available`.
+
+A cluster whose stored port another cluster already holds moves to a free one. A cluster created by
+a Floci that did not record its engine comes back in the configured `db-type`, and one whose graph
+was not kept in a volume gets a new, empty one.
 
 ### Docker Compose
 

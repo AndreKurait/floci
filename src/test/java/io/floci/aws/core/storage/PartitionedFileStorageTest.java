@@ -186,6 +186,7 @@ class PartitionedFileStorageTest {
             // A root user writes through the read-only mode, so there is nothing to test there.
             assumeFalse(Files.isWritable(directory), "the directory stays writable for this user");
             assertThrows(UncheckedIOException.class, storage::flush, "a failed flush is reported");
+            assertThrows(UncheckedIOException.class, storage::flushOrThrow);
             assertFalse(Files.exists(storage.fileFor("busy")));
         } finally {
             Files.setPosixFilePermissions(directory, original);

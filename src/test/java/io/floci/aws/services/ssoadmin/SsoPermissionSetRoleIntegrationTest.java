@@ -396,7 +396,7 @@ class SsoPermissionSetRoleIntegrationTest {
             assertEquals("permitted", session.getParameter(r -> r.name(parameter)).parameter().value());
             SsmException denied = assertThrows(SsmException.class,
                     () -> session.putParameter(r -> r.name(parameter).type("String").value("forbidden").overwrite(true)));
-            assertEquals(400, denied.statusCode());
+            assertEquals(403, denied.statusCode());
             assertEquals("AccessDeniedException", denied.awsErrorDetails().errorCode());
             assertEquals("permitted", owner.getParameter(r -> r.name(parameter)).parameter().value());
         }

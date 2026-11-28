@@ -65,6 +65,15 @@ public class ImageCacheService {
     }
 
     public String ensureImageExists(String imageUri, String platform) {
+        return ensureImageExists(imageUri, platform, null);
+    }
+
+    /** Credentials supplied for this pull only; workload authorization belongs to the caller. */
+    public String ensureImageExists(String imageUri, String platform, AuthConfig credentials) {
+        validateRegistryCredentials(imageUri, credentials);
+        if (credentials != null) {
+            return resolveForLaunch(imageUri, ImagePullBehavior.ALWAYS, platform, credentials).imageId();
+        }
         if (isImageId(imageUri)) {
             return existingImageId(imageUri);
         }
@@ -89,7 +98,7 @@ public class ImageCacheService {
                 return resolvedImage;
             }
             resolvedImage = resolvedImageReference(imageUri,
-                    pull(imageKey, explicitPlatform ? requestedPlatform : null).image());
+                    pull(imageKey, explicitPlatform ? requestedPlatform : null, credentials).image());
             resolvedImages.put(imageKey, resolvedImage);
             return resolvedImage;
         }
@@ -109,6 +118,13 @@ public class ImageCacheService {
      *        the daemon's own. A local image of another platform is never reused for it.
      */
     public LaunchImage resolveForLaunch(String imageUri, ImagePullBehavior behavior, String platform) {
+        return resolveForLaunch(imageUri, behavior, platform, null);
+    }
+
+    /** Credentials supplied for this launch only; workload authorization belongs to the caller. */
+    public LaunchImage resolveForLaunch(String imageUri, ImagePullBehavior behavior, String platform,
+                                        AuthConfig credentials) {
+        validateRegistryCredentials(imageUri, credentials);
         if (isImageId(imageUri)) {
             return new LaunchImage(existingImageId(imageUri), null);
         }
@@ -117,13 +133,15 @@ public class ImageCacheService {
         String pullPlatform = explicitPlatform ? imageKey.platform() : null;
         Object lock = locks.computeIfAbsent(imageUri, k -> new Object());
         synchronized (lock) {
-            LocalImage image = switch (behavior) {
-                case DEFAULT -> pullOrUseCached(imageKey, pullPlatform);
-                case ALWAYS -> pull(imageKey, pullPlatform);
+            // An internal credential must reach the registry before local layers can be reused.
+            ImagePullBehavior selectedBehavior = credentials != null ? ImagePullBehavior.ALWAYS : behavior;
+            LocalImage image = switch (selectedBehavior) {
+                case DEFAULT -> pullOrUseCached(imageKey, pullPlatform, credentials);
+                case ALWAYS -> pull(imageKey, pullPlatform, credentials);
                 case ONCE -> pulledImages.contains(imageKey)
-                        ? cachedOrPull(imageKey, pullPlatform)
-                        : pull(imageKey, pullPlatform);
-                case PREFER_CACHED -> cachedOrPull(imageKey, pullPlatform);
+                        ? cachedOrPull(imageKey, pullPlatform, credentials)
+                        : pull(imageKey, pullPlatform, credentials);
+                case PREFER_CACHED -> cachedOrPull(imageKey, pullPlatform, credentials);
             };
             String imageId = resolvedImageReference(imageUri, image.image());
             resolvedImages.put(imageKey, imageId);
@@ -156,9 +174,9 @@ public class ImageCacheService {
         return resolvedImageReference(imageId, image);
     }
 
-    private LocalImage pullOrUseCached(ImageKey imageKey, String platform) {
+    private LocalImage pullOrUseCached(ImageKey imageKey, String platform, AuthConfig credentials) {
         try {
-            return pull(imageKey, platform);
+            return pull(imageKey, platform, credentials);
         } catch (RuntimeException e) {
             InspectImageResponse cached = Thread.currentThread().isInterrupted() ? null : cachedImage(imageKey);
             if (cached == null) {
@@ -170,9 +188,9 @@ public class ImageCacheService {
         }
     }
 
-    private LocalImage cachedOrPull(ImageKey imageKey, String platform) {
+    private LocalImage cachedOrPull(ImageKey imageKey, String platform, AuthConfig credentials) {
         InspectImageResponse cached = cachedImage(imageKey);
-        return cached != null ? new LocalImage(cached, null) : pull(imageKey, platform);
+        return cached != null ? new LocalImage(cached, null) : pull(imageKey, platform, credentials);
     }
 
     private InspectImageResponse cachedImage(ImageKey imageKey) {
@@ -185,14 +203,14 @@ public class ImageCacheService {
      *
      * @param platform the platform to ask the registry for, or null for the daemon's own
      */
-    private LocalImage pull(ImageKey imageKey, String platform) {
+    private LocalImage pull(ImageKey imageKey, String platform, AuthConfig credentials) {
         String imageUri = imageKey.imageUri();
         LOG.infov("Pulling image: {0}", imageUri);
         AtomicReference<ManifestDigestCallback> lastAttempt = new AtomicReference<>();
         try {
             runWithRetry(imageUri, MAX_PULL_ATTEMPTS, INITIAL_BACKOFF_MS, () -> {
                 PullImageCmd pullImage = dockerClient.pullImageCmd(imageUri)
-                        .withAuthConfig(resolveAuth(imageUri));
+                        .withAuthConfig(resolveAuth(imageUri, credentials));
                 if (platform != null) {
                     pullImage.withPlatform(platform);
                 }
@@ -393,7 +411,17 @@ public class ImageCacheService {
         }
     }
 
-    private AuthConfig resolveAuth(String imageUri) {
+    private static void validateRegistryCredentials(String imageUri, AuthConfig credentials) {
+        if (credentials != null && !extractRegistryHost(imageUri).equals(credentials.getRegistryAddress())) {
+            throw new DockerClientException("Registry credentials do not match image registry");
+        }
+    }
+
+    private AuthConfig resolveAuth(String imageUri, AuthConfig credentials) {
+        validateRegistryCredentials(imageUri, credentials);
+        if (credentials != null) {
+            return credentials;
+        }
         String host = extractRegistryHost(imageUri);
         for (EmulatorConfig.DockerConfig.RegistryCredential cred : registryCredentials) {
             if (cred.server().equals(host)) {

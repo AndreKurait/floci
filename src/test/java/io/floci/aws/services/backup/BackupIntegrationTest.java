@@ -2,12 +2,20 @@ package io.floci.aws.services.backup;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.backup.model.BackupJob;
+import io.floci.aws.services.sns.SnsService;
+import io.floci.aws.testing.TestTime;
+import io.quarkus.arc.Arc;
+import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.JsonPath;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -24,13 +32,20 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 import static io.restassured.RestAssured.given;
-import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Integration tests for AWS Backup via REST JSON protocol.
+ *
+ * <p>The service behind the endpoints is the real one, built on a {@link TestTime}: a job moves on
+ * when the test advances the timeline, with the delay the emulator ships with, instead of when a
+ * scheduler thread gets to it. {@code BackupJobSchedulerIntegrationTest} covers the injected
+ * service and its own executor in real time.
  */
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -50,32 +65,39 @@ class BackupIntegrationTest {
     private static String jobId;
     private static String recoveryPointArn;
 
-    /**
-     * Blocks until a backup job reports {@code COMPLETED}.
-     *
-     * <p>A job finishes asynchronously, so the recovery point it produces is not readable the
-     * instant PutBackupJob returns. Polling the state rather than sleeping a fixed span is what
-     * keeps this honest on a slow runner: a sleep sized for this machine only means the job is
-     * still RUNNING on a slower one, and the assertion that follows fails for a reason that has
-     * nothing to do with the behaviour under test.
-     */
-    private static void awaitJobCompleted(String backupJobId) {
-        awaitJobState(AUTH, backupJobId, "COMPLETED");
+    /** floci.services.backup.job-completion-delay-seconds as shipped in the main application.yml. */
+    private static final int JOB_COMPLETION_DELAY_SECONDS = 3;
+    private static final TestTime time = TestTime.create();
+
+    @BeforeAll
+    static void runJobsOnAControlledTimeline() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().backup().jobCompletionDelaySeconds()).thenReturn(JOB_COMPLETION_DELAY_SECONDS);
+        QuarkusMock.installMockForType(new BackupService(
+                Arc.container().instance(StorageFactory.class).get(), config,
+                Arc.container().instance(RegionResolver.class).get(),
+                Arc.container().instance(ObjectMapper.class).get(),
+                Arc.container().instance(SnsService.class).get(),
+                time.clock(), time.newScheduler()), BackupService.class);
     }
 
-    private static void awaitJobState(String auth, String backupJobId, String expected) {
-        await().atMost(Duration.ofSeconds(10))
-                .pollInterval(Duration.ofMillis(25))
-                .until(() -> {
-                    String state = given()
-                        .header("Authorization", auth)
-                    .when()
-                        .get("/backup-jobs/" + backupJobId)
-                    .then()
-                        .statusCode(200)
-                        .extract().path("State");
-                    return expected.equals(state);
-                });
+    /**
+     * Lets the completion delay pass, which runs every job transition that falls due on the calling
+     * thread, and requires the job to report {@code COMPLETED} once it has.
+     */
+    private static void completeJob(String backupJobId) {
+        passCompletionDelay(AUTH, backupJobId, "COMPLETED");
+    }
+
+    private static void passCompletionDelay(String auth, String backupJobId, String expected) {
+        time.advance(Duration.ofSeconds(JOB_COMPLETION_DELAY_SECONDS));
+        given()
+            .header("Authorization", auth)
+        .when()
+            .get("/backup-jobs/" + backupJobId)
+        .then()
+            .statusCode(200)
+            .body("State", equalTo(expected));
     }
 
     // ── Vault ──────────────────────────────────────────────────────────────────
@@ -346,14 +368,31 @@ class BackupIntegrationTest {
         .then()
             .statusCode(200)
             .body("BackupJobId", equalTo(jobId))
-            .body("State", oneOf("CREATED", "RUNNING", "COMPLETED"))
+            .body("State", equalTo("CREATED"))
+            .body("PercentDone", equalTo("0.0"))
             .body("BackupVaultName", equalTo(VAULT_NAME));
+
+        // One second in, the job is running; it stays so until the completion delay is up.
+        time.advance(Duration.ofSeconds(1).minusMillis(1));
+        given().header("Authorization", AUTH)
+        .when().get("/backup-jobs/" + jobId)
+        .then().statusCode(200).body("State", equalTo("CREATED"));
+        time.advance(Duration.ofMillis(1));
+        given().header("Authorization", AUTH)
+        .when().get("/backup-jobs/" + jobId)
+        .then().statusCode(200)
+            .body("State", equalTo("RUNNING"))
+            .body("PercentDone", equalTo("50.0"));
+        time.advance(Duration.ofSeconds(JOB_COMPLETION_DELAY_SECONDS - 1).minusMillis(1));
+        given().header("Authorization", AUTH)
+        .when().get("/backup-jobs/" + jobId)
+        .then().statusCode(200).body("State", equalTo("RUNNING"));
     }
 
     @Test
     @Order(42)
     void describeBackupJobCompleted() {
-        awaitJobCompleted(jobId);
+        time.advance(Duration.ofMillis(1));
         given()
             .header("Authorization", AUTH)
         .when()
@@ -1218,7 +1257,7 @@ class BackupIntegrationTest {
                 """.formatted(LOCK_VAULT, RESOURCE_ARN, IAM_ROLE))
         .when().put("/backup-jobs").then().statusCode(200).extract().path("BackupJobId");
 
-        awaitJobCompleted(jid);
+        completeJob(jid);
         String rpArn = given().header("Authorization", AUTH)
         .when().get("/backup-jobs/" + jid).then().statusCode(200)
             .body("State", equalTo("COMPLETED"))
@@ -1266,7 +1305,7 @@ class BackupIntegrationTest {
                 """.formatted(vault, RESOURCE_ARN, IAM_ROLE))
         .when().put("/backup-jobs").then().statusCode(200).extract().path("BackupJobId");
 
-        awaitJobCompleted(jid);
+        completeJob(jid);
         String rpArn = given().header("Authorization", AUTH)
         .when().get("/backup-jobs/" + jid).then().extract().path("RecoveryPointArn");
 
@@ -1509,7 +1548,7 @@ class BackupIntegrationTest {
                 """.formatted(vault))
         .when().put("/backup-jobs").then().statusCode(200).extract().path("BackupJobId");
 
-        awaitJobState(OTHER_ACCOUNT_AUTH, jid, "COMPLETED");
+        passCompletionDelay(OTHER_ACCOUNT_AUTH, jid, "COMPLETED");
         String rpArn = given().header("Authorization", OTHER_ACCOUNT_AUTH)
         .when().get("/backup-jobs/" + jid).then().statusCode(200)
             .extract().path("RecoveryPointArn");
@@ -1550,7 +1589,17 @@ class BackupIntegrationTest {
         given().header("Authorization", OTHER_ACCOUNT_AUTH).contentType("application/json").body("{}")
         .when().post("/backup-jobs/" + jid).then().statusCode(204);
 
-        awaitJobState(OTHER_ACCOUNT_AUTH, jid, "ABORTED");
+        // A stop takes effect one second after it is asked for.
+        time.advance(Duration.ofSeconds(1).minusMillis(1));
+        given().header("Authorization", OTHER_ACCOUNT_AUTH)
+        .when().get("/backup-jobs/" + jid).then().statusCode(200).body("State", equalTo("ABORTING"));
+        time.advance(Duration.ofMillis(1));
+        given().header("Authorization", OTHER_ACCOUNT_AUTH)
+        .when().get("/backup-jobs/" + jid).then().statusCode(200).body("State", equalTo("ABORTED"));
+        // The completion the job was started with finds it aborted and leaves it so.
+        passCompletionDelay(OTHER_ACCOUNT_AUTH, jid, "ABORTED");
+        given().header("Authorization", OTHER_ACCOUNT_AUTH)
+        .when().get("/backup-vaults/" + vault).then().statusCode(200).body("NumberOfRecoveryPoints", equalTo(0));
     }
 
 
@@ -1627,11 +1676,9 @@ class BackupIntegrationTest {
         String quietJob = startJobInNotifiedVault("notify-quiet-vault", quietTopic, "BACKUP_JOB_FAILED");
         String jid = startJobInNotifiedVault("notify-vault", notifiedTopic, "BACKUP_JOB_COMPLETED");
 
-        String[] body = new String[1];
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
-            .until(() -> (body[0] = receiveBody(notifiedQueue)) != null && !body[0].isEmpty());
-
-        awaitJobCompleted(jid);
+        completeJob(jid);
+        String[] body = {receiveBody(notifiedQueue)};
+        assertThat(body[0], not(emptyOrNullString()));
         String rpArn = given().header("Authorization", AUTH)
         .when().get("/backup-jobs/" + jid).then().statusCode(200)
             .extract().path("RecoveryPointArn");
@@ -1653,7 +1700,7 @@ class BackupIntegrationTest {
             "StartTime", Map.of("Type", "String", "Value", Instant.ofEpochSecond(created).toString())),
             envelope.getMap("MessageAttributes"));
 
-        awaitJobCompleted(quietJob);
+        completeJob(quietJob);
         assertThat(receiveBody(quietQueue), anyOf(nullValue(), emptyString()));
     }
 
@@ -1671,8 +1718,8 @@ class BackupIntegrationTest {
         try {
             String missingTopic = "arn:aws:sns:us-east-1:000000000000:backup-notify-no-such-topic";
             String jid = startJobInNotifiedVault("notify-broken-vault", missingTopic, "BACKUP_JOB_COMPLETED");
-            awaitJobCompleted(jid);
-            await().atMost(Duration.ofSeconds(10)).until(() -> records.stream()
+            completeJob(jid);
+            assertThat("the failed publish is logged as a warning", records.stream()
                 .anyMatch(r -> r.getLevel().intValue() >= Level.WARNING.intValue()
                     && String.valueOf(r.getMessage()).contains("BACKUP_JOB_COMPLETED")));
             assertThat("the warning carries the exception, not just its message",
@@ -1717,10 +1764,9 @@ class BackupIntegrationTest {
         // old job's completion, and any publish it was going to make, has already happened.
         startJobInNotifiedVault("notify-sentinel-vault", sentinelTopic, "BACKUP_JOB_COMPLETED");
 
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
-            .until(() -> { String b = receiveBody(sentinelQueue); return b != null && !b.isEmpty(); });
         // Its vault is gone, so the old job fails rather than completing into the replacement.
-        awaitJobState(AUTH, oldJob, "FAILED");
+        passCompletionDelay(AUTH, oldJob, "FAILED");
+        assertThat(receiveBody(sentinelQueue), not(emptyOrNullString()));
 
         // The replacement's own job does publish; the old job must not have published too.
         String first = receiveBody(replacementQueue);
@@ -1911,7 +1957,7 @@ class BackupIntegrationTest {
                 """.formatted(vault, RESOURCE_ARN, IAM_ROLE))
         .when().put("/backup-jobs").then().statusCode(200).extract().path("BackupJobId");
 
-        awaitJobCompleted(jid);
+        completeJob(jid);
         String rpArn = given().header("Authorization", AUTH)
         .when().get("/backup-jobs/" + jid).then().statusCode(200)
             .body("State", equalTo("COMPLETED"))
@@ -1951,12 +1997,7 @@ class BackupIntegrationTest {
         given().header("Authorization", AUTH).contentType("application/json").body("{}")
         .when().put("/backup-vaults/" + vault).then().statusCode(200);
 
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(25))
-            .until(() -> {
-                String state = given().header("Authorization", AUTH)
-                .when().get("/backup-jobs/" + oldJob).then().statusCode(200).extract().path("State");
-                return "FAILED".equals(state) || "COMPLETED".equals(state);
-            });
+        time.advance(Duration.ofSeconds(JOB_COMPLETION_DELAY_SECONDS));
         given().header("Authorization", AUTH)
         .when().get("/backup-jobs/" + oldJob).then().statusCode(200)
             .body("State", equalTo("FAILED"))
@@ -2005,7 +2046,7 @@ class BackupIntegrationTest {
                 .body("BackupJobs[0].State", notNullValue());
         JsonNode after = mapper.valueToTree(backupService.describeBackupJob(jid));
         assertEquals(before.path("FlociVaultId"), after.path("FlociVaultId"));
-        awaitJobCompleted(jid);
+        completeJob(jid);
         String point = backupService.describeBackupJob(jid).getRecoveryPointArn();
         backupService.deleteRecoveryPoint(vault, point, "us-east-1");
         backupService.deleteBackupVault(vault, "us-east-1");
@@ -2064,7 +2105,7 @@ class BackupIntegrationTest {
                 .body("{\"BackupVaultName\": \"%s\", \"ResourceArn\": \"%s\", \"IamRoleArn\": \"%s\"}"
                         .formatted(vault, RESOURCE_ARN, IAM_ROLE))
                 .when().put("/backup-jobs").then().statusCode(200).extract().path("BackupJobId");
-        awaitJobCompleted(regionJobId);
+        completeJob(regionJobId);
         String point = given().header("Authorization", AUTH).when().get("/backup-jobs/" + regionJobId)
                 .then().statusCode(200).extract().path("RecoveryPointArn");
         given().header("Authorization", EU_AUTH).contentType("application/json").body("{}")

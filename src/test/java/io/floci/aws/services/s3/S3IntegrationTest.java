@@ -1,8 +1,10 @@
 package io.floci.aws.services.s3;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import io.restassured.config.DecoderConfig;
 import io.restassured.config.RestAssuredConfig;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -14,6 +16,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -26,6 +29,29 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class S3IntegrationTest {
+    private static String wrappingKey;
+    private static int wrappingKeyPort;
+
+    private static String kmsFixtureKey() {
+        if (wrappingKey == null) {
+            wrappingKeyPort = RestAssured.port;
+            wrappingKey = given().contentType("application/x-amz-json-1.1")
+                    .header("X-Amz-Target", "TrentService.CreateKey").body("{}".getBytes(StandardCharsets.UTF_8))
+                    .post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        }
+        return wrappingKey;
+    }
+
+    @AfterAll
+    static void removeWrappingKey() {
+        if (wrappingKey != null) {
+            given().port(wrappingKeyPort).contentType("application/x-amz-json-1.1")
+                    .header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                    .body(("{\"KeyId\":\"" + wrappingKey + "\",\"PendingWindowInDays\":7}").getBytes(StandardCharsets.UTF_8))
+                    .post("/").then().statusCode(200);
+        }
+    }
+
     private static final String SSE_CUSTOMER_KEY = Base64.getEncoder().encodeToString("0123456789abcdef0123456789abcdef".getBytes(StandardCharsets.UTF_8));
     private static final String SSE_CUSTOMER_KEY_MD5 = customerKeyMd5(SSE_CUSTOMER_KEY);
     private static final String WRONG_SSE_CUSTOMER_KEY = Base64.getEncoder().encodeToString("abcdef0123456789abcdef0123456789".getBytes(StandardCharsets.UTF_8));
@@ -1867,6 +1893,83 @@ class S3IntegrationTest {
         given().delete("/cache-control-bucket");
     }
 
+    // --- System headers under the copy metadata directive ---
+
+    @Test
+    void copyObjectReplaceDropsOmittedSystemHeaders() {
+        putObjectWithSystemHeaders("replace-headers-bucket");
+
+        given()
+            .header("x-amz-copy-source", "/replace-headers-bucket/source.html")
+            .header("x-amz-metadata-directive", "REPLACE")
+            .header("x-amz-meta-owner", "team-b")
+        .when()
+            .put("/replace-headers-bucket/replaced.html")
+        .then()
+            .statusCode(200)
+            .body(containsString("CopyObjectResult"));
+
+        given()
+        .when()
+            .head("/replace-headers-bucket/replaced.html")
+        .then()
+            .statusCode(200)
+            .header("x-amz-meta-owner", equalTo("team-b"))
+            .header("Content-Type", equalTo("binary/octet-stream"))
+            .header("Content-Encoding", nullValue())
+            .header("Content-Disposition", nullValue())
+            .header("Cache-Control", nullValue());
+
+        deleteBucketWithKeys("replace-headers-bucket", "source.html", "replaced.html");
+    }
+
+    @Test
+    void copyObjectCopyDirectiveKeepsSystemHeaders() {
+        putObjectWithSystemHeaders("copy-headers-bucket");
+
+        given()
+            .header("x-amz-copy-source", "/copy-headers-bucket/source.html")
+            .header("x-amz-metadata-directive", "COPY")
+        .when()
+            .put("/copy-headers-bucket/copied.html")
+        .then()
+            .statusCode(200)
+            .body(containsString("CopyObjectResult"));
+
+        given()
+        .when()
+            .head("/copy-headers-bucket/copied.html")
+        .then()
+            .statusCode(200)
+            .header("Content-Type", startsWith("text/html"))
+            .header("Content-Encoding", equalTo("gzip"))
+            .header("Content-Disposition", equalTo("attachment; filename=\"page.html\""))
+            .header("Cache-Control", equalTo("max-age=60"));
+
+        deleteBucketWithKeys("copy-headers-bucket", "source.html", "copied.html");
+    }
+
+    private void putObjectWithSystemHeaders(String bucket) {
+        given().put("/" + bucket).then().statusCode(200);
+        given()
+            .contentType("text/html")
+            .header("Content-Encoding", "gzip")
+            .header("Content-Disposition", "attachment; filename=\"page.html\"")
+            .header("Cache-Control", "max-age=60")
+            .body("<p>page</p>")
+        .when()
+            .put("/" + bucket + "/source.html")
+        .then()
+            .statusCode(200);
+    }
+
+    private void deleteBucketWithKeys(String bucket, String... keys) {
+        for (String key : keys) {
+            given().delete("/" + bucket + "/" + key);
+        }
+        given().delete("/" + bucket);
+    }
+
     // --- Content-Disposition header preservation ---
 
     @Test
@@ -2076,7 +2179,7 @@ class S3IntegrationTest {
             .header("ETag", notNullValue())
             .header("x-amz-server-side-encryption", equalTo("AES256"));
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
             .contentType("text/plain")
             .header("x-amz-server-side-encryption", "aws:kms")
@@ -2146,7 +2249,7 @@ class S3IntegrationTest {
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
         .when()
             .get("/sse-bucket/kms-encrypted.txt")
@@ -2174,7 +2277,7 @@ class S3IntegrationTest {
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
         .when()
             .head("/sse-bucket/kms-encrypted.txt")
@@ -2225,7 +2328,7 @@ class S3IntegrationTest {
             .header("x-amz-server-side-encryption", equalTo("AES256"))
             .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        String kmsKeyId = kmsFixtureKey();
         given()
             .header("x-amz-copy-source", "/sse-bucket/encrypted.txt")
             .header("x-amz-server-side-encryption", "aws:kms")
@@ -3382,6 +3485,36 @@ class S3IntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("ListBucketResult"));
+    }
+
+    @Test
+    @Order(118)
+    void putBucketEncryptionRefusesAKeyIdentifierWithALineBreakAndTheBucketKeepsWorking() {
+        String body = "<ServerSideEncryptionConfiguration><Rule>"
+                + "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>"
+                + "<KMSMasterKeyID>key\nid</KMSMasterKeyID></ApplyServerSideEncryptionByDefault>"
+                + "</Rule></ServerSideEncryptionConfiguration>";
+        given()
+            .contentType("application/xml")
+            .body(body)
+        .when()
+            .put("/test-bucket?encryption")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"));
+        given()
+            .contentType("text/plain")
+            .body("safe-data")
+        .when()
+            .put("/test-bucket/plain.txt")
+        .then()
+            .statusCode(200);
+        given()
+        .when()
+            .get("/test-bucket/plain.txt")
+        .then()
+            .statusCode(200)
+            .body(containsString("safe-data"));
     }
 
     @Test

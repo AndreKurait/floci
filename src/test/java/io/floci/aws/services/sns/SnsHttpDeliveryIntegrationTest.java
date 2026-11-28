@@ -11,14 +11,15 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.*;
@@ -89,11 +90,9 @@ class SnsHttpDeliveryIntegrationTest {
     /**
      * Waits until the expected number of requests have been received, with a timeout.
      */
-    private static void awaitRequests(int expectedCount) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (receivedRequests.size() < expectedCount && System.nanoTime() < deadline) {
-            Thread.sleep(50);
-        }
+    private static void awaitRequests(int expectedCount) {
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .until(() -> receivedRequests.size() >= expectedCount);
     }
 
     private static String firstHeader(Map<String, List<String>> headers, String name) {

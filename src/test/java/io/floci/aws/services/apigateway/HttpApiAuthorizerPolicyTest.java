@@ -2,7 +2,10 @@ package io.floci.aws.services.apigateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.apigatewayv2.AuthorizerPolicyFixtures;
 import io.floci.aws.services.apigatewayv2.model.Api;
@@ -216,7 +219,7 @@ class HttpApiAuthorizerPolicyTest {
         routeContext.routeToHttpApi("us-east-1");
         return new ApiGatewayExecuteController(null, null, gateway, lambda,
                 new RegionResolver("us-east-1", "000000000000"), mapper, null, null, null, null, null,
-                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), null, new HttpProxyInvoker());
+                routeContext, null, null, null, null, new AuthorizerPolicyEvaluator(new IamPolicyEvaluator(mapper)), mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class), null);
     }
 
     private InvokeResult result(String payload) {

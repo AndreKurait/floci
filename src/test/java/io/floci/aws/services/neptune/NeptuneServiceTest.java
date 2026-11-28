@@ -1,5 +1,6 @@
 package io.floci.aws.services.neptune;
 
+import com.github.dockerjava.api.exception.ConflictException;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
@@ -15,14 +16,22 @@ import io.floci.aws.services.neptune.model.NeptuneInstanceSettings;
 import io.floci.aws.services.neptune.proxy.NeptuneProxyManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -30,6 +39,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -48,6 +58,9 @@ class NeptuneServiceTest {
     private String currentAccount;
     private String currentRegion;
     private AccountAwareStorageBackend<NeptuneCluster> clusterStorage;
+    private String storageMode = "memory";
+    /** Neptune's own storage mode, or null when it names none. */
+    private String neptuneStorageMode;
 
     @BeforeEach
     void setUp() {
@@ -77,6 +90,14 @@ class NeptuneServiceTest {
         when(neptuneConfig.defaultImage()).thenReturn("tinkerpop/gremlin-server:3.7");
         when(neptuneConfig.defaultNeo4jImage()).thenReturn("neo4j:5");
         when(config.hostname()).thenReturn(Optional.of("localhost"));
+        EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
+        EmulatorConfig.ServiceStorageOverrides storageOverrides = mock(EmulatorConfig.ServiceStorageOverrides.class);
+        EmulatorConfig.NeptuneStorageConfig neptuneStorage = mock(EmulatorConfig.NeptuneStorageConfig.class);
+        when(config.storage()).thenReturn(storage);
+        when(storage.mode()).thenAnswer(invocation -> storageMode);
+        when(storage.services()).thenReturn(storageOverrides);
+        when(storageOverrides.neptune()).thenReturn(neptuneStorage);
+        when(neptuneStorage.mode()).thenAnswer(invocation -> Optional.ofNullable(neptuneStorageMode));
 
         when(storageFactory.create(anyString(), anyString(), any()))
                 .thenAnswer(inv -> {
@@ -86,7 +107,7 @@ class NeptuneServiceTest {
                     }
                     return store;
                 });
-        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString()))
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
                 .thenReturn(new NeptuneContainerHandle("cid", "c", "localhost", 8182));
         doNothing().when(proxyManager).startProxy(anyString(), anyInt(), anyString(), anyInt());
 
@@ -94,8 +115,95 @@ class NeptuneServiceTest {
     }
 
     @Test
+    void duplicateCreateDuringProvisioningCannotStartOrCleanUpTheOwner() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch finish = new CountDownLatch(1);
+        AtomicInteger launches = new AtomicInteger();
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
+                .thenAnswer(call -> {
+                    if (launches.incrementAndGet() != 1) {
+                        throw new ConflictException("The first create owns this container name");
+                    }
+                    started.countDown();
+                    assertTrue(finish.await(5, TimeUnit.SECONDS), "The test must release backend startup");
+                    return new NeptuneContainerHandle("owner-container", "shared", "localhost", 8182);
+                });
+
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<NeptuneCluster> owner = executor.submit(
+                    () -> service.createDbCluster("shared", "1.3.2.1", false));
+            try {
+                assertTrue(started.await(5, TimeUnit.SECONDS), "The first create must enter backend startup");
+                AwsException duplicate = assertThrows(AwsException.class,
+                        () -> service.createDbCluster("shared", "1.3.2.1", false));
+                assertEquals("DBClusterAlreadyExistsFault", duplicate.getErrorCode());
+                verify(containerManager, times(1)).tryStart(
+                        anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any());
+                verify(containerManager, never()).stopByClusterId(anyString());
+                verify(proxyManager, never()).stopProxy(anyString());
+            } finally {
+                finish.countDown();
+            }
+            assertEquals("owner-container", owner.get(5, TimeUnit.SECONDS).getContainerId());
+            assertEquals("owner-container", service.getDbCluster("shared").getContainerId());
+        }
+    }
+
+    @Test
+    void aClusterKeepsItsGraphInAVolumeOfItsOwnWhenNeptuneKeepsItsRecords() {
+        storageMode = "persistent";
+
+        String first = service.createDbCluster("first", null, false).getVolumeId();
+        String second = service.createDbCluster("second", null, false).getVolumeId();
+
+        assertNotNull(first);
+        assertNotEquals(first, second);
+        assertEquals(first, service.getDbCluster("first").getVolumeId());
+        verify(containerManager).tryStart(eq("first"), anyString(), eq(NeptuneDbType.GREMLIN), eq("000000000000"),
+                eq("us-east-1"), eq(first));
+        service.deleteDbCluster("first");
+        verify(containerManager).removeStorage(first);
+        verify(containerManager, never()).discardStorage(any());
+        String recreated = service.createDbCluster("first", null, false).getVolumeId();
+        assertNotNull(recreated);
+        assertNotEquals(first, recreated);
+    }
+
+    @Test
+    void neptunesOwnStorageModeDecidesWhetherAClusterGetsAVolume() {
+        storageMode = "persistent";
+        neptuneStorageMode = "memory";
+        assertNull(service.createDbCluster("neptune-in-memory", null, false).getVolumeId());
+
+        storageMode = "memory";
+        neptuneStorageMode = "persistent";
+        assertNotNull(service.createDbCluster("neptune-on-disk", null, false).getVolumeId());
+
+        neptuneStorageMode = null;
+        assertNull(service.createDbCluster("all-in-memory", null, false).getVolumeId());
+        verify(containerManager).tryStart(eq("all-in-memory"), anyString(), any(NeptuneDbType.class), anyString(),
+                anyString(), isNull());
+    }
+
+    @Test
+    void aFailedCreateDiscardsTheVolumeMadeForIt() {
+        storageMode = "persistent";
+        doThrow(new IllegalStateException("Backend startup failed")).when(containerManager)
+                .tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any());
+
+        assertThrows(IllegalStateException.class, () -> service.createDbCluster("c", null, false));
+
+        ArgumentCaptor<String> volume = ArgumentCaptor.forClass(String.class);
+        verify(containerManager).tryStart(eq("c"), anyString(), any(NeptuneDbType.class), anyString(), anyString(),
+                volume.capture());
+        assertNotNull(volume.getValue());
+        verify(containerManager).discardStorage(volume.getValue());
+        assertFalse(service.hasCluster("c"));
+    }
+
+    @Test
     void failedCreateReleasesItsIdentifierForAnExplicitRetry() {
-        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString()))
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
                 .thenThrow(new IllegalStateException("Backend startup failed"))
                 .thenReturn(new NeptuneContainerHandle("retry-container", "same", "localhost", 8182));
 
@@ -105,6 +213,49 @@ class NeptuneServiceTest {
         assertEquals("retry-container", recovered.getContainerId());
         assertEquals(18182, recovered.getProxyPort());
         verify(containerManager, times(1)).stopByClusterId("000000000000-us-east-1-same");
+    }
+
+    @Test
+    void pendingCreateDoesNotClaimTheSameNameInAnotherAccountOrRegion() throws Exception {
+        ThreadLocal<String> account = ThreadLocal.withInitial(() -> "000000000000");
+        ThreadLocal<String> region = ThreadLocal.withInitial(() -> "us-east-1");
+        when(regionResolver.getAccountId()).thenAnswer(call -> account.get());
+        when(regionResolver.getRegion()).thenAnswer(call -> region.get());
+        when(regionResolver.buildArn(anyString(), anyString(), anyString()))
+                .thenAnswer(call -> "arn:aws:" + call.getArgument(0) + ":" + call.getArgument(1)
+                        + ":" + account.get() + ":" + call.getArgument(2));
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch finish = new CountDownLatch(1);
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
+                .thenAnswer(call -> {
+                    if ("000000000000".equals(call.getArgument(3)) && "us-east-1".equals(call.getArgument(4))) {
+                        started.countDown();
+                        assertTrue(finish.await(5, TimeUnit.SECONDS), "The test must release backend startup");
+                    }
+                    return new NeptuneContainerHandle(
+                            call.getArgument(3) + "-" + call.getArgument(4), "shared", "localhost", 8182);
+                });
+
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<NeptuneCluster> owner = executor.submit(
+                    () -> service.createDbCluster("shared", "1.3.2.1", false));
+            try {
+                assertTrue(started.await(5, TimeUnit.SECONDS), "The first create must enter backend startup");
+                account.set("111111111111");
+                assertEquals("111111111111-us-east-1",
+                        service.createDbCluster("shared", "1.3.2.1", false).getContainerId());
+                account.set("000000000000");
+                region.set("eu-west-1");
+                assertEquals("000000000000-eu-west-1",
+                        service.createDbCluster("shared", "1.3.2.1", false).getContainerId());
+                verify(containerManager, never()).stopByClusterId(anyString());
+            } finally {
+                finish.countDown();
+                account.remove();
+                region.remove();
+            }
+            assertEquals("000000000000-us-east-1", owner.get(5, TimeUnit.SECONDS).getContainerId());
+        }
     }
 
     @Test
@@ -151,7 +302,7 @@ class NeptuneServiceTest {
     @Test
     void failedProvisioningRollsBackContainerAndReleasesProxyPort() {
         NeptuneContainerHandle handle = new NeptuneContainerHandle("cid", "c", "localhost", 8182);
-        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString()))
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
                 .thenReturn(handle);
 
         // Proxy startup blows up after the port is reserved and the container is started.
@@ -177,7 +328,7 @@ class NeptuneServiceTest {
     @Test
     void jvmErrorDuringProvisioningStillRollsBack() {
         NeptuneContainerHandle handle = new NeptuneContainerHandle("cid", "c", "localhost", 8182);
-        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString()))
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
                 .thenReturn(handle);
 
         // A JVM Error (not a RuntimeException) escapes provisioning — a catch (RuntimeException)
@@ -204,7 +355,7 @@ class NeptuneServiceTest {
         // and (crucially) a readiness timeout, where start() created + registered the container
         // before throwing, so no handle ever reaches the service.
         doThrow(new RuntimeException("readiness boom"))
-                .when(containerManager).tryStart(eq("c"), anyString(), any(NeptuneDbType.class), anyString(), anyString());
+                .when(containerManager).tryStart(eq("c"), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any());
 
         // The original failure must propagate to the caller (we clean up, then rethrow).
         assertThrows(RuntimeException.class,
@@ -217,7 +368,7 @@ class NeptuneServiceTest {
         verify(containerManager).stopByClusterId("000000000000-us-east-1-c");
 
         // The reserved proxy port was still released: a subsequent successful create reuses the base port.
-        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString()))
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
                 .thenReturn(new NeptuneContainerHandle("cid", "c2", "localhost", 8182));
         NeptuneCluster recovered = service.createDbCluster("c2", "1.3.2.1", false);
         assertEquals(18182, recovered.getProxyPort(),
@@ -269,7 +420,7 @@ class NeptuneServiceTest {
         // tryStart() returns null when no Docker daemon is reachable. The cluster record is
         // metadata, so the create still succeeds, the cluster reaches 'available' on the first
         // describe (what SDK/Terraform waiters poll), and no proxy is started.
-        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString())).thenReturn(null);
+        when(containerManager.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any())).thenReturn(null);
 
         NeptuneCluster created = service.createDbCluster("no-docker-cluster", "1.3.2.1", false);
 

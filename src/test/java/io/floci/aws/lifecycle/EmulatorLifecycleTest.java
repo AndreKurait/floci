@@ -16,6 +16,7 @@ import io.floci.aws.services.docdb.DocDbService;
 import io.floci.aws.services.docdb.container.DocDbContainerManager;
 import io.floci.aws.services.dynamodb.DynamoDbRuntime;
 import io.floci.aws.services.ec2.Ec2MetadataServer;
+import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecs.EcsService;
 import io.floci.aws.services.ecs.container.EcsTaskRoleCredentialsServer;
@@ -39,6 +40,7 @@ import io.floci.aws.services.memorydb.MemoryDbService;
 import io.floci.aws.services.memorydb.container.MemoryDbContainerManager;
 import io.floci.aws.services.memorydb.proxy.MemoryDbProxyManager;
 import io.floci.aws.services.mwaa.MwaaService;
+import io.floci.aws.services.neptune.NeptuneService;
 import io.floci.aws.services.neptune.container.NeptuneContainerManager;
 import io.floci.aws.services.neptune.proxy.NeptuneProxyManager;
 import io.floci.aws.services.opensearch.OpenSearchService;
@@ -120,6 +122,8 @@ class EmulatorLifecycleTest {
     @Mock private DocDbContainerManager docDbContainerManager;
     @Mock private NeptuneContainerManager neptuneContainerManager;
     @Mock private NeptuneProxyManager neptuneProxyManager;
+    @Mock private NeptuneService neptuneService;
+    @Mock private EmulatorConfig.NeptuneServiceConfig neptuneServiceConfig;
     @Mock private RabbitMqManager rabbitMqManager;
     @Mock private FlinkContainerManager flinkContainerManager;
     @Mock private RdsService rdsService;
@@ -149,6 +153,7 @@ class EmulatorLifecycleTest {
     @Mock private DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     @Mock private PipesService pipesService;
     @Mock private Ec2MetadataServer ec2MetadataServer;
+    @Mock private Ec2Service ec2Service;
     @Mock private EcsTaskRoleCredentialsServer ecsTaskRoleCredentialsServer;
     @Mock private EcrRegistryManager ecrRegistryManager;
     @Mock private FlociUiManager flociUiManager;
@@ -195,6 +200,8 @@ class EmulatorLifecycleTest {
         Mockito.lenient().when(servicesConfig.mwaa()).thenReturn(mwaaServiceConfig);
         Mockito.lenient().when(mwaaServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.docdb()).thenReturn(docDbServiceConfig);
+        Mockito.lenient().when(servicesConfig.neptune()).thenReturn(neptuneServiceConfig);
+        Mockito.lenient().when(neptuneServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(docDbServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.amazonmq()).thenReturn(amazonMqServiceConfig);
         Mockito.lenient().when(amazonMqServiceConfig.enabled()).thenReturn(false);
@@ -214,13 +221,14 @@ class EmulatorLifecycleTest {
                 elastiCacheContainerManager, elastiCacheMemcachedContainerManager,
                 elastiCacheProxyManager, rdsContainerManager, rdsProxyManager,
                 memoryDbContainerManager, memoryDbProxyManager, memoryDbService,
-                docDbContainerManager, docDbService, neptuneContainerManager, neptuneProxyManager,
+                docDbContainerManager, docDbService, neptuneContainerManager, neptuneProxyManager, neptuneService,
                 rabbitMqManager, amazonMqService, flinkContainerManager, kinesisAnalyticsService,
                 openSearchService, mwaaService,
                 sageMakerService, rdsService, timestreamInfluxDbService,
                 elbV2Service, elbClassicService, ecsService,
                 initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller,
-                pipesService, ec2MetadataServer, ecsTaskRoleCredentialsServer, ecrRegistryManager, flociUiManager, initLifecycleState,
+                pipesService, ec2MetadataServer, ec2Service, ecsTaskRoleCredentialsServer,
+                ecrRegistryManager, flociUiManager, initLifecycleState,
                 schemaCreationWorker, stepFunctionsService, durableExecutionService, containerTeardowns,
                 persistentPathValidator,
                 dynamoDbRuntime, redshiftZeroEtlConsumer, eksService, codeArtifactService,
@@ -273,6 +281,24 @@ class EmulatorLifecycleTest {
         inOrder.verify(iamService).sweepOrphanedLambdaExecutionRoleSessions();
         inOrder.verify(iamService).sweepOrphanedEc2InstanceSessions();
         inOrder.verify(rdsService).restorePersistedRuntime();
+        verify(ec2Service, never()).restoreVpcNetworks();
+    }
+
+    @Test
+    void restoresNativeVpcPlansAfterStorageAndBeforeLoadBalancersAndTasks() {
+        stubStorageConfig();
+        when(ec2ServiceConfig.enabled()).thenReturn(true);
+        when(elbv2ServiceConfig.enabled()).thenReturn(true);
+        when(ecsServiceConfig.enabled()).thenReturn(true);
+        when(ec2MetadataServer.start()).thenReturn(CompletableFuture.completedFuture(null));
+
+        emulatorLifecycle.onStart(new StartupEvent());
+
+        InOrder order = Mockito.inOrder(storageFactory, ec2Service, elbV2Service, ecsService);
+        order.verify(storageFactory).loadAll();
+        order.verify(ec2Service).restoreVpcNetworks();
+        order.verify(elbV2Service).restorePersistedRuntime();
+        order.verify(ecsService).restorePersistedRuntime();
     }
 
     @Test
@@ -693,6 +719,48 @@ class EmulatorLifecycleTest {
     }
 
     @Test
+    void restoresPersistedNeptuneClustersAfterStorageLoad() {
+        stubStorageConfig();
+        when(neptuneServiceConfig.enabled()).thenReturn(true);
+        when(neptuneService.restorePersistedRuntime()).thenReturn(CompletableFuture.completedFuture(null));
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        InOrder inOrder = Mockito.inOrder(storageFactory, neptuneService);
+        inOrder.verify(storageFactory).loadAll();
+        inOrder.verify(neptuneService).restorePersistedRuntime();
+    }
+
+    @Test
+    void aFailedNeptuneRestoreDoesNotStopTheOtherRestores() {
+        stubStorageConfig();
+        when(neptuneServiceConfig.enabled()).thenReturn(true);
+        when(elbv2ServiceConfig.enabled()).thenReturn(true);
+        when(neptuneService.restorePersistedRuntime()).thenReturn(CompletableFuture.failedFuture(
+                new IllegalStateException("Could not restore Neptune cluster demo")));
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        verify(elbV2Service).restorePersistedRuntime();
+        verify(initLifecycleState).markReadyCompleted();
+    }
+
+    @Test
+    void leavesNeptuneClustersUntouchedWhenNeptuneIsDisabled() {
+        stubStorageConfig();
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        verify(neptuneService, never()).restorePersistedRuntime();
+    }
+
+    @Test
     void leavesDocDbClustersUntouchedWhenDocDbIsDisabled() {
         stubStorageConfig();
         when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
@@ -1044,8 +1112,11 @@ class EmulatorLifecycleTest {
         // shutdown can't be cut off by the SIGTERM grace window before data is persisted
         // (regression guard for issue #1521). shutdownAll() still runs last to stop the flush
         // schedulers and capture any shutdown-time writes.
-        InOrder inOrder = Mockito.inOrder(storageFactory, rdsContainerManager, elastiCacheContainerManager);
+        InOrder inOrder = Mockito.inOrder(storageFactory, rdsService, rdsProxyManager, rdsContainerManager,
+                elastiCacheContainerManager);
         inOrder.verify(storageFactory).flushAll();
+        inOrder.verify(rdsService).shutdownInstanceStarts();
+        inOrder.verify(rdsProxyManager).stopAll();
         inOrder.verify(elastiCacheContainerManager).stopAll();
         inOrder.verify(rdsContainerManager).stopAll();
         inOrder.verify(storageFactory).shutdownAll();

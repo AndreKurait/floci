@@ -14,6 +14,7 @@ import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.exception.NotModifiedException;
+import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Container;
@@ -25,12 +26,14 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
+import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.floci.aws.config.ContainerCaBundle;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.EmulatorConfig.EcsServiceConfig.ImagePullBehavior;
+import io.floci.aws.core.common.ContainerTeardown;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
 import io.floci.aws.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.quarkus.runtime.annotations.RegisterForReflection;
@@ -66,7 +69,7 @@ import java.util.regex.Pattern;
  * Consolidates common container management patterns used across Floci services.
  */
 @ApplicationScoped
-public class ContainerLifecycleManager {
+public class ContainerLifecycleManager implements ContainerTeardown {
 
     private static final Logger LOG = Logger.getLogger(ContainerLifecycleManager.class);
 
@@ -99,9 +102,12 @@ public class ContainerLifecycleManager {
     private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
     private final long archiveRetryBackoffMillis;
+    private final RemovalWait removalWait;
     private final LongSupplier nanoTime;
     private final CreateWait createWait;
+    private final ContainerInternalDns internalDns;
     private final GelfLogListener gelfLogListener;
+    private final SshDockerEndpoint sshEndpoint;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -118,10 +124,11 @@ public class ContainerLifecycleManager {
                                      ImageCacheService imageCacheService,
                                      ContainerDetector containerDetector,
                                      EmulatorConfig config,
-                                     GelfLogListener gelfLogListener) {
+                                     GelfLogListener gelfLogListener,
+                                     SshDockerEndpoint sshEndpoint) {
         this(dockerClient, streamingDockerClient, imageCacheService, containerDetector, config,
-                RetryingTarCopier.DEFAULT_BACKOFF_MS, System::nanoTime, TimeUnit.NANOSECONDS::sleep,
-                gelfLogListener);
+                RetryingTarCopier.DEFAULT_BACKOFF_MS, WaitContainerResultCallback::awaitCompletion,
+                System::nanoTime, TimeUnit.NANOSECONDS::sleep, gelfLogListener, sshEndpoint);
     }
 
     public ContainerLifecycleManager(DockerClient dockerClient,
@@ -130,7 +137,32 @@ public class ContainerLifecycleManager {
                                      ContainerDetector containerDetector,
                                      EmulatorConfig config) {
         this(dockerClient, streamingDockerClient, imageCacheService, containerDetector, config,
-                GelfLogListener.disabled());
+                GelfLogListener.disabled(), SshDockerEndpoint.none());
+    }
+
+    public ContainerLifecycleManager(DockerClient dockerClient,
+                                     DockerClient streamingDockerClient,
+                                     ImageCacheService imageCacheService,
+                                     ContainerDetector containerDetector,
+                                     EmulatorConfig config,
+                                     GelfLogListener gelfLogListener) {
+        this(dockerClient, streamingDockerClient, imageCacheService, containerDetector, config,
+                gelfLogListener, SshDockerEndpoint.none());
+    }
+
+    public ContainerLifecycleManager(DockerClient dockerClient,
+                                     ImageCacheService imageCacheService,
+                                     ContainerDetector containerDetector,
+                                     EmulatorConfig config) {
+        this(dockerClient, dockerClient, imageCacheService, containerDetector, config, GelfLogListener.disabled());
+    }
+
+    ContainerLifecycleManager(DockerClient dockerClient,
+                              ImageCacheService imageCacheService,
+                              ContainerDetector containerDetector,
+                              EmulatorConfig config,
+                              GelfLogListener gelfLogListener) {
+        this(dockerClient, dockerClient, imageCacheService, containerDetector, config, gelfLogListener);
     }
 
     ContainerLifecycleManager(DockerClient dockerClient,
@@ -139,7 +171,7 @@ public class ContainerLifecycleManager {
                               EmulatorConfig config,
                               long archiveRetryBackoffMillis) {
         this(dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
-                System::nanoTime, TimeUnit.NANOSECONDS::sleep);
+                WaitContainerResultCallback::awaitCompletion);
     }
 
     ContainerLifecycleManager(DockerClient dockerClient,
@@ -149,17 +181,30 @@ public class ContainerLifecycleManager {
                               long archiveRetryBackoffMillis,
                               LongSupplier nanoTime,
                               CreateWait createWait) {
-        this(dockerClient, dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
-                nanoTime, createWait, GelfLogListener.disabled());
+        this(dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
+                WaitContainerResultCallback::awaitCompletion, nanoTime, createWait);
     }
 
     ContainerLifecycleManager(DockerClient dockerClient,
                               ImageCacheService imageCacheService,
                               ContainerDetector containerDetector,
                               EmulatorConfig config,
-                              GelfLogListener gelfLogListener) {
-        this(dockerClient, dockerClient, imageCacheService, containerDetector, config,
-                RetryingTarCopier.DEFAULT_BACKOFF_MS, System::nanoTime, TimeUnit.NANOSECONDS::sleep, gelfLogListener);
+                              long archiveRetryBackoffMillis,
+                              RemovalWait removalWait) {
+        this(dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
+                removalWait, System::nanoTime, TimeUnit.NANOSECONDS::sleep);
+    }
+
+    ContainerLifecycleManager(DockerClient dockerClient,
+                              ImageCacheService imageCacheService,
+                              ContainerDetector containerDetector,
+                              EmulatorConfig config,
+                              long archiveRetryBackoffMillis,
+                              RemovalWait removalWait,
+                              LongSupplier nanoTime,
+                              CreateWait createWait) {
+        this(dockerClient, dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
+                removalWait, nanoTime, createWait, GelfLogListener.disabled(), SshDockerEndpoint.none());
     }
 
     private ContainerLifecycleManager(DockerClient dockerClient,
@@ -168,18 +213,23 @@ public class ContainerLifecycleManager {
                                       ContainerDetector containerDetector,
                                       EmulatorConfig config,
                                       long archiveRetryBackoffMillis,
+                                      RemovalWait removalWait,
                                       LongSupplier nanoTime,
                                       CreateWait createWait,
-                                      GelfLogListener gelfLogListener) {
+                                      GelfLogListener gelfLogListener,
+                                      SshDockerEndpoint sshEndpoint) {
         this.gelfLogListener = gelfLogListener;
+        this.sshEndpoint = sshEndpoint;
         this.dockerClient = dockerClient;
         this.streamingDockerClient = streamingDockerClient;
         this.imageCacheService = imageCacheService;
         this.containerDetector = containerDetector;
         this.config = config;
         this.archiveRetryBackoffMillis = archiveRetryBackoffMillis;
+        this.removalWait = removalWait;
         this.nanoTime = nanoTime;
         this.createWait = createWait;
+        this.internalDns = new ContainerInternalDns(dockerClient, config, archiveRetryBackoffMillis);
     }
 
     // A container created in the log-driver mode dials the listener as it starts, a stopped one adopted
@@ -200,6 +250,26 @@ public class ContainerLifecycleManager {
     @FunctionalInterface
     interface CreateWait {
         void sleep(long nanos) throws InterruptedException;
+    }
+
+    /**
+     * The bounded wait for a removal the daemon already has in progress. Production blocks on the
+     * Docker wait callback for the real duration; a test ends the wait from a timeline it moves.
+     */
+    @FunctionalInterface
+    interface RemovalWait {
+        /** Whether the wait completed within the timeout. */
+        boolean await(WaitContainerResultCallback callback, long timeout, TimeUnit unit) throws InterruptedException;
+    }
+
+    @Override
+    public int teardownOrder() {
+        return 100;
+    }
+
+    @Override
+    public void stopManagedContainers() {
+        internalDns.removeUnusedVolumes();
     }
 
     /**
@@ -235,7 +305,7 @@ public class ContainerLifecycleManager {
 
     /** Starts a disposable container, reclaiming its anonymous volumes if startup fails. */
     public ContainerInfo createAndStartEphemeral(ContainerSpec spec) {
-        return createAndStart(spec, true);
+        return createAndStart(spec, null, true, containerId -> { });
     }
 
     /**
@@ -245,7 +315,17 @@ public class ContainerLifecycleManager {
      * @param platform Docker platform, such as {@code linux/amd64}, or null for the daemon's own
      */
     public ContainerInfo createAndStartEphemeral(ContainerSpec spec, String platform) {
-        return createAndStart(spec, platform, true);
+        return createAndStart(spec, platform, true, containerId -> { });
+    }
+
+    /**
+     * {@link #createAndStartEphemeral(ContainerSpec, String)} that runs {@code beforeStart} on the
+     * created container before it starts, e.g. to join it to additional networks. A failure there
+     * removes the container as a failed start does.
+     */
+    public ContainerInfo createAndStartEphemeral(ContainerSpec spec, String platform,
+                                                 Consumer<String> beforeStart) {
+        return createAndStart(spec, platform, true, beforeStart);
     }
 
     private ContainerInfo createAndStart(ContainerSpec spec, boolean removeAnonymousVolumes) {
@@ -256,6 +336,14 @@ public class ContainerLifecycleManager {
     private ContainerInfo createAndStart(ContainerSpec spec, String platform, boolean removeAnonymousVolumes) {
         String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform);
         return createAndStart(spec, resolvedImage, platform, removeAnonymousVolumes, null);
+    }
+
+    private ContainerInfo createAndStart(ContainerSpec spec, String platform, boolean removeAnonymousVolumes,
+                                         Consumer<String> beforeStart) {
+        String resolvedImage = platform == null
+                ? imageCacheService.ensureImageExists(spec.image())
+                : imageCacheService.ensureImageExists(spec.image(), platform);
+        return createAndStart(spec, resolvedImage, platform, removeAnonymousVolumes, beforeStart);
     }
 
     private ContainerInfo createAndStart(ContainerSpec spec, String resolvedImage, String platform,
@@ -296,6 +384,11 @@ public class ContainerLifecycleManager {
         return imageCacheService.resolveForLaunch(image, behavior, platform);
     }
 
+    public LaunchImage resolveImageForLaunch(String image, ImagePullBehavior behavior, String platform,
+                                             AuthConfig credentials) {
+        return imageCacheService.resolveForLaunch(image, behavior, platform, credentials);
+    }
+
     /**
      * Creates a container without starting it. Use {@link #startCreated} to
      * start it after any pre-start setup (e.g. copying files into the
@@ -306,7 +399,7 @@ public class ContainerLifecycleManager {
      */
     public String create(ContainerSpec spec) {
         String resolvedImage = imageCacheService.ensureImageExists(spec.image());
-        return create(spec, resolvedImage, null);
+        return create(spec, resolvedImage, null, false);
     }
 
     /** Creates a container Docker removes as soon as its process exits. */
@@ -324,6 +417,11 @@ public class ContainerLifecycleManager {
      */
     public String create(ContainerSpec spec, String platform) {
         String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform);
+        return create(spec, resolvedImage, platform);
+    }
+
+    public String create(ContainerSpec spec, String platform, AuthConfig credentials) {
+        String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform, credentials);
         return create(spec, resolvedImage, platform);
     }
 
@@ -368,6 +466,13 @@ public class ContainerLifecycleManager {
         if (autoRemove) {
             hostConfig.withAutoRemove(true);
         }
+        try (ContainerInternalDns.Lease lease = internalDns.configure(spec, resolvedImage, hostConfig)) {
+            return createWithCaBundle(spec, resolvedImage, platform, removeAnonymousVolumes, hostConfig);
+        }
+    }
+
+    private String createWithCaBundle(ContainerSpec spec, String resolvedImage, String platform,
+                                     boolean removeAnonymousVolumes, HostConfig hostConfig) {
         Optional<Path> caBundle = ContainerCaBundle.hostPath(config);
         if (caBundle.isEmpty()) {
             return createContainer(spec, resolvedImage, platform, hostConfig, spec.env());
@@ -423,6 +528,9 @@ public class ContainerLifecycleManager {
         }
         if (spec.entrypoint() != null && !spec.entrypoint().isEmpty()) {
             createCmd.withEntrypoint(spec.entrypoint());
+        }
+        if (spec.linuxOptions().stopSignal() != null) {
+            createCmd.withStopSignal(spec.linuxOptions().stopSignal());
         }
         if (spec.workingDir() != null && !spec.workingDir().isBlank()) {
             createCmd.withWorkingDir(spec.workingDir());
@@ -525,15 +633,24 @@ public class ContainerLifecycleManager {
                 try {
                     existing = findByNameStrict(spec.name());
                 } catch (RuntimeException lookupFailure) {
-                    // An unreadable inventory is not evidence that creation is still pending.
+                    // An unreadable inventory is not evidence that creation is still pending. The
+                    // stall that lost the create response can make the full list fail while the one
+                    // name still inspects, so adopt this call's own container if the name shows it.
                     e.addSuppressed(lookupFailure);
+                    Optional<String> own = ownContainerNamed(spec.name(), spec, createAttemptId);
+                    if (own.isPresent() && !Thread.currentThread().isInterrupted()) {
+                        LOG.infov("Create for {0} hit a name conflict and listing containers failed; "
+                                + "inspecting the name found this call''s container, adopting {1}",
+                                spec.name(), own.get());
+                        return own.get();
+                    }
                     throw e;
                 }
                 if (Thread.currentThread().isInterrupted()) {
                     break;
                 }
                 if (existing.isPresent()) {
-                    if (matchesSpec(existing.get(), spec, createAttemptId)) {
+                    if (matchesSpec(existing.get().getLabels(), spec, createAttemptId)) {
                         LOG.infov("Create for {0} hit a name conflict; an earlier attempt''s response "
                                 + "was lost but the container exists, adopting {1}",
                                 spec.name(), existing.get().getId());
@@ -665,17 +782,37 @@ public class ContainerLifecycleManager {
      * one part of the label set a different concurrent call could never coincidentally reproduce,
      * and on its own sufficient proof of ownership.
      *
-     * <p>Deliberately does NOT compare the image. The list API reports {@code getImage()} as an
-     * image ID/digest rather than the tag once that tag has been re-pulled, retagged, or removed, so
+     * <p>Deliberately does NOT compare the image. Docker reports a container's image as an image
+     * ID/digest rather than the tag once that tag has been re-pulled, retagged, or removed, so
      * a tag comparison would reject this call's own container and leak it untracked, the failure
      * this recovery exists to prevent, arising precisely under the daemon churn that makes a lost
      * create response likely. The attempt-id match already excludes every foreign container.
      */
-    private boolean matchesSpec(Container existing, ContainerSpec spec, String createAttemptId) {
+    private boolean matchesSpec(Map<String, String> actualLabels, ContainerSpec spec, String createAttemptId) {
         Map<String, String> expectedLabels = mergedLabels(spec.labels());
         expectedLabels.put(CREATE_ATTEMPT_LABEL, createAttemptId);
-        Map<String, String> actualLabels = existing.getLabels();
         return actualLabels != null && actualLabels.entrySet().containsAll(expectedLabels.entrySet());
+    }
+
+    /**
+     * The id of this call's own container under {@code name}, found by inspecting the name itself:
+     * one read that the transport replays like any other, so it can still answer when listing every
+     * container fails. Empty when the name is absent, foreign or cannot be inspected; an inspect
+     * failure is logged rather than suppressed, because the list failure already explains the conflict.
+     */
+    private Optional<String> ownContainerNamed(String name, ContainerSpec spec, String createAttemptId) {
+        try {
+            InspectContainerResponse inspect = dockerClient.inspectContainerCmd(name).exec();
+            ContainerConfig containerConfig = inspect.getConfig();
+            Map<String, String> labels = containerConfig == null ? null : containerConfig.getLabels();
+            return matchesSpec(labels, spec, createAttemptId) ? Optional.ofNullable(inspect.getId()) : Optional.empty();
+        } catch (NotFoundException e) {
+            return Optional.empty();
+        } catch (RuntimeException e) {
+            LOG.warnv("Create for {0} hit a name conflict, and inspecting that name failed: {1}",
+                    name, e.getMessage());
+            return Optional.empty();
+        }
     }
 
     /**
@@ -688,6 +825,7 @@ public class ContainerLifecycleManager {
     public ContainerInfo startCreated(String containerId, ContainerSpec spec) {
         startContainer(containerId);
         LOG.infov("Started container {0}", containerId);
+
 
         if (spec.networkMode() != null && !spec.networkMode().isBlank()
                 && connectsAfterStart(spec) && !spec.hasNetworkConfiguration()) {
@@ -789,7 +927,11 @@ public class ContainerLifecycleManager {
      *        SIGTERM before Docker sends SIGKILL. Must be a non-negative integer.
      */
     public void stopAndRemove(String containerId, Closeable logStream, int stopTimeoutSeconds) {
-        boolean stoppedOrMissing = stop(containerId, stopTimeoutSeconds);
+        stopAndRemoveAdmitted(containerId, logStream, stopTimeoutSeconds);
+    }
+
+    private void stopAndRemoveAdmitted(String containerId, Closeable logStream, int stopTimeoutSeconds) {
+        boolean stoppedOrMissing = stopAdmitted(containerId, stopTimeoutSeconds);
         readLastLogLines(logStream);
 
         // Force removal is the recovery path when Docker could not stop the container cleanly. It also
@@ -839,6 +981,10 @@ public class ContainerLifecycleManager {
      * @return whether the container is stopped or already missing
      */
     public boolean stop(String containerId, int stopTimeoutSeconds) {
+        return stopAdmitted(containerId, stopTimeoutSeconds);
+    }
+
+    private boolean stopAdmitted(String containerId, int stopTimeoutSeconds) {
         LOG.infov("Stopping container {0}", containerId);
         try {
             dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
@@ -903,9 +1049,27 @@ public class ContainerLifecycleManager {
         }
     }
 
+    /** Reports a confirmed stop before removal or log draining can block. */
+    public boolean stopAndConfirmRemoved(String containerId, Closeable logStream, int stopTimeoutSeconds,
+                                         boolean removeAnonymousVolumes, Runnable onStopped) {
+        try {
+            stopAndRemoveStrict(containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes, onStopped);
+            return true;
+        } catch (RuntimeException e) {
+            LOG.warnv("Container {0} was not confirmed removed: {1}", containerId, e.getMessage());
+            return false;
+        }
+    }
+
     /** Strict teardown that can also reclaim the container's anonymous volumes. */
     public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds,
                                      boolean removeAnonymousVolumes) {
+        stopAndRemoveStrict(containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes, () -> { });
+    }
+
+    /** Strict teardown with a notification as soon as the container cannot send more traffic. */
+    public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds,
+                                    boolean removeAnonymousVolumes, Runnable onStopped) {
         LOG.infov("Stopping container {0}", containerId);
 
         Exception stopFailure = null;
@@ -913,6 +1077,7 @@ public class ContainerLifecycleManager {
             dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
         } catch (NotFoundException e) {
             LOG.debugv("Container {0} not found (already removed)", containerId);
+            onStopped.run();
             closeLogStreamIfPresent(logStream);
             return;
         } catch (NotModifiedException e) {
@@ -921,6 +1086,9 @@ public class ContainerLifecycleManager {
         } catch (Exception e) {
             stopFailure = e;
             LOG.warnv("Error stopping container {0}: {1}", containerId, e.getMessage());
+        }
+        if (stopFailure == null) {
+            onStopped.run();
         }
         readLastLogLines(logStream);
 
@@ -934,6 +1102,8 @@ public class ContainerLifecycleManager {
         } catch (NotFoundException e) {
             // Already gone, so cleanup succeeded.
         } catch (Exception e) {
+            // Daemon AutoRemove may finish despite an explicit remove error. Only an
+            // authoritative absence permits the caller to retire runtime credentials.
             boolean absent = presenceOf(containerId) == ContainerPresence.ABSENT;
             if (!absent && e instanceof ConflictException) {
                 absent = awaitConcurrentRemoval(containerId);
@@ -949,6 +1119,9 @@ public class ContainerLifecycleManager {
             }
             LOG.debugv("Container {0} is absent after its removal response failed", containerId);
         }
+        if (stopFailure != null) {
+            onStopped.run();
+        }
         // Closed only once the container is stopped and gone, as in stopAndRemove, so the follower
         // can drain the final tail.
         closeLogStreamIfPresent(logStream);
@@ -957,14 +1130,14 @@ public class ContainerLifecycleManager {
     private boolean awaitConcurrentRemoval(String containerId) {
         try (WaitContainerResultCallback callback = new WaitContainerResultCallback()) {
             dockerClient.waitContainerCmd(containerId).withCondition(WaitContainerCondition.REMOVED).exec(callback);
-            callback.awaitCompletion(5, TimeUnit.SECONDS);
+            removalWait.await(callback, 5, TimeUnit.SECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             LOG.debugv("Interrupted waiting for container {0} removal", containerId);
             return false;
         } catch (Exception e) {
-            // Removal can finish before the wait registers, or the wait transport can fail.
-            // In either case, inspect must confirm absence before cleanup succeeds.
+            // AutoRemove can finish before the wait registers, or the wait transport can fail.
+            // In either case, inspect still has to confirm absence before ownership is released.
             LOG.debugv("Could not await container {0} removal: {1}", containerId, e.getMessage());
         }
         return presenceOf(containerId) == ContainerPresence.ABSENT;
@@ -1511,7 +1684,10 @@ public class ContainerLifecycleManager {
         try {
             InspectContainerResponse.ContainerState state =
                     dockerClient.inspectContainerCmd(containerId).exec().getState();
-            boolean running = state != null && Boolean.TRUE.equals(state.getRunning());
+            Boolean running = state != null ? state.getRunning() : null;
+            if (running == null) {
+                return ContainerPresence.UNKNOWN;
+            }
             return running ? ContainerPresence.RUNNING : ContainerPresence.STOPPED;
         } catch (NotFoundException e) {
             return ContainerPresence.ABSENT;
@@ -1679,9 +1855,8 @@ public class ContainerLifecycleManager {
     /**
      * Like {@link #resolveEndpoint(String, int)}, but prefers the container's address on
      * {@code preferredNetwork}, as {@link #createAndStart} does with the spec's network. A
-     * container that publishes ports is created on the default bridge and connected to its
-     * service network after start, so without a preference the bridge address, which Floci
-     * usually cannot reach, can be returned instead.
+     * container attached to several networks must be reached through its service network,
+     * rather than whichever address Docker happens to list first.
      */
     public EndpointInfo resolveEndpoint(String containerId, int containerPort, String preferredNetwork) {
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
@@ -1838,13 +2013,37 @@ public class ContainerLifecycleManager {
     }
 
     private HostConfig buildHostConfig(ContainerSpec spec) {
-        HostConfig hostConfig = HostConfig.newHostConfig();
+        // Lambda output and exit streams are registered before start; the daemon can therefore
+        // finish removing their captured runtime IDs even after Floci's shutdown budget expires.
+        // EC2, other services, and the unlabelled code-volume helpers keep their containers.
+        HostConfig hostConfig = HostConfig.newHostConfig().withAutoRemove(
+                "lambda".equals(ContainerStorageHelper.labelValue(spec.labels(), ContainerStorageHelper.SERVICE_LABEL)));
 
         // Privileged mode (required for e.g. k3s containers)
         if (spec.privileged()) {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
+        if (linux.pidsLimit() != null) {
+            hostConfig.withPidsLimit(linux.pidsLimit());
+        }
+        List<String> securityOptions = new ArrayList<>();
+        if (linux.apparmorProfile() != null) {
+            securityOptions.add("apparmor=" + linux.apparmorProfile());
+        }
+        if (linux.noNewPrivileges()) {
+            securityOptions.add("no-new-privileges:true");
+        }
+        if (!securityOptions.isEmpty()) {
+            hostConfig.withSecurityOpts(securityOptions);
+        }
+
+        if (linux.pidMode() != null && !linux.pidMode().isBlank()) {
+            hostConfig.withPidMode(linux.pidMode());
+        }
+        if (!linux.networkSysctls().isEmpty()) {
+            hostConfig.withSysctls(linux.networkSysctls());
+        }
         List<Capability> capDrop = new ArrayList<>();
         List<Capability> capAdd = capabilities(linux.capAdd());
         if ("true".equals(ContainerStorageHelper.labelValue(
@@ -1899,11 +2098,24 @@ public class ContainerLifecycleManager {
         if (spec.hasMemoryLimit()) {
             hostConfig.withMemory(spec.memoryBytes());
         }
+        if (!spec.ulimits().isEmpty()) {
+            hostConfig.withUlimits(spec.ulimits().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(entry -> new Ulimit(entry.getKey(), entry.getValue().soft(), entry.getValue().hard()))
+                    .toArray(Ulimit[]::new));
+        }
         if (linux.memorySwapBytes() != null) {
             hostConfig.withMemorySwap(linux.memorySwapBytes());
         }
         if (linux.memorySwappiness() != null) {
             hostConfig.withMemorySwappiness(linux.memorySwappiness());
+        }
+
+        if (!spec.ulimits().isEmpty()) {
+            hostConfig.withUlimits(spec.ulimits().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(entry -> new Ulimit(entry.getKey(), entry.getValue().soft(), entry.getValue().hard()))
+                    .toArray(Ulimit[]::new));
         }
 
         // CPU quota and weight
@@ -2121,13 +2333,13 @@ public class ContainerLifecycleManager {
     private EndpointInfo resolveEndpoint(InspectContainerResponse inspect, int containerPort,
                                          String preferredNetwork, boolean requireReachable) {
         if (!containerDetector.isRunningInContainer()) {
-            // Native mode: use localhost and the bound host port
+            // Native mode: the bound host port, on the daemon's host
             Map<ExposedPort, Ports.Binding[]> bindings = inspect.getNetworkSettings().getPorts().getBindings();
             Ports.Binding[] binding = bindings.get(ExposedPort.tcp(containerPort));
 
             if (binding != null && binding.length > 0) {
                 int hostPort = Integer.parseInt(binding[0].getHostPortSpec());
-                return new EndpointInfo("localhost", hostPort);
+                return new EndpointInfo(sshEndpoint.publishedPortHost(), hostPort);
             }
             if (requireReachable) {
                 throw new IllegalStateException(
@@ -2160,10 +2372,16 @@ public class ContainerLifecycleManager {
         if (networks != null) {
             // Prefer the configured network so that when the container is on both
             // bridge (default) and the service network, we return the right IP.
-            if (preferredNetwork != null && networks.containsKey(preferredNetwork)) {
-                String ip = networks.get(preferredNetwork).getIpAddress();
-                if (ip != null && !ip.isBlank()) {
-                    return ip;
+            if (preferredNetwork != null) {
+                for (Map.Entry<String, ContainerNetwork> entry : networks.entrySet()) {
+                    ContainerNetwork network = entry.getValue();
+                    if (network != null && (preferredNetwork.equals(entry.getKey())
+                            || preferredNetwork.equals(network.getNetworkID()))) {
+                        String ip = network.getIpAddress();
+                        if (ip != null && !ip.isBlank()) {
+                            return ip;
+                        }
+                    }
                 }
             }
             // Fall back to any network

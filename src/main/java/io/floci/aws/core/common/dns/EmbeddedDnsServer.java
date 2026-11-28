@@ -3,11 +3,14 @@ package io.floci.aws.core.common.dns;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.LocalStackParity;
 import io.floci.aws.config.TlsConfigSource;
+import io.floci.aws.core.common.AwsEndpoints;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.DomainNames;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.DockerBridgeAddress;
+import io.netty.util.NetUtil;
 import io.quarkus.runtime.Startup;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
@@ -15,14 +18,22 @@ import io.vertx.core.WorkerExecutor;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
+import io.vertx.core.net.NetServer;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.DatagramPacket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
@@ -34,19 +45,22 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.SequencedSet;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Embedded UDP/53 DNS server that is injected into every spawned container (Lambda, RDS,
+ * Embedded UDP/TCP DNS server that is injected into every spawned container (Lambda, RDS,
  * ElastiCache) as their DNS resolver.
  *
  * Resolves *.{floci.hostname} (and any configured extra-suffixes) to Floci's own
@@ -54,8 +68,8 @@ import java.util.regex.Pattern;
  * inside Lambda containers without requiring wildcard Docker aliases.
  *
  * When floci.dns.spoof-aws-endpoints is enabled, every AWS partition suffix and all of its
- * subdomains resolve to Floci's IP as well (transparent endpoint injection), so
- * clients built with explicit real-AWS endpoints land on the emulator.
+ * subdomains resolve to Floci as well. With public AWS API routing enabled, known VPC
+ * clients receive the managed public destination, so their native routes still govern access.
  *
  * Also answers for any name a {@link DnsRecordSource} owns, which is how a service that holds
  * a private DNS zone (Cloud Map) gets real records rather than only API responses.
@@ -101,6 +115,9 @@ public class EmbeddedDnsServer {
     private static final int FORWARD_POOL_SIZE = 8;
     public static final String DEFAULT_SUFFIX = "localhost.floci.io";
     public static final String LOCALSTACK_SUFFIX = "localhost.localstack.cloud";
+    private static final Pattern EC2_PUBLIC_DNS_NAME =
+            Pattern.compile("^ec2-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.(?:compute-1|((?:[a-z0-9]+-)+\\d+)\\.compute)\\.[a-z0-9.-]+$",
+                    Pattern.CASE_INSENSITIVE);
     private static final Pattern EC2_PRIVATE_DNS_NAME =
             Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.(?:ec2|((?:[a-z0-9]+-)+\\d+)\\.compute)\\.internal$",
                     Pattern.CASE_INSENSITIVE);
@@ -114,13 +131,19 @@ public class EmbeddedDnsServer {
 
     private volatile String serverIp;
     private final SequencedSet<String> suffixes = new LinkedHashSet<>();
+    private List<String> authoritativeSuffixes = List.of();
     private volatile List<String> upstreamDnsServers = List.of();
     private volatile WorkerExecutor forwardPool;
+    private final List<Listeners> listeners = new CopyOnWriteArrayList<>();
     // Held as the Iterable a CDI Instance already is, so iterating resolves the beans lazily on
     // the packet path rather than at startup, where a source's storage must not be touched yet.
     private final Iterable<DnsRecordSource> recordSources;
     private final Iterable<DnsForwardingRuleSource> forwardingRuleSources;
     private final Iterable<DnsClientVpcSource> clientVpcSources;
+
+    private boolean publicAwsApi;
+    private List<String> publicApiHosts = List.of();
+    private PublicApiDnsResponse publicApiDnsResponse;
 
     EmbeddedDnsServer(List<String> suffixes) {
         this(suffixes, List.of());
@@ -166,28 +189,93 @@ public class EmbeddedDnsServer {
         this.clientVpcSources = clientVpcSources;
     }
 
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, publicAwsApi, List.of());
+    }
+
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi, List<String> publicApiHosts) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, publicAwsApi, publicApiHosts, null);
+    }
+
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources, boolean publicAwsApi,
+                      List<String> publicApiHosts, String publicUpstream) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources);
+        this.publicAwsApi = publicAwsApi;
+        this.publicApiHosts = publicApiHosts.stream().map(EmbeddedDnsServer::publicEndpointHost).distinct().toList();
+        if (publicAwsApi) {
+            this.suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+            publicApiDnsResponse = publicUpstream == null ? null : new PublicApiDnsResponse(publicUpstream);
+        }
+    }
+
     @Inject
     public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
                              Instance<DnsRecordSource> recordSources,
                              Instance<DnsForwardingRuleSource> forwardingRuleSources,
                              Instance<DnsClientVpcSource> clientVpcSources,
-                             CurrentContainerNetworkResolver currentContainer,
-                             DockerBridgeAddress dockerBridge) {
+                             CurrentContainerNetworkResolver networkResolver, DockerBridgeAddress dockerBridge) {
+        this(config, containerDetector, vertx, recordSources, forwardingRuleSources, clientVpcSources,
+                networkResolver, dockerBridge, DNS_PORT);
+    }
+
+    public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
+                             Instance<DnsRecordSource> recordSources,
+                             Instance<DnsForwardingRuleSource> forwardingRuleSources,
+                             Instance<DnsClientVpcSource> clientVpcSources,
+                             CurrentContainerNetworkResolver networkResolver) {
+        this(config, containerDetector, vertx, recordSources, forwardingRuleSources, clientVpcSources,
+                networkResolver, new DockerBridgeAddress(), DNS_PORT);
+    }
+
+    EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
+                      Iterable<DnsRecordSource> recordSources,
+                      Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                      Iterable<DnsClientVpcSource> clientVpcSources,
+                      CurrentContainerNetworkResolver networkResolver, int port) {
+        this(config, containerDetector, vertx, recordSources, forwardingRuleSources, clientVpcSources,
+                networkResolver, null, port);
+    }
+
+    private EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
+                               Iterable<DnsRecordSource> recordSources,
+                               Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                               Iterable<DnsClientVpcSource> clientVpcSources,
+                               CurrentContainerNetworkResolver networkResolver, DockerBridgeAddress dockerBridge,
+                               int port) {
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
+        authoritativeSuffixes = config.dns().authoritativeSuffixes().orElse(List.of()).stream()
+                .map(EmbeddedDnsServer::authoritativeSuffix).distinct().toList();
+        boolean explicit = config.dns().listenAddress().isPresent();
         try {
+            if (explicit) {
+                prepare(config);
+                startListeners(vertx, resolveServerIp(config, networkResolver), port);
+                return;
+            }
             if (containerDetector.isRunningInContainer()) {
                 prepare(config);
                 if (config.dns().hostPort().isPresent()) {
                     LOG.info("floci.dns.host-port only applies when Floci runs natively; "
-                            + "publish port 53/udp of the Floci container instead");
+                            + "publish port 53/udp and 53/tcp of the Floci container instead");
                 }
-                listenForContainers(vertx, ownAddress(currentContainer), false);
+                if (port == DNS_PORT) {
+                    listenForContainers(vertx, ownAddress(networkResolver), false);
+                } else {
+                    startListeners(vertx, resolveServerIp(config, networkResolver), port);
+                }
                 return;
             }
             OptionalInt hostPort = config.dns().hostPort();
-            Optional<String> bridge = config.dns().bridgeListenerEnabled() ? dockerBridge.resolve() : Optional.empty();
+            Optional<String> bridge = config.dns().bridgeListenerEnabled() && dockerBridge != null
+                    ? dockerBridge.resolve() : Optional.empty();
             if (hostPort.isEmpty() && bridge.isEmpty()) {
                 return;
             }
@@ -196,9 +284,54 @@ public class EmbeddedDnsServer {
                 listenForHost(vertx, hostPort.getAsInt());
             }
             bridge.ifPresent(address -> listenForContainers(vertx, address, true));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while starting the embedded DNS listeners", e);
         } catch (Exception e) {
+            if (explicit) {
+                throw new IllegalStateException("Cannot start DNS at floci.dns.listen-address="
+                        + config.dns().listenAddress().orElseThrow(), e);
+            }
             LOG.warnv("Failed to initialize embedded DNS server: {0}", e.getMessage());
         }
+    }
+
+    int listenerPort() {
+        return listeners.isEmpty() ? -1 : listeners.getFirst().udp().localAddress().port();
+    }
+
+    private Listeners startListeners(Vertx vertx, String address, int port) throws Exception {
+        Future<Listeners> opening = listenAll(vertx, address, port);
+        try {
+            return opening.toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
+        } catch (Exception failure) {
+            opening.onSuccess(bound -> {
+                serverIp = null;
+                listeners.remove(bound);
+                bound.close();
+            });
+            throw failure;
+        }
+    }
+
+    static String resolveServerIp(EmulatorConfig config, CurrentContainerNetworkResolver networkResolver)
+            throws UnknownHostException {
+        Optional<String> configured = config.dns().listenAddress();
+        if (configured.isPresent()) {
+            InetAddress address = InetAddress.ofLiteral(configured.get());
+            if (!(address instanceof Inet4Address) || address.isAnyLocalAddress() || address.isMulticastAddress()) {
+                throw new IllegalArgumentException("floci.dns.listen-address must be a concrete local IPv4 address");
+            }
+            return address.getHostAddress();
+        }
+        Optional<String> address = networkResolver.resolveContainerIp();
+        if (address.isPresent()) {
+            return address.get();
+        }
+        if (config.services().dockerNetwork().isPresent()) {
+            throw new IllegalStateException("Cannot resolve the configured services Docker network for DNS");
+        }
+        return InetAddress.getLocalHost().getHostAddress();
     }
 
     private void prepare(EmulatorConfig config) {
@@ -209,6 +342,12 @@ public class EmbeddedDnsServer {
         LocalStackParity.withDnsSuffixes(config.dns().extraSuffixes()).ifPresent(suffixes::addAll);
         if (config.dns().spoofAwsEndpoints()) {
             suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+            publicAwsApi = config.network().vpcRouting().enabled()
+                    && config.network().vpcRouting().publicAwsApi();
+            publicApiHosts = config.network().vpcRouting().publicAwsApiHosts().orElse(List.of()).stream()
+                    .map(EmbeddedDnsServer::publicEndpointHost).distinct().toList();
+            publicApiDnsResponse = publicAwsApi ? config.network().vpcRouting().publicAwsApiUpstreamHost()
+                    .map(PublicApiDnsResponse::new).orElse(null) : null;
             if (shouldWarnSpoofInvisibleToTls(true, TlsConfigSource.tlsEnabledVisibleToTls(),
                     TlsConfigSource.spoofAwsEndpointsVisibleToTls())) {
                 LOG.warnv("floci.dns.spoof-aws-endpoints is set in application config but the TLS certificate only reads it from FLOCI_DNS_SPOOF_AWS_ENDPOINTS or -Dfloci.dns.spoof-aws-endpoints; https:// calls to {0} will fail the handshake until it is set there.", TlsConfigSource.awsEndpointSuffixes());
@@ -217,7 +356,7 @@ public class EmbeddedDnsServer {
     }
 
     private void listenForContainers(Vertx vertx, String address, boolean onDockerBridge) {
-        Future<DatagramSocket> bound = listen(vertx, address, DNS_PORT)
+        Future<Listeners> bound = listenAll(vertx, address, DNS_PORT)
                 .onSuccess(socket -> LOG.infov(
                         "Embedded DNS server started on {0}:53, resolving {1} → {0}", address, suffixes))
                 .onFailure(error -> {
@@ -238,7 +377,7 @@ public class EmbeddedDnsServer {
      * Holds startup until the bind succeeds or fails: until then {@link #getServerIp()} is empty, and a container
      * launched in that window would be created without Floci's resolver and never be given it.
      */
-    private static void awaitBind(Future<DatagramSocket> bound, String address) {
+    private static void awaitBind(Future<Listeners> bound, String address) {
         try {
             bound.toCompletionStage().toCompletableFuture().get(CONTAINER_LISTENER_WAIT_SECONDS, TimeUnit.SECONDS);
         } catch (ExecutionException ignored) {
@@ -257,7 +396,7 @@ public class EmbeddedDnsServer {
             LOG.warnv("Ignoring floci.dns.host-port {0}: not a port between 1 and 65535", String.valueOf(port));
             return;
         }
-        bind(vertx, LOOPBACK, port, false)
+        bindAll(vertx, LOOPBACK, port, false)
                 .onSuccess(socket -> LOG.infov("Embedded DNS server listening for the host on {0}:{1}",
                         LOOPBACK, String.valueOf(port)))
                 .onFailure(error -> LOG.warnv("Embedded DNS server failed to bind on {0}:{1}: {2}",
@@ -287,7 +426,43 @@ public class EmbeddedDnsServer {
             bound.handler(packet -> handleQuery(vertx, bound, packet.data().getBytes(),
                     packet.sender().host(), packet.sender().port(), address, forwardsUnknownNames));
             return bound;
+        }).onFailure(error -> socket.close());
+    }
+
+    record Listeners(DatagramSocket udp, NetServer tcp) {
+        Future<Void> close() {
+            return Future.all(udp.close(), tcp.close()).mapEmpty();
+        }
+    }
+
+    Future<Listeners> listenAll(Vertx vertx, String address, int port) {
+        return bindAll(vertx, address, port, true).map(bound -> {
+            serverIp = address;
+            return bound;
         });
+    }
+
+    Future<Listeners> bindAll(Vertx vertx, String address, int port, boolean forwardsUnknownNames) {
+        return DnsTcpListener.listen(vertx, address, port,
+                        (query, sender) -> answerQuery(vertx, query, sender, address, true, forwardsUnknownNames))
+                .compose(tcp -> bind(vertx, address, tcp.actualPort(), forwardsUnknownNames)
+                        .map(udp -> new Listeners(udp, tcp))
+                        .recover(error -> tcp.close().compose(ignored -> Future.failedFuture(error))))
+                .map(bound -> {
+                    listeners.add(bound);
+                    return bound;
+                });
+    }
+
+    @PreDestroy
+    void stop() {
+        serverIp = null;
+        Future.all(listeners.stream().map(Listeners::close).toList())
+                .toCompletionStage().toCompletableFuture().join();
+        listeners.clear();
+        if (forwardPool != null) {
+            forwardPool.close();
+        }
     }
 
     // ── packet handling ───────────────────────────────────────────────────────
@@ -299,6 +474,14 @@ public class EmbeddedDnsServer {
 
     void handleQuery(Vertx vertx, DatagramSocket socket, byte[] data,
                      String senderHost, int senderPort, String myIp, boolean forwardsUnknownNames) {
+        answerQuery(vertx, data, senderHost, myIp, false, forwardsUnknownNames).onSuccess(response -> {
+            if (response != null) {
+                socket.send(Buffer.buffer(response), senderPort, senderHost);
+            }
+        }).onFailure(error -> LOG.warnv("DNS query failed: {0}", error.getMessage()));
+    }
+
+    private Future<byte[]> answerQuery(Vertx vertx, byte[] data, String senderHost, String myIp, boolean tcp, boolean forwardsUnknownNames) {
         try {
             ByteBuffer buf = ByteBuffer.wrap(data);
             short txId = buf.getShort();
@@ -309,7 +492,7 @@ public class EmbeddedDnsServer {
             buf.getShort(); // arcount
 
             if ((flags & 0x8000) != 0 || qdCount < 1) {
-                return; // not a standard query
+                return Future.succeededFuture(); // not a standard query
             }
 
             int questionOffset = buf.position(); // always 12 for a standard query
@@ -319,40 +502,64 @@ public class EmbeddedDnsServer {
             int questionEnd = buf.position();
             boolean standardQuery = qdCount == 1 && qclass == 1 && (flags & 0x7840) == 0;
 
-            vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype, standardQuery), false)
-                    .onSuccess(plan -> {
+            return vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype, standardQuery), false)
+                    .compose(plan -> {
                         if (plan.answer().isEmpty()) {
-                            if (!plan.ruleTargets().isEmpty()) {
-                                forwardToRuleTargets(vertx, socket, data, senderHost, senderPort,
-                                        plan.ruleTargets(), qname, txId, questionOffset, questionEnd);
-                            } else if (forwardsUnknownNames) {
-                                forwardAsync(vertx, socket, data, senderHost, senderPort);
-                            } else {
-                                byte[] refused = buildPublicResponse(data, txId, questionOffset, questionEnd,
-                                        DnsAnswer.refused());
-                                socket.send(Buffer.buffer(refused), senderPort, senderHost, v -> {});
+                            if (plan.ruleTargets().isEmpty()) {
+                                if (!forwardsUnknownNames) {
+                                    return Future.succeededFuture(buildPublicResponse(data, txId,
+                                            questionOffset, questionEnd, DnsAnswer.refused(), tcp));
+                                }
+                                Future<byte[]> forwarded = forwardAsync(vertx, data, tcp);
+                                return plan.routedUpstream() ? forwarded.map(publicApiDnsResponse::rewrite) : forwarded;
                             }
-                            return;
+                            return forwardToRuleTargets(vertx, data, plan.ruleTargets(), tcp,
+                                    qname, txId, questionOffset, questionEnd);
                         }
                         DnsAnswer records = plan.answer().orElseThrow();
                         if (records.isPublicAuthorityAnswer() && !standardQuery) {
                             records = DnsAnswer.refused();
                         }
                         byte[] response = records.isPublicAuthorityAnswer()
-                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records)
+                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records, tcp)
                                 : !records.isEmpty()
-                                ? buildAResponse(data, txId, questionOffset, questionEnd, records)
+                                ? buildAResponse(data, txId, questionOffset, questionEnd, records, tcp)
                                 : buildEmptyResponse(data, txId, questionOffset, questionEnd,
                                         records.nameExists() ? 0 : 3);
-                        socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {});
-                    })
-                    .onFailure(e -> LOG.warnv("DNS record lookup failed for {0}: {1}", qname, e.getMessage()));
+                        return Future.succeededFuture(response);
+                    });
         } catch (Exception e) {
             LOG.debugv("DNS packet error: {0}", e.getMessage());
+            return Future.succeededFuture();
         }
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * The address this server answers for a name it spoofs, as a client in {@code origin} receives it
+     * (the routed public AWS API address for a VPC client when that routing is on), or empty when the
+     * server does not own the name or does not know its own address. An EC2 public DNS name answers
+     * with the address it carries.
+     */
+    public Optional<String> emulatorAddress(String name, DnsClientVpcSource.ClientVpc origin) {
+        Optional<String> publicInstance = resolveEc2PublicDnsName(name);
+        if (publicInstance.isPresent()) {
+            return publicInstance;
+        }
+        if (!matchesSuffix(name)) {
+            return Optional.empty();
+        }
+        if (publicAwsApi && origin != null && isUsableOrigin(origin) && isAwsEndpointName(name)) {
+            return Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS);
+        }
+        return getServerIp();
+    }
+
+    private static boolean isAwsEndpointName(String name) {
+        String lower = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        return TlsConfigSource.awsEndpointSuffixes().stream().anyMatch(suffix -> DomainNames.isWithin(lower, suffix));
+    }
 
     boolean matchesSuffix(String name) {
         if (name == null || name.isEmpty()) {
@@ -377,13 +584,37 @@ public class EmbeddedDnsServer {
         return resolveRecordWithOwnership(name, myIp, 1);
     }
 
-    /** Only one stored resource may claim an alias target; failures cannot fall through to DNS. */
+    /** Resolves an owned alias using the DNS address bound by this server. */
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        return resolveAliasTargetInVpc(name, hostedZoneId, type, null);
+    }
+
     public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, String listenerAddress) {
+        return firstAliasTarget(name, source -> source.resolveAliasTarget(name, hostedZoneId, type, listenerAddress));
+    }
+
+    public Optional<DnsAnswer> resolveAliasTargetInVpc(String name, String hostedZoneId, int type,
+                                                       DnsClientVpcSource.ClientVpc origin) {
+        return firstAliasTarget(name, source -> source.resolveAliasTargetInVpc(name, hostedZoneId, type, origin));
+    }
+
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, String listenerAddress,
+                                                 DnsClientVpcSource.ClientVpc origin) {
+        return firstAliasTarget(name, source -> source.resolveAliasTarget(name, hostedZoneId, type, listenerAddress, origin));
+    }
+
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                 DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTargetInVpc(name, hostedZoneId, type, origin);
+    }
+
+    /** A lookup failure or competing resource owners must never fall through to ordinary DNS. */
+    private Optional<DnsAnswer> firstAliasTarget(String name, Function<DnsRecordSource, Optional<DnsAnswer>> query) {
         DnsAnswer resolved = null;
         if (recordSources != null) {
             for (DnsRecordSource source : recordSources) {
                 try {
-                    Optional<DnsAnswer> candidate = source.resolveAliasTarget(name, hostedZoneId, type, listenerAddress);
+                    Optional<DnsAnswer> candidate = query.apply(source);
                     if (candidate.isPresent()) {
                         if (resolved != null) {
                             return Optional.of(DnsAnswer.refused());
@@ -400,8 +631,76 @@ public class EmbeddedDnsServer {
         return Optional.ofNullable(resolved);
     }
 
+    /** A declared public front door keeps its routed transport after validating its owned alias. */
+    public Optional<DnsAnswer> resolvePublicAliasTarget(String publicName, String target, String hostedZoneId,
+                                                        int type, DnsClientVpcSource.ClientVpc origin) {
+        return resolvePublicAliasTarget(publicName, target, hostedZoneId, type, getServerIp().orElse(null), origin);
+    }
+
+    public Optional<DnsAnswer> resolvePublicAliasTarget(String publicName, String target, String hostedZoneId,
+                                                        int type, String listenerAddress,
+                                                        DnsClientVpcSource.ClientVpc origin) {
+        Optional<DnsAnswer> resolved = resolveAliasTarget(target, hostedZoneId, type, listenerAddress, origin);
+        String normalized = publicName.toLowerCase(Locale.ROOT);
+        if (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        if (!publicAwsApi || origin != null && !isUsableOrigin(origin) || type != 1
+                || !publicApiHosts.contains(normalized)) {
+            return resolved;
+        }
+        resolved = firstAliasTarget(target,
+                source -> source.resolveDeclaredPublicAliasTarget(target, hostedZoneId, type, listenerAddress, origin));
+        return resolved.map(answer -> {
+            boolean localListener = Optional.ofNullable(listenerAddress).map(address ->
+                    answer.records().equals(List.of(new DnsRecord.Address(1, address)))).orElse(false);
+            boolean nativeAlb = answer.records().equals(List.of(
+                    new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)));
+            boolean ownedListener = answer.responseCode() == 0 && (localListener || nativeAlb);
+            if (ownedListener && origin == null) {
+                return answer.viaUpstream();
+            }
+            if (nativeAlb) {
+                return answer;
+            }
+            return ownedListener ? new DnsAnswer(
+                    List.of(new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS)),
+                    answer.ttlSeconds(), answer.nameExists(), answer.authority(), answer.responseCode()) : answer;
+        });
+    }
+
+    /**
+     * What the record sources answer for a name, ahead of spoofing and upstream DNS, as a direct
+     * query from origin resolves it: stored records first, and the whole answer under an
+     * authoritative suffix. Empty when no source owns the name.
+     */
+    public Optional<DnsAnswer> resolveOwnedName(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, getServerIp().orElse(null), origin);
+        if (hasAuthoritativeSuffix(name)) {
+            return Optional.of(authoritativeAnswer(stored.or(() -> resolveFromRecordSources(name, type, false, getServerIp().orElse(null), origin))
+                    .or(() -> ec2PublicAnswer(name, type))));
+        }
+        return stored;
+    }
+
+    /** The owned API listener remains subject to the caller's ordinary public routing. */
+    public Optional<String> publicApiAddress(DnsClientVpcSource.ClientVpc origin) {
+        return publicAwsApi && origin != null && isUsableOrigin(origin)
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS) : getServerIp();
+    }
+
+    /** A native public ALB keeps its own TLS transport when API traffic uses an external front door. */
+    public Optional<String> publicAlbHttpsAddress(DnsClientVpcSource.ClientVpc origin) {
+        return publicAwsApi && origin != null && isUsableOrigin(origin)
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : getServerIp();
+    }
+
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp);
+        if (hasAuthoritativeSuffix(name)) {
+            return Optional.of(authoritativeAnswer(stored.or(() -> resolveFromRecordSources(name, type, false, myIp))
+                    .or(() -> ec2PublicAnswer(name, type))));
+        }
         if (stored.isPresent()) {
             return stored;
         }
@@ -414,29 +713,34 @@ public class EmbeddedDnsServer {
      * storage: an answer Floci owns, a set of resolvers a rule forwards the query to, or neither,
      * which leaves it to the upstream resolvers.
      */
-    record QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets) {
+    record QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets, boolean routedUpstream) {
 
-        static final QueryPlan UPSTREAM = new QueryPlan(Optional.empty(), List.of());
+        static final QueryPlan UPSTREAM = new QueryPlan(Optional.empty(), List.of(), false);
+        static final QueryPlan ROUTED_UPSTREAM = new QueryPlan(Optional.empty(), List.of(), true);
 
         static QueryPlan answering(DnsAnswer answer) {
-            return new QueryPlan(Optional.of(answer), List.of());
+            return new QueryPlan(Optional.of(answer), List.of(), false);
         }
 
         static QueryPlan forwardingTo(List<DnsForwardingRule.Target> targets) {
-            return new QueryPlan(Optional.empty(), targets);
+            return new QueryPlan(Optional.empty(), targets, false);
         }
     }
 
-    QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
-        return planQuery(name, clientAddress, myIp, type, true);
-    }
-
     /**
+     * Deployment-owned native dependencies answer only the exact currently admitted endpoint.
+     * These explicit pins are authoritative over stored records and resolver forwarding rules.
+     *
+     * <p>
      * Stored public authority answers take precedence over broad emulator suffix spoofing.
      * Other names the emulator itself owns come first, whatever the rules say. Route 53 Resolver does
      * the same for the AWS-internal domains it autodefines system rules for, so that a rule for a
      * broad domain (or for "." itself) cannot send the platform's own names off to a resolver that
      * knows nothing about them.
+     *
+     * <p>The one exception is an AWS endpoint name that a private zone associated with the querying
+     * VPC covers: on AWS that zone answers the VPC ahead of public resolution, which emulator spoofing
+     * stands in for. Floci's own names and EC2 internal names are not affected.
      *
      * <p>A forwarding rule associated with the querying VPC is then applied before Floci resolves
      * the name from a record source, because a Resolver rule takes precedence over a private
@@ -445,27 +749,126 @@ public class EmbeddedDnsServer {
      * the emulator's own name, unless the packet has a shape the zone refuses on its own: more
      * than one question, a class other than IN, or a non-standard opcode or flag.
      */
+    QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
+        return planQuery(name, clientAddress, myIp, type, true);
+    }
+
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type, boolean standardQuery) {
-        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp);
-        Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
+        ClientOrigin clientOrigin = originForClient(clientAddress);
+        if (clientOrigin.conflicting()) {
+            return QueryPlan.answering(DnsAnswer.refused());
+        }
+        Optional<DnsAnswer> control = Optional.empty();
+        for (DnsClientVpcSource source : clientVpcSources) {
+            Optional<DnsAnswer> answer = source.controlDependency(name, type, clientAddress);
+            if (answer.isPresent()) {
+                if (control.isPresent() && !control.equals(answer)) {
+                    return QueryPlan.answering(DnsAnswer.refused());
+                }
+                control = answer;
+            }
+        }
+        if (control.isPresent()) {
+            return QueryPlan.answering(control.orElseThrow());
+        }
+        DnsClientVpcSource.ClientVpc origin = clientOrigin.vpc();
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp, origin);
+        boolean awsEndpointName = isAwsEndpointName(name);
+        boolean routedApi = publicAwsApi && origin != null && awsEndpointName;
+        boolean externalPeer = publicAwsApi && origin == null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT));
+        boolean authoritative = hasAuthoritativeSuffix(name);
+        Optional<DnsAnswer> emulatorName = externalPeer || authoritative ? Optional.empty() : resolveEmulatorName(name,
+                routedApi ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
-            return QueryPlan.answering(emulatorName.orElseThrow());
+            // Spoofing stands in for public resolution. A private zone associated with the querying
+            // VPC answers ahead of public resolution on AWS, including for an AWS endpoint name (how a
+            // VPC is pointed at a centralized endpoint), so it answers here too, and only for that VPC.
+            // Resolver forwarding rules still do not steer an emulator-owned name, as before.
+            Optional<DnsAnswer> vpcScoped = origin == null || !awsEndpointName ? Optional.empty()
+                    : firstAnswer(name, source -> source.resolvePrivate(name, type, origin));
+            return QueryPlan.answering(vpcScoped.orElseGet(emulatorName::orElseThrow));
         }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
         // gated on the record type: the raw query is relayed to the rule's resolvers as it stands.
-        Optional<DnsForwardingRule> rule = matchingRule(name, clientAddress);
+        Optional<DnsForwardingRule> rule = matchingRule(name, origin);
         if (rule.isPresent() && rule.orElseThrow().forwards()) {
             return QueryPlan.forwardingTo(rule.orElseThrow().targets());
         }
         if (standardQuery && matchesSuffix(name) && (type == 1 || type == 28)
-                && stored.filter(answer -> answer.responseCode() == 5).isPresent()) {
+                && emulatorName.isPresent() && stored.filter(answer -> answer.responseCode() == 5).isPresent()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
-        return stored.or(() -> resolveFromRecordSources(name, type))
-                .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
+        Optional<DnsAnswer> resource = stored.or(() -> resolveFromRecordSources(name, type, false, myIp, origin));
+        if (authoritative) {
+            // An EC2 public DNS name is backed by the address it carries, so it still answers inside a scope.
+            return QueryPlan.answering(authoritativeAnswer(resource.or(() -> ec2PublicAnswer(name, type))));
+        }
+        QueryPlan upstream = publicApiDnsResponse != null && origin != null ? QueryPlan.ROUTED_UPSTREAM
+                : QueryPlan.UPSTREAM;
+        return resource
+                .or(() -> publicAwsApi && origin != null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT))
+                        ? Optional.of(type == 1 ? DnsAnswer.records(
+                                List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                                DnsAnswer.DEFAULT_TTL_SECONDS) : DnsAnswer.noData())
+                        : Optional.empty())
+                .map(answer -> answer.upstream() ? upstream : QueryPlan.answering(answer))
+                .orElse(upstream);
+    }
+
+    private boolean hasAuthoritativeSuffix(String name) {
+        String normalized = name.toLowerCase(Locale.ROOT);
+        if (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        String query = normalized;
+        return authoritativeSuffixes.stream().anyMatch(suffix -> DomainNames.isWithin(query, suffix));
+    }
+
+    /** An EC2 public DNS name's own address, in the exact form AwsEndpoints.ec2PublicDns gives it, or empty. */
+    private Optional<DnsAnswer> ec2PublicAnswer(String name, int type) {
+        return resolveEc2PublicDnsName(name).map(address -> type == 1
+                ? DnsAnswer.records(List.of(address), DnsAnswer.DEFAULT_TTL_SECONDS) : DnsAnswer.noData());
+    }
+
+    private static DnsAnswer authoritativeAnswer(Optional<DnsAnswer> resource) {
+        return resource.map(answer -> answer.upstream() ? DnsAnswer.refused() : answer)
+                .orElseGet(DnsAnswer::nxDomain);
+    }
+
+    private static String authoritativeSuffix(String value) {
+        try {
+            return publicEndpointHost(value);
+        } catch (IllegalArgumentException invalid) {
+            throw new IllegalArgumentException("floci.dns.authoritative-suffixes requires exact DNS suffixes", invalid);
+        }
+    }
+
+    private static String publicEndpointHost(String value) {
+        if (value == null) {
+            throw new IllegalArgumentException("Public endpoint host must be an exact DNS name");
+        }
+        String host = value.toLowerCase(Locale.ROOT);
+        if (host.endsWith(".")) {
+            host = host.substring(0, host.length() - 1);
+        }
+        if (host.length() > 253
+                || !host.matches("[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?"
+                        + "(?:\\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*")
+                || NetUtil.isValidIpV4Address(host)
+                || Arrays.stream(host.split("\\.")).anyMatch(label ->
+                        label.length() > 63 || label.startsWith("-") || label.endsWith("-"))) {
+            throw new IllegalArgumentException("Public endpoint host must be an exact DNS name");
+        }
+        return host;
     }
 
     private Optional<DnsAnswer> resolveEmulatorName(String name, String myIp, int type) {
+        // An instance's public DNS name answers with its own address, ahead of any spoofed AWS suffix.
+        Optional<String> publicInstance = resolveEc2PublicDnsName(name);
+        if (publicInstance.isPresent()) {
+            return Optional.of(type == 1 ? DnsAnswer.records(List.of(publicInstance.orElseThrow()),
+                    DnsAnswer.DEFAULT_TTL_SECONDS) : DnsAnswer.noData());
+        }
         if (matchesSuffix(name)) {
             return Optional.of(type == 1 ? DnsAnswer.records(List.of(myIp), DnsAnswer.DEFAULT_TTL_SECONDS)
                     : DnsAnswer.noData());
@@ -481,14 +884,13 @@ public class EmbeddedDnsServer {
      * than allowed to fail the query, which is how {@link #resolveFromRecordSources} treats one too.
      */
     Optional<DnsForwardingRule> matchingRule(String name, String clientAddress) {
-        if (forwardingRuleSources == null || name == null || name.isBlank()) {
+        return matchingRule(name, originForClient(clientAddress).vpc());
+    }
+
+    private Optional<DnsForwardingRule> matchingRule(String name, DnsClientVpcSource.ClientVpc origin) {
+        if (forwardingRuleSources == null || name == null || name.isBlank() || origin == null) {
             return Optional.empty();
         }
-        Optional<DnsClientVpcSource.ClientVpc> clientVpc = vpcForClient(clientAddress);
-        if (clientVpc.isEmpty()) {
-            return Optional.empty();
-        }
-        DnsClientVpcSource.ClientVpc origin = clientVpc.orElseThrow();
         DnsForwardingRule best = null;
         for (DnsForwardingRuleSource source : forwardingRuleSources) {
             try {
@@ -509,23 +911,31 @@ public class EmbeddedDnsServer {
         return Optional.ofNullable(best);
     }
 
-    private Optional<DnsClientVpcSource.ClientVpc> vpcForClient(String clientAddress) {
+    private record ClientOrigin(DnsClientVpcSource.ClientVpc vpc, boolean conflicting) {
+    }
+
+    private ClientOrigin originForClient(String clientAddress) {
         if (clientVpcSources == null || clientAddress == null || clientAddress.isBlank()) {
-            return Optional.empty();
+            return new ClientOrigin(null, false);
         }
+        DnsClientVpcSource.ClientVpc result = null;
         for (DnsClientVpcSource source : clientVpcSources) {
             try {
                 Optional<DnsClientVpcSource.ClientVpc> clientVpc =
                         source.vpcForClient(clientAddress.trim());
                 if (clientVpc != null && clientVpc.isPresent() && isUsableOrigin(clientVpc.orElseThrow())) {
-                    return clientVpc;
+                    DnsClientVpcSource.ClientVpc found = clientVpc.orElseThrow();
+                    if (result != null && !result.equals(found)) {
+                        return new ClientOrigin(null, true);
+                    }
+                    result = found;
                 }
             } catch (Exception e) {
                 LOG.debugv("DNS client VPC source {0} failed for {1}: {2}",
                         source.getClass().getSimpleName(), clientAddress, e.getMessage());
             }
         }
-        return Optional.empty();
+        return new ClientOrigin(result, false);
     }
 
     private static boolean isUsableOrigin(DnsClientVpcSource.ClientVpc clientVpc) {
@@ -548,6 +958,16 @@ public class EmbeddedDnsServer {
 
     private Optional<DnsAnswer> resolveFromRecordSources(
             String name, int type, boolean authoritative, String listenerAddress) {
+        return resolveFromRecordSources(name, type, authoritative, listenerAddress, null);
+    }
+
+    private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative,
+                                                         String listenerAddress, DnsClientVpcSource.ClientVpc origin) {
+        return firstAnswer(name, source -> authoritative
+                ? source.resolveAuthoritative(name, type, listenerAddress, origin) : source.resolve(name, type, origin));
+    }
+
+    private Optional<DnsAnswer> firstAnswer(String name, Function<DnsRecordSource, Optional<DnsAnswer>> query) {
         if (recordSources == null) {
             return Optional.empty();
         }
@@ -558,8 +978,7 @@ public class EmbeddedDnsServer {
         Optional<DnsAnswer> empty = Optional.empty();
         for (DnsRecordSource source : recordSources) {
             try {
-                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type, listenerAddress)
-                        : source.resolve(name, type);
+                Optional<DnsAnswer> answer = query.apply(source);
                 if (answer != null && answer.isPresent()) {
                     if (answer.get().isEmpty()) {
                         if (empty.isEmpty() || (!empty.get().nameExists() && answer.get().nameExists())) {
@@ -606,11 +1025,33 @@ public class EmbeddedDnsServer {
         return response.array();
     }
 
+    /**
+     * The address in an EC2 public DNS name exactly as {@link AwsEndpoints#ec2PublicDns} forms it
+     * ({@code ec2-a-b-c-d.compute-1.amazonaws.com} in us-east-1), as {@code a.b.c.d}.
+     */
+    Optional<String> resolveEc2PublicDnsName(String name) {
+        Matcher matcher = name == null ? null : EC2_PUBLIC_DNS_NAME.matcher(name);
+        if (matcher == null || !matcher.matches()) {
+            return Optional.empty();
+        }
+        String region = matcher.group(5) == null ? "us-east-1" : matcher.group(5); // partition-literal: compute-1 is us-east-1's zone
+        // Only the vendored region catalog owns these names; new regions require a catalog update.
+        if (!AwsRegions.isRegionId(region)) {
+            return Optional.empty();
+        }
+        return addressOf(EC2_PUBLIC_DNS_NAME, name)
+                .filter(address -> AwsEndpoints.ec2PublicDns(address, region).equalsIgnoreCase(name));
+    }
+
     Optional<String> resolveEc2PrivateDnsName(String name) {
+        return addressOf(EC2_PRIVATE_DNS_NAME, name);
+    }
+
+    private static Optional<String> addressOf(Pattern pattern, String name) {
         if (name == null || name.isEmpty()) {
             return Optional.empty();
         }
-        Matcher matcher = EC2_PRIVATE_DNS_NAME.matcher(name);
+        Matcher matcher = pattern.matcher(name);
         if (!matcher.matches()) {
             return Optional.empty();
         }
@@ -679,14 +1120,20 @@ public class EmbeddedDnsServer {
     }
 
     byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        return buildAResponse(query, txId, questionOffset, questionEnd, answer, false);
+    }
+
+    private byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                  DnsAnswer answer, boolean tcp) {
         List<DnsRecord> records = answer.records();
         int questionLength = questionEnd - questionOffset;
         List<byte[]> data = records.stream().map(DnsRecord::data).toList();
         UdpPayload payload = udpPayload(query, questionEnd);
+        int limit = tcp ? DnsTcpListener.MAX_MESSAGE_SIZE : payload.size();
         int responseLength = 12 + questionLength + (payload.edns() ? 11 : 0);
         int answerCount = 0;
         for (byte[] recordData : data) {
-            if (responseLength + 12 + recordData.length > payload.size()) {
+            if (responseLength + 12 + recordData.length > limit) {
                 break;
             }
             responseLength += 12 + recordData.length;
@@ -721,8 +1168,13 @@ public class EmbeddedDnsServer {
     }
 
     byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd, DnsAnswer answer) {
+        return buildPublicResponse(query, txId, questionOffset, questionEnd, answer, false);
+    }
+
+    private byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                       DnsAnswer answer, boolean tcp) {
         if (!answer.isEmpty()) {
-            return buildAResponse(query, txId, questionOffset, questionEnd, answer);
+            return buildAResponse(query, txId, questionOffset, questionEnd, answer, tcp);
         }
         int flags = 0x8000 | (query[2] & 0x79) << 8 | answer.responseCode();
         DnsAnswer.Authority authority = answer.authority();
@@ -734,7 +1186,8 @@ public class EmbeddedDnsServer {
         UdpPayload payload = udpPayload(query, questionEnd);
         int questionLength = questionEnd - questionOffset;
         int length = 12 + questionLength + (payload.edns() ? 11 : 0);
-        boolean fits = length + owner.length + 10 + soa.length <= payload.size();
+        boolean fits = length + owner.length + 10 + soa.length
+                <= (tcp ? DnsTcpListener.MAX_MESSAGE_SIZE : payload.size());
         ByteBuffer response = ByteBuffer.allocate(length + (fits ? owner.length + 10 + soa.length : 0));
         response.putShort(txId).putShort((short) (flags | 0x0400 | (fits ? 0 : 0x0200)));
         response.putShort((short) 1).putShort((short) 0).putShort((short) (fits ? 1 : 0))
@@ -786,18 +1239,15 @@ public class EmbeddedDnsServer {
         }
     }
 
-    private void forwardAsync(Vertx vertx, DatagramSocket socket, byte[] query,
-                              String senderHost, int senderPort) {
+    private Future<byte[]> forwardAsync(Vertx vertx, byte[] query, boolean tcp) {
         List<String> upstreams = upstreamDnsServers;
         if (upstreams.isEmpty()) {
-            return;
+            return Future.succeededFuture();
         }
-        submitForward(forwardPool(vertx), () -> forwardToUpstreams(query, upstreams, DNS_PORT))
-                .onSuccess(response ->
-                        socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {}))
-                .onFailure(e ->
-                        LOG.warnv("DNS forwarding failed on all upstreams {0}: {1}",
-                                upstreams, e.getMessage()));
+        List<DnsForwardingRule.Target> targets = upstreams.stream()
+                .map(upstream -> new DnsForwardingRule.Target(upstream, DNS_PORT)).toList();
+        return submitForward(forwardPool(vertx),
+                () -> tcp ? forwardToTargetsTcp(query, targets) : forwardToTargets(query, targets));
     }
 
     /**
@@ -809,20 +1259,61 @@ public class EmbeddedDnsServer {
      * falling back to the upstream resolvers. The rule said where the name lives, so an upstream
      * answer for it would be the wrong answer, and resolution of every other name is untouched.
      */
-    private void forwardToRuleTargets(Vertx vertx, DatagramSocket socket, byte[] query,
-                                      String senderHost, int senderPort,
-                                      List<DnsForwardingRule.Target> targets, String qname,
+    private Future<byte[]> forwardToRuleTargets(Vertx vertx, byte[] query,
+                                      List<DnsForwardingRule.Target> targets, boolean tcp, String qname,
                                       short txId, int questionOffset, int questionEnd) {
-        submitForward(forwardPool(vertx), () -> forwardToTargets(query, shuffled(targets)))
-                .onSuccess(response ->
-                        socket.send(Buffer.buffer(response), senderPort, senderHost, v -> {}))
-                .onFailure(e -> {
+        return submitForward(forwardPool(vertx), () -> tcp
+                ? forwardToTargetsTcp(query, shuffled(targets)) : forwardToTargets(query, shuffled(targets)))
+                .recover(e -> {
                     LOG.warnv("Resolver rule forwarding for {0} failed on every target {1}: {2}",
                             qname, targets, e.getMessage());
-                    socket.send(Buffer.buffer(
-                                    buildServerFailureResponse(query, txId, questionOffset, questionEnd)),
-                            senderPort, senderHost, v -> {});
+                    return Future.succeededFuture(
+                            buildServerFailureResponse(query, txId, questionOffset, questionEnd));
                 });
+    }
+
+    static byte[] forwardToTargetsTcp(byte[] query, List<DnsForwardingRule.Target> targets) throws Exception {
+        Exception last = null;
+        for (DnsForwardingRule.Target target : targets) {
+            try (Socket socket = new Socket()) {
+                long deadline = System.nanoTime() + FORWARD_TIMEOUT_MS * 1_000_000L;
+                socket.connect(new InetSocketAddress(target.address(), target.port()), FORWARD_TIMEOUT_MS);
+                DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+                output.write(ByteBuffer.allocate(query.length + 2).putShort((short) query.length).put(query).array());
+                output.flush();
+                while (true) {
+                    byte[] prefix = readTcpBytes(socket, 2, deadline);
+                    int length = Short.toUnsignedInt(ByteBuffer.wrap(prefix).getShort());
+                    byte[] response = readTcpBytes(socket, length, deadline);
+                    if (isValidResponse(query, response, response.length)) {
+                        return response;
+                    }
+                }
+            } catch (Exception e) {
+                last = e;
+                LOG.debugv("DNS TCP forward to {0} failed: {1}", target.address(), e.getMessage());
+            }
+        }
+        throw last != null ? last : new IOException("no resolvers to forward to");
+    }
+
+    private static byte[] readTcpBytes(Socket socket, int length, long deadline) throws IOException {
+        byte[] bytes = new byte[length];
+        InputStream input = socket.getInputStream();
+        int offset = 0;
+        while (offset < length) {
+            long remainingNs = deadline - System.nanoTime();
+            if (remainingNs <= 0) {
+                throw new SocketTimeoutException("DNS TCP forward timeout");
+            }
+            socket.setSoTimeout((int) Math.max(1, remainingNs / 1_000_000L));
+            int count = input.read(bytes, offset, length - offset);
+            if (count == -1) {
+                throw new EOFException("DNS TCP response ended before its advertised length");
+            }
+            offset += count;
+        }
+        return bytes;
     }
 
     /**

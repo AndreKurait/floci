@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
+import io.floci.aws.services.eks.model.AccessPolicy;
 import io.floci.aws.services.eks.model.Addon;
 import io.floci.aws.services.eks.model.AssociateAccessPolicyRequest;
 import io.floci.aws.services.eks.model.AssociatedAccessPolicy;
@@ -20,6 +21,7 @@ import io.floci.aws.services.eks.model.FargateProfile;
 import io.floci.aws.services.eks.model.Nodegroup;
 import io.floci.aws.services.eks.model.PodIdentityAssociation;
 import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateAccessEntryRequest;
 import io.floci.aws.services.eks.model.UpdateAddonRequest;
 import io.floci.aws.services.eks.model.UpdateClusterConfigRequest;
 import io.floci.aws.services.eks.model.UpdatePodIdentityAssociationRequest;
@@ -116,6 +118,20 @@ public class EksController {
                 Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
         return Response.ok(page.nextToken() == null ? Map.of("clusters", page.items())
                 : Map.of("clusters", page.items(), "nextToken", page.nextToken())).build();
+    }
+
+    @GET
+    @Path("/access-policies")
+    public Response listAccessPolicies(@QueryParam("maxResults") String maxResults,
+                                       @QueryParam("nextToken") String nextToken) {
+        PaginatedResult<AccessPolicy> page = eksService.listAccessPolicies(
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("accessPolicies", page.items());
+        if (page.nextToken() != null) {
+            body.put("nextToken", page.nextToken());
+        }
+        return Response.ok(body).build();
     }
 
     @GET
@@ -267,6 +283,14 @@ public class EksController {
     @Path("/clusters/{name}/access-entries/{principalArn: .+}")
     public Response describeAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn) {
         return Response.ok(Map.of("accessEntry", accessEntries.describe(eksService.requireClusterInRequestRegion(name), principalArn))).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/access-entries/{principalArn: .+}")
+    public Response updateAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn,
+                                      JsonNode request) {
+        return Response.ok(Map.of("accessEntry", eksService.updateAccessEntryInRequestRegion(
+                name, principalArn, UpdateAccessEntryRequest.fromJson(request)))).build();
     }
 
     @DELETE

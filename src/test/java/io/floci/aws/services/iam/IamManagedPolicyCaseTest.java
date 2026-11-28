@@ -41,6 +41,7 @@ class IamManagedPolicyCaseTest {
         String prefix = AwsManagedPolicies.arnPrefix(partition) + "/";
         IamPolicy canonical = iam.getPolicy(prefix + name);
         IamPolicy observed = iam.getPolicy(prefix + alias);
+        assertEquals(canonical.getArn(), iam.canonicalPolicyArn(prefix + alias));
         assertEquals(canonical.getArn(), observed.getArn());
         assertEquals(canonical.getPolicyId(), observed.getPolicyId());
         assertEquals(canonical.getPolicyName(), observed.getPolicyName());

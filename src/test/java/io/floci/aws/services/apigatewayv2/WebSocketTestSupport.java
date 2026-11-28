@@ -5,6 +5,7 @@ import io.floci.aws.testing.LambdaCodeFixtures;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -17,6 +18,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Shared test utilities for WebSocket integration tests.
@@ -124,6 +126,23 @@ public final class WebSocketTestSupport {
         return client.newWebSocketBuilder()
                 .buildAsync(URI.create(wsUrl), listener)
                 .get(60, TimeUnit.SECONDS);
+    }
+
+    // ──────────────────────────── WebSocket close ────────────────────────────
+
+    /**
+     * Closes the client side and waits for the server's Close frame. The server runs its close
+     * handler (which unregisters the connection and dispatches {@code $disconnect}) before it
+     * echoes the Close frame, so once the echo has arrived the connection is gone server-side.
+     */
+    public static void closeAndAwait(WebSocket ws) {
+        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
+        // The Close frame is delivered like any other message, so it needs demand.
+        ws.request(Long.MAX_VALUE);
+        await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(5))
+                .until(ws::isInputClosed);
     }
 
     // ──────────────────────────── Message Capture Listeners ────────────────────────────

@@ -18,11 +18,13 @@ import io.floci.aws.services.iam.model.IamPolicy;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
 import io.floci.aws.services.iam.model.InstanceProfile;
+import io.floci.aws.services.iam.model.LambdaExecutionBinding;
 import io.floci.aws.services.iam.model.LoginProfile;
 import io.floci.aws.services.iam.model.OpenIDConnectProvider;
 import io.floci.aws.services.iam.model.OrganizationRootFeatures;
 import io.floci.aws.services.iam.model.PolicyVersion;
 import io.floci.aws.services.iam.model.SessionCredential;
+import io.floci.aws.services.iam.model.VerifiedIdentityContext;
 import io.floci.aws.services.iam.model.VirtualMfaDevice;
 import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.MutableClock;
@@ -47,6 +49,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
@@ -75,7 +78,8 @@ class IamServiceTest {
     // IAM User Guide includes "only when the principal uses temporary credentials".
     private static void assertSessionCaller(IamService.CallerArns expected, IamService.CallerArns actual) {
         assertNotNull(actual.tokenIssueTime());
-        assertEquals(expected.withTokenIssueTime(actual.tokenIssueTime()), actual);
+        assertEquals(expected.withTokenIssueTime(actual.tokenIssueTime())
+                .withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())), actual);
     }
 
     private static IamService iamService(boolean seedDeployerPrincipal) {
@@ -133,6 +137,13 @@ class IamServiceTest {
         assertFalse(service.isRoleSession("ASIAUSER", "user-token"));
         assertFalse(service.isRoleSession("ASIAFEDERATED", "federated-token"));
         assertFalse(service.isRoleSession("ASIAUNKNOWN", "token"));
+        // An EC2 instance-profile session is not role chaining: on AWS a process on the instance may
+        // assume a role for longer than an hour (an SDK config session may ask for 8 h).
+        SessionCredential instance = new SessionCredential("ASIAINSTANCE", "secret", "instance-token",
+                role.getArn(), clock.instant().plusSeconds(60), null, "000000000000");
+        instance.setEc2InstanceId("i-0abc000000000001");
+        service.registerEc2InstanceSession(instance);
+        assertFalse(service.isRoleSession("ASIAINSTANCE", "instance-token"));
         clock.advance(Duration.ofSeconds(60));
         assertFalse(service.isRoleSession("ASIACHAIN", "token"));
     }
@@ -155,6 +166,80 @@ class IamServiceTest {
                 "arn:aws:sts::000000000000:assumed-role/reader/s", "AROAREADER")) {
             assertEquals(Optional.empty(), iamService.heldPrincipalArn(none), none);
         }
+    }
+
+    @Test
+    void genericSessionSourceIdentityRequiresCurrentTokenAndSurvivesResolution() {
+        MutableClock clock = new MutableClock();
+        StorageBackend<String, SessionCredential> sessions = new InMemoryStorage<>();
+        IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), sessions, new RegionResolver("us-east-1", "000000000000"), false, clock);
+        IamRole role = service.createRole("source-role", "/source/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
+        service.registerSession("ASIASOURCE", "secret", "token", role.getArn(),
+                clock.instant().plusSeconds(900), null, "000000000000", "source-session",
+                role.getRoleId() + ":source-session", Map.of(), Map.of(), "original");
+        assertEquals("original", service.findSourceIdentity("ASIASOURCE", "token"));
+        assertNull(service.findSourceIdentity("ASIASOURCE", "wrong"));
+        assertNull(service.findSourceIdentity("ASIASOURCE", null));
+        assertNull(service.findSourceIdentity("absent", "token"));
+        assertEquals("original", service.resolveCallerArns("ASIASOURCE").orElseThrow().sourceIdentity());
+        clock.advance(Duration.ofSeconds(901));
+        assertNull(service.findSourceIdentity("ASIASOURCE", "token"));
+        assertTrue(service.resolveCallerArns("ASIASOURCE").isEmpty());
+    }
+
+    @Test
+    void inheritedTagsRequireTheIssuedTokenAndFollowTheSessionClock() {
+        MutableClock clock = new MutableClock();
+        IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"), false, clock);
+        IamRole role = service.createRole("ChainRole", "/teams/chain/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
+        Map<String, String> transitive = new LinkedHashMap<>(Map.of("Project", "session"));
+        service.registerSession("ASIACHAIN", "secret", "token", role.getArn(), clock.instant().plusSeconds(60),
+                null, "000000000000", "chain", role.getRoleId() + ":chain",
+                Map.of("Project", "session", "Local", "not-transitive"), transitive);
+        transitive.put("Project", "mutated");
+        assertEquals(Map.of("Project", "session"), service.findTransitiveSessionTags("ASIACHAIN", "token"));
+        assertEquals(Map.of(), service.findTransitiveSessionTags("ASIACHAIN", "wrong"));
+        assertEquals(Map.of(), service.findTransitiveSessionTags("ASIACHAIN", null));
+        clock.advance(Duration.ofSeconds(60));
+        assertEquals(Map.of(), service.findTransitiveSessionTags("ASIACHAIN", "token"));
+    }
+
+    @Test
+    void sessionTagPersistenceIsolationRolePathExpiryAndRevocation() throws Exception {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        IamRole role = service.createRole("tag-role", "/team/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
+        service.tagRole("tag-role", Map.of("Project", "role", "Team", "attached"));
+        Instant expiration = Instant.now().plusSeconds(3600);
+        Map<String, String> mutableTags = new LinkedHashMap<>(Map.of("project", "session"));
+        service.registerSession("ASIATAGGED", "secret", "token", role.getArn(), expiration, null,
+                "000000000000", "tagged", role.getRoleId() + ":tagged", mutableTags);
+        mutableTags.put("project", "mutated");
+        service.registerSession("ASIAUNTAGGED", "secret", "token", role.getArn(), expiration, null,
+                "000000000000", "untagged", role.getRoleId() + ":untagged");
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        SessionCredential stored = sessions.getForAccount("000000000000", "ASIATAGGED").orElseThrow();
+        sessions.putForAccount("000000000000", "ASIATAGGED",
+                mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class));
+        IamService.CallerArns tagged = service.resolveCallerArns("ASIATAGGED").orElseThrow();
+        assertEquals(role.getArn(), tagged.principalArn());
+        assertEquals(Map.of("project", "session", "Team", "attached"), tagged.principalTags());
+        assertEquals(Map.of("Project", "role", "Team", "attached"),
+                service.resolveCallerArns("ASIAUNTAGGED").orElseThrow().principalTags());
+        service.tagRole("tag-role", Map.of("Project", "new-role", "Team", "changed"));
+        assertEquals(Map.of("project", "session", "Team", "changed"),
+                service.resolveCallerArns("ASIATAGGED").orElseThrow().principalTags());
+        assertTrue(service.isExpiredSession("ASIATAGGED", expiration.plusSeconds(1)));
+        assertNull(service.resolveCallerContext("ASIATAGGED", expiration.plusSeconds(1)));
+        assertTrue(service.resolveCallerArns("ASIATAGGED").isEmpty());
+        service.unregisterSession("000000000000", "ASIAUNTAGGED");
+        assertTrue(service.resolveCallerArns("ASIAUNTAGGED").isEmpty());
+        assertEquals("new-role", service.getRole("tag-role").getTags().get("Project"));
     }
 
     @Test
@@ -507,12 +592,10 @@ class IamServiceTest {
         // The principal keys ride along from the same lookup: a role session is typed as an
         // assumed role, its aws:userid is the stored role-id:session-name, and it has no
         // aws:username, which the guide lists as not present for a role.
-        // It carries what its credentials say about MFA as well, which for a session minted
-        // without a device is the key present and false.
+        // AssumeRole authenticates MFA on the request; its credentials carry neither MFA context key.
         assertSessionCaller(new IamService.CallerArns("arn:aws:sts::123456789012:assumed-role/TestRole/s",
                         "arn:aws:iam::123456789012:role/team/TestRole",
-                        IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null)
-                        .withSessionMfa(new IamService.CallerArns.SessionMfa(false, 0)),
+                        IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null),
                 service.resolveCallerArns("ASIALIVESESSION").orElseThrow());
         // An expired session answers for neither, never for one and not the other.
         assertTrue(service.resolveCallerArns("ASIAEXPIREDSESSION").isEmpty());
@@ -589,7 +672,7 @@ class IamServiceTest {
         IamRole role = iamService.createRole("Tagged", "/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
         role.setTags(Map.of("Team", "role-team", "Owner", "platform"));
         iamService.registerSession("ASIASESSIONTAGS", "secret", "token", role.getArn(),
-                Instant.now().plusSeconds(3600), null, "000000000000", "tagged", "AROATAGGED:tagged");
+                Instant.now().plusSeconds(3600), null, "000000000000", "tagged", role.getRoleId() + ":tagged");
         iamService.recordSessionTags("ASIASESSIONTAGS", Map.of("Team", "session-team", "Project", "atlas"),
                 List.of());
 
@@ -696,7 +779,7 @@ class IamServiceTest {
         IamRole role = iamService.createRole("Worker", "/teams/platform/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
         role.setTags(Map.of("Team", "platform"));
         iamService.registerSession("ASIATAGGEDROLE", "secret", "token", role.getArn(),
-                Instant.now().plusSeconds(3600), null, "000000000000", "worker", "AROAWORKER:worker");
+                Instant.now().plusSeconds(3600), null, "000000000000", "worker", role.getRoleId() + ":worker");
         Map<String, List<String>> context = new LinkedHashMap<>();
         iamService.resolveCallerArns("ASIATAGGEDROLE").orElseThrow().putPrincipalKeys(context);
         assertEquals(List.of("platform"), context.get("aws:PrincipalTag/Team"));
@@ -704,6 +787,23 @@ class IamServiceTest {
         context.clear();
         iamService.resolveCallerArns("ASIATAGGEDROLE").orElseThrow().putPrincipalKeys(context);
         assertFalse(context.containsKey("aws:PrincipalTag/Team"));
+    }
+
+    @Test
+    void replacedRoleDoesNotSupplyTagsToPreviouslyIssuedSession() {
+        IamRole role = iamService.createRole("Worker", "/teams/platform/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
+        role.setTags(Map.of("Team", "original"));
+        iamService.registerAssumeRoleSession("ASIAREPLACEDROLE", "secret", "token", role.getArn(),
+                Instant.now().plusSeconds(3600), null, "000000000000", "worker",
+                role.getRoleId() + ":worker", false, null, Map.of("Project", "session"));
+        iamService.deleteRole("Worker");
+        IamRole replacement = iamService.createRole("Worker", "/teams/platform/", EMPTY_POLICY_DOCUMENT,
+                null, 3600, null);
+        replacement.setTags(Map.of("Team", "replacement"));
+
+        IamService.CallerArns caller = iamService.resolveCallerArns("ASIAREPLACEDROLE").orElseThrow();
+        assertEquals(Map.of("Project", "session"), caller.principalTags());
+        assertEquals(role.getArn(), caller.principalArn());
     }
 
     @Test
@@ -1861,6 +1961,28 @@ class IamServiceTest {
     }
 
     @Test
+    void createServiceLinkedRoleAttachesTheOpenSearchManagedPolicy() {
+        IamRole role = iamService.createServiceLinkedRole("opensearchservice.amazonaws.com", null, null);
+
+        assertEquals(List.of("arn:aws:iam::aws:policy/aws-service-role/AmazonOpenSearchServiceRolePolicy"),
+                role.getAttachedPolicyArns());
+        List<IamPolicy> attached = iamService.listAttachedRolePolicies(role.getRoleName(), null);
+        assertEquals(1, attached.size());
+        assertEquals("AmazonOpenSearchServiceRolePolicy", attached.getFirst().getPolicyName());
+        assertEquals("/aws-service-role/", attached.getFirst().getPath());
+        assertTrue(attached.getFirst().getDefaultDocument().contains("ec2:CreateNetworkInterface"),
+                "the attached document is the bundled one");
+    }
+
+    @Test
+    void createServiceLinkedRoleForAServiceWithNoKnownPolicyAttachesNone() {
+        IamRole role = iamService.createServiceLinkedRole("autoscaling.amazonaws.com", null, null);
+
+        assertTrue(role.getAttachedPolicyArns().isEmpty());
+        assertTrue(iamService.listAttachedRolePolicies(role.getRoleName(), null).isEmpty());
+    }
+
+    @Test
     void createServiceLinkedRoleForCloud9UsesAwsCanonicalName() {
         IamRole role = iamService.createServiceLinkedRole(
                 "cloud9.amazonaws.com", null, "Cloud9 SLR");
@@ -2974,6 +3096,88 @@ class IamServiceTest {
 
         assertEquals(policy, sessions.getForAccount(accountId, accessKeyId).orElseThrow().getSessionPolicyDocument());
         assertEquals(policy, service.resolveCallerContext(accessKeyId).sessionPolicyDocument());
+    }
+
+    @Test
+    void explicitRoleSessionRetainsIdentityPartitionTokenAndCleanupOwnership() {
+        String accountId = "222233334444";
+        String accessKeyId = "ASIASERVICEROLETEST";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions,
+                new RegionResolver("us-gov-west-1", accountId));
+        IamRole role = service.createRole("worker", "/service-role/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
+        Instant expires = Instant.now().plusSeconds(900);
+        service.registerSessionForAccount(accountId, accessKeyId, "secret", "token", role.getArn(), expires,
+                null, "service-call", role.getRoleId() + ":service-call");
+        SessionCredential stored = sessions.getForAccount(accountId, accessKeyId).orElseThrow();
+        assertEquals(expires, stored.getExpiration());
+        assertEquals(accountId, stored.getOriginAccountId());
+        assertEquals("service-call", stored.getRoleSessionName());
+        assertFalse(stored.isLambdaExecutionRole());
+        assertTrue(sessions.getForAccount("000000000000", accessKeyId).isEmpty());
+        IamService.CallerArns principal = service.resolveCallerArns(accessKeyId).orElseThrow();
+        assertEquals(role.getArn(), principal.principalArn());
+        assertEquals("arn:aws-us-gov:sts::" + accountId + ":assumed-role/worker/service-call", principal.callerArn());
+        assertEquals(role.getRoleId() + ":service-call", principal.userId());
+        assertEquals("secret", service.findSecretKey(accessKeyId, "token").orElseThrow());
+        assertTrue(service.findSecretKey(accessKeyId, "wrong-token").isEmpty());
+        assertTrue(service.findSecretKey(accessKeyId, null).isEmpty());
+        service.unregisterSession(accountId, accessKeyId);
+        assertTrue(service.resolveCallerArns(accessKeyId).isEmpty());
+        assertTrue(service.findSecretKey(accessKeyId, "token").isEmpty());
+        assertTrue(sessions.getForAccount(accountId, accessKeyId).isEmpty());
+    }
+
+    @Test
+    void explicitRoleSessionExpiryRemovesOnlyTheOwnedCredential() {
+        String accountId = "222233334444";
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        String roleArn = "arn:aws:iam::" + accountId + ":role/service-role/worker";
+        service.registerSessionForAccount(accountId, "ASIAEXPIREDSERVICE", "secret", "token", roleArn,
+                Instant.now().minusSeconds(1), null, "expired", "AROAEXAMPLE:expired");
+        service.registerSessionForAccount("333344445555", "ASIAOTHERSERVICE", "secret", "other-token", roleArn,
+                Instant.now().plusSeconds(900), null, "other", "AROAEXAMPLE:other");
+        assertTrue(service.resolveCallerArns("ASIAEXPIREDSERVICE").isEmpty());
+        assertTrue(sessions.getForAccount(accountId, "ASIAEXPIREDSERVICE").isEmpty());
+        assertTrue(sessions.getForAccount("333344445555", "ASIAOTHERSERVICE").isPresent());
+    }
+
+    @Test
+    void inspectedAssumeRoleSessionRetainsTokenIssueTime() {
+        Instant issuedAt = Instant.parse("2026-11-19T10:00:00Z");
+        IamService service = iamServiceOn(Clock.fixed(issuedAt, ZoneOffset.UTC));
+        service.registerAssumeRoleSession("ASIAISSUEDTIME", "secret", "token",
+                "arn:aws:iam::000000000000:role/worker", issuedAt.plusSeconds(3600),
+                null, "000000000000", "worker", "AROAEXAMPLE:worker", false);
+
+        assertEquals(issuedAt, service.issuedSessionCandidates("ASIAISSUEDTIME").getFirst().getIssuedAt());
+    }
+
+    @Test
+    void lambdaSessionBindingUsesUniqueExactKeysBeyondThePrincipalScanLimit() {
+        String account = "222233334444";
+        String role = "arn:aws:iam::222233334444:role/LambdaRole";
+        String key = "ASIALARGESESSIONREGISTRY";
+        AccountAwareStorageBackend<SessionCredential> sessions = AccountAwareStorageBackend.inMemory("000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        for (int i = 0; i < 5000; i++) {
+            sessions.putForAccount(account, "unrelated-" + i,
+                    new SessionCredential("unrelated-" + i, "secret", "token", role, null, null, account));
+        }
+        service.registerLambdaExecutionRoleSession(account, key, "secret", role);
+        LambdaExecutionBinding binding = new LambdaExecutionBinding(account, "us-east-1", "fn",
+                "arn:aws:lambda:us-east-1:222233334444:function:fn", "$LATEST", role,
+                "code", "revision", null, null);
+        service.bindLambdaExecution(account, key, binding);
+        assertEquals(binding, service.lambdaIdentitySession(key).orElseThrow().getLambdaExecution());
+        assertTrue(service.issuedSessionCandidates("missing").isEmpty());
+        assertThrows(IllegalStateException.class, () -> service.issuedSessionCandidates(null));
+        service.registerLambdaExecutionRoleSession("333344445555", key, "other-secret", role);
+        assertEquals(2, service.issuedSessionCandidates(key).size());
+        assertTrue(service.lambdaIdentitySession(key).isEmpty());
     }
 
     @Test
@@ -4219,6 +4423,54 @@ class IamServiceTest {
     }
 
     @Test
+    void instanceProfileProvenanceExpiresAndIsRetiredWithTheSession() {
+        SessionCredential session = new SessionCredential(
+                "ASIAPROFILEKEY", "secret", "token", "arn:aws:iam::000000000000:role/nodes/worker",
+                Instant.now().plusSeconds(3600), null, "000000000000");
+        session.setEc2InstanceId("i-1234567890abcdef0");
+        session.setEc2InstanceArn("arn:aws:ec2:us-east-1:000000000000:instance/i-1234567890abcdef0");
+        session.setEc2RoleId("AROAWORKER");
+        iamService.registerEc2InstanceSession(session);
+
+        assertSame(session, iamService.ec2InstanceProfileSession(session.getAccessKeyId()).orElseThrow());
+        assertEquals(session.getEc2InstanceId(),
+                iamService.findEc2SessionInstanceId(session.getAccessKeyId()).orElseThrow());
+        assertTrue(iamService.findSecretKey(session.getAccessKeyId(), "wrong-token").isEmpty());
+        assertEquals("secret", iamService.findSecretKey(session.getAccessKeyId(), "token").orElseThrow());
+        session.setExpiration(Instant.now().minusSeconds(1));
+        assertTrue(iamService.ec2InstanceProfileSession(session.getAccessKeyId()).isEmpty());
+        session.setExpiration(Instant.now().plusSeconds(3600));
+        iamService.registerEc2InstanceSession(session);
+        iamService.unregisterSession("000000000000", session.getAccessKeyId());
+        assertTrue(iamService.ec2InstanceProfileSession(session.getAccessKeyId()).isEmpty());
+    }
+
+    @Test
+    void ordinaryAssumedRoleSessionNamesCannotSupplyInstanceProfileProvenance() {
+        iamService.registerSession("ASIAORDINARYKEY", "secret", "token",
+                "arn:aws:iam::000000000000:role/nodes/worker", Instant.now().plusSeconds(3600), null,
+                "000000000000", "i-1234567890abcdef0", "AROAWORKER:i-1234567890abcdef0");
+        assertTrue(iamService.ec2InstanceProfileSession("ASIAORDINARYKEY").isEmpty());
+        assertTrue(iamService.findEc2SessionInstanceId("ASIAORDINARYKEY").isEmpty());
+    }
+
+    @Test
+    void instanceIdentityAndLegacyProfileRecordsDoNotBecomeProfileProvenance() {
+        SessionCredential session = new SessionCredential(
+                "ASIAIDENTITYKEY", "secret", "token", "arn:aws:iam::000000000000:role/aws:ec2-instance",
+                Instant.now().plusSeconds(3600), null, "000000000000");
+        session.setEc2InstanceId("i-1234567890abcdef0");
+        session.setEc2InstanceArn("arn:aws:ec2:us-east-1:000000000000:instance/i-1234567890abcdef0");
+        iamService.registerEc2InstanceSession(session);
+        assertTrue(iamService.ec2InstanceProfileSession(session.getAccessKeyId()).isEmpty());
+        session.setEc2RoleId(" ");
+        assertTrue(iamService.ec2InstanceProfileSession(session.getAccessKeyId()).isEmpty());
+        session.setEc2RoleId("AROAWORKER");
+        session.setEc2InstanceArn(null);
+        assertTrue(iamService.ec2InstanceProfileSession(session.getAccessKeyId()).isEmpty());
+    }
+
+    @Test
     void resolveCallerUserIdReturnsEc2AssumedRoleIdForEc2Session() {
         SessionCredential session = new SessionCredential(
                 "ASIAEC2KEY", "test-secret", "token", "arn:aws:iam::000000000000:role/ec2role",
@@ -4280,5 +4532,243 @@ class IamServiceTest {
         Optional<String> nullOpt = iamService.resolveCallerUserId("ASIATOKENCHECKKEY", null);
         assertTrue(nullOpt.isEmpty());
     }
-}
 
+    @Test
+    void sessionMfaProvenancePreservesUnknownAndKnownFalse() throws Exception {
+        for (Boolean state : new Boolean[] {null, false, true}) {
+            SessionCredential original = new SessionCredential();
+            original.setMultiFactorAuthPresent(state);
+            ObjectMapper mapper = new ObjectMapper();
+            SessionCredential restored = mapper.readValue(mapper.writeValueAsBytes(original), SessionCredential.class);
+            assertEquals(state, restored.getMultiFactorAuthPresent());
+            IamService.CallerArns caller = IamService.CallerArns.accountRoot("arn:aws:iam::000000000000:root",
+                    "000000000000").withMultiFactorAuthPresent(state).withTokenIssueTime(Instant.EPOCH)
+                    .withPrincipalTags(Map.of("team", "test"));
+            Map<String, List<String>> context = new LinkedHashMap<>();
+            caller.putPrincipalKeys(context);
+            assertEquals(state == null ? null : List.of(state.toString()),
+                    context.get("aws:MultiFactorAuthPresent"));
+        }
+        assertNull(new ObjectMapper().readValue("{}", SessionCredential.class).getMultiFactorAuthPresent());
+    }
+
+    @Test
+    void temporarySessionWithoutMfaIsFalseAndFederatedSessionOmitsMfa() {
+        iamService.registerIssuedSession("ASIAUNKNOWN", "secret", "token", null,
+                Instant.now().plusSeconds(3600), null, "000000000000", "test");
+        iamService.registerIssuedSession("ASIAFEDERATED", "secret", "token",
+                "arn:aws:sts::000000000000:federated-user/test", Instant.now().plusSeconds(3600),
+                null, "000000000000", "test");
+        assertEquals(Boolean.FALSE, iamService.resolveCallerArns("ASIAUNKNOWN").orElseThrow()
+                .multiFactorAuthPresent());
+        assertNull(iamService.resolveCallerArns("ASIAFEDERATED").orElseThrow().multiFactorAuthPresent());
+        iamService.registerSessionToken("ASIANONMFA", "secret", "token", Instant.now().plusSeconds(3600),
+                "000000000000", "test", null, null, Instant.now());
+        assertEquals(Boolean.FALSE, iamService.resolveCallerArns("ASIANONMFA").orElseThrow()
+                .multiFactorAuthPresent());
+    }
+
+    @Test
+    void rejectedMfaDoesNotRegisterSession() {
+        AwsException denied = assertThrows(AwsException.class, () -> iamService.registerSessionToken(
+                "ASIAREJECTED", "secret", "token", Instant.now().plusSeconds(3600), "000000000000", "test",
+                "arn:aws:iam::000000000000:mfa/missing", "123456", Instant.now()));
+        assertEquals("AccessDenied", denied.getErrorCode());
+        assertTrue(iamService.resolveCallerArns("ASIAREJECTED").isEmpty());
+    }
+
+    @Test
+    void registeredMfaProvenanceSurvivesStorageRoundTripAndIsNotInferredFromDeviceAssignment() throws Exception {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.createUser("mfa-issuer", "/");
+        AccessKey key = service.createAccessKey("mfa-issuer");
+        VirtualMfaDevice device = service.createVirtualMfaDevice("issuer-device", "/", Map.of());
+        Instant now = Instant.now();
+        long step = Totp.stepAt(now);
+        service.enableMfaDevice("mfa-issuer", device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step - 1), Totp.codeAt(device.getBase32Seed(), step));
+        service.registerSessionToken("ASIAWITHMFA", "secret", "token", now.plusSeconds(3600),
+                "000000000000", key.getAccessKeyId(), device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step), now);
+        service.registerSessionToken("ASIAWITHOUTMFA", "secret", "token", now.plusSeconds(3600),
+                "000000000000", key.getAccessKeyId(), null, null, now);
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        for (String sessionKey : List.of("ASIAWITHMFA", "ASIAWITHOUTMFA")) {
+            SessionCredential stored = sessions.getForAccount("000000000000", sessionKey).orElseThrow();
+            SessionCredential reloaded = mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class);
+            sessions.putForAccount("000000000000", sessionKey, reloaded);
+            assertTrue(reloaded.isSessionTokenCredential());
+            assertEquals(!"ASIAWITHMFA".equals(sessionKey),
+                    service.sessionTokenDeniesOperation(sessionKey, "iam", "iam:GetUser"));
+            assertTrue(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetAccessKeyInfo"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetCallerIdentity"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:AssumeRole"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "ssm", "ssm:DescribeParameters"));
+            assertEquals("ASIAWITHMFA".equals(sessionKey),
+                    service.resolveCallerArns(sessionKey).orElseThrow().multiFactorAuthPresent());
+            assertEquals("ASIAWITHMFA".equals(sessionKey) ? now : null, reloaded.getMultiFactorAuthenticatedAt());
+        }
+    }
+
+    @Test
+    void alreadyVerifiedRequestMfaKeepsSessionTokenProvenanceAfterReload() throws Exception {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.createUser("verified-issuer", "/");
+        AccessKey key = service.createAccessKey("verified-issuer");
+        Instant authenticatedAt = Instant.now();
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        for (boolean authenticated : List.of(true, false)) {
+            String sessionKey = authenticated ? "ASIAVERIFIEDMFA" : "ASIAVERIFIEDPLAIN";
+            service.registerVerifiedSessionToken(sessionKey, "secret", "token", authenticatedAt.plusSeconds(3600),
+                    "000000000000", key.getAccessKeyId(), authenticated ? authenticatedAt : null);
+            SessionCredential stored = sessions.getForAccount("000000000000", sessionKey).orElseThrow();
+            SessionCredential reloaded = mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class);
+            sessions.putForAccount("000000000000", sessionKey, reloaded);
+            assertTrue(reloaded.isSessionTokenCredential());
+            assertEquals(authenticated, reloaded.getMultiFactorAuthPresent());
+            assertEquals(authenticated ? authenticatedAt : null, reloaded.getMfaAuthenticatedAt());
+            assertEquals(!authenticated, service.sessionTokenDeniesOperation(sessionKey, "iam", "iam:GetUser"));
+            assertTrue(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetAccessKeyInfo"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:AssumeRole"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetCallerIdentity"));
+        }
+    }
+
+    @Test
+    void sessionTokenRestrictionsRequireExplicitIssuanceAndDoNotApplyToLegacyOrFederatedSessions() throws Exception {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        service.createUser("restriction-issuer", "/");
+        AccessKey key = service.createAccessKey("restriction-issuer");
+        Instant now = Instant.now();
+        service.registerIssuedSession("ASIALEGACY", "secret", "token", null, now.plusSeconds(3600),
+                null, "000000000000", key.getAccessKeyId());
+        service.registerIssuedSession("ASIAFEDERATED", "secret", "token",
+                "arn:aws:sts::000000000000:federated-user/reader", now.plusSeconds(3600),
+                null, "000000000000", key.getAccessKeyId());
+        for (String sessionKey : List.of("ASIALEGACY", "ASIAFEDERATED")) {
+            SessionCredential stored = sessions.getForAccount("000000000000", sessionKey).orElseThrow();
+            stored.setMultiFactorAuthPresent(false);
+            stored.setMultiFactorAuthenticatedAt(now);
+            sessions.putForAccount("000000000000", sessionKey, stored);
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "iam", "iam:GetUser"));
+            assertFalse(service.sessionTokenDeniesOperation(sessionKey, "sts", "sts:GetAccessKeyInfo"));
+        }
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        SessionCredential old = mapper.readValue("{\"accessKeyId\":\"ASIAOLD\"}", SessionCredential.class);
+        assertFalse(old.isSessionTokenCredential());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void mfaIssuanceCannotChangeTheVerifiedUserIntoRootAfterKeyRemoval() {
+        StorageBackend<String, AccessKey> keys = Mockito.spy(new InMemoryStorage<String, AccessKey>());
+        IamService service = iamService(false, keys);
+        IamUser user = service.createUser("mfa-stable-issuer", "/");
+        AccessKey key = service.createAccessKey(user.getUserName());
+        VirtualMfaDevice device = service.createVirtualMfaDevice("stable-issuer-device", "/", Map.of());
+        Instant now = Instant.now();
+        long step = Totp.stepAt(now);
+        service.enableMfaDevice(user.getUserName(), device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step - 1), Totp.codeAt(device.getBase32Seed(), step));
+        AtomicBoolean removeAfterRead = new AtomicBoolean(true);
+        Mockito.doAnswer(invocation -> {
+            Optional<AccessKey> observed = (Optional<AccessKey>) invocation.callRealMethod();
+            if (removeAfterRead.compareAndSet(true, false)) {
+                keys.delete(key.getAccessKeyId());
+            }
+            return observed;
+        }).when(keys).get(key.getAccessKeyId());
+        service.registerSessionToken("ASIASTABLEISSUER", "secret", "token", now.plusSeconds(3600),
+                "000000000000", key.getAccessKeyId(), device.getSerialNumber(),
+                Totp.codeAt(device.getBase32Seed(), step), now);
+        IamService.CallerArns caller = service.resolveCallerArns("ASIASTABLEISSUER").orElseThrow();
+        assertEquals(user.getArn(), caller.principalArn());
+        assertEquals(user.getUserId(), caller.userId());
+        assertEquals(Boolean.TRUE, caller.multiFactorAuthPresent());
+        assertTrue(keys.get(key.getAccessKeyId()).isEmpty());
+    }
+
+    @Test
+    void mfaAgeUsesAuthenticationTimeAndAdvancesAtResolution() throws Exception {
+        Instant authenticated = Instant.parse("2026-10-26T12:00:00Z");
+        Clock clock = Mockito.mock(Clock.class);
+        Mockito.when(clock.instant()).thenReturn(authenticated);
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), sessions,
+                new RegionResolver("us-east-1", "000000000000"), false, clock);
+        service.registerIssuedSession("ASIAMFAAGE", "secret", "token", null,
+                authenticated.plusSeconds(3600), null, "000000000000", "test");
+        SessionCredential stored = sessions.getForAccount("000000000000", "ASIAMFAAGE").orElseThrow();
+        stored.setMultiFactorAuthPresent(true);
+        stored.setMultiFactorAuthenticatedAt(authenticated.minusSeconds(5));
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        sessions.putForAccount("000000000000", "ASIAMFAAGE",
+                mapper.readValue(mapper.writeValueAsBytes(stored), SessionCredential.class));
+        for (long seconds : List.of(0L, 54L, 55L, 56L)) {
+            Mockito.when(clock.instant()).thenReturn(authenticated.plusSeconds(seconds).plusMillis(999));
+            IamService.CallerArns caller = service.resolveCallerArns("ASIAMFAAGE").orElseThrow();
+            Map<String, List<String>> context = new LinkedHashMap<>();
+            caller.withPrincipalTags(Map.of("team", "test")).withTokenIssueTime(authenticated)
+                    .withMultiFactorAuthPresent(true).putPrincipalKeys(context);
+            assertEquals(List.of(Long.toString(seconds + 5)), context.get("aws:MultiFactorAuthAge"));
+        }
+        Mockito.when(clock.instant()).thenReturn(authenticated.minusSeconds(10));
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        service.resolveCallerArns("ASIAMFAAGE").orElseThrow().putPrincipalKeys(context);
+        assertEquals(List.of("0"), context.get("aws:MultiFactorAuthAge"));
+        Mockito.when(clock.instant()).thenReturn(authenticated.plusSeconds(3601));
+        assertTrue(service.resolveCallerArns("ASIAMFAAGE").isEmpty());
+    }
+
+    @Test
+    void mfaAgeRequiresVerifiedProvenanceAndAuthenticationInstant() {
+        AccountAwareStorageBackend<SessionCredential> sessions = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        int index = 0;
+        for (Boolean present : new Boolean[] {null, false, true}) {
+            for (Instant authenticated : new Instant[] {null, Instant.now().minusSeconds(30)}) {
+                String key = "ASIAAGEABSENT" + index++;
+                service.registerIssuedSession(key, "secret", "token", null,
+                        Instant.now().plusSeconds(3600), null, "000000000000", "test");
+                SessionCredential stored = sessions.getForAccount("000000000000", key).orElseThrow();
+                stored.setMultiFactorAuthPresent(present);
+                stored.setMultiFactorAuthenticatedAt(authenticated);
+                sessions.putForAccount("000000000000", key, stored);
+                Map<String, List<String>> context = new LinkedHashMap<>();
+                service.resolveCallerArns(key).orElseThrow().putPrincipalKeys(context);
+                assertEquals(Boolean.TRUE.equals(present) && authenticated != null,
+                        context.containsKey("aws:MultiFactorAuthAge"));
+            }
+        }
+    }
+
+    @Test
+    void sourceIdentityRequiresCurrentMatchingSessionAndSurvivesCallerResolution() {
+        MutableClock clock = new MutableClock();
+        StorageBackend<String, SessionCredential> sessions = new InMemoryStorage<>();
+        IamService service = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), sessions, new RegionResolver("us-east-1", "000000000000"), false, clock);
+        IamRole role = service.createRole("source-role", "/source/", EMPTY_POLICY_DOCUMENT, null, 3600, null);
+        service.registerAssumeRoleSession("ASIASOURCE", "secret", "token", role.getArn(),
+                clock.instant().plusSeconds(900), null, "000000000000", "source-session",
+                role.getRoleId() + ":source-session", false, null, Map.of(), Map.of(), "original");
+        assertEquals("original", service.findSourceIdentity("ASIASOURCE", "token"));
+        assertNull(service.findSourceIdentity("ASIASOURCE", "wrong"));
+        assertNull(service.findSourceIdentity("ASIASOURCE", null));
+        assertNull(service.findSourceIdentity("absent", "token"));
+        assertEquals("original", service.resolveCallerArns("ASIASOURCE").orElseThrow().sourceIdentity());
+        clock.advance(Duration.ofSeconds(901));
+        assertNull(service.findSourceIdentity("ASIASOURCE", "token"));
+        assertTrue(service.resolveCallerArns("ASIASOURCE").isEmpty());
+    }
+}

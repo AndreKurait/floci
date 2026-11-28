@@ -43,7 +43,9 @@ or list operations. Resource tags are not retained for post-deletion policy cond
 | `ListClusters` | List cluster names with pagination (`maxResults` 1-100 and `nextToken`) |
 | `DeleteCluster` | Delete a cluster |
 | `CreateAccessEntry` | Create STANDARD, EC2_LINUX or EC2 (EKS Auto Mode) access-entry metadata |
+| `ListAccessPolicies` | List the bundled access-policy catalog with pagination |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
+| `UpdateAccessEntry` | Replace supplied username or Kubernetes groups while preserving access-entry identity and policies |
 | `ListAccessEntries` | List principal ARNs with pagination |
 | `DeleteAccessEntry` | Delete access-entry metadata |
 | `AssociateAccessPolicy` | Associate an EKS access policy and its cluster or namespace scope with a STANDARD or EC2 access entry |
@@ -76,6 +78,19 @@ or list operations. Resource tags are not retained for post-deletion policy cond
 
 ## Access-entry management
 
+`ListAccessPolicies` serves `GET /access-policies` without requiring a cluster or access entry.
+It returns policy names and global ARNs in the request's partition, under `accessPolicies`.
+`maxResults` defaults to 100 and accepts 1 through 100. Continue with the opaque `nextToken`;
+the final page omits it. IAM enforcement checks `eks:ListAccessPolicies` on `*`.
+
+The bundled catalog contains 39 names from the
+[AWS emulator catalog at f515581](https://github.com/aws/aws-emulator/blob/f515581569b98a9dcbd2e686c12f912fdce51bba/services/service-com-amazonaws-eks-awswesleyfrontend/src/state.rs),
+checked on 2026-11-12 against its SDK responses. The
+[AWS API reference](https://docs.aws.amazon.com/eks/latest/APIReference/API_ListAccessPolicies.html)
+defines the listing and pagination contract. This is a fixed local snapshot, with no automatic
+AWS synchronization or emulation of policy availability by partition. Listing names does not
+expose policy contents or grant Kubernetes permissions.
+
 `CreateCluster` accepts `accessConfig.authenticationMode` (`CONFIG_MAP`, `API_AND_CONFIG_MAP`, or `API`) and `bootstrapClusterCreatorAdminPermissions`. The API default is `CONFIG_MAP`; access-entry operations require an ACTIVE cluster created with `API` or `API_AND_CONFIG_MAP`.
 
 The access-entry management operations support `STANDARD` (the default), `EC2_LINUX` and `EC2`. STANDARD accepts existing IAM users or roles, including principals in another account. EC2_LINUX requires a role in the cluster account and generates `system:node:{{EC2PrivateDNSName}}`; custom usernames and Kubernetes groups are not accepted for node entries. `EC2`, the type of EKS Auto Mode's node role, accepts roles only and generates `system:node:{{SessionName}}` in the `system:nodes` group; like AWS, it refuses Kubernetes groups, a username or an IAM user with AWS's messages, and access policies can be associated with it. When a cluster's EKS Auto Mode compute capability is turned on, by `CreateCluster` or `UpdateClusterConfig`, Floci makes the node role's `EC2` entry with `AmazonEKSAutoNodePolicy` on the cluster scope, as EKS does, unless the role already has an entry, IAM doesn't have the role, or the cluster's authentication mode is `CONFIG_MAP`. Tags supplied at creation are preserved. Repeating a create with the same client token and normalized parameters returns the existing entry. Listing accepts `maxResults` from 1 to 100 and cluster-specific `nextToken` values.
@@ -83,6 +98,28 @@ The access-entry management operations support `STANDARD` (the default), `EC2_LI
 Access policies are management metadata, like the entries they belong to: Floci stores and returns them but does not enforce their Kubernetes permissions. `policyArn` must be an `arn:<partition>:eks::aws:cluster-access-policy/<name>` ARN in the cluster's partition. The policy name itself is not checked against AWS's list of access policies. The scope `type` is `cluster` (no namespaces) or `namespace` (one or more names; wildcards such as `dev-*` are kept as given, and a repeated name is stored once). Associating a policy that is already associated replaces its scope and keeps its `associatedAt`. Only STANDARD and EC2 entries accept access policies, and deleting an entry removes its policies. Disassociating a policy the entry does not hold succeeds. `ListAccessEntries` accepts `associatedPolicyArn`.
 
 The principal ARN in an access-entry path should be URL-encoded, as the SDKs and the CLI send it. Sent unencoded, a principal whose ARN ends in `/access-policies` (a role named `access-policies`) is read as the access-policies route of the shorter principal before it. A DELETE is a disassociate only when a cluster access policy ARN follows `access-policies`, so an entry with `access-policies` inside its IAM path can always be deleted.
+
+`UpdateAccessEntry` uses the native POST route and returns the complete access entry. It replaces only supplied
+`username` and `kubernetesGroups`, retaining the entry ARN, principal, type, tags, creation time, stable principal ID,
+creation token and policy associations. Both fields are validated before publishing one detached replacement;
+invalid usernames, malformed field types and node-entry overrides cannot partially apply another field.
+Floci accepts an empty group list as clearing the groups and omitted or null members as unchanged. These empty/null
+rules are local behavior consistent with the compared emulator source, without a separate live AWS oracle.
+`clientRequestToken` is accepted but does not maintain a historical update-response replay cache.
+
+The update shares the cluster-deletion lock and the access-entry service lock. Entries remain scoped to the caller's
+account, Region and cluster incarnation. The IAM lookup reads scoped rows and default-account legacy rows without
+migrating them, checking the stored ARN's owner and Region. The authorized update may migrate a matching legacy row
+before replacing it; unrelated EKS APIs retain their existing legacy-read behavior. The replacement uses the existing
+storage backend's atomic batch operation. Persistent and WAL backends publish after their synchronous write succeeds; hybrid storage retains its asynchronous durability.
+
+With IAM enforcement enabled, the new action authorizes the actual access-entry ARN, not the cluster ARN or principal
+ARN. It reads live `aws:ResourceTag` values, including empty values. `eks:clusterName` and `eks:principalArn` come from the
+path; `eks:username` and `eks:kubernetesGroups` come only from supplied request members. Omitted fields do not borrow
+stored values to satisfy conditions, and an explicit empty group list supplies an empty value set. This omitted-value
+rule is a local policy: the AWS service reference does not fully specify the fallback behavior. The update does not
+populate `eks:accessEntryType`, whose meaning for an API without a type input is not established here. This change does
+not add Kubernetes authorization, node bootstrap behavior or broader EKS IAM condition support.
 
 Access entries use EKS storage and retain the IAM principal's stable ID internally. Cluster deletion removes its entries, and a cluster recreated with the same name does not inherit previous entries or pagination tokens.
 
@@ -104,7 +141,7 @@ rejects instance credentials. Obtain fresh IMDS credentials after upgrading so t
 includes the stable role ID.
 
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, ListAccessPolicies, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode remains unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \
@@ -467,7 +504,9 @@ launches nodes on AWS. Floci checks every 10 seconds.
 
 - **Pool.** The pod goes to the first NodePool, by `weight` then name, with an instance type the pool's requirements
   allow, whose node the pod's `nodeSelector`, required node affinity and tolerations accept, and that fits its CPU and
-  memory requests. A requirement on a label Floci doesn't give its nodes (a GPU count, say) is left out. A pod one of
+  memory requests. A type whose node would take the pool's nodes, joined or joining, past its `limits` (`cpu`,
+  `memory`, `nodes`) is left out, as AWS stopped at two 2-vCPU nodes for a pool limited to 4 vCPUs, so a pod such a
+  pool can't take goes to the next pool, or waits. A requirement on a label Floci doesn't give its nodes (a GPU count, say) is left out. A pod one of
   the pool's schedulable nodes has room for, joined or still joining, waits for the scheduler instead. A joined
   node's room is its `status.allocatable` CPU, memory and pods less its pods' requests (sidecars included); one still
   joining has its instance type's whole size and 110 pods. A cordoned node, one with a taint of its own the pod
@@ -476,7 +515,9 @@ launches nodes on AWS. Floci checks every 10 seconds.
   key isn't modelled; the taints a node carries while it starts (`node.kubernetes.io/not-ready` and the
   like) don't count in the 3 minutes after its launch, as Karpenter counts a starting node.
 - **Instance.** One node a pool and pass, of the smallest type in the instance type catalog with at least 2 vCPUs
-  that fits all of the pool's waiting pods, or else the largest of them. AWS picked a 2-vCPU `c6a.large` for a pod of
+  that fits all of the pool's waiting pods and the DaemonSet pods that would run on it (by their node selector,
+  required node affinity and tolerations, against its labels and region), or else the largest of them. A node still joining has room for its
+  DaemonSet pods taken too. AWS picked a 2-vCPU `c6a.large` for a pod of
   100m CPU. It is launched in a subnet of the pool's NodeClass, in the zone the pods ask for if they do, with its
   security groups, the instance
   profile `eks-<region>-<cluster>-<number>` (path `/eks/<region>/<cluster>/`) holding the NodeClass's role, and the
@@ -493,6 +534,39 @@ launches nodes on AWS. Floci checks every 10 seconds.
   honours those flags too. The labels are: `karpenter.sh/nodepool`,
   `eks.amazonaws.com/compute-type: auto`, `node.kubernetes.io/instance-type`, `karpenter.sh/capacity-type`, and the
   `eks.amazonaws.com/instance-*` category, generation, family, size, CPU and memory labels.
+- **Empty nodes.** A node that runs no workload (DaemonSet and static pods aside) and that no pending pod is counting
+  on is removed once it has been empty for its pool's `disruption.consolidateAfter`, as Auto Mode's consolidation
+  removes it: it is tainted `karpenter.sh/disrupted:NoSchedule`, as Karpenter marks a node it removes, and unless
+  the scheduler bound a pod to it meanwhile, it is drained (`kubectl drain`, so a pod that tolerates the taint and
+  arrived late is evicted, its disruption budget kept; on Floci's own Ready node, which has no kubelet to finish a
+  pod's shutdown, evicted pods go at once), its node is taken out and its instance terminated. A node a removal
+  that was called off or failed left with the taint, and that isn't being removed, has it taken off by the next pass. AWS removed an empty node within 90
+  seconds. A pool whose `consolidateAfter` is `Never` keeps its nodes. Each pass removes no more of a pool's nodes
+  than its disruption budgets that cover emptiness allow (a percentage is of its joined nodes, as Karpenter leaves
+  out nodes not yet initialized), less its nodes already not Ready or being deleted (a percentage rounded up, 10% without a budget; one whose
+  `reasons` leave out `Empty` doesn't count); a budget with a `schedule` is
+  left out, as Floci doesn't model its window. How long a node has been empty is kept in memory, so a restart starts
+  the wait again.
+- **Deleted pools.** The nodes of a NodePool that is deleted (or being deleted, held by its NodeClaims), or that
+  `UpdateClusterConfig` drops, are tainted, drained and removed the same way, whatever they run, as Karpenter removes
+  them. A pool being deleted launches nothing more. So is the node of a NodeClaim that is deleted (`kubectl delete
+  nodeclaim`), as deleting a claim is how Karpenter removes a node; the claim goes once its instance has.
+  The node of an Auto Mode instance that is terminated (one that registered while its instance was being
+  terminated, say), by its provider ID, is deleted by the next pass, while EC2 keeps the instance, an hour as on AWS, with compute on or
+  off.
+- **NodeClaim.** Each node has a `NodeClaim` (`karpenter.sh/v1`), as on AWS: named after its pool with five
+  characters (`general-purpose-kw46r`) no other instance's claim has, kept in its instance's `karpenter.sh/nodeclaim`
+  tag as Karpenter tags its instances, owned by its NodePool and held by the `karpenter.sh/termination` finalizer,
+  labelled as its node, with the pool's requirements (plus the chosen instance type, the pool and the NodeClass), its
+  pods' requests, and the pool's `expireAfter` and `terminationGracePeriod` (336h and 24h0m0s when the pool doesn't
+  say, as on AWS). Its status says `Launched` once the instance is up, then, once the node joins, `Registered`,
+  `Initialized` and `Ready`
+  (as the node's own Ready), with the node's name, capacity and allocatable, kept in step as they change. It goes
+  with its instance, Karpenter's finalizer taken off (other finalizers stay). A claim that couldn't be made is made
+  on a later pass. Floci touches only the claims labelled `app.kubernetes.io/managed-by: eks`. `kubectl get
+  nodeclaims` shows the type, capacity type, zone, node and readiness, as Karpenter's columns do.
+- **Pool status.** Each pool's `status.resources` (`cpu`, `memory`, `pods`, `nodes`) and `status.nodes` say what its
+  joined nodes have, the sum of their capacity, as AWS shows them.
 - **Removal.** Turning compute off terminates the cluster's Auto Mode instances and takes their nodes out of it.
   Deleting the cluster terminates them, waits up to a minute for them to finish terminating, as they hold the
   cluster security group deleted next (one that doesn't fails the delete, which can be retried), and deletes the
@@ -500,7 +574,8 @@ launches nodes on AWS. Floci checks every 10 seconds.
 
 On AWS, a node is named after its instance ID and is a managed instance a plain `DescribeInstances` doesn't list.
 In Floci it is named as other joined instances are, after its private DNS name, and `DescribeInstances` lists it.
-Floci makes no `NodeClaim` objects, and doesn't yet remove empty nodes.
+Floci doesn't replace underutilized nodes with smaller ones, and a NodeClaim's requirements name only the instance
+type chosen, where AWS lists every type that would do.
 
 ### Auto Mode load balancing for Services
 
@@ -759,6 +834,10 @@ services:
     k3s containers bind their API server port (6500-6599) directly on the host via Docker: no `ports:` entry is required in `docker-compose.yml`. See [Ports Reference](../configuration/ports.md#ports-65006599-eks-real-mode) for the full explanation.
 
 #### Clusters survive a restart
+
+Removing a retired k3s container also removes its anonymous Docker volumes.
+The named k3s data volume follows the storage policy below, including when a
+capacity replacement retires the old container.
 
 With a persistent [storage mode](../configuration/storage.md) (the default), clusters recorded in
 `eks-clusters.json` are **re-latched to their k3s containers when Floci starts**:

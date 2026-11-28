@@ -107,7 +107,9 @@ class ElbV2ForwardedHeadersIntegrationTest {
 
     private void startHttpListener() {
         listenerArn = createListener(loadBalancerArn, targetGroupArn, listenerPort);
-        await().atMost(Duration.ofSeconds(3)).untilAsserted(() -> assertEquals(200, send().statusCode()));
+        await().atMost(Duration.ofSeconds(3))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals(200, send().statusCode()));
     }
 
     private Response send(String... forwardedFor) {
@@ -295,8 +297,10 @@ class ElbV2ForwardedHeadersIntegrationTest {
             deleteListener(listenerArn);
             listenerArn = null;
             client.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(
-                    () -> acmService.deleteCertificate(certificate.getArn(), REGION));
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(
+                            () -> acmService.deleteCertificate(certificate.getArn(), REGION));
         }
     }
 }

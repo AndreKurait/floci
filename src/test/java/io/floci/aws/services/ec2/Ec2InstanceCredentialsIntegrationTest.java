@@ -25,8 +25,8 @@ class Ec2InstanceCredentialsIntegrationTest {
     IamService iam;
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void imdsCredentialsResolveToTheAttachedRoleAndAreRevokedOnCleanup(boolean stopServer) throws Exception {
+    @ValueSource(strings = {"stop", "unregister", "revoke"})
+    void imdsCredentialsResolveToTheAttachedRoleAndAreRevokedOnCleanup(String cleanup) throws Exception {
         String account = "246813579012";
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String role = "worker-" + suffix;
@@ -46,6 +46,7 @@ class Ec2InstanceCredentialsIntegrationTest {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         Instance instance = new Instance();
         instance.setInstanceId("i-credentials");
+        instance.setRegion("us-east-1");
         instance.setIamInstanceProfileArn("arn:aws:iam::" + account + ":instance-profile/" + profile);
         try (Ec2MetadataTestFixture fixture = new Ec2MetadataTestFixture()) {
             fixture.start(iam, config, instance);
@@ -62,20 +63,33 @@ class Ec2InstanceCredentialsIntegrationTest {
             assertEquals("AWS-HMAC", credential.getString("Type"));
             assertTrue(Instant.parse(credential.getString("Expiration")).isAfter(Instant.now()));
             String key = credential.getString("AccessKeyId");
+            assertTrue(key.matches("ASIATS5Z4K4C[A-P][A-Z2-7]{7}"));
             String sessionToken = credential.getString("Token");
             assertEquals(credential.getString("SecretAccessKey"), iam.findSecretKey(key, sessionToken).orElseThrow());
             assertEquals(account, iam.resolveAccountId(key).orElseThrow());
+            assertEquals("arn:aws:ec2:us-east-1:" + account + ":instance/i-credentials",
+                    iam.ec2InstanceProfileSession(key).orElseThrow().getEc2InstanceArn());
+            assertTrue(iam.findSecretKey(key, "incorrect-token").isEmpty());
             assertEquals("arn:aws:sts::" + account + ":assumed-role/" + role + "/i-credentials",
                     iam.resolveCallerArn(key).orElseThrow());
             assertEquals(response.body(), fixture.get(path + role, token.body()).body());
-            if (stopServer) {
+            if ("stop".equals(cleanup)) {
                 server.stop();
             } else {
-                server.unregisterInstance(instance);
+                if ("revoke".equals(cleanup)) {
+                    server.revokeInstanceCredentials(instance);
+                } else {
+                    server.unregisterInstance(instance);
+                }
                 assertNotEquals(200, fixture.get(path + role, token.body()).statusCode());
             }
             assertTrue(iam.findSecretKey(key, sessionToken).isEmpty());
-            assertTrue(server.registeredContainer("127.0.0.1").isEmpty());
+            assertTrue(iam.ec2InstanceProfileSession(key).isEmpty());
+            assertEquals("revoke".equals(cleanup), server.registeredContainer("127.0.0.1").isPresent());
+            if ("revoke".equals(cleanup)) {
+                server.registerContainer("127.0.0.1", instance.getInstanceId(), instance);
+                assertNotEquals(200, fixture.get(path + role, fixture.putToken("60").body()).statusCode());
+            }
         } finally {
             given().header("Authorization", auth).contentType("application/x-www-form-urlencoded")
                     .formParam("Action", "RemoveRoleFromInstanceProfile").formParam("InstanceProfileName", profile)
@@ -121,9 +135,12 @@ class Ec2InstanceCredentialsIntegrationTest {
             assertTrue(Instant.parse(credential.getString("Expiration")).isAfter(Instant.now()));
             assertNotNull(Instant.parse(credential.getString("LastUpdated")));
             String key = credential.getString("AccessKeyId");
+            assertTrue(key.matches("ASIATS5Z4K4C[A-P][A-Z2-7]{7}"));
             String sessionToken = credential.getString("Token");
             assertEquals(credential.getString("SecretAccessKey"), iam.findSecretKey(key, sessionToken).orElseThrow());
             assertEquals("246813579012", iam.resolveAccountId(key).orElseThrow());
+            assertTrue(iam.ec2InstanceProfileSession(key).isEmpty());
+            assertEquals("i-identity", iam.findEc2SessionInstanceId(key).orElseThrow());
             assertEquals("arn:aws:sts::246813579012:assumed-role/aws:ec2-instance/i-identity",
                     iam.resolveCallerArn(key).orElseThrow());
             assertEquals("246813579012:aws:ec2-instance:i-identity", iam.resolveCallerUserId(key, sessionToken).orElseThrow());
@@ -135,6 +152,7 @@ class Ec2InstanceCredentialsIntegrationTest {
 
             server.unregisterInstance(instance);
             assertTrue(iam.findSecretKey(key, sessionToken).isEmpty());
+            assertTrue(iam.ec2InstanceProfileSession(key).isEmpty());
         }
     }
 

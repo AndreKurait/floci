@@ -19,6 +19,8 @@ import io.floci.aws.core.common.docker.DockerHostResolver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -49,9 +51,10 @@ class EcsCredentialsProxyTest {
     private DockerHostResolver dockerHostResolver;
     private EmulatorConfig config;
     private EcsCredentialsProxy proxy;
+    private String helperRecipe;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws IOException {
         dockerClient = mock(DockerClient.class);
         InfoCmd info = mock(InfoCmd.class);
         when(dockerClient.infoCmd()).thenReturn(info);
@@ -245,7 +248,7 @@ class EcsCredentialsProxyTest {
      * container with the given id: the image check, the launch, the running check for a repeat
      * call, and the endpoint-reachability exec/callback plumbing.
      */
-    private void stubSuccessfulLaunch(String containerId) {
+    private ContainerBuilder.Builder stubSuccessfulLaunch(String containerId) {
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         when(builder.build()).thenReturn(new ContainerSpec("floci/network-helper:local"));
         when(containerBuilder.newContainer(any())).thenReturn(builder);
@@ -265,6 +268,18 @@ class EcsCredentialsProxyTest {
         when(running.getRunning()).thenReturn(true);
 
         ContainerExecStubs.completeEveryExec(dockerClient, containerId, 0, "404", "");
+        return builder;
+    }
+
+    @Test
+    void theProxyRelaysTheCredentialsAddressToFlociOnTheSharedRelayAddresses() {
+        when(config.services().ecs().taskRoleCredentials().port()).thenReturn(9150);
+        ContainerBuilder.Builder builder = stubSuccessfulLaunch("proxy-1");
+
+        proxy.ensureProxyOn("floci-net");
+
+        verify(builder).withCmd(List.of("TCP-LISTEN:80,bind=169.254.170.2,fork,reuseaddr,nodelay,backlog=4096",
+                "TCP:host.docker.internal:9150,nodelay"));
     }
 
     @Test

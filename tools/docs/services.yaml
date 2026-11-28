@@ -29,6 +29,10 @@ services:
     doc: docs/services/ec2-instance-connect.md
     sources:
       - { path: services/ec2instanceconnect/InstanceConnectJsonHandler.java, mode: switch }
+  - service: acm-pca
+    doc: docs/services/acm-pca.md
+    sources:
+      - { path: services/acmpca/AcmPcaJsonHandler.java, mode: switch }
   - service: acm
     doc: docs/services/acm.md
     sources:
@@ -54,6 +58,7 @@ services:
     doc: docs/services/athena.md
     sources:
       - { path: services/athena/AthenaJsonHandler.java, mode: switch }
+      - { path: services/athena/AthenaPreparedStatementHandler.java, mode: switch }
   - service: bedrock
     doc: docs/services/bedrock.md
     sources:
@@ -89,10 +94,15 @@ services:
     doc: docs/services/ce.md
     sources:
       - { path: services/ce/CostExplorerJsonHandler.java, mode: switch }
+  - service: codedeploy-agent
+    doc: docs/design/codedeploy-agent-runtime.md
+    sources:
+      - { path: services/codedeploy/CodeDeployAgentJsonHandler.java, mode: switch }
   - service: cloudformation
     doc: docs/services/cloudformation.md
     sources:
       - { path: services/cloudformation/CloudFormationQueryHandler.java, mode: switch }
+      - { path: services/cloudformation/CloudFormationDriftHandler.java, mode: switch }
   - service: cloudhsmv2
     doc: docs/services/cloudhsmv2.md
     sources:
@@ -339,6 +349,7 @@ services:
     doc: docs/services/memorydb.md
     sources:
       - { path: services/memorydb/MemoryDbHandler.java, mode: switch }
+      - { path: services/memorydb/MemoryDbParameterGroupHandler.java, mode: switch }
   - service: macie2
     doc: docs/services/macie2.md
     sources:
@@ -417,6 +428,7 @@ services:
       ListVpcAssociationAuthorizations: ListVPCAssociationAuthorizations
       ListHostedZonesByVpc: ListHostedZonesByVPC
       GetDnssec: GetDNSSEC
+      TestDnsAnswer: TestDNSAnswer
   - service: route53resolver
     doc: docs/services/route53resolver.md
     sources:
@@ -501,9 +513,12 @@ deferred_handlers:
   - { path: services/cloudcontrol/CloudControlJsonHandler.java }  # no standalone action table yet
   - { path: services/cloudmap/CloudMapHandler.java }  # non-tabular doc (grouped/inline)
   - { path: services/cloudwatch/logs/CloudWatchLogsHandler.java }  # multi-table doc (nested handler)
+  - { path: services/cloudwatch/logs/CloudWatchLogsTransformerHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsMetricFilterHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsDeliveryHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsQueryDefinitionHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
+  - { path: services/cloudwatch/logs/CloudWatchLogsExportHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
+  - { path: services/cloudwatch/insights/CloudWatchInsightRulesHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsJsonHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsQueryHandler.java }  # multi-table doc (nested handler)
   - { path: services/codebuild/CodeBuildJsonHandler.java }  # non-tabular doc (grouped/inline)
@@ -530,6 +545,8 @@ deferred_handlers:
   - { path: services/sns/SnsJsonHandler.java }  # multi-table doc
   - { path: services/sns/SnsQueryHandler.java }  # multi-table doc
   - { path: services/ssm/Ec2MessagesJsonHandler.java }  # multi-table doc
+  - { path: services/ssm/SsmDataChannelController.java }  # Session Manager data channel documented in the SSM multi-table doc
+  - { path: services/ssm/SsmMessagesController.java }  # control channel documented in the SSM multi-table doc
   - { path: services/ssm/SsmJsonHandler.java }  # multi-table doc
   - { path: services/ssm/SsmSessionJsonHandler.java }  # dispatch already counted from SsmJsonHandler
   - { path: services/textract/TextractJsonHandler.java }  # no standalone action table yet

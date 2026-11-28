@@ -21,11 +21,15 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.applicationautoscaling.ApplicationAutoScalingClient;
 import software.amazon.awssdk.services.applicationautoscaling.model.ApplicationAutoScalingException;
 import software.amazon.awssdk.services.applicationautoscaling.model.PutScheduledActionRequest;
 import software.amazon.awssdk.services.applicationautoscaling.model.ScalableTargetAction;
+import software.amazon.awssdk.services.ecr.EcrClient;
+import software.amazon.awssdk.services.ecr.model.RepositoryNotFoundException;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -160,6 +164,25 @@ class IamRequestResourceEnforcementIntegrationTest {
         refused(configureHealthCheck(user, otherLoadBalancer), "elasticloadbalancing:ConfigureHealthCheck");
     }
 
+    /**
+     * A Query request's API is the {@code Version} its handler dispatches it by, its form's on a POST: one naming the
+     * v2 version only in its URL runs as the classic API, so it is checked on the classic load balancer its
+     * {@code LoadBalancerName} names, and a grant on a v2 load balancer's ARN does not delete that one.
+     */
+    @Test
+    void aQueryRequestsApiIsTheVersionItsFormNames() {
+        String name = classicLoadBalancer("data");
+        String v2 = ELB + "loadbalancer/app/res-v2/0123456789abcdef";
+        User user = user("res-elb-version");
+        user.policy(allowOn("elasticloadbalancing:DeleteLoadBalancer", v2));
+        refused(user.query("elasticloadbalancing", "DeleteLoadBalancer").queryParam("Version", "2015-12-01")
+                .formParam("LoadBalancerName", name).formParam("LoadBalancerArn", v2).post("/").then(),
+                "elasticloadbalancing:DeleteLoadBalancer");
+        admin("elasticloadbalancing").formParam("Action", "DescribeLoadBalancers").formParam("Version", "2012-06-01")
+                .formParam("LoadBalancerNames.member.1", name).post("/").then().statusCode(200)
+                .body(containsString(name));
+    }
+
     /** An IP target group an administrator creates, deleted after the test; its ARN. */
     private String elbTargetGroup() {
         String arn = admin("elasticloadbalancing").formParam("Action", "CreateTargetGroup")
@@ -242,8 +265,9 @@ class IamRequestResourceEnforcementIntegrationTest {
 
     /**
      * A v2 {@code CreateLoadBalancer} of a {@code Type} outside the enum names no v2 load balancer for IAM to check,
-     * and Elastic Load Balancing refuses it, as AWS does, so a grant on a classic load balancer's name does not
-     * create a v2 one under another.
+     * and a v2 request is never read for the classic API's {@code LoadBalancerName}, which only a classic request has
+     * (the table's rows name the API they are read for), so a grant on a classic load balancer's name does not create
+     * a v2 one under another: the request is checked on {@code *} and refused.
      */
     @Test
     void aLoadBalancerOfATypeOutsideTheEnumIsNotCreatedUnderAnotherName() {
@@ -253,8 +277,7 @@ class IamRequestResourceEnforcementIntegrationTest {
         user.query("elasticloadbalancing", "CreateLoadBalancer").formParam("Version", "2015-12-01")
                 .formParam("Name", name).formParam("Type", "other").formParam("LoadBalancerName", "res-allowed")
                 .formParam("Subnets.member.1", "subnet-a").formParam("Subnets.member.2", "subnet-b").post("/").then()
-                .statusCode(400).body(containsString("ValidationError"))
-                .body(containsString("Member must satisfy enum value set: [application, network, gateway]"));
+                .statusCode(403).body(containsString("elasticloadbalancing:CreateLoadBalancer"));
         admin("elasticloadbalancing").formParam("Action", "DescribeLoadBalancers").formParam("Version", "2015-12-01")
                 .post("/").then().statusCode(200).body(not(containsString(name)));
     }
@@ -298,23 +321,17 @@ class IamRequestResourceEnforcementIntegrationTest {
         assertTrue(error.path("message").asText().contains("states:DescribeStateMachine"), error.toString());
     }
 
-    /**
-     * A Step Functions Local {@code <stateMachineArn>#<test case>} is checked as given: it is no ARN AWS has, and
-     * nothing botocore or the Service Reference says reads it otherwise. So a grant on the machine alone does not
-     * reach a start naming a test case, a grant covering it does, and a deny on the machine alone does not apply.
-     */
+    /** The Local test-case suffix selects execution behavior; authorization still checks the underlying state machine. */
     @Test
-    void aStateMachinesTestCaseIsCheckedAsGiven() {
+    void aStateMachinesTestCaseIsCheckedOnTheMachineItRuns() {
         String arn = createStateMachine("res-tc-" + suffix());
         User user = user("res-tc");
         user.policy(allowOn("states:StartExecution", arn));
-        refusedJson(startExecution(user, arn + "#"), "states:StartExecution");
-        user.policy(allowOn("states:StartExecution", arn + "*"));
         startExecution(user, arn + "#").statusCode(200);
 
         user.policy(allowOn("states:StartExecution", "*") + ",{\"Effect\":\"Deny\",\"Action\":\"states:StartExecution\","
                 + "\"Resource\":\"" + arn + "\"}");
-        startExecution(user, arn + "#").statusCode(200);
+        refusedJson(startExecution(user, arn + "#"), "states:StartExecution");
     }
 
     /**
@@ -716,15 +733,48 @@ class IamRequestResourceEnforcementIntegrationTest {
     void aRepositoryIsCheckedInTheRegistryItsRequestNames() {
         String name = "res-repo-" + suffix();
         String other = "111122223333";
+        String arn = "arn:aws:ecr:" + REGION + ":" + other + ":repository/" + name;
+        String request = "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name + "\"]}";
         User user = user("res-repo-registry");
-        user.policy(allowOn("ecr:DescribeRepositories", "arn:aws:ecr:" + REGION + ":" + other + ":repository/" + name));
-        describeRepositoriesWith(user, "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name + "\"]}")
-                .statusCode(400).body(containsString("RepositoryNotFoundException"));
-        refusedJson(describeRepositories(user, name), "ecr:DescribeRepositories");
+        user.policy(allowOn("ecr:DescribeRepositories", arn));
+        refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+        when(ecrRegistry.internalRepoName(other, REGION, name)).thenReturn(other + "/" + REGION + "/" + name);
+        when(ecrRegistry.getRepositoryUri(other, REGION, name)).thenReturn("registry.example.test/" + name);
 
-        user.policy(allowOn("ecr:DescribeRepositories", "arn:aws:ecr:" + REGION + ":" + ACCOUNT + ":repository/" + name));
-        refusedJson(describeRepositoriesWith(user, "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name
-                + "\"]}"), "ecr:DescribeRepositories");
+        try (EcrClient owner = ecrAccount(other)) {
+            String createdArn = owner.createRepository(r -> r.repositoryName(name)).repository().repositoryArn();
+            try {
+                assertEquals(arn, createdArn);
+                refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+                String policy = """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                          "Principal":{"AWS":"arn:aws:iam::%s:user/%s"},
+                          "Action":"ecr:DescribeRepositories","Resource":"%s"}]}
+                        """.formatted(ACCOUNT, user.name(), arn);
+                owner.setRepositoryPolicy(r -> r.repositoryName(name).policyText(policy));
+                describeRepositoriesWith(user, request).statusCode(200)
+                        .body("repositories[0].registryId", equalTo(other))
+                        .body("repositories[0].repositoryArn", equalTo(arn));
+                refusedJson(describeRepositories(user, name), "ecr:DescribeRepositories");
+
+                user.policy(allowOn("ecr:DescribeRepositories",
+                        "arn:aws:ecr:" + REGION + ":" + ACCOUNT + ":repository/" + name));
+                refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+                user.policy(allowOn("ecr:DescribeRepositories", arn));
+                owner.deleteRepositoryPolicy(r -> r.repositoryName(name));
+                refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+            } finally {
+                owner.deleteRepository(r -> r.repositoryName(name).force(true));
+            }
+            assertThrows(RepositoryNotFoundException.class,
+                    () -> owner.describeRepositories(r -> r.repositoryNames(name)));
+        }
+    }
+
+    private static EcrClient ecrAccount(String account) {
+        return EcrClient.builder().endpointOverride(baseUri).region(Region.of(REGION))
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(account, "test")))
+                .build();
     }
 
     /** A {@code registryId} of JSON null is no registry, as ECR reads it, so a deny on the caller's repository holds. */
@@ -893,11 +943,11 @@ class IamRequestResourceEnforcementIntegrationTest {
                 + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
         send(user, "ssm", "AmazonSSM.GetParameter", "1.1", "{\"Name\":\"" + tagged + "\"}").statusCode(200);
         refusedJson(send(user, "ssm", "AmazonSSM.GetParameter", "1.1", "{\"Name\":\"" + other + "\"}"),
-                "ssm:GetParameter");
+                "ssm:GetParameter", 403);
         send(user, "ssm", "AmazonSSM.DescribeDocument", "1.1", "{\"Name\":\"" + taggedDocument + "\"}")
                 .statusCode(200);
         refusedJson(send(user, "ssm", "AmazonSSM.DescribeDocument", "1.1", "{\"Name\":\"" + otherDocument + "\"}"),
-                "ssm:DescribeDocument");
+                "ssm:DescribeDocument", 403);
     }
 
     /** An SSM String parameter of the name, tagged with the team, deleted afterwards. */
@@ -2751,14 +2801,9 @@ class IamRequestResourceEnforcementIntegrationTest {
     }
 
     /** An assignment of the permission set to a group, in the account. */
-    /**
-     * An IAM Identity Center permission set provisioned to all the accounts it is provisioned to, with no
-     * {@code TargetId} or a null one, is checked on its instance and itself: nothing botocore or the Service Reference
-     * says names those accounts, so a grant on the instance and the permission set lets it through and a deny on one of
-     * its accounts does not apply. One provisioned to an account is checked on that account too.
-     */
+    /** Bulk provisioning checks the instance, permission set and each account whose provisioning it changes. */
     @Test
-    void aPermissionSetProvisionedToAllItsAccountsIsCheckedOnItsInstanceAndItself() {
+    void aPermissionSetProvisionedToAllItsAccountsIsCheckedOnEachOfThem() {
         String instance = ssoInstance();
         String permissionSet = permissionSet(instance);
         for (String account : List.of("111111111111", "222222222222")) {
@@ -2774,18 +2819,25 @@ class IamRequestResourceEnforcementIntegrationTest {
 
         User user = user("res-sso-provision");
         user.policy(allowOn("sso:ProvisionPermissionSet", instance) + ","
-                + allowOn("sso:ProvisionPermissionSet", permissionSet));
-        ssoAdmin(user, "ProvisionPermissionSet", all).statusCode(200);
-        ssoAdmin(user, "ProvisionPermissionSet", provision + "\"TargetType\":\"ALL_PROVISIONED_ACCOUNTS\","
-                + "\"TargetId\":null}").statusCode(200);
-        refusedJson(ssoAdmin(user, "ProvisionPermissionSet", one), "sso:ProvisionPermissionSet");
-        user.policy(allowOn("sso:ProvisionPermissionSet", "*") + ",{\"Effect\":\"Deny\","
-                + "\"Action\":\"sso:ProvisionPermissionSet\",\"Resource\":\"arn:aws:sso:::account/222222222222\"}");
-        ssoAdmin(user, "ProvisionPermissionSet", all).statusCode(200);
-        user.policy(allowOn("sso:ProvisionPermissionSet", instance) + ","
                 + allowOn("sso:ProvisionPermissionSet", permissionSet) + ","
                 + allowOn("sso:ProvisionPermissionSet", "arn:aws:sso:::account/111111111111"));
         ssoAdmin(user, "ProvisionPermissionSet", one).statusCode(200);
+        refusedJson(ssoAdmin(user, "ProvisionPermissionSet", all), "sso:ProvisionPermissionSet");
+        user.policy(allowOn("sso:ProvisionPermissionSet", "*") + ",{\"Effect\":\"Deny\","
+                + "\"Action\":\"sso:ProvisionPermissionSet\",\"Resource\":\"arn:aws:sso:::account/222222222222\"}");
+        refusedJson(ssoAdmin(user, "ProvisionPermissionSet", all), "sso:ProvisionPermissionSet");
+        ssoAdmin(user, "ProvisionPermissionSet", one).statusCode(200);
+        // A grant on both accounts covers it, a null TargetId naming no account of its own.
+        user.policy(allowOn("sso:ProvisionPermissionSet", instance) + ","
+                + allowOn("sso:ProvisionPermissionSet", permissionSet) + ","
+                + allowOn("sso:ProvisionPermissionSet", "arn:aws:sso:::account/111111111111") + ","
+                + allowOn("sso:ProvisionPermissionSet", "arn:aws:sso:::account/222222222222"));
+        ssoAdmin(user, "ProvisionPermissionSet", provision + "\"TargetType\":\"ALL_PROVISIONED_ACCOUNTS\","
+                + "\"TargetId\":null}").statusCode(200);
+        String third = assignment(instance, permissionSet, "333333333333");
+        adminJson("sso", "SWBExternalService.CreateAccountAssignment").body(third).post("/").then().statusCode(200);
+        cleanup.register(() -> adminJson("sso", "SWBExternalService.DeleteAccountAssignment").body(third).post("/"));
+        refusedJson(ssoAdmin(user, "ProvisionPermissionSet", all), "sso:ProvisionPermissionSet");
     }
 
     /**
@@ -4139,7 +4191,11 @@ class IamRequestResourceEnforcementIntegrationTest {
 
     /** A JSON-protocol service refuses with {@code AccessDeniedException}, which those protocols send as a 400. */
     private static void refusedJson(ValidatableResponse response, String action) {
-        response.statusCode(400).body(containsString("AccessDeniedException"))
+        refusedJson(response, action, 400);
+    }
+
+    private static void refusedJson(ValidatableResponse response, String action, int status) {
+        response.statusCode(status).body(containsString("AccessDeniedException"))
                 .body(containsString("not authorized to perform: " + action)).body(not(containsString("NotFound")));
     }
 

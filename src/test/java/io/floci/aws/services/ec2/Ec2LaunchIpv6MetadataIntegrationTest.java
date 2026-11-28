@@ -66,6 +66,19 @@ class Ec2LaunchIpv6MetadataIntegrationTest {
         // The stored blocks are independent of a MAC, so this catches the block gap on its own.
         assertEquals(List.of(fixture.subnetBlock()), eni.getSubnetIpv6CidrBlocks());
         assertEquals(List.of(fixture.vpcBlock()), eni.getVpcIpv6CidrBlocks());
+        try (Ec2MetadataTestFixture metadata = new Ec2MetadataTestFixture()) {
+            metadata.start(null, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), before);
+            HttpResponse<String> token = metadata.putToken("60");
+            assertEquals(200, token.statusCode());
+            String prefix = "/latest/meta-data/network/interfaces/macs/" + eni.getMacAddress();
+            for (Map.Entry<String, String> expected : Map.of(
+                    prefix + "/subnet-ipv6-cidr-blocks", fixture.subnetBlock(),
+                    prefix + "/vpc-ipv6-cidr-blocks", fixture.vpcBlock()).entrySet()) {
+                HttpResponse<String> response = metadata.get(expected.getKey(), token.body());
+                assertEquals(200, response.statusCode(), expected.getKey());
+                assertEquals(expected.getValue(), response.body(), expected.getKey());
+            }
+        }
         fixture.client().assignIpv6Addresses(request -> request.networkInterfaceId(eni.getNetworkInterfaceId())
                 .ipv6AddressCount(1));
         Instance after = service.findInstanceById(fixture.account(), id);

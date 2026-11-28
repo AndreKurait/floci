@@ -45,6 +45,12 @@ class Ec2CreateImageCaptureTest {
     private static final String CONTAINER_ID = "container-1";
 
     private static Ec2ContainerManager managerWith(DockerClient dockerClient) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.ec2()).thenReturn(ec2);
+        when(ec2.nativePeerDependencies()).thenReturn("[]");
         return new Ec2ContainerManager(
                 mock(ContainerBuilder.class),
                 mock(ContainerLifecycleManager.class),
@@ -53,7 +59,7 @@ class Ec2CreateImageCaptureTest {
                 mock(DockerHostResolver.class),
                 dockerClient,
                 mock(PortAllocator.class),
-                mock(EmulatorConfig.class),
+                config,
                 mock(Ec2MetadataServer.class),
                 mock(Ec2PortForwardManager.class),
                 mock(RegionResolver.class),

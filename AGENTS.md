@@ -261,7 +261,9 @@ Guidelines:
 - Plain test classes (no `@QuarkusTest`) run four at a time in CI, in a Surefire pass before the
   Quarkus classes. A plain class that opens a socket declares `@ResourceLock(ParallelLocks.PORTS)`:
   the default mode when it releases a port and binds or dials it later (`FreePorts`, a port expected
-  to refuse), `mode = ResourceAccessMode.READ` otherwise. A plain class that builds the
+  to refuse), `mode = ResourceAccessMode.READ` otherwise. A plain class that starts a child process
+  declares it in READ mode too: until the child execs it holds a copy of every socket the JVM has
+  open, so a listener closed meanwhile keeps its port bound. A plain class that builds the
   `EmulatorConfig` mapping with a `SmallRyeConfigBuilder` declares
   `@ResourceLock(ParallelLocks.CONFIG_MAPPING)`. `ParallelLocksInventoryTest` enforces both. A class
   that shares other process-wide state takes a lock named in `ParallelLocks` (`TLS_CONFIG` for
@@ -361,7 +363,11 @@ the registry and stubs what nothing serves; never add type-specific code to it.
 2. `resourceTypes()` lists the `AWS::*` types; `provision(resource, props, ctx)`
    does the work, switching on `resource.getResourceType()` when it serves several.
 3. Set **both** reference mechanisms. They are separate:
-   - `resource.setPhysicalId(...)` backs `Ref`
+   - `resource.setPhysicalId(...)` stores the durable resource identity and normally backs `Ref`.
+     When AWS returns only part of a compound identity, override `referenceValue(physicalId)`.
+     Keep the complete physical ID so deletion and rollback can still identify the resource.
+     Override `publicPhysicalId(physicalId)` separately when CFN resource/event/change-set responses
+     expose part of that identity; the default keeps the complete ID in public responses.
    - `resource.getAttributes().put(...)` backs `Fn::GetAtt`, one entry per attribute
    Omitting an attribute does not fail; `Fn::GetAtt` resolves to the literal
    `"LogicalId.Attr"`. Source the attribute names from the type's registry schema in

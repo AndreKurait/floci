@@ -26,6 +26,7 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
@@ -38,6 +39,8 @@ import java.util.Map;
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class AppConfigController {
+    private static final String STORED_TAGS_MEMBER = "tags";
+
     private final AppConfigService service;
     private final AppConfigDataService dataService;
     private final ObjectMapper objectMapper;
@@ -58,13 +61,13 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         Application app = service.createApplication(request);
-        return Response.status(201).entity(app).build();
+        return Response.status(201).entity(resourceResponse(app)).build();
     }
 
     @GET
     @Path("/applications/{id}")
     public Response getApplication(@PathParam("id") String id) {
-        return Response.ok(service.getApplication(id)).build();
+        return Response.ok(resourceResponse(service.getApplication(id))).build();
     }
 
     @PATCH
@@ -72,7 +75,7 @@ public class AppConfigController {
     public Response updateApplication(@PathParam("id") String id, String body) throws IOException {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
-        return Response.ok(service.updateApplication(id, request)).build();
+        return Response.ok(resourceResponse(service.updateApplication(id, request))).build();
     }
 
     @GET
@@ -82,7 +85,7 @@ public class AppConfigController {
                                      @Context UriInfo uriInfo) {
         PaginatedResult<Application> page = service.listApplicationsPage(
                 Pagination.parseMaxResults(maxResults, "BadRequestException"), rawNextToken(nextToken, uriInfo));
-        return listResponse(page.items(), page.nextToken());
+        return listResponse(page.items().stream().map(this::resourceResponse).toList(), page.nextToken());
     }
 
     @DELETE
@@ -100,13 +103,21 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         Environment env = service.createEnvironment(appId, request);
-        return Response.status(201).entity(env).build();
+        return Response.status(201).entity(resourceResponse(env)).build();
     }
 
     @GET
     @Path("/applications/{appId}/environments/{envId}")
     public Response getEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId) {
-        return Response.ok(service.getEnvironment(appId, envId)).build();
+        return Response.ok(resourceResponse(service.getEnvironment(appId, envId))).build();
+    }
+
+    @PATCH
+    @Path("/applications/{appId}/environments/{envId}")
+    public Response updateEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId,
+                                      String body) {
+        return Response.ok(resourceResponse(service.updateEnvironment(appId, envId,
+                AppConfigUpdateRequest.read(objectMapper, body)))).build();
     }
 
     @DELETE
@@ -124,7 +135,7 @@ public class AppConfigController {
                                      @Context UriInfo uriInfo) {
         PaginatedResult<Environment> page = service.listEnvironmentsPage(appId,
                 parseListMaxResults(maxResults, uriInfo), rawNextToken(nextToken, uriInfo));
-        return listResponse(page.items(), page.nextToken());
+        return listResponse(page.items().stream().map(this::resourceResponse).toList(), page.nextToken());
     }
 
     // ──────────────────────────── Configuration Profile ────────────────────────────
@@ -135,13 +146,38 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         ConfigurationProfile profile = service.createConfigurationProfile(appId, request);
-        return Response.status(201).entity(profile).build();
+        return Response.status(201).entity(resourceResponse(profile)).build();
     }
 
     @GET
     @Path("/applications/{appId}/configurationprofiles/{profileId}")
     public Response getConfigurationProfile(@PathParam("appId") String appId, @PathParam("profileId") String profileId) {
-        return Response.ok(service.getConfigurationProfile(appId, profileId)).build();
+        ConfigurationProfile profile = service.getConfigurationProfile(appId, profileId);
+        ObjectNode response = resourceResponse(profile);
+        if ("".equals(profile.getDescription())) {
+            response.remove("Description");
+        }
+        return Response.ok(response).build();
+    }
+
+    @PATCH
+    @Path("/applications/{appId}/configurationprofiles/{profileId}")
+    public Response updateConfigurationProfile(@PathParam("appId") String appId,
+                                                @PathParam("profileId") String profileId,
+                                                String body) throws IOException {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> request = objectMapper.readValue(body, Map.class);
+        return Response.ok(resourceResponse(service.updateConfigurationProfile(appId, profileId, request))).build();
+    }
+
+    @POST
+    @Path("/applications/{appId}/configurationprofiles/{profileId}/validators")
+    @Consumes(MediaType.WILDCARD)
+    public Response validateConfiguration(@PathParam("appId") String appId,
+                                          @PathParam("profileId") String profileId,
+                                          @QueryParam("configuration_version") String version) {
+        service.validateConfiguration(appId, profileId, version);
+        return Response.noContent().build();
     }
 
     @GET
@@ -173,7 +209,7 @@ public class AppConfigController {
                                                     @Context UriInfo uriInfo) {
         PaginatedResult<HostedConfigurationVersionSummary> page = service.listHostedConfigurationVersionsPage(
                 appId, profileId, parseListMaxResults(maxResults, uriInfo),
-                rawNextToken(nextToken, uriInfo));
+                rawNextToken(nextToken, uriInfo), uriInfo.getQueryParameters().getFirst("version_label"));
         return listResponse(page.items(), page.nextToken());
     }
 
@@ -184,8 +220,12 @@ public class AppConfigController {
                                                      @PathParam("profileId") String profileId,
                                                      @HeaderParam("Content-Type") String contentType,
                                                      @HeaderParam("Description") String description,
+                                                     @Context HttpHeaders headers,
                                                      byte[] content) {
-        HostedConfigurationVersion version = service.createHostedConfigurationVersion(appId, profileId, content, contentType, description);
+        HostedConfigurationVersion version = service.createHostedConfigurationVersion(
+                appId, profileId, content, contentType, description,
+                headers.getHeaderString("VersionLabel"),
+                parseLatestVersionNumber(headers.getHeaderString("Latest-Version-Number")));
         return versionResponse(version, 201);
     }
 
@@ -214,6 +254,9 @@ public class AppConfigController {
         rb.header("Version-Number", v.getVersionNumber());
         rb.header("Content-Type", v.getContentType());
         if (v.getDescription() != null) rb.header("Description", v.getDescription());
+        if (v.getVersionLabel() != null) {
+            rb.header("VersionLabel", v.getVersionLabel());
+        }
         return rb.build();
     }
 
@@ -225,13 +268,20 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         DeploymentStrategy strategy = service.createDeploymentStrategy(request);
-        return Response.status(201).entity(strategy).build();
+        return Response.status(201).entity(resourceResponse(strategy)).build();
     }
 
     @GET
     @Path("/deploymentstrategies/{id}")
     public Response getDeploymentStrategy(@PathParam("id") String id) {
-        return Response.ok(service.getDeploymentStrategy(id)).build();
+        return Response.ok(resourceResponse(service.getDeploymentStrategy(id))).build();
+    }
+
+    @PATCH
+    @Path("/deploymentstrategies/{id}")
+    public Response updateDeploymentStrategy(@PathParam("id") String id, String body) {
+        return Response.ok(resourceResponse(service.updateDeploymentStrategy(id,
+                AppConfigUpdateRequest.read(objectMapper, body)))).build();
     }
 
     @GET
@@ -278,10 +328,20 @@ public class AppConfigController {
         return listResponse(page.items(), page.nextToken());
     }
 
+    /**
+     * An application or environment as AWS answers it. Their models carry the tags storage keeps, which AWS returns
+     * only through ListTagsForResource, so the stored {@code tags} member is left out of the answer.
+     */
+    private ObjectNode resourceResponse(Object model) {
+        ObjectNode node = objectMapper.valueToTree(model);
+        node.remove(STORED_TAGS_MEMBER);
+        return node;
+    }
+
     private Response listResponse(List<?> items, String nextToken) {
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode itemArray = root.putArray("Items");
-        items.forEach(itemArray::addPOJO);
+        items.forEach(item -> itemArray.add(resourceResponse(item)));
         if (nextToken != null) {
             root.put("NextToken", nextToken);
         }
@@ -320,7 +380,7 @@ public class AppConfigController {
         String clientVersion = uriInfo.getQueryParameters().getFirst("client_configuration_version");
         LegacyConfiguration data = dataService.getConfiguration(
                 appId, envId, configuration, clientId, clientVersion, accept);
-        if (data.configurationVersion().equals(clientVersion)) {
+        if (data.configurationVersion().equals(clientVersion) && !data.s3Source()) {
             return Response.noContent()
                     .header("Configuration-Version", data.configurationVersion())
                     .build();
@@ -344,5 +404,16 @@ public class AppConfigController {
             throw new AwsException("BadRequestException", "max_results must be an integer.", 400);
         }
         return Pagination.parseMaxResults(maxResults, "BadRequestException");
+    }
+
+    private static Integer parseLatestVersionNumber(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("BadRequestException", "LatestVersionNumber must be an integer.", 400);
+        }
     }
 }

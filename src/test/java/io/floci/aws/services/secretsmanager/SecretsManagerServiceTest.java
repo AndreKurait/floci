@@ -14,6 +14,7 @@ import io.floci.aws.services.lambda.model.InvokeResult;
 import io.floci.aws.services.secretsmanager.model.Secret;
 import io.floci.aws.services.secretsmanager.model.SecretVersion;
 import org.apache.commons.lang3.RandomStringUtils;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -21,6 +22,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentMatchers;
 import org.mockito.Mockito;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -125,6 +127,31 @@ class SecretsManagerServiceTest {
 
         SecretVersion previous = service.getSecretValue("my-secret", null, "AWSPREVIOUS", REGION);
         assertEquals("v1", previous.getSecretString());
+    }
+
+    @Test
+    void putSecretValueExplicitCurrentAndPreviousKeepsPreviousOnNewVersionOnly() {
+        String v1Id = service.createSecret("my-secret", "v1", null, null, null, null, REGION).getCurrentVersionId();
+        SecretVersion v2 = service.putSecretValue("my-secret", "v2", null, null, REGION,
+                List.of("AWSCURRENT", "AWSPREVIOUS"));
+
+        Secret described = service.describeSecret("my-secret", REGION);
+        long previousCount = described.getVersions().values().stream()
+                .filter(v -> v.getVersionStages().contains("AWSPREVIOUS")).count();
+        assertEquals(1, previousCount);
+        assertTrue(described.getVersions().get(v2.getVersionId()).getVersionStages().contains("AWSCURRENT"));
+        assertTrue(described.getVersions().get(v2.getVersionId()).getVersionStages().contains("AWSPREVIOUS"));
+        assertFalse(described.getVersions().get(v1Id).getVersionStages().contains("AWSPREVIOUS"));
+    }
+
+    @Test
+    void putSecretValueDefaultMovesPreviousToOldCurrent() {
+        String v1Id = service.createSecret("my-secret", "v1", null, null, null, null, REGION).getCurrentVersionId();
+        SecretVersion v2 = service.putSecretValue("my-secret", "v2", null, null, REGION, null);
+
+        Secret described = service.describeSecret("my-secret", REGION);
+        assertEquals(List.of("AWSPREVIOUS"), described.getVersions().get(v1Id).getVersionStages());
+        assertEquals(List.of("AWSCURRENT"), described.getVersions().get(v2.getVersionId()).getVersionStages());
     }
 
     @Test
@@ -727,6 +754,18 @@ class SecretsManagerServiceTest {
     }
 
     @Test
+    void listSecretVersionIds_valuelessPendingVersion_isExcluded() {
+        String pendingToken = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        service.createSecret("my-secret", "v1", null, null, null, null, REGION);
+        service.putSecretValue("my-secret", null, null, pendingToken, REGION, List.of("AWSPENDING"));
+
+        Map<String, List<String>> versions = service.listSecretVersionIds("my-secret", REGION);
+
+        assertEquals(1, versions.size());
+        assertFalse(versions.containsKey(pendingToken));
+    }
+
+    @Test
     void getSecretValueByVersionId() {
         service.createSecret("my-secret", "v1", null, null, null, null, REGION);
         SecretVersion v1 = service.getSecretValue("my-secret", null, "AWSCURRENT", REGION);
@@ -1161,19 +1200,10 @@ class SecretsManagerServiceTest {
         svc.rotateSecret("my-secret", "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                 lambdaArn, null, true, REGION);
 
-        long end = System.currentTimeMillis() + 2000;
-        boolean passed = false;
-        while (System.currentTimeMillis() < end) {
-            try {
-                SecretVersion current = svc.getSecretValue("my-secret", null, "AWSCURRENT", REGION);
-                assertEquals("new-rotated-value", current.getSecretString());
-                passed = true;
-                break;
-            } catch (Throwable t) {
-                Thread.sleep(100);
-            }
-        }
-        assertTrue(passed, "Failed to wait for rotation completion");
+        Awaitility.await("rotation completion").atMost(Duration.ofSeconds(2)).pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10)).ignoreExceptions()
+                .untilAsserted(() -> assertEquals("new-rotated-value",
+                        svc.getSecretValue("my-secret", null, "AWSCURRENT", REGION).getSecretString()));
     }
 
     @Test
@@ -1235,18 +1265,9 @@ class SecretsManagerServiceTest {
                 lambdaArn, null, true, REGION);
                 
         // Wait until AWSPENDING is set by the background thread
-        long end = System.currentTimeMillis() + 2000;
-        boolean pendingFound = false;
-        while (System.currentTimeMillis() < end) {
-            try {
-                svc.getSecretValue("my-secret", null, "AWSPENDING", REGION);
-                pendingFound = true;
-                break;
-            } catch (Exception e) {
-                Thread.sleep(100);
-            }
-        }
-        assertTrue(pendingFound, "AWSPENDING version was not created in time");
+        Awaitility.await("the AWSPENDING version").atMost(Duration.ofSeconds(2)).pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10)).ignoreExceptions()
+                .until(() -> svc.getSecretValue("my-secret", null, "AWSPENDING", REGION) != null);
 
         // Trigger second rotation while the first one is running and holds AWSPENDING
         AwsException ex = assertThrows(AwsException.class, () ->
@@ -1284,6 +1305,18 @@ class SecretsManagerServiceTest {
 
         assertFalse(result.secret().isRotationEnabled());
         assertFalse(service.describeSecret("rotating", REGION).isRotationEnabled());
+    }
+
+    @Test
+    void rotationConfiguredIsFalseUntilRotateSecretAndSurvivesCancel() {
+        service.createSecret("rotating", "v1", null, null, null, null, REGION);
+        assertFalse(service.describeSecret("rotating", REGION).isRotationConfigured());
+
+        enableRotation("rotating");
+        assertTrue(service.describeSecret("rotating", REGION).isRotationConfigured());
+
+        service.cancelRotateSecret("rotating", REGION);
+        assertTrue(service.describeSecret("rotating", REGION).isRotationConfigured());
     }
 
     @Test

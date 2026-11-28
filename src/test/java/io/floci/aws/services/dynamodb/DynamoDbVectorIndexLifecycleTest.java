@@ -8,9 +8,11 @@ import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.dynamodb.model.VectorIndex;
+import io.floci.aws.testing.ManualClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
@@ -22,10 +24,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * The two phases a vector index added by UpdateTable walks through.
  *
- * <p>The phases are derived from one stored instant on read, so a test moves through them by
- * rewinding that instant rather than by sleeping, the way {@code AcmIssuanceServiceTest} rewinds
- * a certificate's validation wait. Both durations are 0 under {@code @QuarkusTest}, which is why
- * this coverage lives in a unit test.
+ * <p>The phases are derived on read from the instant the index was created and the service's
+ * clock, so a test moves through them by advancing that clock: each phase is asserted one
+ * millisecond before it ends and at the instant it ends. Both durations are 0 under
+ * {@code @QuarkusTest}, which is why this coverage lives in a unit test.
  */
 class DynamoDbVectorIndexLifecycleTest {
 
@@ -33,14 +35,18 @@ class DynamoDbVectorIndexLifecycleTest {
     private static final String TABLE = "Docs";
     private static final int ALLOCATION_SECONDS = 4;
     private static final int BACKFILL_SECONDS = 10;
+    private static final Duration ALLOCATION = Duration.ofSeconds(ALLOCATION_SECONDS);
+    private static final Duration BACKFILL = Duration.ofSeconds(BACKFILL_SECONDS);
+    private static final Duration ONE_MILLI = Duration.ofMillis(1);
 
+    private final ManualClock clock = new ManualClock(Instant.parse("2026-01-01T00:00:00Z"));
     private DynamoDbService service;
 
     @BeforeEach
     void setUp() {
-        service = new DynamoDbService(new InMemoryStorage<>(), null, null, null,
-                new RegionResolver(REGION, "000000000000"), null, null, null, null,
-                ALLOCATION_SECONDS, BACKFILL_SECONDS);
+        service = new DynamoDbService(new InMemoryStorage<>(), null, null, null, new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"), null, null, null, null,
+                ALLOCATION_SECONDS, BACKFILL_SECONDS, 0, clock);
         TableDefinition table = service.createTable(TABLE,
                 List.of(new KeySchemaElement("pk", "HASH")),
                 List.of(new AttributeDefinition("pk", "S")),
@@ -68,9 +74,8 @@ class DynamoDbVectorIndexLifecycleTest {
                 List.of(), List.of(indexName), null, REGION);
     }
 
-    private void elapse(String indexName, int seconds) {
-        service.describeTable(TABLE, REGION).findVectorIndex(indexName).orElseThrow()
-                .setCreationStartedAt(Instant.now().minusSeconds(seconds));
+    private void elapse(Duration duration) {
+        clock.advance(duration);
     }
 
     private VectorIndex describeIndex(String indexName) {
@@ -120,9 +125,24 @@ class DynamoDbVectorIndexLifecycleTest {
     }
 
     @Test
+    void resourceAllocationLastsUntilTheInstantItsDurationIsUp() {
+        addIndex("vix");
+        elapse(ALLOCATION.minus(ONE_MILLI));
+
+        TableDefinition described = service.describeTable(TABLE, REGION);
+        VectorIndex index = described.findVectorIndex("vix").orElseThrow();
+
+        assertEquals("UPDATING", described.getTableStatus());
+        assertEquals("CREATING", index.getIndexStatus());
+        assertFalse(service.isVectorIndexBackfilling(index));
+        assertEquals("ResourceInUseException",
+                assertThrows(AwsException.class, () -> deleteIndex("vix")).getErrorCode());
+    }
+
+    @Test
     void backfillingReportsAnActiveTableAndACreatingIndex() {
         addIndex("vix");
-        elapse("vix", ALLOCATION_SECONDS + 1);
+        elapse(ALLOCATION);
 
         TableDefinition described = service.describeTable(TABLE, REGION);
         VectorIndex index = described.findVectorIndex("vix").orElseThrow();
@@ -135,15 +155,30 @@ class DynamoDbVectorIndexLifecycleTest {
     @Test
     void deleteDuringBackfillingSucceeds() {
         addIndex("vix");
-        elapse("vix", ALLOCATION_SECONDS + 1);
+        elapse(ALLOCATION);
 
         assertTrue(deleteIndex("vix").getVectorIndexes().isEmpty());
     }
 
     @Test
+    void backfillingLastsUntilTheInstantItsDurationIsUp() {
+        addIndex("vix");
+        elapse(ALLOCATION.plus(BACKFILL).minus(ONE_MILLI));
+
+        TableDefinition described = service.describeTable(TABLE, REGION);
+        VectorIndex index = described.findVectorIndex("vix").orElseThrow();
+
+        assertEquals("ACTIVE", described.getTableStatus());
+        assertEquals("CREATING", index.getIndexStatus());
+        assertTrue(service.isVectorIndexBackfilling(index));
+        assertEquals("LimitExceededException",
+                assertThrows(AwsException.class, () -> addIndex("second")).getErrorCode());
+    }
+
+    @Test
     void indexEndsActiveWithBackfillingGone() {
         addIndex("vix");
-        elapse("vix", ALLOCATION_SECONDS + BACKFILL_SECONDS + 1);
+        elapse(ALLOCATION.plus(BACKFILL));
 
         TableDefinition described = service.describeTable(TABLE, REGION);
         VectorIndex index = described.findVectorIndex("vix").orElseThrow();
@@ -202,7 +237,7 @@ class DynamoDbVectorIndexLifecycleTest {
     @Test
     void anotherIndexMayBeCreatedOnceTheFirstIsActive() {
         addIndex("first");
-        elapse("first", ALLOCATION_SECONDS + BACKFILL_SECONDS + 1);
+        elapse(ALLOCATION.plus(BACKFILL));
         service.describeTable(TABLE, REGION);
 
         addIndex("second");
@@ -227,7 +262,7 @@ class DynamoDbVectorIndexLifecycleTest {
     @Test
     void deleteTableSucceedsOnceTheIndexIsActive() {
         addIndex("vix");
-        elapse("vix", ALLOCATION_SECONDS + BACKFILL_SECONDS + 1);
+        elapse(ALLOCATION.plus(BACKFILL));
 
         service.deleteTable(TABLE, REGION);
 

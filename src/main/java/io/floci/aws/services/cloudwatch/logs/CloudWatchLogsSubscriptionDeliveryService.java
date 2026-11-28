@@ -30,6 +30,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -57,6 +58,7 @@ public class CloudWatchLogsSubscriptionDeliveryService {
     private final FirehoseService firehoseService;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final CloudWatchLogsSubscriptionAdmissionService admission;
 
     @Inject
     public CloudWatchLogsSubscriptionDeliveryService(CloudWatchLogsService logsService,
@@ -64,13 +66,15 @@ public class CloudWatchLogsSubscriptionDeliveryService {
                                                      KinesisService kinesisService,
                                                      FirehoseService firehoseService,
                                                      RegionResolver regionResolver,
-                                                     ObjectMapper objectMapper) {
+                                                     ObjectMapper objectMapper,
+                                                     CloudWatchLogsSubscriptionAdmissionService admission) {
         this.store = logsService.subscriptionFilterStore();
         this.lambdaService = lambdaService;
         this.kinesisService = kinesisService;
         this.firehoseService = firehoseService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.admission = Objects.requireNonNull(admission);
     }
 
     @RegisterForReflection
@@ -127,11 +131,12 @@ public class CloudWatchLogsSubscriptionDeliveryService {
         FilterPattern pattern = FilterPattern.parse(filter.getFilterPattern());
         List<SubscriptionLogEvent> matching = new ArrayList<>();
         for (LogEvent logEvent : event.events()) {
-            if (pattern.match(logEvent.getMessage()).matched()) {
+            String message = logEvent.messageForFilter(Boolean.TRUE.equals(filter.getApplyOnTransformedLogs()));
+            if (message != null && pattern.match(message).matched()) {
                 matching.add(new SubscriptionLogEvent(
                         logEvent.getEventId(),
                         logEvent.getTimestamp(),
-                        logEvent.getMessage()));
+                        message));
             }
         }
         if (matching.isEmpty()) {
@@ -152,6 +157,13 @@ public class CloudWatchLogsSubscriptionDeliveryService {
             return;
         }
 
+        if (CloudWatchLogsCrossAccountService.isCrossAccountDestinationArn(destinationArn)) {
+            deliverChunks(filter, event, account, matching, gzipped -> admission.deliverLogical(destinationArn,
+                    event.logGroupName(), event.region(), account, gzipped,
+                    "Random".equals(filter.getDistribution()) ? UUID.randomUUID().toString() : event.logStreamName()));
+            return;
+        }
+
         // Direct cross-account delivery without a Logs Destination (PutDestination) is unauthorized in AWS
         if (!arn.accountId().isBlank() && !arn.accountId().equals(account)) {
             LOG.warnv("Cross-account subscription delivery is unauthorized without a Logs destination: destinationAccount={0}, groupAccount={1}",
@@ -169,6 +181,7 @@ public class CloudWatchLogsSubscriptionDeliveryService {
                         destinationArn, event.logStreamName(), event.logGroupName());
                 return;
             }
+            admission.validate(destinationArn, event.logGroupName(), event.region(), account);
             deliverChunks(filter, event, account, matching, gzipped -> deliverToLambda(destinationArn, gzipped));
         } else if ("kinesis".equals(service)) {
             deliverChunks(filter, event, account, matching, gzipped ->

@@ -75,7 +75,10 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$work/tool"
-git archive "$target_sha" tools/rename | tar -x -C "$work/tool"
+# Some tar implementations stop at the end markers before consuming git's padding.
+# Materialize the archive so pipefail cannot turn that successful extraction into SIGPIPE.
+git archive --format=tar --output="$work/tool.tar" "$target_sha" tools/rename
+tar -xf "$work/tool.tar" -C "$work/tool"
 
 # Plumbing commits only: they are never pushed, and the user's identity, hooks and signing do not
 # belong on them.

@@ -7,6 +7,7 @@ import io.floci.aws.core.common.PassedRoleMembers.Into;
 import io.floci.aws.core.common.PassedRoleMembers.Step;
 import io.floci.aws.core.common.TagOnCreateMembers.Entry;
 import io.floci.aws.core.common.TagOnCreateMembers.Member;
+import io.floci.aws.testing.MockQueryRequests;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import org.junit.jupiter.api.DynamicTest;
@@ -14,11 +15,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
 
 import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -38,7 +42,7 @@ class TagOnCreateMembersTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
-    void theTableReadsTheOperationsOfEveryNamespaceItCoversOnce() {
+    void theTableReadsTheOperationsOfEveryNamespaceItCoversOnce() throws Exception {
         TagOnCreateMembers.Table table = TagOnCreateMembers.table();
         assertFalse(table.entries().isEmpty());
         for (String operation : table.entries().keySet()) {
@@ -47,7 +51,12 @@ class TagOnCreateMembersTest {
         }
         assertFalse(table.byHand().stream().anyMatch(table.notRead()::contains));
         assertTrue(table.otherNamespaces().stream().noneMatch(table.namespaces()::contains));
-        assertTrue(table.notCovered().stream().noneMatch(table.namespaces()::contains));
+        Set<String> partial;
+        try (InputStream input = getClass().getClassLoader().getResourceAsStream(TagOnCreateMembers.RESOURCE_NAME)) {
+            partial = MAPPER.readTree(input).path("partialNamespaces").propertyStream()
+                    .map(Map.Entry::getKey).collect(Collectors.toSet());
+        }
+        assertTrue(table.notCovered().stream().filter(table.namespaces()::contains).allMatch(partial::contains));
     }
 
     /** The operations the table says Floci checks by hand are the ones {@link TagOnCreate} leaves to the filter. */
@@ -220,7 +229,7 @@ class TagOnCreateMembersTest {
     }
 
     private static ContainerRequestContext form(String body) {
-        return request("application/x-www-form-urlencoded", body);
+        return MockQueryRequests.postedToRoot(request("application/x-www-form-urlencoded", body));
     }
 
     private static ContainerRequestContext request(String mediaType, String body) {

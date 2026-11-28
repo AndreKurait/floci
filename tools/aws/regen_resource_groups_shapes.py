@@ -10,7 +10,7 @@ from request_shapes import REPO_ROOT
 
 OUTPUT = REPO_ROOT / "src/main/resources/aws/resource-groups-request-shapes.json"
 MODEL = Path("resource-groups/2017-11-27")
-OPERATIONS = ("CreateGroup", "GetGroup", "DeleteGroup", "GroupResources", "ListGroupResources")
+OPERATIONS = ("CreateGroup", "GetGroup", "DeleteGroup", "GroupResources", "ListGroupResources", "ListGroups")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -5,6 +5,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegionFacts;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.CertificateReferenceResolver;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
@@ -19,12 +20,16 @@ import io.floci.aws.core.storage.StorageBackedMap;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.EmulatorOriginSource;
+import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
+import io.floci.aws.services.ec2.SecurityGroupNftCompiler;
 import io.floci.aws.services.ec2.VpcDependencyProvider;
 import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.elbv2.model.*;
 import io.floci.aws.services.iam.ServerCertificateReferenceProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -39,13 +44,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
-public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider {
+public class ElbV2Service implements ResourceProvider, ServerCertificateReferenceProvider, VpcDependencyProvider,
+        EmulatorOriginSource {
 
     private static final Logger LOG = Logger.getLogger(ElbV2Service.class);
     private static final String DEFAULT_SSL_POLICY = "ELBSecurityPolicy-2016-08";
@@ -57,6 +64,18 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     public static final int CERTIFICATES_PER_LOAD_BALANCER = 25;
     /** {@code LoadBalancerTypeEnum}, in the model's order. */
     private static final List<String> LOAD_BALANCER_TYPES = List.of("application", "network", "gateway");
+    private static final String NETWORK = "network";
+
+    private final ElbV2VpcNetworkManager vpcNetworks;
+
+    public ElbV2Service() {
+        this(null);
+    }
+
+    @Inject
+    public ElbV2Service(ElbV2VpcNetworkManager vpcNetworks) {
+        this.vpcNetworks = vpcNetworks;
+    }
 
     @Inject
     ElbV2DataPlane dataPlane;
@@ -84,6 +103,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     @Inject
     CertificateReferenceResolver certificateResolver;
 
+    /** Left null by the unit tests, which wire this service without EC2 security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
+
     // region → ARN → resource
     private Map<String, Map<String, LoadBalancer>> loadBalancers = new ConcurrentHashMap<>();
     private Map<String, Map<String, TargetGroup>> targetGroups = new ConcurrentHashMap<>();
@@ -105,47 +128,96 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
 
-    /** DNS selects the resource owner independently of a management request's account. */
-    List<LoadBalancer> findByDnsName(String name) {
-        if (name == null || name.isBlank()) {
-            return List.of();
+    /** The accounts of {@code floci.services.elbv2.single-zone-alb-accounts}; see {@link #minimumAlbZones}. */
+    private Set<String> singleZoneAlbAccounts = Set.of();
+
+    /**
+     * Reads {@code floci.services.elbv2.single-zone-alb-accounts} and refuses, at startup, a value that
+     * is not a 12-digit account id, so a typo cannot silently leave the exception off.
+     */
+    void readSingleZoneAlbAccounts() {
+        if (config == null) {
+            singleZoneAlbAccounts = Set.of();
+            return;
         }
-        String normalized = name.endsWith(".") ? name.substring(0, name.length() - 1) : name;
-        if (normalized.regionMatches(true, 0, "dualstack.", 0, "dualstack.".length())) {
-            normalized = normalized.substring("dualstack.".length());
-        }
-        String target = normalized;
-        Collection<Map<String, LoadBalancer>> regions = allAccounts(loadBalancers, loadBalancerStore);
-        return regions.stream().flatMap(region -> region.values().stream())
-                .filter(lb -> target.equalsIgnoreCase(lb.getDnsName()))
+        // Entries are trimmed, and a blank one (an empty value or a trailing comma) lists nothing, so
+        // "111111111111, 222222222222" lists both and blanking the setting turns it off.
+        List<String> accounts = config.services().elbv2().singleZoneAlbAccounts().orElse(List.of()).stream()
+                .filter(account -> account != null && !account.isBlank())
+                .map(String::trim)
                 .toList();
+        for (String account : accounts) {
+            if (!account.matches("[0-9]{12}")) {
+                throw new IllegalStateException("floci.services.elbv2.single-zone-alb-accounts must list 12-digit"
+                        + " account ids, not '" + account + "'");
+            }
+        }
+        singleZoneAlbAccounts = Set.copyOf(accounts);
+    }
+
+    /**
+     * The fewest Availability Zones an Application Load Balancer of the calling account takes in
+     * {@code region}. The regional zone policy ({@link #requiresTwoAlbZones}) decides between one and
+     * two; Floci also lowers that to one for the accounts
+     * {@code floci.services.elbv2.single-zone-alb-accounts} lists. Nothing is listed by default.
+     */
+    private int minimumAlbZones(String region) {
+        if (!singleZoneAlbAccounts.isEmpty() && singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
+            return 1;
+        }
+        return requiresTwoAlbZones(region) ? 2 : 1;
+    }
+
+    /**
+     * The regional ALB zone policy: {@code floci.services.elbv2.alb-zone-rule-by-region} for the
+     * region, then {@code floci.services.elbv2.alb-zone-rule}, then the default requirement for two Availability Zones.
+     */
+    private boolean requiresTwoAlbZones(String region) {
+        EmulatorConfig.AlbZoneRule rule = EmulatorConfig.AlbZoneRule.AWS;
+        if (config != null) {
+            EmulatorConfig.ElbV2ServiceConfig settings = config.services().elbv2();
+            if (settings.albZoneRule() != null) {
+                rule = settings.albZoneRule();
+            }
+            Map<String, EmulatorConfig.AlbZoneRule> regions = settings.albZoneRuleByRegion();
+            EmulatorConfig.AlbZoneRule regional = regions == null ? null : regions.get(region);
+            if (regional != null) {
+                rule = regional;
+            }
+        }
+        return switch (rule) {
+            case AWS -> true;
+            case ALLOW_SINGLE_ZONE -> false;
+            case REQUIRE_TWO_ZONES -> true;
+        };
     }
 
     @PostConstruct
     void initializeStorage()
     {
+        readSingleZoneAlbAccounts();
         if (storageFactory == null) {
             return;
         }
         this.loadBalancerStore = storageFactory.create("elbv2", "elbv2-load-balancers.json",
                 new TypeReference<Map<String, Map<String, LoadBalancer>>>() {});
+        this.loadBalancers = new StorageBackedMap<>(loadBalancerStore);
         this.targetGroupStore = storageFactory.create("elbv2", "elbv2-target-groups.json",
                 new TypeReference<Map<String, Map<String, TargetGroup>>>() {});
+        this.targetGroups = new StorageBackedMap<>(targetGroupStore);
         this.listenerStore = storageFactory.create("elbv2", "elbv2-listeners.json",
                 new TypeReference<Map<String, Map<String, Listener>>>() {});
+        this.listeners = new StorageBackedMap<>(listenerStore);
         this.ruleStore = storageFactory.create("elbv2", "elbv2-rules.json",
                 new TypeReference<Map<String, Map<String, Rule>>>() {});
-        this.loadBalancers = new StorageBackedMap<>(loadBalancerStore);
-        this.targetGroups = new StorageBackedMap<>(targetGroupStore);
-        this.listeners = new StorageBackedMap<>(listenerStore);
         this.rules = new StorageBackedMap<>(ruleStore);
         this.tagStore = storageFactory.create("elbv2", "elbv2-tags.json",
                 new TypeReference<Map<String, Map<String, String>>>() {});
         this.tags = new StorageBackedMap<>(tagStore);
-        normalizeRegionMaps(loadBalancers);
-        normalizeRegionMaps(targetGroups);
-        normalizeRegionMaps(listeners);
-        normalizeRegionMaps(rules);
+        normalizeStoredRegions(loadBalancers, loadBalancerStore);
+        normalizeStoredRegions(targetGroups, targetGroupStore);
+        normalizeStoredRegions(listeners, listenerStore);
+        normalizeStoredRegions(rules, ruleStore);
         normalizeRegionMaps(tags);
         rebuildIndexes();
     }
@@ -155,6 +227,41 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             if (!(entry.getValue() instanceof ConcurrentHashMap)) {
                 resources.put(entry.getKey(), new ConcurrentHashMap<>(entry.getValue()));
             }
+        }
+    }
+
+    private record StoredRegion<V>(String accountId, String region, Map<String, V> resources) {}
+
+    private <V> List<StoredRegion<V>> storedRegions(Map<String, Map<String, V>> resources,
+                                                  AccountAwareStorageBackend<Map<String, V>> store) {
+        List<StoredRegion<V>> stored = new ArrayList<>();
+        if (store == null) {
+            resources.forEach((region, values) -> stored.add(new StoredRegion<>(null, region, values)));
+            return stored;
+        }
+        store.scanAllAccountsWithRawKeys().forEach((rawKey, values) -> {
+            int slash = rawKey.indexOf('/');
+            if (slash < 0 && store.getForAccount(config.defaultAccountId(), rawKey).isPresent()) {
+                return;
+            }
+            String accountId = slash < 0 ? config.defaultAccountId() : rawKey.substring(0, slash);
+            String region = slash < 0 ? rawKey : rawKey.substring(slash + 1);
+            stored.add(new StoredRegion<>(accountId, region, values));
+        });
+        return stored;
+    }
+
+    private <V> void normalizeStoredRegions(Map<String, Map<String, V>> resources,
+                                           AccountAwareStorageBackend<Map<String, V>> store) {
+        if (store == null) {
+            normalizeRegionMaps(resources);
+            return;
+        }
+        for (StoredRegion<V> stored : storedRegions(resources, store)) {
+            Map<String, V> concurrent = stored.resources() instanceof ConcurrentHashMap
+                    ? stored.resources() : new ConcurrentHashMap<>(stored.resources());
+            store.putForAccount(stored.accountId(), stored.region(), concurrent);
+            store.deleteRaw(stored.region());
         }
     }
 
@@ -224,25 +331,35 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      */
     public void restorePersistedRuntime()
     {
-        if (loadBalancerStore == null) {
-            restoreAccountRuntime();
-            return;
-        }
-        Set<String> accountIds = new TreeSet<>();
-        for (AccountAwareStorageBackend<?> store : List.of(loadBalancerStore, targetGroupStore, listenerStore, ruleStore)) {
-            store.scanAllAccountEntries(key -> true).forEach(entry -> accountIds.add(entry.accountId()));
-        }
-        for (String accountId : accountIds) {
-            RequestScopes.runAs(accountId, this::restoreAccountRuntime);
-        }
-    }
-
-    private void restoreAccountRuntime()
-    {
         refreshCanonicalHostedZones();
+        if (vpcNetworks != null) {
+            for (StoredRegion<LoadBalancer> stored : storedRegions(loadBalancers, loadBalancerStore)) {
+                Runnable persist = () -> persistStoredLoadBalancers(stored);
+                for (LoadBalancer balancer : stored.resources().values()) {
+                    try {
+                        if (vpcNetworks.enabled() && "application".equals(balancer.getType())) {
+                            balancer.setState("provisioning");
+                            persist.run();
+                        }
+                        vpcNetworks.reconcile(balancer, persist);
+                        if (vpcNetworks.enabled() && "application".equals(balancer.getType())) {
+                            balancer.setState("active");
+                            persist.run();
+                        }
+                    } catch (RuntimeException failure) {
+                        if (vpcNetworks.enabled() && "application".equals(balancer.getType())) {
+                            balancer.setState("failed");
+                            persist.run();
+                        }
+                        LOG.warnv(failure, "ELBv2 backend network could not be restored for {0}",
+                                balancer.getLoadBalancerArn());
+                    }
+                }
+            }
+        }
         if (healthChecker != null) {
-            for (Map<String, TargetGroup> regionTargetGroups : targetGroups.values()) {
-                for (TargetGroup targetGroup : regionTargetGroups.values()) {
+            for (StoredRegion<TargetGroup> stored : storedRegions(targetGroups, targetGroupStore)) {
+                for (TargetGroup targetGroup : stored.resources().values()) {
                     healthChecker.startMonitoring(targetGroup);
                     if (!targetGroup.getTargets().isEmpty()) {
                         healthChecker.addTargets(targetGroup.getTargetGroupArn(), targetGroup.getTargets(), targetGroup);
@@ -251,11 +368,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             }
         }
         if (dataPlane != null) {
-            for (Map.Entry<String, Map<String, Listener>> regionEntry : listeners.entrySet()) {
-                String region = regionEntry.getKey();
-                for (Listener listener : regionEntry.getValue().values()) {
+            for (StoredRegion<Listener> stored : storedRegions(listeners, listenerStore)) {
+                String region = stored.region();
+                for (Listener listener : stored.resources().values()) {
                     try {
-                        restoreListener(region, listener.getListenerArn());
+                        RequestScopes.runAs(stored.accountId(), region,
+                                () -> restoreListener(region, listener.getListenerArn()));
                     } catch (RuntimeException failure) {
                         LOG.warnv("ELBv2 saved listener {0} could not be restored ({1}: {2}); its configuration is retained",
                                 listener.getListenerArn(), failure.getClass().getSimpleName(), failure.getMessage());
@@ -293,8 +411,33 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (type != null && !LOAD_BALANCER_TYPES.contains(type)) {
             throw SmithyValidationErrors.validationError(SmithyValidationErrors.notInEnum(type, "type", LOAD_BALANCER_TYPES));
         }
-        return ec2Service.supplyWithSubnetReferencesHeld(region, () -> createLoadBalancerWithSubnetsHeld(
+        LoadBalancer balancer = ec2Service.supplyWithSubnetReferencesHeld(region, () -> createLoadBalancerWithSubnetsHeld(
                 region, name, scheme, type, ipAddressType, subnets, securityGroups, initialTags));
+        if (vpcNetworks != null) {
+            synchronized (balancer) {
+                if (loadBalancers.getOrDefault(region, Map.of()).get(balancer.getLoadBalancerArn()) != balancer) {
+                    throw new AwsException("LoadBalancerNotFound", "The load balancer was deleted.", 400);
+                }
+                if ("active".equals(balancer.getState())) {
+                    return balancer;
+                }
+                try {
+                    vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, region));
+                    balancer.setState("active");
+                    persistRegion(loadBalancers, region);
+                } catch (RuntimeException failure) {
+                    balancer.setState("failed");
+                    persistRegion(loadBalancers, region);
+                    try {
+                        deleteLoadBalancer(region, balancer.getLoadBalancerArn());
+                    } catch (RuntimeException cleanupFailure) {
+                        failure.addSuppressed(cleanupFailure);
+                    }
+                    throw failure;
+                }
+            }
+        }
+        return balancer;
     }
 
     private LoadBalancer createLoadBalancerWithSubnetsHeld(String region, String name, String scheme,
@@ -302,21 +445,33 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                                            List<String> subnets, List<String> securityGroups,
                                                            Map<String, String> initialTags) {
         validateName(name, "load balancer");
+        String lbType = type != null ? type : "application";
+        String lbScheme = scheme != null ? scheme : "internet-facing";
+        String ipType = ipAddressType != null ? ipAddressType : "ipv4";
         Map<String, LoadBalancer> regionLbs = loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-        boolean duplicate = regionLbs.values().stream()
-                .anyMatch(lb -> lb.getLoadBalancerName().equals(name));
-        if (duplicate) {
+        LoadBalancer existing = regionLbs.values().stream()
+                .filter(lb -> lb.getLoadBalancerName().equals(name)).findFirst().orElse(null);
+        if (existing != null) {
+            // CreateLoadBalancer is idempotent for the same settings. Returning the stored
+            // resource also preserves its listeners, attributes, creation time and DNS name.
+            if (lbType.equals(existing.getType()) && lbScheme.equals(existing.getScheme())
+                    && ipType.equals(existing.getIpAddressType())
+                    && new HashSet<>(subnets != null ? subnets : List.of()).equals(
+                            existing.getAvailabilityZones().stream().map(AvailabilityZone::getSubnetId)
+                                    .collect(Collectors.toSet()))
+                    && new HashSet<>(securityGroups != null ? securityGroups : List.of()).equals(
+                            new HashSet<>(existing.getSecurityGroups()))
+                    && initialTags.equals(tags.getOrDefault(existing.getLoadBalancerArn(), Map.of()))) {
+                return existing;
+            }
             throw new AwsException("DuplicateLoadBalancerName",
                     "A load balancer with name '" + name + "' already exists.", 400);
         }
 
-        String lbType = type != null ? type : "application";
-        String lbScheme = scheme != null ? scheme : "internet-facing";
-        String ipType = ipAddressType != null ? ipAddressType : "ipv4";
         String typePrefix = lbTypePrefix(lbType);
         String id = randomHex16();
         String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
-        String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
+        String dnsName = loadBalancerDnsName(name, id, lbType, lbScheme, region);
         requireSubnets(region, lbType, subnets);
         String vpcId = resolveSubnetVpcId(region, lbType, subnets);
 
@@ -328,7 +483,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         lb.setLoadBalancerName(name);
         lb.setScheme(lbScheme);
         lb.setVpcId(vpcId);
-        lb.setState("active");
+        lb.setState(vpcNetworks != null && vpcNetworks.enabled() && "application".equals(lbType)
+                ? "provisioning" : "active");
         lb.setType(lbType);
         lb.setIpAddressType(ipType);
         lb.setRegion(region);
@@ -341,6 +497,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (!initialTags.isEmpty()) {
             tags.put(arn, new LinkedHashMap<>(initialTags));
         }
+        emulatorOriginsChanged(lb);
         return lb;
     }
 
@@ -356,11 +513,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * a SetSubnets that names none, and {@link #setSubnets} on a list that names some, once it has the
      * balancer's type; whether the subnets span two Availability Zones is checked after they are looked
      * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
-     * message and order. Explicit global or regional single-zone overrides reduce the minimum to one.
+     * message and order. For an account granted single-zone ALBs ({@link #minimumAlbZones}) one subnet
+     * is enough, and none still gets the Application Load Balancer message. Where the regional zone
+     * policy ({@link #requiresTwoAlbZones}) accepts one zone, one subnet is enough for every account
+     * and none gets the Network Load Balancer message.
      */
     private void requireSubnets(String region, String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
-        if ("application".equals(lbType) && requiresTwoAlbZones(region) && count < 2) {
+        if ("application".equals(lbType) && requiresTwoAlbZones(region) && count < minimumAlbZones(region)) {
             throw new AwsException("ValidationError",
                     "At least two subnets in two different Availability Zones must be specified", 400);
         }
@@ -369,23 +529,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
     }
 
-    private boolean requiresTwoAlbZones(String region) {
-        EmulatorConfig.AlbZoneRule rule = EmulatorConfig.AlbZoneRule.AWS;
-        if (config != null) {
-            EmulatorConfig.ElbV2ServiceConfig settings = config.services().elbv2();
-            if (settings.albZoneRule() != null) {
-                rule = settings.albZoneRule();
-            }
-            Map<String, EmulatorConfig.AlbZoneRule> regions = settings.albZoneRuleByRegion();
-            if (regions != null) {
-                rule = regions.getOrDefault(region, rule);
-            }
-        }
-        return switch (rule) {
-            case AWS -> true;
-            case ALLOW_SINGLE_ZONE -> false;
-        };
-    }
+
 
     /**
      * A subnet is in use while a load balancer is configured with it. Account-scoped through the
@@ -409,6 +553,59 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             return EmbeddedDnsServer.DEFAULT_SUFFIX;
         }
         return config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+    }
+
+    /**
+     * The DNS name a new load balancer gets, in the form {@code floci.services.elbv2.dns-name-strategy}
+     * selects. The AWS form is the documented one: an Application Load Balancer's name ends in a
+     * decimal number and the region comes before {@code elb}, with {@code internal-} in front for an
+     * internal scheme; a Network or Gateway Load Balancer's name ends in the id its ARN carries and
+     * {@code elb} comes before the region.
+     */
+    private String loadBalancerDnsName(String name, String id, String type, String scheme, String region) {
+        if (!awsDnsNames()) {
+            return name + "-" + id + ".elb." + loadBalancerDnsSuffix();
+        }
+        String suffix = AwsRegions.dnsSuffixFor(region);
+        if ("application".equals(type)) {
+            String prefix = "internal".equals(scheme) ? "internal-" : "";
+            long number = ThreadLocalRandom.current().nextLong(1_000_000_000L, 10_000_000_000L);
+            return prefix + name + "-" + number + "." + region + ".elb." + suffix;
+        }
+        return name + "-" + id + ".elb." + region + "." + suffix;
+    }
+
+    boolean awsDnsNames() {
+        if (config == null || config.services() == null || config.services().elbv2() == null) {
+            return false;
+        }
+        return config.services().elbv2().dnsNameStrategy() == EmulatorConfig.ElbV2ServiceConfig.DnsNameStrategy.AWS;
+    }
+
+    /** DNS selects the resource owner independently of a management request's account. */
+    List<LoadBalancer> findByDnsName(String name) {
+        if (name == null || name.isBlank()) {
+            return List.of();
+        }
+        String normalized = name.endsWith(".") ? name.substring(0, name.length() - 1) : name;
+        if (normalized.regionMatches(true, 0, "dualstack.", 0, "dualstack.".length())) {
+            normalized = normalized.substring("dualstack.".length());
+        }
+        String target = normalized;
+        Collection<Map<String, LoadBalancer>> regions =
+                loadBalancerStore != null ? loadBalancerStore.scanAllAccounts() : loadBalancers.values();
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(lb -> target.equalsIgnoreCase(lb.getDnsName()))
+                .toList();
+    }
+
+    /** DNS inspects the selected load balancer's listeners across management accounts. */
+    List<Listener> findListenersForLoadBalancer(String loadBalancerArn) {
+        Collection<Map<String, Listener>> regions =
+                listenerStore != null ? listenerStore.scanAllAccounts() : listeners.values();
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(listener -> loadBalancerArn.equals(listener.getLoadBalancerArn()))
+                .toList();
     }
 
     public List<LoadBalancer> describeLoadBalancers(String region, List<String> arns, List<String> names,
@@ -446,6 +643,12 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         }
         List<String> listenerArns;
         synchronized (lb) {
+            if (regionLbs.get(arn) != lb) {
+                return;
+            }
+            if (vpcNetworks != null) {
+                vpcNetworks.release(lb, () -> persistRegion(loadBalancers, region));
+            }
             if (!regionLbs.remove(arn, lb)) {
                 return;
             }
@@ -461,6 +664,51 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         tgToLbs.values().forEach(lbSet -> lbSet.remove(arn));
         tags.remove(arn);
         loadBalancers.put(region, regionLbs);
+        emulatorOriginsChanged(lb);
+    }
+
+    /**
+     * Every network load balancer with security groups in a VPC, in every account. Floci sends its
+     * health checks and forwarded connections from its own address, so a target's rule that admits one
+     * of these groups admits that address. An application load balancer is not one: it reaches its
+     * targets from its own VPC interfaces (ElbV2VpcNetworkManager).
+     */
+    @Override
+    public List<SecurityGroupNftCompiler.EmulatorOrigin> emulatorOrigins() {
+        if (config != null && config.services().elbv2().mock()) {
+            // A mock ELBv2 sends no traffic, so it admits nothing.
+            return List.of();
+        }
+        Collection<Map<String, LoadBalancer>> regions = loadBalancerStore != null
+                ? loadBalancerStore.scanAllAccounts() : loadBalancers.values();
+        List<SecurityGroupNftCompiler.EmulatorOrigin> origins = new ArrayList<>();
+        for (Map<String, LoadBalancer> regionLbs : regions) {
+            for (LoadBalancer lb : regionLbs.values()) {
+                AwsArnUtils.Arn arn;
+                try {
+                    arn = AwsArnUtils.looksLikeArn(lb.getLoadBalancerArn())
+                            ? AwsArnUtils.parse(lb.getLoadBalancerArn()) : null;
+                } catch (IllegalArgumentException e) {
+                    // One unreadable record must not hide every other load balancer's groups.
+                    continue;
+                }
+                String accountId = arn != null ? arn.accountId() : null;
+                String region = lb.getRegion() != null ? lb.getRegion() : arn != null ? arn.region() : null;
+                List<String> groups = lb.getSecurityGroups();
+                if (NETWORK.equals(lb.getType()) && accountId != null && region != null && lb.getVpcId() != null
+                        && groups != null && !groups.isEmpty()) {
+                    origins.add(new SecurityGroupNftCompiler.EmulatorOrigin(accountId, region,
+                            lb.getVpcId(), groups.stream().filter(Objects::nonNull).collect(Collectors.toSet())));
+                }
+            }
+        }
+        return origins;
+    }
+
+    private void emulatorOriginsChanged(LoadBalancer lb) {
+        if (NETWORK.equals(lb.getType()) && lb.getVpcId() != null && securityGroupFirewall != null && securityGroupFirewall.isResolvable()) {
+            securityGroupFirewall.get().emulatorOriginsChanged();
+        }
     }
 
     public Map<String, String> describeLoadBalancerAttributes(String region, String arn) {
@@ -476,6 +724,19 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         persistRegion(loadBalancers, region);
     }
 
+    /** Restores only attributes changed by a failed CloudFormation update; null means previously absent. */
+    public void restoreLoadBalancerAttributes(String region, String arn, Map<String, String> previous) {
+        LoadBalancer lb = requireLoadBalancer(region, arn);
+        previous.forEach((key, value) -> {
+            if (value == null) {
+                lb.getAttributes().remove(key);
+            } else {
+                lb.getAttributes().put(key, value);
+            }
+        });
+        persistRegion(loadBalancers, region);
+    }
+
     private static void requireValidAttributeValue(Map<String, String> attributes, String key, Set<String> allowed) {
         String value = attributes.get(key);
         if (value != null && !allowed.contains(value)) {
@@ -488,8 +749,70 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         return loadBalancers.getOrDefault(region, Map.of()).get(arn);
     }
 
+    /**
+     * The security groups of the load balancer that {@code arn} (a load balancer or listener ARN)
+     * belongs to, in any account; empty when it has none or is unknown. Floci checks a protected
+     * target's ingress against these before its NLB traffic dials it.
+     */
+    Set<String> originSecurityGroups(String arn) {
+        if (arn == null || !AwsArnUtils.isArn(arn)) {
+            return Set.of();
+        }
+        AwsArnUtils.Arn parsed;
+        try {
+            parsed = AwsArnUtils.parse(arn);
+        } catch (IllegalArgumentException e) {
+            return Set.of();
+        }
+        String resource = parsed.resource();
+        if (resource.startsWith("listener/")) {
+            String[] parts = resource.split("/");
+            if (parts.length < 5) {
+                return Set.of();
+            }
+            arn = arn.substring(0, arn.indexOf(resource)) + "loadbalancer/" + parts[1] + "/" + parts[2] + "/" + parts[3];
+        }
+        Map<String, LoadBalancer> regionLbs = loadBalancerStore == null ? loadBalancers.get(parsed.region())
+                : loadBalancerStore.getForAccount(parsed.accountId(), parsed.region()).orElse(null);
+        LoadBalancer lb = regionLbs == null ? null : regionLbs.get(arn);
+        return lb == null || lb.getSecurityGroups() == null ? Set.of()
+                : lb.getSecurityGroups().stream().filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet());
+    }
+
     Listener getListener(String region, String arn) {
         return listeners.getOrDefault(region, Map.of()).get(arn);
+    }
+
+    TargetGroup getTargetGroupForListener(String region, String listenerArn, String targetGroupArn) {
+        return dataPlaneResource(targetGroups, targetGroupStore, region, listenerArn, targetGroupArn);
+    }
+
+    LoadBalancer getLoadBalancerForListener(String region, String listenerArn, String loadBalancerArn) {
+        return dataPlaneResource(loadBalancers, loadBalancerStore, region, listenerArn, loadBalancerArn);
+    }
+
+    Listener getDataPlaneListener(String region, String listenerArn) {
+        return dataPlaneResource(listeners, listenerStore, region, listenerArn, listenerArn);
+    }
+
+    private <V> V dataPlaneResource(Map<String, Map<String, V>> resources,
+                                   AccountAwareStorageBackend<Map<String, V>> store,
+                                   String region, String listenerArn, String resourceArn) {
+        if (!AwsArnUtils.isArn(listenerArn) || !AwsArnUtils.isArn(resourceArn)) {
+            return null;
+        }
+        AwsArnUtils.Arn owner = AwsArnUtils.parse(listenerArn);
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        if (!"elasticloadbalancing".equals(owner.service()) || !owner.service().equals(resource.service())
+                || !region.equals(owner.region()) || !region.equals(resource.region())
+                || !owner.partition().equals(resource.partition())
+                || !owner.partition().equals(AwsRegions.partitionFor(region))
+                || owner.accountId().isBlank() || !owner.accountId().equals(resource.accountId())) {
+            return null;
+        }
+        Map<String, V> regionResources = store == null ? resources.get(region)
+                : store.getForAccount(owner.accountId(), region).orElse(null);
+        return regionResources == null ? null : regionResources.get(resourceArn);
     }
 
     /** Capacity reservation status for a load balancer. All fields are {@code null} when no
@@ -504,10 +827,64 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         return new CapacityReservation(null, null, null);
     }
 
+    public record ProvisionedCapacity(int minimumLBCapacityUnits, String status, int decreasesRemaining) {}
+
+    /** Legacy capacity view for an application load balancer without a reservation. */
+    public ProvisionedCapacity describeProvisionedCapacity(String region, String arn) {
+        AwsArnUtils.Arn parsed;
+        try {
+            parsed = AwsArnUtils.parse(arn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("ValidationError", "A valid LoadBalancerArn must be specified.", 400);
+        }
+        if (!"elasticloadbalancing".equals(parsed.service())
+                || !parsed.accountId().matches("[0-9]{12}")
+                || !parsed.resource().matches("loadbalancer/app/[A-Za-z0-9-]{1,32}/[0-9a-f]{16}")
+                || !region.equals(parsed.region())
+                // Match createLoadBalancer's ARN derivation, including persisted custom-region ARNs.
+                || !AwsRegions.partitionFor(region).equals(parsed.partition())) {
+            throw new AwsException("ValidationError",
+                    "LoadBalancerArn must identify an application load balancer in the request region.", 400);
+        }
+        if (!regionResolver.getAccountId().equals(parsed.accountId())) {
+            throw new AwsException("LoadBalancerNotFound", "One or more load balancers not found.", 400);
+        }
+        LoadBalancer lb = requireLoadBalancer(region, arn);
+        if (!"application".equals(lb.getType())) {
+            throw new AwsException("ValidationError", "LoadBalancerArn must identify an application load balancer.", 400);
+        }
+        // Capacity is never reserved in Floci, so none of the four daily decreases has been consumed.
+        return new ProvisionedCapacity(0, "disabled", 4);
+    }
+
     public void setSecurityGroups(String region, String arn, List<String> sgIds) {
         LoadBalancer lb = requireLoadBalancer(region, arn);
-        lb.setSecurityGroups(new ArrayList<>(sgIds));
-        persistRegion(loadBalancers, region);
+        synchronized (lb) {
+            if (loadBalancers.getOrDefault(region, Map.of()).get(arn) != lb) {
+                throw new AwsException("LoadBalancerNotFound", "The load balancer was deleted.", 400);
+            }
+            List<String> previous = lb.getSecurityGroups();
+            lb.setSecurityGroups(new ArrayList<>(sgIds));
+            try {
+                if (vpcNetworks != null) {
+                    vpcNetworks.reconcile(lb, () -> persistRegion(loadBalancers, region));
+                }
+                persistRegion(loadBalancers, region);
+            } catch (RuntimeException failure) {
+                lb.setSecurityGroups(previous);
+                try {
+                    if (vpcNetworks != null) {
+                        vpcNetworks.reconcile(lb, () -> persistRegion(loadBalancers, region));
+                    }
+                    persistRegion(loadBalancers, region);
+                } catch (RuntimeException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                    retainFailedBackend(lb, region, failure);
+                }
+                throw failure;
+            }
+        }
+        emulatorOriginsChanged(lb);
     }
 
     /**
@@ -541,6 +918,40 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     private void setSubnets(String region, String arn, List<String> subnets, boolean restoreSnapshot) {
+        LoadBalancer balancer = requireLoadBalancer(region, arn);
+        synchronized (balancer) {
+            List<AvailabilityZone> previous = List.copyOf(balancer.getAvailabilityZones());
+            String previousVpc = balancer.getVpcId();
+            setSubnetsWithBalancerHeld(region, arn, subnets, restoreSnapshot);
+            try {
+                if (vpcNetworks != null) {
+                    vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, region));
+                }
+            } catch (RuntimeException failure) {
+                balancer.setAvailabilityZones(new ArrayList<>(previous));
+                balancer.setVpcId(previousVpc);
+                try {
+                    persistRegion(loadBalancers, region);
+                    vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, region));
+                } catch (RuntimeException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                    retainFailedBackend(balancer, region, failure);
+                }
+                throw failure;
+            }
+        }
+    }
+
+    private void retainFailedBackend(LoadBalancer balancer, String region, RuntimeException failure) {
+        balancer.setState("failed");
+        try {
+            persistRegion(loadBalancers, region);
+        } catch (RuntimeException persistenceFailure) {
+            failure.addSuppressed(persistenceFailure);
+        }
+    }
+
+    private void setSubnetsWithBalancerHeld(String region, String arn, List<String> subnets, boolean restoreSnapshot) {
         ec2Service.runWithSubnetReferencesHeld(region, () -> {
             LoadBalancer lb = requireLoadBalancer(region, arn);
             // Counted as on create, before any subnet is looked up; an empty list is taken, as above.
@@ -557,6 +968,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 lb.setVpcId(vpcId);
             }
             persistRegion(loadBalancers, region);
+            emulatorOriginsChanged(lb);
         });
     }
 
@@ -577,6 +989,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                           String matcher, String ipAddressType,
                                           Map<String, String> initialTags) {
         validateHealthCheckTimeout(healthCheckTimeout);
+        validateHealthCheckInterval(healthCheckInterval);
         validatePort(port, "port");
         validateName(name, "target group");
         if (port == null && !"lambda".equals(targetType)) {
@@ -684,6 +1097,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                                    Integer healthCheckTimeout, Integer healthyThreshold,
                                    Integer unhealthyThreshold, String matcher) {
         validateHealthCheckTimeout(healthCheckTimeout);
+        validateHealthCheckInterval(healthCheckInterval);
         TargetGroup tg = requireTargetGroup(region, arn);
         validateHealthCheckPort(healthCheckPort);
         validateHealthCheckEnabled(tg.getTargetType(), healthCheckEnabled);
@@ -695,7 +1109,6 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             throw new AwsException("ValidationError", "Path and return code are required for layer 7 health checks.",
                     400);
         }
-        Integer previousInterval = tg.getHealthCheckIntervalSeconds();
         if (healthCheckProtocol != null) tg.setHealthCheckProtocol(healthCheckProtocol);
         if (!isHttpProtocol(checkProtocol)) {
             tg.setHealthCheckPath(null);
@@ -710,9 +1123,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (unhealthyThreshold != null)  tg.setUnhealthyThresholdCount(unhealthyThreshold);
         if (matcher != null)             tg.setMatcher(matcher);
         persistRegion(targetGroups, region);
-        if (!Objects.equals(previousInterval, tg.getHealthCheckIntervalSeconds())) {
-            healthChecker.startMonitoring(tg);
-        }
+        healthChecker.startMonitoring(tg);
     }
 
     /**
@@ -780,6 +1191,15 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         return "HTTP".equals(protocol) || "HTTPS".equals(protocol);
     }
 
+    private static void validateHealthCheckInterval(Integer interval) {
+        if (interval != null && (interval < 5 || interval > 300)) {
+            String constraint = interval < 5 ? "greater than or equal to 5" : "less than or equal to 300";
+            throw new AwsException("ValidationError", "1 validation error detected: Value '" + interval
+                    + "' at 'healthCheckIntervalSeconds' failed to satisfy constraint: Member must have value "
+                    + constraint, 400);
+        }
+    }
+
     private static void validateHealthCheckEnabled(String targetType, Boolean enabled) {
         if (Boolean.FALSE.equals(enabled) && !"lambda".equals(targetType)) {
             throw new AwsException("InvalidConfigurationRequest",
@@ -804,6 +1224,19 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     public void modifyTargetGroupAttributes(String region, String arn, Map<String, String> newAttrs) {
         TargetGroup tg = requireTargetGroup(region, arn);
         tg.getAttributes().putAll(newAttrs);
+        persistRegion(targetGroups, region);
+    }
+
+    /** Puts back the values a rolled-back update replaced; a key that had no stored value is removed again. */
+    public void restoreTargetGroupAttributes(String region, String arn, Map<String, String> previous) {
+        TargetGroup tg = requireTargetGroup(region, arn);
+        previous.forEach((key, value) -> {
+            if (value == null) {
+                tg.getAttributes().remove(key);
+            } else {
+                tg.getAttributes().put(key, value);
+            }
+        });
         persistRegion(targetGroups, region);
     }
 
@@ -957,7 +1390,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 Map<String, Rule> regionRules = rules.computeIfAbsent(region, ignored -> new ConcurrentHashMap<>());
                 List<String> ruleArns = listenerToRules.remove(listenerArn);
                 if (ruleArns != null) {
-                    ruleArns.forEach(regionRules::remove);
+                    for (String ruleArn : ruleArns) {
+                        regionRules.remove(ruleArn);
+                        tags.remove(ruleArn);
+                    }
                 }
                 listeners.put(region, regionListeners);
                 rules.put(region, regionRules);
@@ -1349,7 +1785,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 return th;
             }
             int port = ElbV2HealthChecker.effectivePort(t, tg);
-            th.setHealthCheckPort(String.valueOf(port));
+            th.setHealthCheckPort(String.valueOf(ElbV2HealthChecker.healthCheckPort(tg, port)));
             if (hasFilterTargets && !isRegisteredTarget(tg, t)) {
                 th.setState("unused");
                 th.setReason("Target.NotRegistered");
@@ -1904,7 +2340,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     .map(Subnet::getAvailabilityZone)
                     .distinct()
                     .count();
-            if (requiresTwoAlbZones(region) && distinctAvailabilityZones < 2) {
+            if (distinctAvailabilityZones < minimumAlbZones(region)) {
                 throw new AwsException("InvalidConfigurationRequest",
                         "Application Load Balancers must be attached to subnets in at least two Availability Zones.", 400);
             }
@@ -2000,7 +2436,17 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             greenTuple.setWeight(greenWeightPct);
             action.setTargetGroups(List.of(blueTuple, greenTuple));
         }
-        defaultRule.setActions(List.of(action));
+        defaultRule.setActions(new ArrayList<>(List.of(action)));
+        Listener listener = listeners.getOrDefault(region, Map.of()).get(listenerArn);
+        if (listener != null) {
+            // The listener answers with the same default action as its default rule, and the
+            // target groups it now forwards to are in use; the ones it left are not.
+            listener.setDefaultActions(new ArrayList<>(List.of(action)));
+            linkTgToLb(action, listener.getLoadBalancerArn());
+            unlinkUnreferencedTargetGroups(region, listener.getLoadBalancerArn());
+            persistRegion(listeners, region);
+        }
+        persistRegion(rules, region);
         dataPlane.recompileRules(listenerArn, () -> getListenerRules(region, listenerArn));
     }
 
@@ -2097,16 +2543,21 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * zone of their region and type again, written back so the stored copy agrees.
      */
     private void refreshCanonicalHostedZones() {
-        for (String region : List.copyOf(loadBalancers.keySet())) {
-            Map<String, LoadBalancer> regionLoadBalancers = loadBalancers.get(region);
-            if (regionLoadBalancers == null) {
-                continue;
-            }
-            for (LoadBalancer lb : regionLoadBalancers.values()) {
+        for (StoredRegion<LoadBalancer> stored : storedRegions(loadBalancers, loadBalancerStore)) {
+            String region = stored.region();
+            for (LoadBalancer lb : stored.resources().values()) {
                 String lbType = lb.getType() != null ? lb.getType() : "application";
                 lb.setCanonicalHostedZoneId(canonicalHostedZoneId(lbType, region));
             }
-            loadBalancers.put(region, regionLoadBalancers);
+            persistStoredLoadBalancers(stored);
+        }
+    }
+
+    private void persistStoredLoadBalancers(StoredRegion<LoadBalancer> stored) {
+        if (loadBalancerStore == null) {
+            loadBalancers.put(stored.region(), stored.resources());
+        } else {
+            loadBalancerStore.putForAccount(stored.accountId(), stored.region(), stored.resources());
         }
     }
 

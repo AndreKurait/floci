@@ -18,6 +18,18 @@ import java.util.Optional;
  */
 public interface PassedRoleLookup {
 
+    /** Execution roles assigned by the HTTP API importer, using its normalized import plan. */
+    default List<String> importedHttpApiRoles(String document, String region) {
+        return List.of();
+    }
+
+
+    /** Integration and Lambda authorizer credentials assigned by a REST API import, using its owning service's parser. */
+    default List<String> importedRestApiRoles(String document, String region) {
+        return List.of();
+    }
+
+
     /**
      * The task role and the task execution role of the ECS task definition {@code reference} names in
      * {@code region}, a family, a {@code family:revision} or an ARN, as the definition stores them;
@@ -66,5 +78,14 @@ public interface PassedRoleLookup {
     /** The type of the Service Catalog constraint {@code constraintId}; empty when there is none. */
     default Optional<String> serviceCatalogConstraintType(String constraintId) {
         return Optional.empty();
+    }
+
+    /**
+     * The OpenAPI definitions a request for {@code operation} in {@code region} can import from its {@code body}, as
+     * its service takes them from it, each as the service reads it before it reads the roles it names; empty for an
+     * operation whose service says nothing of how, whose definition is then read where the table locates it.
+     */
+    default List<String> openApiDefinitions(String operation, String body, String region) {
+        return List.of();
     }
 }

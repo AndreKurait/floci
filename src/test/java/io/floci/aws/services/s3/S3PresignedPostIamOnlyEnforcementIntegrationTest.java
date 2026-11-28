@@ -255,7 +255,7 @@ class S3PresignedPostIamOnlyEnforcementIntegrationTest {
                     .body("Error.Code", equalTo("AccessDenied"));
             trailWriter.flushNow();
 
-            List<JsonNode> records = trailRecords(logBucket);
+            List<JsonNode> records = trailRecords(logBucket, region);
             assertTrue(records.stream().anyMatch(record -> "PostObject".equals(record.path("eventName").asText())
                             && "AccessDenied".equals(record.path("errorCode").asText())
                             && bucket.equals(record.path("requestParameters").path("bucketName").asText())
@@ -279,40 +279,55 @@ class S3PresignedPostIamOnlyEnforcementIntegrationTest {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String bucket = "presigned-post-encryption-" + suffix;
         String userName = "presigned-post-encryption-user-" + suffix;
-        String value = field.endsWith("key-id") ? "approved-key" : "aws:kms";
-        boolean isDenied = "Deny".equals(effect);
-        createBucketAsRoot(bucket);
-        String accessKeyId = createUser(userName);
-        if (isDenied) {
-            putUserPolicy(userName, "AllowPutObject", """
+        String keyArn = given().header("Authorization", auth("test", "kms"))
+                .header("X-Amz-Target", "TrentService.CreateKey").contentType("application/x-amz-json-1.1")
+                .body("{}").post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        try {
+            String value = field.endsWith("key-id") ? keyArn : "aws:kms";
+            boolean isDenied = "Deny".equals(effect);
+            createBucketAsRoot(bucket);
+            String accessKeyId = createUser(userName);
+            putUserPolicy(userName, "EncryptOwnedKey", """
                     {"Version":"2012-10-17","Statement":[
-                      {"Effect":"Allow","Action":"s3:PutObject","Resource":"*"}
-                    ]}""");
+                      {"Effect":"Allow","Action":"kms:GenerateDataKey","Resource":"%s"}
+                    ]}""".formatted(keyArn));
+            if (isDenied) {
+                putUserPolicy(userName, "AllowPutObject", """
+                        {"Version":"2012-10-17","Statement":[
+                          {"Effect":"Allow","Action":"s3:PutObject","Resource":"*"}
+                        ]}""");
+            }
+            putUserPolicy(userName, "EncryptionCondition", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"%s","Action":"s3:PutObject","Resource":"arn:aws:s3:::%s/*",
+                       "Condition":{"StringEquals":{"s3:%s":"%s"}}}
+                    ]}""".formatted(effect, bucket, field, value));
+
+            given()
+                    .header(field, "header-only-value")
+                    .multiPart("key", "encrypted.txt")
+                    .multiPart("x-amz-credential", presignedCredential(accessKeyId))
+                    .multiPart("X-Amz-Server-Side-Encryption", encryption)
+                    .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", keyArn)
+                    .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
+            .when()
+                    .post("/" + bucket)
+            .then()
+                    .statusCode(isDenied ? 403 : 204);
+
+            given()
+                    .header("Authorization", auth("test", "s3"))
+            .when()
+                    .get("/" + bucket + "/encrypted.txt")
+            .then()
+                    .statusCode(isDenied ? 404 : 200);
+        } finally {
+            given().header("Authorization", auth("test", "kms"))
+                    .header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                    .contentType("application/x-amz-json-1.1")
+                    .body("{\"KeyId\":\"" + keyArn + "\",\"PendingWindowInDays\":7}")
+                    .post("/").then().statusCode(200);
         }
-        putUserPolicy(userName, "EncryptionCondition", """
-                {"Version":"2012-10-17","Statement":[
-                  {"Effect":"%s","Action":"s3:PutObject","Resource":"arn:aws:s3:::%s/*",
-                   "Condition":{"StringEquals":{"s3:%s":"%s"}}}
-                ]}""".formatted(effect, bucket, field, value));
-
-        given()
-                .header(field, "header-only-value")
-                .multiPart("key", "encrypted.txt")
-                .multiPart("x-amz-credential", presignedCredential(accessKeyId))
-                .multiPart("X-Amz-Server-Side-Encryption", encryption)
-                .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "approved-key")
-                .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
-        .when()
-                .post("/" + bucket)
-        .then()
-                .statusCode(isDenied ? 403 : 204);
-
-        given()
-                .header("Authorization", auth("test", "s3"))
-        .when()
-                .get("/" + bucket + "/encrypted.txt")
-        .then()
-                .statusCode(isDenied ? 404 : 200);
     }
 
     @ParameterizedTest
@@ -375,10 +390,13 @@ class S3PresignedPostIamOnlyEnforcementIntegrationTest {
                 .statusCode(200);
     }
 
-    /** Every record in the log files the trail delivered to {@code logBucket}. */
-    private static List<JsonNode> trailRecords(String logBucket) throws IOException {
+    /**
+     * Every record in the log files the trail delivered to {@code logBucket}, read with requests signed for the
+     * bucket's {@code region}: S3 redirects a request signed for any other.
+     */
+    private static List<JsonNode> trailRecords(String logBucket, String region) throws IOException {
         String listing = given()
-                .header("Authorization", auth("test", "s3"))
+                .header("Authorization", auth("test", "s3", region))
         .when()
                 .get("/" + logBucket + "?list-type=2")
         .then()
@@ -388,7 +406,7 @@ class S3PresignedPostIamOnlyEnforcementIntegrationTest {
         Matcher key = Pattern.compile("<Key>([^<]+\\.json\\.gz)</Key>").matcher(listing);
         while (key.find()) {
             byte[] compressed = given()
-                    .header("Authorization", auth("test", "s3"))
+                    .header("Authorization", auth("test", "s3", region))
             .when()
                     .get("/" + logBucket + "/" + key.group(1))
             .then()

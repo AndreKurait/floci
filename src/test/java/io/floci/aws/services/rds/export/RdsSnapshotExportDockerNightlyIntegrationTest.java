@@ -29,12 +29,13 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 
+import static io.floci.aws.testing.RdsRequests.waitForAvailableInstance;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
@@ -88,15 +89,16 @@ class RdsSnapshotExportDockerNightlyIntegrationTest {
         String taskId = "export-" + suffix;
         s3Service.createBucket(bucket, "us-east-1");
         try (RdsClient rds = rdsClient()) {
-            DBInstance instance = rds.createDBInstance(request -> request
+            rds.createDBInstance(request -> request
                     .dbInstanceIdentifier(dbId)
                     .engine("postgres")
                     .masterUsername(MASTER_USER)
                     .masterUserPassword(MASTER_PASSWORD)
                     .dbName("appdb")
                     .allocatedStorage(20)
-                    .dbInstanceClass("db.t3.micro")).dbInstance();
+                    .dbInstanceClass("db.t3.micro"));
             try {
+                DBInstance instance = waitForAvailableInstance(rds, dbId);
                 asMaster(instance.endpoint().port(),
                         "CREATE TABLE items (id int PRIMARY KEY, small int2, big int8, ratio float8, flag bool, "
                                 + "name text, price numeric(10,2), created_at timestamptz, attrs jsonb, "
@@ -191,15 +193,16 @@ class RdsSnapshotExportDockerNightlyIntegrationTest {
         String taskId = "export-" + suffix;
         s3Service.createBucket(bucket, "us-east-1");
         try (RdsClient rds = rdsClient()) {
-            DBInstance instance = rds.createDBInstance(request -> request
+            rds.createDBInstance(request -> request
                     .dbInstanceIdentifier(dbId)
                     .engine("postgres")
                     .masterUsername(MASTER_USER)
                     .masterUserPassword(MASTER_PASSWORD)
                     .dbName("appdb")
                     .allocatedStorage(20)
-                    .dbInstanceClass("db.t3.micro")).dbInstance();
+                    .dbInstanceClass("db.t3.micro"));
             try {
+                DBInstance instance = waitForAvailableInstance(rds, dbId);
                 asMaster(instance.endpoint().port(),
                         "CREATE TABLE events (id int)",
                         "CREATE TABLE late_events () INHERITS (events)",
@@ -241,15 +244,16 @@ class RdsSnapshotExportDockerNightlyIntegrationTest {
         String taskId = "export-" + suffix;
         s3Service.createBucket(bucket, "us-east-1");
         try (RdsClient rds = rdsClient()) {
-            DBInstance instance = rds.createDBInstance(request -> request
+            rds.createDBInstance(request -> request
                     .dbInstanceIdentifier(dbId)
                     .engine("postgres")
                     .masterUsername(MASTER_USER)
                     .masterUserPassword(MASTER_PASSWORD)
                     .dbName("appdb")
                     .allocatedStorage(20)
-                    .dbInstanceClass("db.t3.micro")).dbInstance();
+                    .dbInstanceClass("db.t3.micro"));
             try {
+                DBInstance instance = waitForAvailableInstance(rds, dbId);
                 asMaster(instance.endpoint().port(),
                         "CREATE DOMAIN public.int4 AS text",
                         "CREATE TABLE labelled (id int, label public.int4)",
@@ -287,16 +291,11 @@ class RdsSnapshotExportDockerNightlyIntegrationTest {
         }
     }
 
-    private static ExportTask awaitTerminal(RdsClient rds, String taskId) throws InterruptedException {
-        Instant deadline = Instant.now().plus(Duration.ofMinutes(3));
-        while (true) {
-            ExportTask task = rds.describeExportTasks(request -> request.exportTaskIdentifier(taskId))
-                    .exportTasks().getFirst();
-            if (List.of("COMPLETE", "FAILED", "CANCELED").contains(task.status()) || Instant.now().isAfter(deadline)) {
-                return task;
-            }
-            Thread.sleep(1_000);
-        }
+    private static ExportTask awaitTerminal(RdsClient rds, String taskId) {
+        return await().atMost(Duration.ofMinutes(3)).pollDelay(Duration.ZERO).pollInterval(Duration.ofSeconds(1))
+                .until(() -> rds.describeExportTasks(request -> request.exportTaskIdentifier(taskId))
+                                .exportTasks().getFirst(),
+                        task -> List.of("COMPLETE", "FAILED", "CANCELED").contains(task.status()));
     }
 
     private static RdsClient rdsClient() {

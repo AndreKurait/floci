@@ -4,17 +4,21 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricDatum;
+import io.floci.aws.testing.InMemoryStorageFactory;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -111,6 +115,28 @@ class AlarmEvaluatorTest {
     }
 
     @Test
+    void injectedClockExcludesTheCurrentPeriodAtAnExactBoundary() {
+        CloudWatchMetricsService realMetrics = spy(new CloudWatchMetricsService(
+                new InMemoryStorageFactory("000000000000"), new RegionResolver(REGION, "000000000000")));
+        MetricAlarm alarm = alarm();
+        alarm.setEvaluationPeriods(1);
+        realMetrics.putMetricAlarm(alarm, REGION);
+        Instant boundary = Instant.parse("2026-11-17T12:01:00Z");
+        realMetrics.putMetricData(alarm.getNamespace(), List.of(
+                MetricDatum.of(alarm.getMetricName(), "Percent", 90, List.of(), boundary.getEpochSecond() - 1),
+                MetricDatum.of(alarm.getMetricName(), "Percent", 0, List.of(), boundary.getEpochSecond())), REGION);
+        when(handlers.iterator()).thenAnswer(invocation -> List.<AlarmActionHandler>of().iterator());
+        AlarmEvaluator fixed = new AlarmEvaluator(realMetrics, handlers,
+                Clock.fixed(boundary.plusSeconds(10), ZoneOffset.UTC), mock(ScheduledExecutorService.class));
+
+        fixed.evaluate(alarm);
+
+        verify(realMetrics).getMetricStatistics(any(), any(), any(), any(), eq(boundary),
+                eq(60), any(), any(), eq(REGION));
+        verify(realMetrics).setAlarmState(eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
+    }
+
+    @Test
     void transitionsToAlarmAndDispatchesWhenThresholdBreachedForAllPeriods() {
         stubMetrics(datapoints(80, 85, 90));
         when(handlers.iterator()).thenAnswer(inv -> List.of(handler).iterator());
@@ -180,7 +206,7 @@ class AlarmEvaluatorTest {
     }
 
     @Test
-    void skipsAlarmsConfiguredWithExtendedStatisticOnly() {
+    void evaluatesAlarmsConfiguredWithExtendedStatisticOnly() {
         MetricAlarm alarm = new MetricAlarm();
         alarm.setAlarmName("p99-only-alarm");
         alarm.setRegion(REGION);
@@ -194,13 +220,13 @@ class AlarmEvaluatorTest {
 
         assertDoesNotThrow(() -> evaluator.evaluate(alarm));
 
-        verify(metricsService, never()).getMetricStatistics(
-                any(), any(), any(), any(), any(), anyInt(), any(), any(), anyString());
+        verify(metricsService).getMetricStatistics(
+                any(), any(), any(), any(), any(), eq(300), eq(List.of("p99")), any(), eq(REGION));
     }
 
     @Test
     void evaluateAllSurvivesAllAlarmsThrowing() {
-        when(metricsService.allAlarms()).thenThrow(new RuntimeException("storage hiccup"));
+        when(metricsService.metricAlarmsInEveryAccount()).thenThrow(new RuntimeException("storage hiccup"));
 
         assertDoesNotThrow(evaluator::evaluateAll);
     }
