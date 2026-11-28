@@ -124,7 +124,7 @@ public class KmsService implements ResourceProvider {
         return bytes;
     }
 
-    private String buildDefaultKeyPolicy() {
+    public String buildDefaultKeyPolicy() {
         String account = regionResolver.getAccountId();
         return "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Enable IAM User Permissions\"," +
                "\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"" + regionResolver.buildGlobalArn("iam", account, "root") + "\"}," +

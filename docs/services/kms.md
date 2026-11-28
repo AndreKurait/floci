@@ -1,5 +1,17 @@
 # KMS
 
+## CloudFormation keys
+
+`AWS::KMS::Key` honors `KeySpec`, `KeyUsage`, `KeyPolicy`, `MultiRegion`,
+`Origin`, `Description`, `Enabled`, `EnableKeyRotation`, and `Tags`. Key policies
+resolve CloudFormation intrinsic functions. Updates preserve key identity and
+cryptographic material. Changes to immutable `KeySpec`, `KeyUsage`, `Origin`, or
+`MultiRegion` fail before mutable properties are applied. Omitting the key spec
+and usage creates a symmetric encryption key. Dropping a previously declared
+`KeyPolicy` restores the account default; a policy the template never declared
+stays unchanged. Failed updates restore the prior key settings and stack-owned
+tags, preserving tags added outside the stack.
+
 **Protocol:** JSON 1.1 (`X-Amz-Target: TrentService.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
