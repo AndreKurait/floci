@@ -1530,3 +1530,15 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
+
+### Verified caller context
+
+When request signature validation succeeds, stack operations retain a snapshot of the
+caller identity and policy limits for resource provisioners. Deferred deletion uses its
+own requesting caller. Account-only internal requests and legacy development credentials
+provide no verified provider identity. Executor scopes clear the snapshot after each
+operation. This context does not add CloudFormation execution-role support or change
+existing `Fn::GetStackOutput` role authorization.
+
+The snapshot includes the caller account's configured effective SCP levels, copied with the
+identity, session, and permissions-boundary policies so downstream evaluation retains those ceilings.
