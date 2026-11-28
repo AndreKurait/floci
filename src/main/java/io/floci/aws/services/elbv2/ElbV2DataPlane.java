@@ -28,7 +28,10 @@ import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.InvokeResult;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.handler.ssl.SslHandshakeTimeoutException;
+import io.quarkus.vertx.http.runtime.ProxyConfig;
+import io.quarkus.vertx.http.runtime.VertxHttpConfig;
 import io.vertx.core.Future;
+import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -223,6 +226,7 @@ public class ElbV2DataPlane {
             new AtomicBoolean();
     private final Map<Integer, Map<String, String>> listenersByHostAndPort = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ListenerBinding> listenerBindings;
+    private final ProxyConfig proxyConfig;
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rrCounters = new ConcurrentHashMap<>();
     private final Map<String, String> listenerRegions = new ConcurrentHashMap<>();
@@ -235,8 +239,18 @@ public class ElbV2DataPlane {
         this(new ConcurrentHashMap<>());
     }
 
+    @Inject
+    public ElbV2DataPlane(VertxHttpConfig httpConfig) {
+        this(new ConcurrentHashMap<>(), httpConfig.proxy());
+    }
+
     ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings) {
+        this(listenerBindings, null);
+    }
+
+    private ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings, ProxyConfig proxyConfig) {
         this.listenerBindings = listenerBindings;
+        this.proxyConfig = proxyConfig;
     }
 
     record ListenerBinding(int port, String host, String loadBalancerArn,
@@ -613,7 +627,7 @@ public class ElbV2DataPlane {
         long generation = ++state.generation;
         servers.put(port, server);
         try {
-            server.requestHandler(req -> handleRequest(req, port));
+            server.requestHandler(standaloneRequestHandler(port));
             server.listen()
                     .onSuccess(s -> portStarted(port, state, generation, secure ? "HTTPS" : "HTTP"))
                     .onFailure(err -> onCurrentPort(port, state, () -> {
@@ -637,6 +651,14 @@ public class ElbV2DataPlane {
             }
             throw failure;
         }
+    }
+
+    private Handler<HttpServerRequest> standaloneRequestHandler(int port) {
+        Handler<HttpServerRequest> handler = request -> handleRequest(request, port);
+        if (proxyConfig == null) {
+            return handler;
+        }
+        return ElbV2ProxyHandler.create(proxyConfig, vertx, handler);
     }
 
     private void startTcpServer(int port, PortState state) {

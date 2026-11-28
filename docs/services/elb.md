@@ -45,6 +45,18 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 
 ### Listeners
 
+Standalone ALB HTTP and HTTPS listeners use the API listener's configured
+`quarkus.http.proxy` forwarding policy. With proxy address forwarding enabled,
+the same Quarkus parser and trusted-proxy checks determine the client address
+appended to `X-Forwarded-For`. Configure `trusted-proxies` explicitly and have the
+upstream proxy replace caller-supplied forwarding headers with its actual peer.
+The original Host, request target and listener scheme still determine routing
+and backend requests; forwarded authority and prefix values do not replace them.
+Resource listeners do not authenticate client certificates. When the API proxy
+policy requires a trusted client certificate, these listeners retain the socket
+peer identity and ignore forwarding claims. This does not change TLS certificates
+or the ALB's append/preserve/remove attribute. It does not add shared-port TLS routing.
+
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
 Listener responses carry the listener's default certificate in `Certificates`, and omit the
