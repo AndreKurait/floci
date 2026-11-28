@@ -5041,8 +5041,7 @@ public class CloudFormationService implements ResourceProvider {
                 (name, output, outputRegion, roleArn) ->
                         resolveStackOutput(accountId, name, output, outputRegion, roleArn, identity),
                 parameterTypes,
-                (id, attribute, value) -> dispatcher.attributeValue(
-                        resources.path(id).path("Type").asText(), attribute, value));
+                resourceValueResolver(resources));
     }
 
     /**
