@@ -24,7 +24,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
+import java.util.function.LongUnaryOperator;
 import java.util.function.ToIntFunction;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -49,6 +51,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private final Route53Service route53Service;
     private final DnsLookupHelper dnsLookupHelper;
     private final EmbeddedDnsServer embeddedDnsServer;
+    private final LongUnaryOperator weightedDraw;
     private final Set<String> flociSuffixes = new LinkedHashSet<>();
 
     public Route53DnsRecordSource(Route53Service route53Service) {
@@ -62,9 +65,16 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     @Inject
     public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper,
                                   EmbeddedDnsServer embeddedDnsServer) {
+        this(route53Service, config, dnsLookupHelper, embeddedDnsServer,
+                bound -> ThreadLocalRandom.current().nextLong(bound));
+    }
+
+    Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper,
+                          EmbeddedDnsServer embeddedDnsServer, LongUnaryOperator weightedDraw) {
         this.route53Service = route53Service;
         this.dnsLookupHelper = dnsLookupHelper != null ? dnsLookupHelper : new DnsLookupHelper(config);
         this.embeddedDnsServer = embeddedDnsServer;
+        this.weightedDraw = weightedDraw;
         this.flociSuffixes.addAll(BUILTIN_SUFFIXES);
         if (config != null) {
             config.hostname().ifPresent(this.flociSuffixes::add);
@@ -163,15 +173,21 @@ public class Route53DnsRecordSource implements DnsRecordSource {
 
     private DnsAnswer buildPublicRecords(String name, int type, List<ResourceRecordSet> sets,
                                         Function<String, DnsRecord> recordFactory, String listenerAddress) {
+        try {
+            sets = selectPublicRecords(sets);
+        } catch (IllegalArgumentException e) {
+            LOG.debugv("Cannot select public DNS records for {0}: {1}", name, e.getMessage());
+            return DnsAnswer.refused();
+        }
         if (sets.stream().noneMatch(record -> record.getAliasTarget() != null)) {
-            return buildRecords(name, sets, recordFactory, Route53DnsRecordSource::publicTtlOf);
+            return buildRecords(name, sets, recordFactory, Route53DnsRecordSource::publicTtlOf, true);
         }
         if (sets.size() != 1 || embeddedDnsServer == null || (type != 1 && type != 28)) {
             return DnsAnswer.refused();
         }
         ResourceRecordSet record = sets.getFirst();
         AliasTarget alias = record.getAliasTarget();
-        if (record.getSetIdentifier() != null || record.getWeight() != null || record.getRegion() != null
+        if (record.getRegion() != null
                 || record.getFailover() != null || record.getHealthCheckId() != null
                 || Boolean.TRUE.equals(record.getMultiValueAnswer())
                 || record.getTtl() != null
@@ -185,6 +201,39 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             return DnsAnswer.refused();
         }
         return target;
+    }
+
+    private List<ResourceRecordSet> selectPublicRecords(List<ResourceRecordSet> records) {
+        if (records.stream().noneMatch(record -> record.getWeight() != null || record.getSetIdentifier() != null)) {
+            return records;
+        }
+        Set<String> identifiers = new HashSet<>();
+        long totalWeight = 0;
+        for (ResourceRecordSet record : records) {
+            if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null
+                    || Boolean.TRUE.equals(record.getMultiValueAnswer())
+                    || record.getAliasTarget() != null && record.getAliasTarget().isEvaluateTargetHealth()) {
+                throw new IllegalArgumentException("Unsupported weighted DNS routing policy");
+            }
+            Long weight = record.getWeight();
+            String identifier = record.getSetIdentifier();
+            if (weight == null || weight < 0 || weight > 255 || identifier == null || identifier.isBlank()
+                    || !identifiers.add(identifier)) {
+                throw new IllegalArgumentException("Invalid or mixed weighted DNS records");
+            }
+            totalWeight += weight;
+        }
+        long draw = weightedDraw.applyAsLong(totalWeight == 0 ? records.size() : totalWeight);
+        if (totalWeight == 0) {
+            return List.of(records.get(Math.toIntExact(draw)));
+        }
+        for (ResourceRecordSet record : records) {
+            if (draw < record.getWeight()) {
+                return List.of(record);
+            }
+            draw -= record.getWeight();
+        }
+        throw new IllegalArgumentException("Weighted DNS selection is outside the group");
     }
 
     @Override
@@ -219,12 +268,18 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private static DnsAnswer buildRecords(String name, List<ResourceRecordSet> sets,
                                          Function<String, DnsRecord> recordFactory,
                                          ToIntFunction<ResourceRecordSet> ttlReader) {
+        return buildRecords(name, sets, recordFactory, ttlReader, false);
+    }
+
+    private static DnsAnswer buildRecords(String name, List<ResourceRecordSet> sets,
+                                         Function<String, DnsRecord> recordFactory,
+                                         ToIntFunction<ResourceRecordSet> ttlReader, boolean allowWeighted) {
         List<DnsRecord> records = new ArrayList<>();
         int ttl = Integer.MAX_VALUE;
         try {
             for (ResourceRecordSet set : sets) {
-                if (set.getSetIdentifier() != null || set.getAliasTarget() != null
-                        || set.getWeight() != null || set.getRegion() != null
+                if (!allowWeighted && (set.getSetIdentifier() != null || set.getWeight() != null)
+                        || set.getAliasTarget() != null || set.getRegion() != null
                         || set.getFailover() != null || set.getHealthCheckId() != null
                         || set.getRecords() == null) {
                     return DnsAnswer.refused();

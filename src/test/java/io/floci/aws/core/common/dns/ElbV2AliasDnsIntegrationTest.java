@@ -45,16 +45,21 @@ class ElbV2AliasDnsIntegrationTest {
     Vertx vertx;
 
     @ParameterizedTest
-    @CsvSource({"internal,A,1,127.0.0.1,false", "internet-facing,A,1,127.0.0.1,false",
-            "internal,AAAA,28,127.0.0.1,false", "internet-facing,AAAA,28,127.0.0.1,false",
-            "internal,A,1,127.0.0.2,false", "internet-facing,A,1,127.0.0.2,false",
-            "internal,AAAA,28,127.0.0.2,false", "internet-facing,AAAA,28,127.0.0.2,false",
-            "internal,A,1,127.0.0.1,true", "internet-facing,A,1,127.0.0.1,true",
-            "internal,AAAA,28,127.0.0.1,true", "internet-facing,AAAA,28,127.0.0.1,true",
-            "internal,A,1,127.0.0.2,true", "internet-facing,A,1,127.0.0.2,true",
-            "internal,AAAA,28,127.0.0.2,true", "internet-facing,AAAA,28,127.0.0.2,true"})
+    @CsvSource({"internal,A,1,127.0.0.1,false,false", "internet-facing,A,1,127.0.0.1,false,false",
+            "internal,AAAA,28,127.0.0.1,false,false", "internet-facing,AAAA,28,127.0.0.1,false,false",
+            "internal,A,1,127.0.0.2,false,false", "internet-facing,A,1,127.0.0.2,false,false",
+            "internal,AAAA,28,127.0.0.2,false,false", "internet-facing,AAAA,28,127.0.0.2,false,false",
+            "internal,A,1,127.0.0.1,true,false", "internet-facing,A,1,127.0.0.1,true,false",
+            "internal,AAAA,28,127.0.0.1,true,false", "internet-facing,AAAA,28,127.0.0.1,true,false",
+            "internal,A,1,127.0.0.2,true,false", "internet-facing,A,1,127.0.0.2,true,false",
+            "internal,AAAA,28,127.0.0.2,true,false", "internet-facing,AAAA,28,127.0.0.2,true,false",
+            "internal,A,1,127.0.0.1,false,true", "internet-facing,A,1,127.0.0.1,false,true",
+            "internal,AAAA,28,127.0.0.1,false,true", "internet-facing,AAAA,28,127.0.0.1,false,true",
+            "internal,A,1,127.0.0.2,false,true", "internet-facing,A,1,127.0.0.2,false,true",
+            "internal,AAAA,28,127.0.0.2,false,true", "internet-facing,AAAA,28,127.0.0.2,false,true"})
     void publicAliasValidatesItsTargetAcrossAccounts(
-            String scheme, String type, int queryType, String listenerAddress, boolean evaluateTargetHealth)
+            String scheme, String type, int queryType, String listenerAddress, boolean evaluateTargetHealth,
+            boolean weighted)
             throws Exception {
         assumeTrue("127.0.0.1".equals(listenerAddress) || OS.current() == OS.LINUX,
                 "binding " + listenerAddress + " needs Linux, which routes all of 127/8 locally");
@@ -91,20 +96,34 @@ class ElbV2AliasDnsIntegrationTest {
                         .noneMatch(lb -> lb.loadBalancerArn().equals(target.loadBalancerArn())));
                 zone = route53.createHostedZone(r -> r.name(name).callerReference(UUID.randomUUID().toString()))
                         .hostedZone().id();
-                installed = alias(name, type, target.dnsName(), target.canonicalHostedZoneId(), evaluateTargetHealth);
+                installed = withRouting(
+                        alias(name, type, target.dnsName(), target.canonicalHostedZoneId(), evaluateTargetHealth), weighted);
                 change(route53, zone, ChangeAction.CREATE, installed);
                 assertValidTarget(query(listener, name, queryType), queryType, listenerAddress);
 
-                installed = alias(name, type, "dualstack." + target.dnsName().toUpperCase(Locale.ROOT),
-                        target.canonicalHostedZoneId(), evaluateTargetHealth);
+                String literal = queryType == 1 ? "192.0.2.50" : "2001:db8::50";
+                installed = withRouting(ResourceRecordSet.builder().name(name).type(type).ttl(31L)
+                        .resourceRecords(record -> record.value(literal)).build(), weighted);
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                byte[] literalResponse = query(listener, name, queryType);
+                byte[] literalRequest = DnsTestQuery.query(name, queryType, 1234);
+                assertEquals(0, rcode(literalResponse));
+                assertEquals(1, ByteBuffer.wrap(literalResponse).getShort(6));
+                assertEquals(31, ByteBuffer.wrap(literalResponse).getInt(literalRequest.length + 6));
+                assertArrayEquals(new DnsRecord.Address(queryType, literal).data(),
+                        Arrays.copyOfRange(literalResponse, literalRequest.length + 12, literalResponse.length));
+
+                installed = withRouting(alias(name, type, "dualstack." + target.dnsName().toUpperCase(Locale.ROOT),
+                        target.canonicalHostedZoneId(), evaluateTargetHealth), weighted);
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 assertValidTarget(query(listener, name.toUpperCase(Locale.ROOT) + ".", queryType),
                         queryType, listenerAddress);
 
-                installed = alias(name, type, target.dnsName(), "WRONG", evaluateTargetHealth);
+                installed = withRouting(alias(name, type, target.dnsName(), "WRONG", evaluateTargetHealth), weighted);
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 assertEquals(5, rcode(query(listener, name, queryType)));
-                installed = alias(name, type, target.dnsName(), target.canonicalHostedZoneId(), evaluateTargetHealth);
+                installed = withRouting(
+                        alias(name, type, target.dnsName(), target.canonicalHostedZoneId(), evaluateTargetHealth), weighted);
                 change(route53, zone, ChangeAction.UPSERT, installed);
                 assertValidTarget(query(listener, name, queryType), queryType, listenerAddress);
 
@@ -137,6 +156,10 @@ class ElbV2AliasDnsIntegrationTest {
                 ec2.deleteVpc(r -> r.vpcId(vpc));
             }
         }
+    }
+
+    private static ResourceRecordSet withRouting(ResourceRecordSet record, boolean weighted) {
+        return weighted ? record.toBuilder().setIdentifier("primary").weight(1L).build() : record;
     }
 
     private static ResourceRecordSet alias(String name, String type, String target, String zone,
