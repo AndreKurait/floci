@@ -7,6 +7,7 @@ import io.floci.aws.core.common.DomainNames;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestConditionSpelling;
 import io.floci.aws.core.common.Resettable;
+import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.floci.aws.core.common.dns.DnsLookupHelper;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
@@ -30,15 +31,19 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class Route53Service implements Resettable, RequestConditionSpelling {
@@ -806,36 +811,45 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
                 .toList();
     }
 
-    public boolean isCoveredByPrivateZone(String qname) {
-        if (qname == null || qname.isBlank()) {
-            return false;
-        }
-        String normalizedQname = normalizeName(qname).toLowerCase();
-        if (privateZoneNameCounts.isEmpty()
-                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
-            return false;
-        }
-        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
-            HostedZone zone = owned.zone();
-            if (!zone.isPrivateZone()) {
-                continue;
-            }
-            String zoneName = normalizeName(zone.getName()).toLowerCase();
-            if (DomainNames.isWithin(normalizedQname, zoneName)) {
-                return true;
-            }
-        }
-        return false;
+    public boolean isCoveredByPrivateZone(String qname, ClientVpc origin) {
+        return !privateDnsZones(qname, origin).isEmpty();
     }
 
-    public List<ResourceRecordSet> findPrivateRecordsForName(String qname) {
+    /** Selects the most specific private zones, filtering associations when the caller VPC is known. */
+    public Set<String> privateDnsZoneIds(String qname, ClientVpc origin) {
+        return privateDnsZones(qname, origin).stream()
+                .map(owned -> owned.zone().getId()).collect(Collectors.toSet());
+    }
+
+    public List<ResourceRecordSet> findPrivateRecordsForName(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        return zones.isEmpty() ? List.of() : findRecordsForName(normalizeName(qname).toLowerCase(),
+                zones.stream().map(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId())).toList());
+    }
+
+    public boolean hasPrivateRecordsBeneath(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        if (zones.isEmpty()) {
+            return false;
+        }
+        String suffix = "." + normalizeName(qname).toLowerCase();
+        return zones.stream().flatMap(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId()).stream())
+                .anyMatch(record -> normalizeName(record.getName()).toLowerCase().endsWith(suffix));
+    }
+
+    private List<OwnedZone> privateDnsZones(String qname, ClientVpc origin) {
         if (qname == null || qname.isBlank()) {
             return List.of();
         }
-        return findRecordsForName(normalizeName(qname).toLowerCase(),
-                mostSpecificZones(normalizeName(qname).toLowerCase(), true).stream()
-                        .map(owned -> getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId()))
-                        .toList());
+        return mostSpecificZones(normalizeName(qname).toLowerCase(), true, owned -> origin == null
+                || owned.zone().getVpcAssociations().stream().anyMatch(association ->
+                        origin.vpcId().equals(association.getVpcId())
+                                && origin.region().equals(association.getVpcRegion())
+                                && origin.accountId().equals(association.getOwnerAccountId() != null
+                                ? association.getOwnerAccountId()
+                                : resolveVpcOwnerAccount(association).orElse(owned.accountId()))));
     }
 
     private static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
@@ -900,26 +914,6 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         return shared;
     }
 
-    /**
-     * Whether a private zone holds records beneath {@code qname} although none at it: an empty
-     * non-terminal, which exists in DNS and so answers NOERROR rather than NXDOMAIN.
-     */
-    public boolean hasPrivateRecordsBeneath(String qname) {
-        if (qname == null || qname.isBlank()) {
-            return false;
-        }
-        String normalizedQname = normalizeName(qname).toLowerCase();
-        String suffix = "." + normalizedQname;
-        for (OwnedZone owned : mostSpecificZones(normalizedQname, true)) {
-            for (ResourceRecordSet rrs : getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId())) {
-                if (normalizeName(rrs.getName()).toLowerCase().endsWith(suffix)) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     record PublicDnsZone(String name, List<ResourceRecordSet> matchingRecords, List<ResourceRecordSet> records) {}
 
     List<PublicDnsZone> publicDnsZones(String qname) {
@@ -934,12 +928,82 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
                 .toList();
     }
 
+    public record PublicAlias(String dnsName, String hostedZoneId) {}
+
+    /**
+     * Follows an unambiguous public alias/CNAME chain without making an upstream DNS request.
+     * Returns null for unresolved or ambiguous names. A zone alone does not identify the service
+     * that owns a hostname; the consumer must match the result to its own resource before routing.
+     */
+    public PublicAlias lookupPublicAlias(String name) {
+        String normalized = normalizeName(name).toLowerCase(Locale.ROOT);
+        if (publicZoneNameCounts.keySet().stream().noneMatch(zone -> DomainNames.isWithin(normalized, zone))) {
+            return null;
+        }
+        String current = normalized;
+        Set<String> visited = new HashSet<>();
+        String targetZoneId = null;
+        for (int depth = 0; depth < 8; depth++) {
+            if (!visited.add(current)) {
+                break;
+            }
+            List<OwnedZone> zones = mostSpecificZones(current, false);
+            if (zones.isEmpty()) {
+                return new PublicAlias(current, targetZoneId);
+            }
+            if (zones.size() != 1) {
+                break;
+            }
+            OwnedZone owned = zones.getFirst();
+            if (targetZoneId != null && !owned.zone().getId().equals(targetZoneId)) {
+                break;
+            }
+            List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId());
+            String currentName = current;
+            boolean delegated = records.stream().anyMatch(record -> "NS".equals(record.getType())
+                    && !record.getName().equalsIgnoreCase(owned.zone().getName())
+                    && DomainNames.isWithin(currentName, normalizeName(record.getName()).toLowerCase(Locale.ROOT)));
+            List<ResourceRecordSet> matches = findRecordsForName(current, List.of(records)).stream()
+                    .filter(record -> "A".equals(record.getType()) || "CNAME".equals(record.getType()))
+                    .toList();
+            if (delegated || matches.size() != 1) {
+                break;
+            }
+            ResourceRecordSet record = matches.getFirst();
+            if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null) {
+                break;
+            }
+            AliasTarget alias = record.getAliasTarget();
+            String next;
+            if ("A".equals(record.getType()) && alias != null) {
+                next = alias.getDnsName();
+                targetZoneId = alias.getHostedZoneId();
+            } else if ("CNAME".equals(record.getType())
+                    && record.getRecords() != null && record.getRecords().size() == 1) {
+                next = record.getRecords().getFirst().getValue();
+                targetZoneId = null;
+            } else {
+                break;
+            }
+            if (next == null || next.isBlank()) {
+                break;
+            }
+            current = normalizeName(next).toLowerCase(Locale.ROOT);
+        }
+        return null;
+    }
+
     private Map<String, Integer> zoneNameCounts(boolean privateZone) {
         return privateZone ? privateZoneNameCounts : publicZoneNameCounts;
     }
 
     /** The longest containing zones, so a parent never answers for a more specific child. */
     private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone) {
+        return mostSpecificZones(normalizedQname, privateZone, owned -> true);
+    }
+
+    private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone,
+                                             Predicate<OwnedZone> visible) {
         Map<String, Integer> names = zoneNameCounts(privateZone);
         if (names.isEmpty() || names.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
             return List.of();
@@ -948,7 +1012,7 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         int maxZoneLength = -1;
         for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
             HostedZone zone = owned.zone();
-            if (zone.isPrivateZone() != privateZone) {
+            if (zone.isPrivateZone() != privateZone || !visible.test(owned)) {
                 continue;
             }
             String zoneName = normalizeName(zone.getName()).toLowerCase();

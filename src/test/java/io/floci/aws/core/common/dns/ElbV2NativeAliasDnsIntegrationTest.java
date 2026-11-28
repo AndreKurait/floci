@@ -1,0 +1,293 @@
+package io.floci.aws.core.common.dns;
+
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.elbv2.ElbV2DnsRecordSource;
+import io.floci.aws.services.elbv2.ElbV2Service;
+import io.floci.aws.services.route53.Route53DnsRecordSource;
+import io.floci.aws.services.route53.Route53Service;
+import io.quarkus.test.common.http.TestHTTPResource;
+import io.quarkus.test.junit.QuarkusTest;
+import io.vertx.core.Vertx;
+import io.vertx.core.datagram.DatagramSocket;
+import io.vertx.core.datagram.DatagramSocketOptions;
+import jakarta.inject.Inject;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.apache5.Apache5HttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.acm.AcmClient;
+import software.amazon.awssdk.services.acm.model.DeleteCertificateRequest;
+import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.DeleteLoadBalancerRequest;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.LoadBalancer;
+import software.amazon.awssdk.services.route53.Route53Client;
+import software.amazon.awssdk.services.route53.model.AliasTarget;
+import software.amazon.awssdk.services.route53.model.Change;
+import software.amazon.awssdk.services.route53.model.ChangeAction;
+import software.amazon.awssdk.services.route53.model.DeleteHostedZoneRequest;
+import software.amazon.awssdk.services.route53.model.ResourceRecordSet;
+
+import java.net.DatagramPacket;
+import java.net.InetAddress;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.when;
+
+/** Signed management calls in separate accounts, followed by accountless DNS packets. */
+@QuarkusTest
+class ElbV2NativeAliasDnsIntegrationTest {
+    @Inject
+    ElbV2Service loadBalancers;
+    @Inject
+    Route53Service zones;
+    @Inject
+    EmulatorConfig config;
+    @Inject
+    Vertx vertx;
+    @TestHTTPResource("/")
+    URI endpoint;
+
+    @ParameterizedTest
+    @CsvSource({"internal,false,false,false,true,false", "internet-facing,false,false,false,true,false",
+            "internal,true,false,false,true,false", "internet-facing,true,false,false,true,false",
+            "internal,false,true,false,true,false", "internet-facing,false,true,false,true,false",
+            "internal,true,true,false,true,false", "internet-facing,true,true,false,true,false",
+            "internal,false,false,true,true,false", "internet-facing,false,false,true,true,false",
+            "internal,false,true,true,true,false", "internet-facing,false,true,true,true,false",
+            "internal,false,false,true,false,false", "internet-facing,false,false,true,false,false",
+            "internal,false,true,true,false,false", "internet-facing,false,true,true,false,false",
+            "internal,false,false,false,true,true", "internet-facing,false,false,false,true,true",
+            "internet-facing,false,true,false,true,true", "internet-facing,false,false,false,false,true",
+            "internet-facing,true,false,false,true,true", "internet-facing,true,true,false,true,true"})
+    void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme, boolean declaredPublicRoute,
+                                                   boolean weighted, boolean nativeHttps, boolean knownVpc,
+                                                   boolean externalApi)
+            throws Exception {
+        StaticCredentialsProvider owner =
+                StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000001", "test"));
+        StaticCredentialsProvider zoneOwner =
+                StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000002", "test"));
+        try (Ec2Client ec2 = Ec2Client.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
+                     .credentialsProvider(owner).httpClientBuilder(Apache5HttpClient.builder()).build();
+             AcmClient acm = AcmClient.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
+                     .credentialsProvider(owner).httpClientBuilder(Apache5HttpClient.builder()).build();
+             ElasticLoadBalancingV2Client elb = ElasticLoadBalancingV2Client.builder().endpointOverride(endpoint)
+                     .region(Region.EU_WEST_1).credentialsProvider(owner)
+                     .httpClientBuilder(Apache5HttpClient.builder()).build();
+             ElasticLoadBalancingV2Client other = ElasticLoadBalancingV2Client.builder().endpointOverride(endpoint)
+                     .region(Region.EU_WEST_1).credentialsProvider(zoneOwner)
+                     .httpClientBuilder(Apache5HttpClient.builder()).build();
+             Route53Client route53 = Route53Client.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
+                     .credentialsProvider(zoneOwner).httpClientBuilder(Apache5HttpClient.builder()).build()) {
+            String name = "api." + UUID.randomUUID() + ".example.test";
+            String vpc = ec2.createVpc(r -> r.cidrBlock("10.73.0.0/16")).vpc().vpcId();
+            List<String> subnets = new ArrayList<>();
+            String zone = null;
+            String arn = null;
+            String certificate = null;
+            ResourceRecordSet installed = null;
+            DatagramSocket listener = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
+            try {
+                subnets.add(ec2.createSubnet(r -> r.vpcId(vpc).cidrBlock("10.73.1.0/24")
+                        .availabilityZone("eu-west-1a")).subnet().subnetId());
+                subnets.add(ec2.createSubnet(r -> r.vpcId(vpc).cidrBlock("10.73.2.0/24")
+                        .availabilityZone("eu-west-1b")).subnet().subnetId());
+                LoadBalancer target = elb.createLoadBalancer(r -> r.name("dns-" + UUID.randomUUID().toString().substring(0, 20))
+                        .type("application").scheme(scheme).subnets(subnets)).loadBalancers().getFirst();
+                arn = target.loadBalancerArn();
+                certificate = acm.requestCertificate(r -> r.domainName(name).validationMethod("DNS")).certificateArn();
+                String https = createHttpsListener(elb, arn, certificate);
+                assertTrue(arn.contains(":730000000001:"));
+                assertTrue(other.describeLoadBalancers().loadBalancers().stream()
+                        .noneMatch(lb -> lb.loadBalancerArn().equals(target.loadBalancerArn())));
+                zone = route53.createHostedZone(r -> r.name(name).callerReference(UUID.randomUUID().toString()))
+                        .hostedZone().id();
+                List<DnsRecordSource> sources = new ArrayList<>();
+                DnsClientVpcSource clients = address -> knownVpc ? Optional.of(
+                        new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", vpc)) : Optional.empty();
+                boolean publicTransport = nativeHttps || externalApi;
+                EmbeddedDnsServer dns = spy(new EmbeddedDnsServer(
+                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute || publicTransport,
+                        declaredPublicRoute ? List.of(name) : List.of()));
+                doReturn(Optional.of("127.0.0.1")).when(dns).getServerIp();
+                sources.add(new Route53DnsRecordSource(zones, config, new DnsLookupHelper(), dns));
+                EmulatorConfig transportConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+                when(transportConfig.network().vpcRouting().enabled()).thenReturn(publicTransport);
+                when(transportConfig.network().vpcRouting().publicAwsApi()).thenReturn(publicTransport);
+                when(transportConfig.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(nativeHttps);
+                when(transportConfig.network().vpcRouting().publicAwsApiUpstreamHost())
+                        .thenReturn(externalApi ? Optional.of("172.18.0.20") : Optional.empty());
+                when(transportConfig.tls().enabled()).thenReturn(publicTransport);
+                when(transportConfig.tls().awsHttpsPort()).thenReturn(443);
+                sources.add(new ElbV2DnsRecordSource(loadBalancers, dns, transportConfig));
+                listener.listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+                listener.handler(packet -> dns.handleQuery(vertx, listener, packet.data().getBytes(),
+                        packet.sender().host(), packet.sender().port(), "127.0.0.1"));
+
+                ResourceRecordSet alias = withRouting(alias(name, target.dnsName(), target.canonicalHostedZoneId()), weighted);
+                change(route53, zone, ChangeAction.CREATE, alias);
+                installed = alias;
+                byte[] response = query(listener, name, 1);
+                assertEquals(0, rcode(response));
+                assertEquals(1, ByteBuffer.wrap(response).getShort(6));
+                String expectedAddress = "127.0.0.1";
+                if (externalApi && !nativeHttps && knownVpc && "internet-facing".equals(scheme)) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS;
+                } else if (declaredPublicRoute) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+                } else if (nativeHttps && knownVpc && "internet-facing".equals(scheme)) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+                }
+                assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(response));
+                assertTrue((ByteBuffer.wrap(response).getShort(2) & 0x0400) != 0);
+                assertEquals(0, rcode(query(listener, name, 28)));
+                assertEquals(0, ByteBuffer.wrap(query(listener, name, 28)).getShort(6));
+
+                if (externalApi && knownVpc && !declaredPublicRoute && !weighted
+                        && "internet-facing".equals(scheme)) {
+                    verifyListenerChangesPreserveOtherPorts(elb, listener, name, target.loadBalancerArn(),
+                            certificate, https);
+                }
+
+                installed = withRouting(ResourceRecordSet.builder().name(name).type("A").ttl(60L)
+                        .resourceRecords(record -> record.value("127.0.0.1")).build(), weighted);
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(listener, name, 1)),
+                        "A literal public record keeps its published value even for a declared endpoint name");
+                installed = withRouting(alias(name, "dualstack." + target.dnsName().toUpperCase(),
+                        target.canonicalHostedZoneId()), weighted);
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                byte[] uppercase = query(listener, name.toUpperCase() + ".", 1);
+                assertEquals(0, rcode(uppercase));
+                assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(uppercase));
+                installed = withRouting(alias(name, target.dnsName(), "WRONG"), weighted);
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                assertEquals(5, rcode(query(listener, name, 1)));
+                installed = alias;
+                change(route53, zone, ChangeAction.UPSERT, installed);
+                assertEquals(0, rcode(query(listener, name, 1)));
+
+                elb.deleteLoadBalancer(r -> r.loadBalancerArn(target.loadBalancerArn()));
+                arn = null;
+                assertEquals(5, rcode(query(listener, name, 1)),
+                        "A deleted ALB must not resolve via the emulator suffix or a recursive lookup");
+            } finally {
+                listener.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+                if (installed != null) {
+                    change(route53, zone, ChangeAction.DELETE, installed);
+                }
+                if (zone != null) {
+                    route53.deleteHostedZone(DeleteHostedZoneRequest.builder().id(zone).build());
+                }
+                if (arn != null) {
+                    elb.deleteLoadBalancer(DeleteLoadBalancerRequest.builder().loadBalancerArn(arn).build());
+                }
+                if (certificate != null) {
+                    acm.deleteCertificate(DeleteCertificateRequest.builder().certificateArn(certificate).build());
+                }
+                for (String subnet : subnets) {
+                    ec2.deleteSubnet(r -> r.subnetId(subnet));
+                }
+                ec2.deleteVpc(r -> r.vpcId(vpc));
+            }
+        }
+    }
+
+    private static String createHttpsListener(ElasticLoadBalancingV2Client elb, String arn, String certificate) {
+        return elb.createListener(r -> r.loadBalancerArn(arn).protocol("HTTPS").port(443)
+                .certificates(c -> c.certificateArn(certificate)).defaultActions(a -> a.type("fixed-response")
+                        .fixedResponseConfig(f -> f.statusCode("200").contentType("text/plain").messageBody("owned"))))
+                .listeners().getFirst().listenerArn();
+    }
+
+    private static void verifyListenerChangesPreserveOtherPorts(ElasticLoadBalancingV2Client elb,
+                                                                DatagramSocket dns, String name, String arn,
+                                                                String certificate, String https) throws Exception {
+        String http = elb.createListener(r -> r.loadBalancerArn(arn).protocol("HTTP").port(80)
+                .defaultActions(a -> a.type("redirect").redirectConfig(c -> c.protocol("HTTPS").port("443")
+                        .statusCode("HTTP_301")))).listeners().getFirst().listenerArn();
+        byte[] isolatedAddress = InetAddress.getByName(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)
+                .getAddress();
+        assertArrayEquals(isolatedAddress, address(query(dns, name, 1)),
+                "A mixed HTTP/HTTPS ALB retains its isolated route for both listeners");
+        elb.deleteListener(r -> r.listenerArn(https));
+        assertArrayEquals(isolatedAddress, address(query(dns, name, 1)),
+                "An HTTP-only ALB uses the isolated route");
+        elb.deleteListener(r -> r.listenerArn(http));
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "An ALB without listeners is not advertised on the isolated ALB destination");
+        String restored = createHttpsListener(elb, arn, certificate);
+        assertArrayEquals(InetAddress.getByName(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS).getAddress(),
+                address(query(dns, name, 1)), "The only HTTPS443 listener restores the dedicated destination");
+        elb.modifyListener(r -> r.listenerArn(restored).port(8443));
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "A custom HTTPS port retains its existing address");
+        elb.modifyListener(r -> r.listenerArn(restored).port(443));
+    }
+
+    private static ResourceRecordSet withRouting(ResourceRecordSet record, boolean weighted) {
+        return weighted ? record.toBuilder().setIdentifier("primary").weight(1L).build() : record;
+    }
+
+    private static ResourceRecordSet alias(String name, String target, String zone) {
+        return ResourceRecordSet.builder().name(name).type("A").aliasTarget(AliasTarget.builder()
+                .dnsName(target + ".").hostedZoneId(zone).evaluateTargetHealth(false).build()).build();
+    }
+
+    private static void change(Route53Client client, String zone, ChangeAction action, ResourceRecordSet record) {
+        client.changeResourceRecordSets(r -> r.hostedZoneId(zone).changeBatch(b -> b.changes(
+                Change.builder().action(action).resourceRecordSet(record).build())));
+    }
+
+    private static byte[] query(DatagramSocket listener, String name, int type) throws Exception {
+        byte[] encoded = DnsRecord.encodeName(name);
+        byte[] request = ByteBuffer.allocate(16 + encoded.length)
+                .putShort((short) 1234).putShort((short) 256).putShort((short) 1)
+                .putShort((short) 0).putShort((short) 0).putShort((short) 0)
+                .put(encoded).putShort((short) type).putShort((short) 1).array();
+        try (java.net.DatagramSocket client = new java.net.DatagramSocket()) {
+            client.connect(InetAddress.getByName("127.0.0.1"), listener.localAddress().port());
+            client.setSoTimeout(5000);
+            client.send(new DatagramPacket(request, request.length));
+            DatagramPacket reply = new DatagramPacket(new byte[4096], 4096);
+            client.receive(reply);
+            return Arrays.copyOf(reply.getData(), reply.getLength());
+        }
+    }
+
+    private static int rcode(byte[] answer) {
+        return ByteBuffer.wrap(answer).getShort(2) & 15;
+    }
+
+    private static byte[] address(byte[] answer) {
+        ByteBuffer packet = ByteBuffer.wrap(answer);
+        packet.position(12);
+        EmbeddedDnsServer.readName(packet, answer);
+        packet.getInt();
+        EmbeddedDnsServer.readName(packet, answer);
+        assertEquals(1, packet.getShort());
+        packet.getShort();
+        assertEquals(60, packet.getInt());
+        assertEquals(4, packet.getShort());
+        byte[] value = new byte[4];
+        packet.get(value);
+        return value;
+    }
+}

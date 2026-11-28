@@ -429,6 +429,7 @@ Alongside the classic Query API, Floci implements a subset of the SES v2 REST JS
 | `PUT` | `/v2/email/reputation/entities/{ReputationEntityType}/{ReputationEntityReference}/customer-managed-status` | `UpdateReputationEntityCustomerManagedStatus` |
 | `POST` | `/v2/email/email-address-insights/` | `GetEmailAddressInsights` |
 | `POST` | `/v2/email/vdm/recommendations` | `ListRecommendations` |
+| `POST` | `/v2/email/account/delivery` | `PutAccountDeliveryAttributes` |
 
 Floci models no leased dedicated IPs: `GetDedicatedIps` is empty and IP-targeted operations return `NotFoundException`, as real AWS does for an account with no leased IPs, with required request members validated first (`BadRequestException`). `PutDedicatedIpPoolScalingAttributes` rejects downgrading a `MANAGED` pool to `STANDARD`, and `PutAccountDedicatedIpWarmupAttributes` stores the flag behind `GetAccount.DedicatedIpAutoWarmupEnabled` (default `true`).
 
@@ -457,6 +458,8 @@ A recipient on the [account-level suppression list](https://docs.aws.amazon.com/
 Account-level VDM (Virtual Deliverability Manager) attributes are stored per region. `PutAccountVdmAttributes` sets `VdmEnabled` (opt-in, defaults `DISABLED`) plus the optional `DashboardAttributes.EngagementMetrics` and `GuardianAttributes.OptimizedSharedDelivery`. `GetAccount` omits `VdmAttributes` until VDM has been configured for the region, then returns `VdmEnabled`, adding the `DashboardAttributes`/`GuardianAttributes` sub-objects only while `VdmEnabled` is `ENABLED`. Floci stores the settings but does not run VDM analytics.
 
 Account provisioning details are stored per region. `PutAccountDetails` sets `MailType` (required, ∈ {`MARKETING`, `TRANSACTIONAL`}) and `WebsiteURL` (required, 1–1000 chars) plus the optional `ContactLanguage` (∈ {`EN`, `JA`}), `UseCaseDescription` (≤5000 chars), `AdditionalContactEmailAddresses` (1–4 entries, each 6–254 chars matching `^(.+)@(.+)$`), and `ProductionAccessEnabled`. Floci stores `ProductionAccessEnabled` as given but stays production-enabled regardless (it has no sandbox), so the flag has no functional effect. Like `VdmAttributes`, `GetAccount` omits `Details` until it has been configured for the region, then echoes the stored fields under `Details` with a `ReviewDetails` block. Matching AWS, all modeled-constraint violations (null / enum / length / list) are aggregated into a single `BadRequestException` reporting every failure; a malformed (but in-range) `WebsiteURL` is reported separately as `Url contains invalid format`. Floci has no sandbox and does not run a production-access review, so `ReviewDetails.Status` is always `GRANTED`.
+
+[Global shared delivery](https://docs.aws.amazon.com/ses/latest/dg/global-shared-delivery.html) settings are stored, not acted on: Floci has no shared IP pools to route through. `PutAccountDeliveryAttributes` sets the account's `SharedPoolDeliveryMode` per region, and `GetAccount` always reports it under `DeliveryAttributes`. A region that never set it reads `GLOBAL`, the default AWS gives an account that starts using SES on or after 2026-11-19; an older AWS account reads `REGIONAL`. A configuration set's `DeliveryOptions.SharedPoolDeliveryMode` also takes `ACCOUNT` and is omitted when never set. `PutConfigurationSetDeliveryOptions` replaces the other delivery options but keeps the stored `SharedPoolDeliveryMode` when the request omits it, as the API reference documents, so a v1 `PutConfigurationSetDeliveryOptions`, which has no such member, never clears it.
 
 Tenants (multi-tenancy) are stored per region. `CreateTenant` requires a `TenantName` (1–64 chars, `[A-Za-z0-9_-]`) and accepts optional `Tags`; it returns the tenant with a generated `TenantId` (`tn-` + 30 hex), a `TenantArn` (`arn:aws:ses:<region>:<account>:tenant/<name>/<id>`), a `CreatedTimestamp`, and `SendingStatus` `ENABLED`. The operations use RPC-style POST subpaths (`/tenants/get`, `/tenants/list`, `/tenants/delete`); `ListTenants` returns the `TenantInfo` subset (no `Tags`/`SendingStatus`). A duplicate name is `AlreadyExistsException`; an unknown tenant on get/delete is `NotFoundException`.
 
@@ -570,14 +573,21 @@ See the [AWS receipt-rule resource reference](https://docs.aws.amazon.com/AWSClo
 
 ### IAM enforcement
 
-With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, every SES v2 operation is authorized as the `ses:`
-action AWS's service reference lists for it, which is always `ses:<Operation>`, in the `ses` namespace
-v1 and v2 share. The v1 Query API resolves the same way from its `Action`. Both are evaluated with
-resource `*`, so a policy that limits `ses:` actions to an identity, configuration set or template ARN
-does not grant them yet. The other actions the service reference lists for some operations are not
-checked: `ses:TagResource` for the create operations, and `iam:PassRole` (with `iam:PassedToService`
-`ses.amazonaws.com`) for creating or updating an event destination. A v2 `SendEmail` is authorized as
-`ses:SendEmail` whatever its content: `ses:SendRawEmail` is a v1 action.
+With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, every SES operation is authorized as the `ses:`
+action AWS's Service Reference lists for it, in the `ses` namespace v1 and v2 share: a v2 request by the
+route botocore's model gives its operation, a v1 request by its `Action`. Each is checked on the resources
+the generated table of request resources reads from the request, as for every namespace that table reads:
+an identity by its name (`identity/<name>`), a configuration set, a template or a contact list by theirs,
+an ARN member by the ARN it holds; an operation naming none of the types its action acts on is checked on
+`*`. A create that carries tags also needs `ses:TagResource`, and an event destination or a receipt rule
+that names a role `iam:PassRole` for it. A v2 `SendEmail` is authorized as `ses:SendEmail` whatever its
+content: `ses:SendRawEmail` is a v1 action. v1 and v2 share the operation in that table, and a request is read
+for its own API's members alone: a v1 `SendEmail` names its identity by its `SourceArn`, a v2 one by its
+`FromEmailAddressIdentityArn`, and neither is read for the other's. A v2 templated send is checked on the
+template its `Content.Template` (`DefaultContent.Template` for `SendBulkEmail`) names by `TemplateName` or
+`TemplateArn`; one with inline `TemplateContent` names none. `ListConfigurationSets` and `ListEmailIdentities` are
+`POST /v2/email/list-configuration-sets` and `POST /v2/email/list-identities` in the model; the `GET` routes
+an SDK built before that still sends are served but match no route of the model, so they are not checked.
 
 SES publishes to an SNS topic as `ses.amazonaws.com`, so the topic's policy decides whether it may,
 whatever the sender's own SNS permissions: an event destination's events with the configuration set's

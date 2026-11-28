@@ -17,6 +17,50 @@ so the generated request resource table takes the prefix from the response examp
 EC2 API reference's `CreateVpcEndpoint` page, which `tools/aws/fetch_ec2_id_examples.py`
 copies, matched to botocore's output shapes.
 
+
+## Native peer dependencies
+
+`FLOCI_EC2_NATIVE_PEER_DEPENDENCIES` declares deployment-owned TCP dependencies for
+protected EC2 guests. It defaults to an empty JSON array. The deployment must
+verify ownership of each destination and provision its TLS trust separately:
+
+```json
+[{"hostname":"api.peer.example","address":"172.18.0.2","port":443}]
+```
+
+Each entry requires an exact lowercase DNS hostname with at least two labels,
+a canonical RFC1918 IPv4 address, and an integer TCP port from 1 through 65535.
+Wildcards, duplicate hostnames, unknown fields, ambiguous addresses, and invalid
+JSON fail startup. Different names may share the same destination and port.
+This is immutable parent configuration, not an EC2 request or guest override.
+
+The EC2 launch and retained-instance restore paths install the exact destination
+and port through the existing security-group and VPC control-connection rules.
+Other destinations and ports keep their ordinary policies. The route retains
+the guest's existing public source identity; it does not add HTTP forwarding
+headers or alter service authentication.
+
+Only the current registered EC2 namespace carrying that dependency receives its
+DNS answer, with a five-second TTL. The explicit deployment pin takes precedence
+over stored public and private records, Resolver forwarding rules, and synthetic
+public API routing for that exact hostname. Other callers, including Lambda
+namespaces and unregistered guests, retain normal DNS resolution. Non-A queries
+for an admitted peer return NODATA. Namespace retirement removes the DNS
+authority; security-group reconciliation retains the declared dependency.
+
+The existing `/_floci/info` response reports
+`ec2_native_peer_dependencies` with `contract: 1`, the hostname `count`, and
+`sha256`. The digest covers the parsed array sorted by hostname, with each
+object's keys sorted and JSON encoded without whitespace. Admission tooling
+must verify this response against its declaration; checking an environment
+variable alone cannot establish that an older image supports the contract.
+
+Changing or removing the declaration requires normal parent recreation and
+guest admission. Persistent-state restoration applies the new declaration,
+including withdrawing removed permissions. Memory storage remains volatile;
+restarting a memory-mode parent does not preserve its control-plane state.
+
+
 ## Instance IAM authorization
 
 With IAM enforcement enabled, modeled instance-list operations, including `StartInstances`, `StopInstances`, `TerminateInstances`, and `RebootInstances`, authorize each requested instance ARN before changing any instance state.
@@ -222,6 +266,91 @@ metadata.
 
 Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) falls back to the catalog `defaultDockerImage` (`public.ecr.aws/amazonlinux/amazonlinux:2023` by default).
 
+### Images with their own startup command
+
+Set `guestRuntime: image` on an AMI entry in an external catalog selected with
+`FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` to run the Docker image's declared
+ENTRYPOINT and CMD without either override:
+
+```yaml
+defaultDockerImage: example/base:1
+images:
+  - imageId: ami-local-worker
+    dockerImage: example/worker:1
+    name: local-worker
+    description: Worker with its own startup command
+    architecture: arm64
+    creationDate: '2026-10-08T00:00:00.000Z'
+    guestRuntime: image
+```
+
+The image must provide a working startup command. This mode does not add the
+systemd mounts, install an init system, or establish application readiness.
+The normal EC2 networking, resource limits, metadata, SSH and UserData behavior
+still applies. Omitted `guestRuntime` and unknown AMI IDs retain the `minimal`
+runtime; selecting `image` on one entry does not change other entries.
+
+### Guest startup files
+
+Deployment configuration can supply read-only files or directories before the
+guest's first process starts:
+
+```yaml
+floci:
+  services:
+    ec2:
+      read-only-binds:
+        - source: /srv/guest-inputs/ca.pem
+          target: /etc/guest-ca.pem
+```
+
+The equivalent environment variables are
+`FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE` and
+`FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET`; increment the index for more mounts.
+Both paths must be normalized absolute Linux paths, including when the Floci
+process runs on Windows. Sources must already exist on the Docker daemon host.
+Docker refuses a missing source without creating it.
+Duplicate targets and replacing the guest root are rejected before guest
+resources are allocated.
+
+These mounts apply to EC2 guest containers in every runtime mode. Helpers retain
+their own configuration. Image ENTRYPOINT/CMD, process limits, metadata and
+credential selection keep their existing behavior. A stop/start retains the
+container's mounts. Mount configuration is a deployment input, not an EC2 API
+extension.
+
+When a mount replaces `/etc` or `/etc/resolv.conf`, the guest receives a literal-IP
+`AWS_ENDPOINT_URL` so its configured DNS does not need to resolve the emulator host.
+`floci.services.ec2.privileged` defaults to `true`; set it to `false` to run guests
+without privileged mode. `floci.services.ec2.cap-drop` accepts capabilities to drop
+from guest containers. Security-group enforcement always disables privileged mode
+and keeps its existing network-capability restrictions. These settings apply to
+guests, not the trusted metadata helper.
+
+### Binding registered AMIs to local images
+
+An external catalog entry can declare `registrationNames`, an optional list of
+exact `RegisterImage` names:
+
+```yaml
+    guestRuntime: image
+    registrationNames:
+      - local-worker-release
+```
+
+Registering `Name=local-worker-release` then binds the generated AMI ID to that
+catalog entry. RunInstances uses its Docker image, guest runtime and Docker
+platform. An omitted architecture inherits the catalog architecture; an
+explicit mismatch returns `InvalidParameterValue` before registration.
+Duplicate or blank registration names make the catalog invalid. Names are
+case-sensitive, with no wildcard or prefix matching.
+
+CopyImage retains this binding across regions through its source ancestry.
+CreateImage and CopyImage use their explicit source, even when the output name
+matches another registration binding. Names without a declared binding retain
+the existing metadata registration and default-image fallback behavior.
+The mapping does not import snapshot bytes or prove that a guest boots.
+
 ### Cloud-image-derived AMI guests
 
 The `ami-ubuntu2404-cloud` entry is an experimental Ubuntu 24.04 guest image built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It is intended for EC2 workflows that need packages such as `systemd` and `cloud-init` to match a real Ubuntu cloud image more closely.
@@ -264,9 +393,38 @@ When the image lacks `sshd` or `scp`, Floci first installs OpenSSH with the imag
 
 ## Security Group Port Publishing
 
-With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. This filters packets but does not emulate VPC routing, NACLs, NAT gateways, or peering. Rootless Docker and Windows containers are unsupported.
+With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. Security-group enforcement alone does not implement VPC routes or NAT; see [NAT Gateways](#nat-gateways) for the optional public routing path. NACLs, peering, rootless Docker and Windows containers are unsupported.
 
 An ENI's IPv6 addresses are part of its identity too. A rule naming an IPv6 range matches a managed peer on any IPv6 address its ENI holds, and admits that peer's traffic only on its helper's Docker IPv6 address, never on its IPv4 one. On a Docker network without IPv6 the helper has no IPv6 address, so such a rule has nothing to match. `AssignIpv6Addresses` and `UnassignIpv6Addresses` update the ENI's firewall identity at once.
+
+With VPC Docker networks enabled, the protected EC2 namespace also joins its VPC
+at the instance's allocated private IP. Guests can bind and reach that address;
+the private and primary Docker addresses share the same ENI permissions.
+A failed VPC attachment stops the launch. Stop/start retains the private interface.
+
+When embedded DNS is available, the protected namespace supplies its address as
+the sole nameserver before starting workloads. Workloads inherit that resolver
+file, so ordinary DNS works on an internal Docker network without an external
+gateway. Floci handles recursive lookups and the workload VPC's Resolver rules.
+The existing DNS packet exception still permits only port 53 at that resolver.
+
+Rule and prefix-list updates refresh protected workloads in the caller's account and region.
+Workloads in other accounts keep their own groups and prefix-list entries.
+
+An observer detects externally stopped, removed, or disconnected namespace helpers.
+It retires their DNS identity and removes their addresses from peer security-group rules,
+so an unrelated container reusing an address does not inherit the former ENI's membership.
+Losing either registered interface withdraws both addresses, including a surviving primary interface.
+Detection is asynchronous; failed policy updates quarantine peers and are retried.
+The owning workload retains responsibility for removing its retired helper; failed
+Docker removal is reported and remains retryable.
+
+VPC-connected Docker Lambda environments use the same policy engine. Their Runtime API
+has an exact IP and TCP-port exception, while their application traffic remains filtered.
+See [Lambda VPC configuration](lambda.md#vpcconfig-snapstart-loggingconfig-and-durableconfig)
+for execution and lifecycle limits.
+
+
 
 Security-group permissions on a host-published port use the source visible inside Docker, and Docker can replace the original client address (Docker Desktop shows every host client as its gateway). So while enforcement is enabled, host-published access counts as traffic from outside the VPC: Floci publishes an application port only when an ingress rule opens it to every address, `0.0.0.0/0` or `::/0`, since such a rule admits a client whatever address it arrives with. A client's family is still seen on the host, so a port only `0.0.0.0/0` opens is published on the host's IPv4 addresses, one only `::/0` opens on its IPv6 addresses, and one both open on every address. The socat sidecar described below dials the instance through its protected namespace, on the instance's IPv4 address, or on its Docker IPv6 address when only `::/0` opens the port; on a Docker network without IPv6 such a port is not published. A port that only a narrower CIDR, a prefix list or a referenced group opens stays reachable on the direct container path, where the firewall sees the peer's own ENI identity. Authorizing a world-open rule after launch publishes the port. Revoking the last world-open rule closes the host listener. If egress permits TCP to every address and port in the address family the relay uses to reach the guest, revocation also closes existing connections immediately. With narrower egress, established connections can finish until the instance stops or terminates. SSH is published directly by the protected namespace.
 
@@ -289,7 +447,10 @@ Notes and limitations:
 
 `UserData` must be base64-encoded in the request (matching the AWS wire format). Floci decodes it, copies the script into `/var/lib/user-data.sh` inside the container, and executes the script directly after SSH key injection so the script shebang selects the interpreter. Output is captured and logged.
 
-EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci.
+EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://169.254.169.254`
+for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci. The
+metadata endpoint uses the instance's prepared link-local route, including when
+security groups deny ordinary egress.
 
 CloudFormation `AWS::EC2::VPCEndpoint` resolves `IpAddressType` on create and update, including parameter references. Omission, a selected `AWS::NoValue` branch, or `not-specified` uses the default `ipv4`; an explicitly empty value is rejected. Updates retain the existing replacement behavior; synthetic interfaces remain IPv4-only.
 
@@ -299,19 +460,43 @@ An `AWS::EC2::Instance` that declares no `IamInstanceProfile` launches with the 
 
 ## Instance Metadata Service (IMDS)
 
-Floci runs an IMDS-compatible HTTP server on port `9169` of the host. Each launched container receives the environment variable `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing to this server.
+Floci runs an IMDS-compatible HTTP server on port `9169` of the host. The
+instance's link-local route forwards metadata requests to this server.
 
-Inside each launched container, the link-local address `169.254.169.254` is a proxy to this
-server. The helper shells that install and start the proxy clear `LD_LIBRARY_PATH`,
-`PYTHONPATH` and `PYTHONHOME` before running system tools, so an application's library search
-path and Python installation do not reach the package manager, `socat` and `curl`. The
-container's configured environment and the application's processes keep these variables. The
-proxy is ready once an IMDSv2 token request with a 60-second TTL succeeds and that token reads the
+Before starting a guest image, Floci prepares its network in a trusted helper container.
+The guest joins that network namespace with its normal ENTRYPOINT and CMD. This prevents
+an early metadata request from reaching the Docker host's metadata service while Floci
+is still setting up the guest. The helper also owns the published SSH port and VPC network
+attachment. Stop/start keeps the namespace; termination removes both containers.
+
+The helper image is configured by `floci.services.ec2.metadata-helper-image`
+(`FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE`). The default `floci/network-helper:local` is
+built from Floci's bundled Dockerfile when absent. A custom value must identify an
+available image with a shell, `ip`, `iptables`, and `curl`. With security-group enforcement
+enabled, Floci prepares metadata in the existing firewall helper instead.
+
+Inside this namespace, the link-local address `169.254.169.254` routes to Floci's metadata
+server. Routing is ready once an IMDSv2 token request with a 60-second TTL succeeds and that token reads the
 instance ID. The check bypasses any HTTP proxy the image configures, a failed or empty token
 response does not fall back to a tokenless request, and the check passes on an instance that
-requires tokens.
+requires tokens. Failed setup prevents the guest image from starting. With `HttpEndpoint`
+disabled, the route is still installed, but the token readiness check is omitted so the
+instance can boot with metadata disabled.
 
-For EC2 guests, a working `iptables` or `nft` NAT backend routes link-local port `80` to the IMDS
+`HttpEndpoint=disabled` makes the local metadata server return HTTP 404 with no
+body for metadata and token requests, including requests using a previously
+issued token. Changes through `ModifyInstanceMetadataOptions` take effect
+without restarting the guest. The HTTP 404 is a local-emulator response; Floci
+keeps the route in place so disabled metadata cannot fall through to the host.
+Default helper images are rebuilt when their bundled Dockerfile changes, so
+an older Docker cache receives the current routing tools.
+
+Recreate containers launched by older Floci versions to receive the helper namespace.
+
+New prepared namespaces route link-local port `80` directly to Floci's metadata backend
+and refuse launch if that route cannot be installed. Existing unmarked guest containers
+retain their legacy relay during restart: a working `iptables` or `nft` NAT backend routes
+link-local port `80` to the IMDS
 relay on port `42169`, leaving the guest's wildcard port `80` available. If no NAT backend works
 (for example, an offline image without firewall tools), Floci uses the older link-local port `80`
 listener to preserve IMDS access. That fallback can still conflict with a guest server binding
@@ -468,6 +653,8 @@ private gateway lifecycles are not modelled.
 | ModifySubnetAttribute | Updates supported subnet attributes. |
 
 ### Security Groups
+
+New security groups in a VPC with an IPv6 CIDR block include the default `::/0` outbound rule alongside `0.0.0.0/0`. Associating the first IPv6 CIDR block also adds IPv6 outbound access to existing groups whose outbound permissions still consist only of the original IPv4 rule; groups with customized outbound permissions retain them. Both `DescribeSecurityGroups` and `DescribeSecurityGroupRules` expose the added rules.
 
 | Action | Description |
 |--------|-------------|
@@ -894,7 +1081,7 @@ Route table ids follow the live API's own inconsistency: an id that does not exi
 |--------|-------------|
 | CreateNatGateway | Creates a NAT gateway record. |
 | DescribeNatGateways | Lists or returns stored NAT gateways. `DryRun=true` is answered with `DryRunOperation` before any id is looked up, so a well-formed id that names nothing still gets it. |
-| DeleteNatGateway | Deletes a NAT gateway record. |
+| DeleteNatGateway | Deletes a NAT gateway record and marks routes targeting it as `blackhole`. The routes retain their destination and gateway ID until replaced or deleted. Other routes stay unchanged. |
 
 Every NAT gateway Floci creates is zonal: it sits in the subnet it was created in, and responses
 report `availabilityMode` as `zonal`. Regional NAT gateways are not supported: `CreateNatGateway` with
@@ -933,6 +1120,46 @@ back, and a new address that is already held fails the update and leaves the gat
 | DeleteInstanceConnectEndpoint | Deletes an endpoint and answers with it in `delete-in-progress`. |
 
 A repeated `ClientToken` returns the endpoint the first call created (`IdempotentParameterMismatch` when reused with another subnet, security group set, `IpAddressType`, `PreserveClientIp` or tag set; tags added later with `CreateTags` do not count). While an endpoint exists, `DeleteSubnet` on its subnet and `DeleteVpc` on its VPC fail with `DependencyViolation`, as on AWS. The interface ID in an endpoint's `networkInterfaceIdSet` resolves in `DescribeNetworkInterfaces` while the endpoint exists: a requester-managed `ec2_instance_connect_endpoint` interface carrying the endpoint's private address, subnet, VPC and security groups. An unknown filter name is `InvalidParameterValue` even when no endpoint exists. `DescribeInstanceConnectEndpoints` pages by `MaxResults`/`NextToken` in endpoint ID order (`MaxResults` outside 1-50 is `InvalidMaxResults`), and `publicDnsNames` carries only the `ipv4` names. The endpoint's tunnel is real: see [EC2 Instance Connect](ec2-instance-connect.md#instance-connect-endpoint-tunnels).
+
+`FLOCI_NETWORK_VPC_ROUTING_ENABLED=true` additionally enables an experimental IPv4
+packet path from protected workloads through public NAT gateways to managed
+internet-facing [Classic frontends](elb-classic.md#protected-frontends).
+It requires EC2 VPC networks, native private addresses and security-group enforcement.
+The frontend observes the allocated NAT Elastic IP. The workload's NAT route and
+both the NAT and frontend subnets' internet-gateway routes must exist; missing or
+unsupported routes drop traffic. Frontend security-group ingress remains a
+separate requirement.
+
+`FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true` also routes workloads to
+Floci's public AWS APIs. Private workloads use their NAT; EC2 instances with a
+native public IPv4 address use their subnet's attached internet-gateway route.
+Enable DNS spoofing
+(`FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true`) and TLS (`FLOCI_TLS_ENABLED=true`) for clients
+using normal AWS HTTPS endpoints, and install Floci's CA in the client's trust store.
+Known VPC clients resolve spoofed AWS API names to `192.0.2.1`; stored resource
+DNS answers still take precedence. Security-group egress, a private-subnet NAT
+route and the NAT subnet's attached internet-gateway route remain required for
+private callers. Public EC2 callers require security-group egress and their
+own internet-gateway route, without a NAT gateway. Elastic IP association and
+removal, stop and start update this admission.
+An internal Docker control network stays isolated. Floci attaches these public
+instances to its managed public transport for AWS API traffic and preserves the
+instance's advertised public source address there. It removes that attachment
+when the public address or instance retires. Routing and NAT are programmed inside
+owned namespaces. Managed public destinations without an admitted path still
+reach the namespace's drop policy, including when Docker supplies no default route.
+HTTP and HTTPS use their standard ports. This does not enable arbitrary internet
+access, other public-instance destinations or VPC endpoints. The host-port
+loopback fallback is not a native public IPv4 address. The shared TLS proxy does
+not preserve the original source for IAM `aws:SourceIp` evaluation.
+
+In this mode, public NAT creation without an attached internet gateway returns a
+failed gateway with failure code `Gateway.NotAttached`. Runtime programming errors fail route API calls.
+Deleting a NAT removes forwarding before releasing its addresses; a remaining
+namespace consumer prevents retirement and keeps the reservation for a retry.
+This is limited to managed public destinations, with no general internet,
+private NAT, multi-address NAT, IPv6/NAT64, peering or NACL forwarding.
+See the [routing design and qualification limits](../design/vpc-public-routing.md).
 
 ### Capacity Reservations
 
@@ -1590,10 +1817,18 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_PUBLIC_IP_FROM_SERVICE_NETWORK` | `false` | When Floci itself runs as a container, report an instance's address on Floci's own Docker network as its public IP, so clients on that network (an orchestrator, a worker running Ansible) reach the guest's real ports, port 22 included |
 | `FLOCI_SERVICES_EC2_RECONCILE_CONTAINERS_ON_STARTUP` | `true` | On startup, remove instance containers this Floci left on the daemon whose record did not survive the restart or came back terminated; stopped instances are never swept |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED` | `true` | Back each VPC with a real Docker network (see [VPC Docker networks](#vpc-docker-networks)) |
+| `FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES` | `false` | Preserve overlapping native IPv4 ranges on separate, account-scoped bridges; requires protected namespaces, faithful private addresses and Docker Engine 28 or newer |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_POOL` | `10.240.0.0/12` | RFC 1918 pool that substituted CIDRs are drawn from |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_PREFIX_LENGTH` | `16` | Prefix length of each block handed out of that pool |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator. Whatever its value, the network a previous run created for a VPC that still exists is kept, and goes when that VPC is deleted |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER` | `bridge` | Docker network driver used for VPC networks |
+| `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
+| `FLOCI_NETWORK_VPC_ROUTING_ENABLED` | `false` | Enforce native IPv4 routes and public NAT for protected workloads reaching managed Classic frontends |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API` | `false` | Route spoofed AWS API destinations from private workloads through their native public NAT and internet gateway |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HOST` | unset | Optional exact IPv4 front door for the public TCP bridge; unset retains Floci's API listener |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HTTP_PORT` | `80` | HTTP port at the explicitly selected front door |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_UPSTREAM_HTTPS_PORT` | `443` | TLS port at that front door; clients retain certificate verification |
+| `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` | unset | Comma-separated exact peer DNS names that use the public destination for known VPC clients, after native DNS records and forwarding rules |
 
 ## VPC Docker networks
 
@@ -1605,9 +1840,39 @@ VPC reach each other at those addresses; instances in different VPCs sit on diff
 `CreateVpc` and `CreateSubnet` record declarations without contacting Docker. CIDR collision
 checks and fallback address planning run when a consumer first needs an effective address or
 network attachment. This keeps management calls responsive even when the Docker daemon is slow.
-For overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the declared range;
+By default, for overlapping VPC CIDRs, the first VPC whose addresses are needed keeps the declared range;
 later VPCs use the fallback pool. Within one emulator run, allocated addresses remain on the
 same effective range.
+
+Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES=true` to preserve each
+VPC's declared IPv4 range, including identical addresses in different accounts.
+This mode requires Linux Docker Engine 28 or newer, the `bridge` driver,
+`FLOCI_SERVICES_EC2_AWS_FAITHFUL_PRIVATE_IP=true`, and security-group enforcement.
+Each account and VPC gets its own bridge, including the seeded default VPCs.
+Docker allocates a separate IPv4 transport pool for each bridge; the native VPC
+range is not registered in Docker IPAM. Floci configures the declared address and
+subnet mask inside an owned, protected network namespace and verifies
+them before admitting a workload. Floci's API container stays on its control network.
+Malformed declarations and collisions with that control network fail attachment;
+this mode never substitutes a fallback CIDR.
+
+The native interface carries IPv4 only. Its IPv6 addresses are removed
+before workload admission, and its IPv6 traffic is blocked. Existing control
+connections keep their own addresses and default gateway. Private DNS requests,
+including requests explicitly bound to the native private address, retain their
+account and VPC identity through the namespace's unique control address.
+Public NAT routing can connect overlapping VPCs through managed public frontends;
+this mode does not add peering or arbitrary internet access.
+
+Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL=true` to create internal Docker VPC
+bridges. This deployment setting does not change EC2 request or response fields.
+A retained VPC network with a different internal setting refuses attachment and
+is preserved; use a fresh deployment when changing this option.
+Other guest network attachments retain their own connectivity, so this option
+alone does not isolate a guest attached to an external bridge. Configure the
+guest's primary network accordingly. Docker host access and explicit forwarding
+also remain separate from this network setting.
+Publishing the guest's SSH port does not add Docker's default bridge.
 
 When Floci runs in Docker, deleting a VPC disconnects Floci's own container before removing
 the VPC network. Other endpoints are not forcibly disconnected: removal retries while they
@@ -1621,17 +1886,18 @@ still depend on daemon responsiveness.
 
 One network per **VPC**, not per subnet: subnets inside a VPC route to each other in AWS, so a
 network per subnet would manufacture a partition AWS does not have. Per-subnet addressing is kept
-anyway: the network's IPAM pool is the whole VPC CIDR and each subnet allocates static addresses
-out of its own slice of it.
+anyway: each subnet allocates static addresses from its own CIDR. The default mode gives
+Docker IPAM the whole VPC range; isolated address spaces configure the native interface directly.
 
 An address a subnet picks on its own is never one that an instance, network interface or NAT
 gateway of the account in the subnet already holds. Each account's VPC has a network of its own,
 the default VPC included, whose id every account shares: a network for any account but the
-default one carries the account in its name. As two accounts' default VPCs declare the same
-`172.31.0.0/16`, the second one's network takes a range from `fallback-pool`, as overlapping
-CIDRs do.
+default one carries the account in its name. In the default address-space mode,
+two accounts' default VPCs declare the same `172.31.0.0/16`, so the second network
+takes a range from `fallback-pool`. With address-space isolation enabled, both
+keep their declared range and independently lease their own addresses.
 
-The declared CIDR is used verbatim whenever it can be. It cannot be when it is absent, malformed,
+In the default mode the declared CIDR is used verbatim whenever it can be. It cannot be when it is absent, malformed,
 outside RFC 1918, or already claimed on the Docker daemon, including by another Floci VPC, since
 two VPCs may legally declare the same CIDR in AWS but one daemon cannot route two identical
 ranges. Only then is an equivalent block taken from `fallback-pool`, and the substitution is
@@ -1640,9 +1906,9 @@ true or it is in the log.
 
 Limits worth knowing before reading a passing test as evidence:
 
-- **Security groups and NACLs are not enforced by this.** Within one Docker network every
-  container reaches every other on every port.
-- **Between-VPC isolation is the daemon's, not Floci's.** It comes from Docker's own
+- **VPC networks alone do not enforce security groups or NACLs.** Enable security-group
+  enforcement to protect EC2 namespaces on these networks. NACLs remain unemulated.
+- **Without packet enforcement, between-VPC isolation depends on the daemon.** It comes from Docker's own
   `DOCKER-ISOLATION-STAGE` rules. OrbStack does not apply them: measured on OrbStack 29.4.0,
   two containers on separate networks reach each other in both directions, `--internal` included.
   On such a host the VPC boundary is an addressing boundary only.
@@ -1667,7 +1933,7 @@ options, and the `PrivateIpAddress` of a launch template's primary interface. Se
 from `PrivateIpAddresses` entries not marked `Primary` or from `SecondaryPrivateIpAddressCount`, are
 not applied. An address outside the subnet's CIDR, or one of the five AWS reserves, fails with
 `InvalidParameterValue`, and one that an instance, network interface, NAT gateway or interface
-endpoint already holds fails with `InvalidIPAddress.InUse`. In a Docker-backed default subnet, whose
+endpoint already holds fails with `InvalidIPAddress.InUse`. In a shared Docker-backed default subnet, whose
 network every account shares, that includes an address another account's instance, network interface
 or NAT gateway holds. As on AWS it applies only to a single instance that creates its own primary
 interface: with more than one instance, or with `NetworkInterface.1.NetworkInterfaceId`, the call

@@ -7,6 +7,7 @@ import io.floci.aws.core.common.Resettable;
 import io.floci.aws.core.common.ServiceRegistry;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.dynamodb.backend.DynamoDbBackendSelector;
+import io.floci.aws.services.ec2.Ec2NativePeerDependencies;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -55,6 +56,37 @@ class EmulatorInfoControllerTest {
     void setUp() {
         controller = new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
                 resettables, containerTeardowns, certificateAuthority, config, dynamoDbBackendSelector);
+    }
+
+    @Test
+    void health_reportsNativePeerAttestationProtocol() {
+        when(serviceRegistry.getServices()).thenReturn(Map.of());
+        Map<?, ?> health = (Map<?, ?>) controller.health().getEntity();
+        assertEquals(Map.of("ec2_native_peer_dependencies", 1), health.get("features"));
+    }
+
+    @Test
+    void infoAttestsTheParsedNativePeerPolicy() {
+        Ec2NativePeerDependencies policy = new Ec2NativePeerDependencies("""
+                [{"hostname":"api.peer.example","address":"172.18.0.2","port":443}]
+                """);
+        EmulatorConfig manifestConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(serviceRegistry.getServices()).thenReturn(Map.of());
+        Map<?, ?> info = (Map<?, ?>) new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
+                resettables, containerTeardowns, certificateAuthority, manifestConfig, dynamoDbBackendSelector, policy)
+                .info().getEntity();
+        assertEquals(policy.attestation(), info.get("ec2_native_peer_dependencies"));
+        assertEquals(1, ((Map<?, ?>) info.get("ec2_native_peer_dependencies")).get("count"));
+        assertEquals("aws", info.get("cloud"));
+    }
+
+    @Test
+    void healthAdvertisesNativePeerAttestationOnBothControllers() {
+        when(serviceRegistry.getServices()).thenReturn(Map.of());
+        Map<?, ?> health = (Map<?, ?>) controller.health().getEntity();
+        assertEquals(Map.of("ec2_native_peer_dependencies", 1), health.get("features"));
+        assertEquals(health, new HealthController(serviceRegistry).health().getEntity());
+        assertEquals("UP", health.get("status"));
     }
 
     @Test

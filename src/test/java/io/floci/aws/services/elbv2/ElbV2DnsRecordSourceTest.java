@@ -60,7 +60,7 @@ class ElbV2DnsRecordSourceTest {
     void validIpv6TargetsAndUnavailableListenerAddressesReturnNoData() {
         when(service.findByDnsName(NAME)).thenReturn(List.of(balancer("application")));
         assertEquals(Optional.of(DnsAnswer.noData()), source.resolveAliasTarget(NAME, "ZOWNED", 28, "192.0.2.10"));
-        assertEquals(Optional.of(DnsAnswer.noData()), source.resolveAliasTarget(NAME, "ZOWNED", 1, null));
+        assertEquals(Optional.of(DnsAnswer.noData()), source.resolveAliasTarget(NAME, "ZOWNED", 1, (String) null));
         assertEquals(Optional.of(DnsAnswer.noData()), source.resolveAliasTarget(NAME, "ZOWNED", 1, " "));
     }
 

@@ -2,10 +2,24 @@
 
 Floci supports optional TLS, enabling `https://` for all REST/JSON/Query endpoints and `wss://` for WebSocket connections. Both HTTP and HTTPS are served simultaneously (LocalStack parity).
 
+## Local AWS HTTPS fallback
+
+The AWS HTTPS listener can forward an unclaimed TLS connection to a configured
+local destination. This fallback is disabled by default and keeps the original
+TLS connection intact; the destination supplies its certificate and validates
+its callers.
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `FLOCI_TLS_AWS_HTTPS_FALLBACK_PORT` | `0` | Destination TCP port; zero disables fallback. |
+| `FLOCI_TLS_AWS_HTTPS_FALLBACK_HOST` | `127.0.0.1` | Explicit local IPv4 destination. |
+| `FLOCI_TLS_AWS_HTTPS_FALLBACK_PROXY_PROTOCOL` | `false` | Send a PROXY protocol header when the destination supports it. |
+| `FLOCI_TLS_AWS_HTTPS_FALLBACK_HOSTS` | Empty | Exact TLS names selecting this destination before owned listener lookup. |
+
 ## Quick Start
 
 ```bash
-docker run -e FLOCI_TLS_ENABLED=true -p 4566:4566 floci/floci:latest
+docker run -e FLOCI_TLS_ENABLED=true -p 127.0.0.1:4566:4566 floci/floci:latest
 ```
 
 Then point your SDK at `https://localhost:4566` and trust Floci's local CA in the processes that talk to it. Every certificate Floci issues (its HTTPS endpoint, every ACM certificate and every IoT device certificate) chains to that one CA. With TLS on, `GET /_floci/tls-cert` serves the same PEM as `application/x-pem-file`, at the path every Floci emulator uses (see [Control-Plane Endpoints](endpoints.md)):
@@ -49,6 +63,7 @@ Disabling verification (`--no-verify-ssl`, `verify=False`, `NODE_TLS_REJECT_UNAU
 | `FLOCI_TLS_CERT_PATH` | *(unset)* | Path to PEM certificate file |
 | `FLOCI_TLS_KEY_PATH` | *(unset)* | Path to PEM private key file |
 | `FLOCI_TLS_EXTRA_CA_PATH` | *(unset)* | PEM file of extra CA certificates Floci's own outbound HTTPS clients trust, with TLS on or off. See [Trusting Your Own CAs for Outbound Calls](#trusting-your-own-cas-for-outbound-calls) |
+| `FLOCI_TLS_EXTRA_CA_CERTS` | *(unset)* | Path to additional PEM certificates included in workload CA bundles and Java trust stores |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate a server certificate signed by Floci's local CA when no cert/key paths provided |
 
 The HTTPS listener accepts TLS 1.3 and TLS 1.2 by default, matching
@@ -104,11 +119,23 @@ A wildcard SAN matches one label only, so `*.localhost.floci.io` covers `api.loc
 
 Only a name under a local suffix is accepted: `localhost`, `localhost.floci.io`, `localhost.localstack.cloud`, `FLOCI_HOSTNAME`, the `FLOCI_BASE_URL` host, and every `FLOCI_DNS_EXTRA_SUFFIXES` entry. Any other name is refused with a warning, so a Floci certificate can never cover a public name. This only applies to the generated certificate; a user-provided one is never changed.
 
-Names are added by the custom domain operations: API Gateway `CreateDomainName`, IoT Core `CreateDomainConfiguration` with a `domainName`, and Cognito `CreateUserPoolDomain` with a `CustomDomainConfig`. The AWS operation succeeds either way; a name outside the local suffixes, or a reissue that fails, is logged as a warning.
+Names are added by the custom domain operations: API Gateway `CreateDomainName`, IoT Core `CreateDomainConfiguration` with a `domainName`, and Cognito `CreateUserPoolDomain` with a `CustomDomainConfig`. EventBridge V2 `CreateEventSource` and `DescribeEventSource` add `*.c01.events-webhook.<region>.<host>`, which covers every webhook source of that Region. The AWS operation succeeds either way; a name outside the local suffixes, or a reissue that fails, is logged as a warning.
 
 ### Containers Floci Launches
 
 Every container Floci launches, from Lambda functions and ECS or Batch tasks to the Docker backends behind RDS, ElastiCache, MWAA and Flink, and the Kubernetes Lambda pods, receives `/etc/floci-ca-bundle.pem`: the public root CAs the Floci JVM trusts, followed by the Floci CA (or your certificate file when you provide one). `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` and `AWS_CA_BUNDLE` point at it, so curl, Python, Node.js, Go, the AWS CLI and the AWS SDKs that read `AWS_CA_BUNDLE` reach both Floci and public HTTPS sites with no setup in the workload. A variable you set on the function or task definition wins over the injected one. The JVM ignores all of these variables, so a Java workload still needs its own trust store, as shown under SDK Configuration Examples. Floci writes one beside the bundle, `{persistent-path}/tls/floci-ca-bundle.p12` (PKCS12, no password), with the same certificates. Lambda functions on a Java runtime or from a container image (in Docker), ECS tasks, Batch jobs, Flink applications, and EMR steps, bootstrap actions and EMR Serverless job runs in the `docker` runner mode get it at `/etc/floci-ca-bundle.p12`, and every JVM in them uses it through `JAVA_TOOL_OPTIONS`, saying so on its standard error (`Picked up JAVA_TOOL_OPTIONS: ...`). Floci's option gives only the store's path (`-Djavax.net.ssl.trustStore`) and comes ahead of the options the function, task or image sets, so a trust store a workload names itself replaces it, with that store's own type and password. The bundle is written to `{persistent-path}/tls/floci-ca-bundle.pem` at startup; when it is missing, or when an image has no `/etc` to copy it into, the container starts without the variables and Floci logs a warning. Floci trusts the same bundle when it fetches a JWT issuer's keys for an HTTP API authorizer or an AppSync OIDC provider, so an issuer it serves itself, a Cognito user pool for one, verifies over HTTPS.
+
+To let workloads reach peers signed by another development or corporate CA, mount its
+public certificate bundle read-only and set `FLOCI_TLS_EXTRA_CA_CERTS` to that path in
+the Floci container. At startup, Floci appends those certificates to its workload PEM
+bundle and Java trust store, retaining its own CA and the JVM's public roots. Private
+keys are never copied. Missing, invalid or empty extra certificates, or failure to
+write either configured trust output, prevent startup. Restart Floci after changing
+the file. This does not change the server certificate or override trust settings
+explicitly supplied by a workload.
+`FLOCI_TLS_EXTRA_CA_PATH` continues to configure Floci's own outbound clients;
+those certificates enter workload trust only when also supplied through
+`FLOCI_TLS_EXTRA_CA_CERTS`.
 
 ## User-Provided Certificates
 
@@ -120,7 +147,7 @@ docker run \
   -e FLOCI_TLS_CERT_PATH=/certs/server.crt \
   -e FLOCI_TLS_KEY_PATH=/certs/server.key \
   -v ./certs:/certs:ro \
-  -p 4566:4566 \
+  -p 127.0.0.1:4566:4566 \
   floci/floci:latest
 ```
 

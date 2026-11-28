@@ -12,17 +12,22 @@ import org.eclipse.microprofile.config.spi.ConfigSource;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * A MicroProfile {@link ConfigSource} that dynamically provides Quarkus TLS/SSL
@@ -79,6 +84,7 @@ public class TlsConfigSource implements ConfigSource {
                 "*.execute-api.localhost.localstack.cloud",
                 "*.cloudfront.localhost.floci.io", "*.cloudfront.localhost",
                 "*.emrappui.localhost.floci.io", "*.emrappui.localhost",
+                "*.emr-trino.localhost.floci.io", "*.emr-trino.localhost",
                 "*.emr-serverless-ui.localhost.floci.io", "*.emr-serverless-ui.localhost",
                 "host.docker.internal"));
         for (String region : AwsRegions.KNOWN_IDS.stream().sorted().toList()) {
@@ -171,6 +177,7 @@ public class TlsConfigSource implements ConfigSource {
         properties.put("quarkus.http.host", "127.0.0.1");
         properties.put("quarkus.http.port", String.valueOf(HTTP_INTERNAL_PORT));
         properties.put("quarkus.http.ssl-port", String.valueOf(HTTPS_INTERNAL_PORT));
+        properties.put("quarkus.http.proxy.use-proxy-protocol", "true");
 
         LOG.infov("TLS: HTTPS enabled, proxy will listen on port {0} (HTTP+HTTPS), cert={1}",
                 resolveProperty("floci.port", "4566"), certPath);
@@ -178,8 +185,9 @@ public class TlsConfigSource implements ConfigSource {
 
     @Override
     public int getOrdinal() {
-        // Higher than application.yml (250) so TLS properties take precedence
-        return 300;
+        // Above system properties (400): internal listeners must stay behind the public proxy.
+        // NetworkExposureGuard.publicHost resolves the user-configured host from other sources.
+        return 500;
     }
 
     @Override
@@ -247,7 +255,39 @@ public class TlsConfigSource implements ConfigSource {
         List<String> sans = new ArrayList<>(DEFAULT_SAN_HOSTNAMES);
         sans.addAll(extractCustomHostnames());
         sans.addAll(awsSpoofSans());
+        if ("true".equalsIgnoreCase(resolveProperty("floci.services.ec2.guest-tls-endpoint", "false"))) {
+            interfaceAddresses().stream().filter(address -> !sans.contains(address)).forEach(sans::add);
+        }
         return sans;
+    }
+
+    /**
+     * This host's non-loopback, non-link-local interface addresses, sorted. With
+     * {@code floci.services.ec2.guest-tls-endpoint} an EC2 guest that brings its own resolver is given
+     * Floci's https endpoint by address (the current container network's address when Floci runs in a
+     * container), so the server certificate must name it. Only addresses Floci itself listens on are
+     * added, so the certificate names no one else's host.
+     */
+    static List<String> interfaceAddresses() {
+        Set<String> addresses = new TreeSet<>();
+        try {
+            for (NetworkInterface nic : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!nic.isUp() || nic.isLoopback()) {
+                    continue;
+                }
+                for (InetAddress address : Collections.list(nic.getInetAddresses())) {
+                    if (address.isLoopbackAddress() || address.isLinkLocalAddress() || address.isAnyLocalAddress()) {
+                        continue;
+                    }
+                    String text = address.getHostAddress();
+                    int scope = text.indexOf('%');
+                    addresses.add(scope < 0 ? text : text.substring(0, scope));
+                }
+            }
+        } catch (SocketException e) {
+            LOG.warnv("TLS: could not list interface addresses for the server certificate: {0}", e.getMessage());
+        }
+        return List.copyOf(addresses);
     }
 
     /**
@@ -265,9 +305,9 @@ public class TlsConfigSource implements ConfigSource {
         return result;
     }
 
-    /** Service infixes that AWS virtual-hosts with an extra resource-id label before the region. */
+    /** Service infixes preceded by an extra label in AWS regional hostnames. */
     private static final List<String> MULTI_LABEL_REGIONAL_SERVICE_INFIXES = List.of(
-            "execute-api", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
+            "ddb", "execute-api", "ecr", "ecr-fips", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
             "s3-fips", "s3-fips.dualstack");
 
     /**
@@ -292,9 +332,10 @@ public class TlsConfigSource implements ConfigSource {
      * DescribeRegions); DNS spoofing routes it to Floci regardless of region, so every
      * {@link AwsRegions#KNOWN_IDS published region id} gets a SAN, not just the configured default.
      *
-     * <p>A single wildcard label also cannot cover multi-label endpoints, where a resource id
-     * contributes an extra label before the service name:
+     * <p>A single wildcard label also cannot cover multi-label endpoints, where a prefix or
+     * resource id contributes an extra label before the service name:
      * {@code <api-id>.execute-api.<region>.amazonaws.com},
+     * {@code api.ecr.<region>.amazonaws.com} (and its {@code ecr-fips} form),
      * {@code <account>.dkr.ecr.<region>.amazonaws.com},
      * {@code <account>.s3-control.<region>.amazonaws.com}, and
      * {@code <bucket>.s3.dualstack.<region>.amazonaws.com}. Each needs its own
@@ -420,20 +461,32 @@ public class TlsConfigSource implements ConfigSource {
 
     /**
      * Containers Floci launches get this bundle copied in (Docker) or mounted (Kubernetes), and
-     * those whose workload is Java its trust store too. A failure here must not stop Floci: log it,
-     * and containers simply will not trust Floci HTTPS until a boot manages to write it.
+     * those whose workload is Java its trust store too. Explicit extra trust must load successfully;
+     * without that option, a bundle failure retains the existing warning-only behavior.
      */
     private static void writeContainerCaBundle(Path tlsDir, Path trustAnchor) {
+        String extraCaCerts = resolveProperty("floci.tls.extra-ca-certs", "");
+        List<Path> anchors = new ArrayList<>(List.of(trustAnchor));
+        if (!extraCaCerts.isBlank()) {
+            validateFileExists(extraCaCerts, "Additional TLS trust");
+            anchors.add(Path.of(extraCaCerts));
+        }
         Path bundle;
         try {
-            bundle = ContainerCaBundle.write(tlsDir, trustAnchor);
+            bundle = ContainerCaBundle.write(tlsDir, anchors);
         } catch (Exception e) {
+            if (!extraCaCerts.isBlank()) {
+                throw new IllegalStateException("Cannot build container trust with floci.tls.extra-ca-certs", e);
+            }
             LOG.warnv(e, "TLS: could not write the container CA bundle under {0}: {1}", tlsDir, e.getMessage());
             return;
         }
         try {
             ContainerCaBundle.writeJavaTrustStore(bundle);
         } catch (Exception e) {
+            if (!extraCaCerts.isBlank()) {
+                throw new IllegalStateException("Cannot build Java trust with floci.tls.extra-ca-certs", e);
+            }
             LOG.warnv(e, "TLS: could not write the containers'' Java trust store under {0}: {1}", tlsDir,
                     e.getMessage());
         }

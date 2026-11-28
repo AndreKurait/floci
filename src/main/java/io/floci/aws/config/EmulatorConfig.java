@@ -144,6 +144,35 @@ public interface EmulatorConfig {
 
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
+        VpcRoutingConfig vpcRouting();
+    }
+
+    interface VpcRoutingConfig {
+        String PUBLIC_AWS_API_ADDRESS = "192.0.2.1";
+        String PUBLIC_ALB_HTTPS_ADDRESS = "192.0.2.2";
+
+        @WithDefault("false")
+        boolean enabled();
+
+        /** Routes spoofed AWS API names from known VPC clients through their public NAT gateways. */
+        @WithDefault("false")
+        boolean publicAwsApi();
+
+        /** Explicit IPv4 front door for the public TCP bridge and matching recursive VPC DNS answers. */
+        Optional<String> publicAwsApiUpstreamHost();
+
+        @WithDefault("80")
+        int publicAwsApiUpstreamHttpPort();
+
+        @WithDefault("443")
+        int publicAwsApiUpstreamHttpsPort();
+
+        /** Sends public HTTPS through Floci's SNI listener while retaining the selected HTTP upstream. */
+        @WithDefault("false")
+        boolean publicAwsApiNativeHttps();
+
+        /** Exact additional peer names served by the selected public endpoint front door. */
+        Optional<List<String>> publicAwsApiHosts();
     }
 
     interface SecurityGroupEnforcementConfig {
@@ -194,6 +223,15 @@ public interface EmulatorConfig {
 
     interface DnsConfig {
         /**
+         * A local IPv4 address to bind and advertise for UDP/TCP DNS on port 53.
+         * Enables the resolver for a host process as well as a container. When unset,
+         * existing automatic container, native bridge and host-port listeners are unchanged.
+         * Workload containers must be able to reach this address.
+         * Env: {@code FLOCI_DNS_LISTEN_ADDRESS}.
+         */
+        Optional<String> listenAddress();
+
+        /**
          * Additional hostname suffixes the embedded DNS server will resolve to Floci's
          * container IP, alongside the primary {@code floci.hostname}.
          *
@@ -211,6 +249,13 @@ public interface EmulatorConfig {
          * </pre>
          */
         Optional<List<String>> extraSuffixes();
+
+        /**
+         * Suffixes served only from live resource records or a matching VPC forwarding rule.
+         * Unknown names return NXDOMAIN instead of wildcard spoofing or upstream recursion.
+         * Env: {@code FLOCI_DNS_AUTHORITATIVE_SUFFIXES}, comma-separated.
+         */
+        Optional<List<String>> authoritativeSuffixes();
 
         /**
          * When {@code true} (default), the configured {@link #containerFallbackServers()} are
@@ -1687,6 +1732,15 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean globalBucketNamespace();
 
+        /**
+         * Answer a SigV4 request signed for a Region other than its bucket's with S3's
+         * {@code 301 PermanentRedirect} and the bucket's Region in {@code x-amz-bucket-region}.
+         * When off, every bucket is served from every Region.
+         * Env: FLOCI_SERVICES_S3_REGION_REDIRECT
+         */
+        @WithDefault("true")
+        boolean regionRedirect();
+
         /** Seconds before RestoreObject reports a completed temporary copy. */
         @WithDefault("0")
         long restoreCompletionDelaySeconds();
@@ -2133,6 +2187,16 @@ public interface EmulatorConfig {
          *  The proxy still listens in the proxy port range; connect there. */
         @WithDefault("false")
         boolean advertiseRequestedPort();
+
+        /**
+         * When true, a DB instance in a subnet with a Docker-backed VPC network gets its own address there and
+         * serves the Port it was created with, or its engine's default, under the endpoint name RDS gives it,
+         * which Floci's DNS server answers. A DB cluster's instances serve its port the same way, and its cluster,
+         * reader and custom endpoint names resolve to them; a DB proxy's endpoints serve its engine family's port
+         * at their own addresses. Off, every endpoint is Floci's address and a proxy port.
+         */
+        @WithDefault("false")
+        boolean endpointsInVpc();
 
         /** Empty when Floci should adapt its built-in image to the requested engine version. */
         Optional<String> defaultPostgresImage();
@@ -3734,6 +3798,14 @@ public interface EmulatorConfig {
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
 
+        /**
+         * Additional existing Docker networks joined before a Lambda container starts.
+         * The primary network remains selected by docker-network or docker-flags.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
+
         /** Additional Docker create flags applied to every Lambda execution container. */
         Optional<String> dockerFlags();
 
@@ -3960,11 +4032,69 @@ public interface EmulatorConfig {
     }
 
     interface Ec2ServiceConfig {
+        /**
+         * Immutable deployment-owned peer dependencies for protected EC2 guests.
+         * A JSON array of exact hostname, private IPv4 address and TCP port objects.
+         * Env: {@code FLOCI_EC2_NATIVE_PEER_DEPENDENCIES}.
+         */
+        @WithDefault("[]")
+        String nativePeerDependencies();
+
+        @WithDefault("false")
+        boolean hotAttachNetworkInterfaces();
+
+        /** Trusted network helper that prepares IMDS before the guest image starts. */
+        @WithDefault("floci/network-helper:local")
+        String metadataHelperImage();
+
         /** Optional full EC2 catalog file for locally built guest images. */
         Optional<String> imageCatalogPath();
 
         /** Optional JSON file of additional regional AWS-managed prefix lists. */
         Optional<String> managedPrefixListCatalogPath();
+
+        /**
+         * Explicit guest environment entries, each {@code KEY=VALUE}. Duplicate keys and
+         * Floci-owned identity, credential, region, endpoint and IMDS settings are rejected.
+         * Env: {@code FLOCI_SERVICES_EC2_EXTRA_ENV}, comma-separated; escape a comma as {@code \,}.
+         */
+        Optional<List<String>> extraEnv();
+
+        /**
+         * Guest process limits, each {@code name=soft[:hard]}; omitted hard equals soft and
+         * {@code -1} means unlimited. Unset keeps Docker's defaults.
+         * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
+         */
+        Optional<List<String>> ulimits();
+
+        /**
+         * Docker privileged mode for guest containers. Security-group enforcement always
+         * disables it. Network and volume helpers retain their own privilege settings.
+         * Env: {@code FLOCI_SERVICES_EC2_PRIVILEGED}.
+         */
+        @WithDefault("true")
+        boolean privileged();
+
+        /**
+         * Linux capabilities to drop from guest containers, in addition to mandatory
+         * security-group restrictions. Set privileged=false for capability restrictions.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_DROP}, comma-separated.
+         */
+        Optional<List<String>> capDrop();
+
+        /**
+         * Read-only bind mounts supplied by the deployment before the guest starts.
+         * Sources are absolute Linux paths on the Docker daemon host, not the Floci process host.
+         * Indexed environment entries use {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE}
+         * and {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET}.
+         */
+        @WithDefault("")
+        List<GuestReadOnlyBind> readOnlyBinds();
+
+        interface GuestReadOnlyBind {
+            String source();
+            String target();
+        }
 
         @WithDefault("true")
         boolean enabled();
@@ -4131,8 +4261,23 @@ public interface EmulatorConfig {
      * the CIDR the caller declared, and instances in different VPCs cannot route to each other.
      */
     interface VpcNetworksConfig {
+        @WithDefault("false")
+        boolean hotAttachAcrossAddressSpaces();
+
+        @WithDefault("false")
+        boolean hotAttachEnabled();
+
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * Preserve native IPv4 ranges in independent protected VPC namespaces, including
+         * overlapping ranges. Requires Docker Engine 28+, native private IPs and security-group
+         * enforcement, with non-internal Docker transport bridges.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES}.
+         */
+        @WithDefault("false")
+        boolean isolateAddressSpaces();
 
         /**
          * Private range that substituted CIDRs are allocated from, used when a declared VPC CIDR
@@ -4158,6 +4303,14 @@ public interface EmulatorConfig {
         /** Docker network driver for VPC networks. */
         @WithDefault("bridge")
         String driver();
+
+        /**
+         * Create internal Docker VPC networks without external connectivity through that network.
+         * Other guest attachments retain their own connectivity.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL}.
+         */
+        @WithDefault("false")
+        boolean internal();
     }
 
     interface AppConfigServiceConfig {
@@ -4230,6 +4383,13 @@ public interface EmulatorConfig {
         /** When true, no health check is ever probed and a registered instance is InService at once. */
         @WithDefault("false")
         boolean mock();
+
+        /** Serve supported Classic frontends inside their own protected VPC namespaces. */
+        @WithDefault("false")
+        boolean vpcFrontends();
+
+        @WithDefault("haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b")
+        String proxyImage();
     }
 
     interface ElbV2ServiceConfig {
@@ -4247,17 +4407,47 @@ public interface EmulatorConfig {
         @WithDefault("60")
         int backendKeepAliveTimeoutSeconds();
 
+        /** Optional local probe interval ceiling; zero preserves each target group's interval. */
+        @WithDefault("0")
+        long maxHealthCheckIntervalMillis();
+
+        /**
+         * Accounts (12-digit ids) whose Application Load Balancers may be in a single Availability
+         * Zone, for local setups that model single-zone deployments. AWS refuses an ALB in fewer than
+         * two zones. Unset (the default) keeps the two-zone rule for every account.
+         */
+        Optional<List<String>> singleZoneAlbAccounts();
+
         /** AWS defaults unless explicitly overridden for local deployments. */
         @WithDefault("aws")
         AlbZoneRule albZoneRule();
 
         /** A region entry takes precedence over the global rule, including an explicit AWS reset. */
         Map<String, AlbZoneRule> albZoneRuleByRegion();
+
+        /**
+         * The form of the DNS name a new load balancer gets:
+         * <ul>
+         *   <li>{@code floci}: {@code <name>-<id>.elb.<hostname>}, under the emulator's own DNS suffix.</li>
+         *   <li>{@code aws}: the AWS form, {@code [internal-]<name>-<digits>.<region>.elb.<dnsSuffix>} for an
+         *       Application Load Balancer and {@code <name>-<id>.elb.<region>.<dnsSuffix>} for a Network or
+         *       Gateway Load Balancer, with the DNS suffix of the region's partition. Floci's DNS answers
+         *       each such name with the address it answers the {@code floci} form with.</li>
+         * </ul>
+         */
+        @WithDefault("floci")
+        DnsNameStrategy dnsNameStrategy();
+
+        enum DnsNameStrategy {
+            FLOCI,
+            AWS
+        }
     }
 
     enum AlbZoneRule {
         AWS,
-        ALLOW_SINGLE_ZONE
+        ALLOW_SINGLE_ZONE,
+        REQUIRE_TWO_ZONES
     }
 
     interface EksServiceConfig {
@@ -4546,6 +4736,9 @@ public interface EmulatorConfig {
         /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
         Optional<String> keyPath();
 
+        /** PEM certificates appended to workload trust bundles. Env: FLOCI_TLS_EXTRA_CA_CERTS */
+        Optional<String> extraCaCerts();
+
         /**
          * PEM file of extra CA certificates that Floci's own outbound HTTPS clients trust, on top of
          * the JVM's default roots (and Floci's CA when TLS is on). Applies whether or not TLS is enabled.
@@ -4578,6 +4771,18 @@ public interface EmulatorConfig {
          */
         @WithDefault("443")
         int awsHttpsPort();
+        /** Optional local TLS destination for names without an owned listener on the AWS HTTPS port. */
+        @WithDefault("0")
+        int awsHttpsFallbackPort();
+
+        /** Explicit local IPv4 destination; defaults to loopback. */
+        Optional<String> awsHttpsFallbackHost();
+
+        @WithDefault("false")
+        boolean awsHttpsFallbackProxyProtocol();
+
+        /** Exact names selecting the configured TLS destination before owned listener lookup. */
+        Optional<List<String>> awsHttpsFallbackHosts();
     }
 
     /**
@@ -4602,6 +4807,15 @@ public interface EmulatorConfig {
         /** Unix socket or TCP URL for the Docker daemon (e.g. unix:///var/run/docker.sock). */
         @WithDefault("unix:///var/run/docker.sock")
         String dockerHost();
+
+        /**
+         * Opt-in: allow an {@code ssh://} Docker host (from {@code docker-host}, {@code DOCKER_HOST},
+         * or the active Docker context). Off by default, because each Docker connection runs an
+         * {@code ssh} process on the Floci host; an {@code ssh://} endpoint is refused at startup
+         * until this is set to {@code true}.
+         */
+        @WithDefault("false")
+        boolean allowSshHost();
 
         /**
          * Size of the connection pool behind the shared Docker client. Every short Docker call

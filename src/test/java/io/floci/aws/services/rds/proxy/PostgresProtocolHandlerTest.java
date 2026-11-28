@@ -27,9 +27,12 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -48,6 +51,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.LogRecord;
 
@@ -58,6 +64,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -296,16 +303,13 @@ class PostgresProtocolHandlerTest {
     void forwardsClientDatabaseToBackendStartup() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendStartup(backendServer, backendDatabase, false);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendStartup(backendServer, backendDatabase, false);
+                return null;
             });
 
             Socket proxyClient;
@@ -341,9 +345,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals("auth_db", backendDatabase.get());
@@ -387,16 +391,13 @@ class PostgresProtocolHandlerTest {
     void doesNotSendAuthenticationOkWhenBackendStartupFails() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendStartup(backendServer, backendDatabase, true);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendStartup(backendServer, backendDatabase, true);
+                return null;
             });
 
             Socket proxyClient;
@@ -432,9 +433,9 @@ class PostgresProtocolHandlerTest {
                 assertNotEquals('R', firstResponse);
 
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals("missing_db", backendDatabase.get());
@@ -443,7 +444,7 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void forceSslRefusesPlaintextStartupBeforeContactingTheBackend() throws Exception {
-        try (ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -468,7 +469,7 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void forceSslAcceptsStartupOverTls() throws Exception {
-        try (ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -505,16 +506,13 @@ class PostgresProtocolHandlerTest {
     void acceptsPostgresSslRequestAndContinuesStartup() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendStartup(backendServer, backendDatabase, false);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendStartup(backendServer, backendDatabase, false);
+                return null;
             });
 
             Socket proxyClient;
@@ -558,9 +556,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals("auth_db", backendDatabase.get());
@@ -572,7 +570,7 @@ class PostgresProtocolHandlerTest {
             "host.docker.internal, true, true", "never-registered.example.com, false, true"})
     void hostnameVerificationRequiresRegisteredAdvertisedHost(String advertisedHost, boolean registered,
                                                               boolean legacyCa) throws Exception {
-        try (ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -645,8 +643,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void cancelRequestInsideTlsIsForwardedToTheBackend() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
              Socket proxyClient = acceptTestSocket(clientServer)) {
 
@@ -695,15 +693,12 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void closesClientWhenBackendClosesDuringBridge() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendClosesDuringBridge(backendServer);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendClosesDuringBridge(backendServer);
+                return null;
             });
 
             try (Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort())) {
@@ -740,9 +735,9 @@ class PostgresProtocolHandlerTest {
 
                 assertEquals(-1, clientIn.read(), "backend close must be visible to the client");
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
     }
@@ -752,16 +747,13 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, backendStartup, backendQuery, "approle", true);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, backendStartup, backendQuery, "approle", true);
+                return null;
             });
 
             Socket proxyClient;
@@ -787,9 +779,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals("dbadmin", backendStartup.get().get("user"), "backend connection is still opened as master");
@@ -802,16 +794,13 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, backendStartup, backendQuery, "approle", true);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, backendStartup, backendQuery, "approle", true);
+                return null;
             });
 
             try (Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort())) {
@@ -845,9 +834,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertFalse(authThread.isAlive(), "authThread did not terminate");
-                assertFalse(backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals("rdsadmin", backendStartup.get().get("user"));
@@ -895,23 +884,20 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> settingsQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, backendStartup, new AtomicReference<>(),
-                            "approle", true, (in, out) -> {
-                                settingsQuery.set(readSimpleQuery(in));
-                                writeParameterStatus(out, "application_name", "svc");
-                                writeCommandComplete(out, "SELECT 1");
-                                writeReadyForQuery(out);
-                                answerRoleAdmission(in, out, "approle", true, true);
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, backendStartup, new AtomicReference<>(),
+                        "approle", true, (in, out) -> {
+                            settingsQuery.set(readSimpleQuery(in));
+                            writeParameterStatus(out, "application_name", "svc");
+                            writeCommandComplete(out, "SELECT 1");
+                            writeReadyForQuery(out);
+                            answerRoleAdmission(in, out, "approle", true, true);
+                        });
+                return null;
             });
 
             Socket proxyClient;
@@ -942,9 +928,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals(List.of("user", "database", "client_encoding"), List.copyOf(backendStartup.get().keySet()),
@@ -963,26 +949,23 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> privilegeQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, backendStartup, new AtomicReference<>(),
-                            "approle", true, (in, out) -> {
-                                answerRoleAdmission(in, out, "approle", true, true);
-                                privilegeQuery.set(readSimpleQuery(in));
-                                writeDataRow(out, "100", privileged ? "t" : "f");
-                                writeCommandComplete(out, "SELECT 1");
-                                writeReadyForQuery(out);
-                                if (!privileged) {
-                                    assertEquals(-1, in.read(), "refusal must close the backend");
-                                }
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, backendStartup, new AtomicReference<>(),
+                        "approle", true, (in, out) -> {
+                            answerRoleAdmission(in, out, "approle", true, true);
+                            privilegeQuery.set(readSimpleQuery(in));
+                            writeDataRow(out, "100", privileged ? "t" : "f");
+                            writeCommandComplete(out, "SELECT 1");
+                            writeReadyForQuery(out);
+                            if (!privileged) {
+                                assertEquals(-1, in.read(), "refusal must close the backend");
+                            }
+                        });
+                return null;
             });
 
             Socket proxyClient;
@@ -1018,9 +1001,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals(List.of("user", "database", "client_encoding", "replication"),
@@ -1036,30 +1019,27 @@ class PostgresProtocolHandlerTest {
             throws Exception {
         List<String> relayed = new CopyOnWriteArrayList<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
-                            "approle", true, (in, out) -> {
-                                answerRoleAdmission(in, out, "approle", true, true);
-                                if (replication) {
-                                    readSimpleQuery(in);
-                                    writeDataRow(out, "100", "t");
-                                    writeCommandComplete(out, "SELECT 1");
-                                    writeReadyForQuery(out);
-                                }
-                                for (int i = 0; i < 2; i++) {
-                                    relayed.add(readSimpleQuery(in));
-                                    writeCommandComplete(out, "OK");
-                                    writeReadyForQuery(out);
-                                }
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
+                        "approle", true, (in, out) -> {
+                            answerRoleAdmission(in, out, "approle", true, true);
+                            if (replication) {
+                                readSimpleQuery(in);
+                                writeDataRow(out, "100", "t");
+                                writeCommandComplete(out, "SELECT 1");
+                                writeReadyForQuery(out);
+                            }
+                            for (int i = 0; i < 2; i++) {
+                                relayed.add(readSimpleQuery(in));
+                                writeCommandComplete(out, "OK");
+                                writeReadyForQuery(out);
+                            }
+                        });
+                return null;
             });
 
             try (Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort())) {
@@ -1095,9 +1075,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertFalse(authThread.isAlive(), "authThread did not terminate");
-                assertFalse(backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
 
@@ -1107,24 +1087,20 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void iamSessionIsRefusedWhenPostgresRefusesAStartupParameterForTheTokenRole() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
-                            "approle", true, (in, out) -> {
-                                readSimpleQuery(in);
-                                // What PostgreSQL answers when a role that is not a member of
-                                // the master asks to act as it.
-                                writeErrorResponse(out, "ERROR", "42501",
-                                        "permission denied to set role \"dbadmin\"");
-                                writeReadyForQuery(out);
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
+                        "approle", true, (in, out) -> {
+                            readSimpleQuery(in);
+                            // What PostgreSQL answers when a role that is not a member of
+                            // the master asks to act as it.
+                            writeErrorAndReadyForQuery(out, "ERROR", "42501",
+                                    "permission denied to set role \"dbadmin\"");
+                        });
+                return null;
             });
 
             Socket proxyClient;
@@ -1153,9 +1129,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals(-1, clientIn.read(), "the login must fail, not continue without the parameter");
 
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
     }
@@ -1164,17 +1140,14 @@ class PostgresProtocolHandlerTest {
     void iamSessionIsRefusedBeforeAnyParameterIsAppliedWhenOneWouldRestoreTheMaster() throws Exception {
         AtomicReference<Integer> afterHandover = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
-                            "approle", true, (in, out) -> afterHandover.set(in.read()));
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
+                        "approle", true, (in, out) -> afterHandover.set(in.read()));
+                return null;
             });
 
             Socket proxyClient;
@@ -1203,9 +1176,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals(-1, clientIn.read(), "the login must fail");
 
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
         assertEquals(-1, afterHandover.get(), "no setting may reach the backend once one is refused");
@@ -1213,23 +1186,20 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void iamSessionIsRefusedWhenPostgresReportsAnotherSessionRoleAfterTheParameters() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
-                            "approle", true, (in, out) -> {
-                                readSimpleQuery(in);
-                                writeParameterStatus(out, "session_authorization", "dbadmin");
-                                writeParameterStatus(out, "is_superuser", "on");
-                                writeCommandComplete(out, "SELECT 1");
-                                writeReadyForQuery(out);
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, new AtomicReference<>(), new AtomicReference<>(),
+                        "approle", true, (in, out) -> {
+                            readSimpleQuery(in);
+                            writeParameterStatus(out, "session_authorization", "dbadmin");
+                            writeParameterStatus(out, "is_superuser", "on");
+                            writeCommandComplete(out, "SELECT 1");
+                            writeReadyForQuery(out);
+                        });
+                return null;
             });
 
             Socket proxyClient;
@@ -1257,9 +1227,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals(-1, clientIn.read(), "the session must not be handed over as the master");
 
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
     }
@@ -1271,36 +1241,30 @@ class PostgresProtocolHandlerTest {
         AtomicReference<String> handover = new AtomicReference<>();
         List<String> afterHandover = new ArrayList<>();
 
-        try (ServerSocket lookupServer = new ServerSocket(0);
-             ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket lookupServer = loopbackServerSocket();
+             ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
-            Thread lookupThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleDefaultsLookup(lookupServer, List.of(
-                            new String[] {"temp_file_limit", "1GB"},
-                            new String[] {"no_such_parameter", "on"},
-                            new String[] {"role", "reader"},
-                            new String[] {"session_authorization", "dbadmin"},
-                            new String[] {"client_encoding", "LATIN1"},
-                            new String[] {"search_path", "app, public"}), tried);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> lookupTask = ProxyTestTask.start(() -> {
+                mockBackendRoleDefaultsLookup(lookupServer, List.of(
+                        new String[] {"temp_file_limit", "1GB"},
+                        new String[] {"no_such_parameter", "on"},
+                        new String[] {"role", "reader"},
+                        new String[] {"session_authorization", "dbadmin"},
+                        new String[] {"client_encoding", "LATIN1"},
+                        new String[] {"search_path", "app, public"}), tried);
+                return null;
             });
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, reopenedStartup, handover, "approle", true, (in, out) -> {
-                        for (int i = 0; i < 3; i++) {
-                            afterHandover.add(readSimpleQuery(in));
-                            writeCommandComplete(out, "SELECT 1");
-                            writeReadyForQuery(out);
-                        }
-                        answerRoleAdmission(in, out, "approle", true, true);
-                    }, false);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, reopenedStartup, handover, "approle", true, (in, out) -> {
+                    for (int i = 0; i < 3; i++) {
+                        afterHandover.add(readSimpleQuery(in));
+                        writeCommandComplete(out, "SELECT 1");
+                        writeReadyForQuery(out);
+                    }
+                    answerRoleAdmission(in, out, "approle", true, true);
+                }, false);
+                return null;
             });
 
             Socket proxyClient;
@@ -1336,11 +1300,10 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                lookupThread.join(5_000);
-                backendThread.join(5_000);
+                lookupTask.await();
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, lookupThread.isAlive(), "lookupThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
 
@@ -1363,16 +1326,13 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void iamSessionFailsWhenARoleDefaultHitsAnErrorOtherThanARefusal() throws Exception {
-        try (ServerSocket lookupServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket lookupServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
-            Thread lookupThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleDefaultsLookup(lookupServer,
-                            List.<String[]>of(new String[] {"broken_default", "on"}), new ArrayList<>());
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> lookupTask = ProxyTestTask.start(() -> {
+                mockBackendRoleDefaultsLookup(lookupServer,
+                        List.<String[]>of(new String[] {"broken_default", "on"}), new ArrayList<>());
+                return null;
             });
 
             Socket proxyClient;
@@ -1397,9 +1357,8 @@ class PostgresProtocolHandlerTest {
                 assertEquals(-1, clientIn.read(), "the login must fail");
 
                 authThread.join(5_000);
-                lookupThread.join(5_000);
+                lookupTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, lookupThread.isAlive(), "lookupThread did not terminate");
             }
         }
     }
@@ -1632,16 +1591,13 @@ class PostgresProtocolHandlerTest {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, backendStartup, backendQuery, "nosuchrole", false);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, backendStartup, backendQuery, "nosuchrole", false);
+                return null;
             });
 
             Socket proxyClient;
@@ -1665,9 +1621,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("password authentication failed for user \"nosuchrole\"", error.get('M'));
 
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
 
             assertEquals(PostgresProtocolHandler.databaseRoleQuery("nosuchrole", true, false), backendQuery.get());
@@ -1702,17 +1658,14 @@ class PostgresProtocolHandlerTest {
     void iamSessionForTheMasterUserKeepsTheMasterSession() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendMasterSession(backendServer, (in, out) ->
-                            answerRoleAdmission(in, out, "dbadmin", true, false));
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendMasterSession(backendServer, (in, out) ->
+                        answerRoleAdmission(in, out, "dbadmin", true, false));
+                return null;
             });
 
             Socket proxyClient;
@@ -1737,9 +1690,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
     }
@@ -1748,26 +1701,23 @@ class PostgresProtocolHandlerTest {
     void iamSessionIsTerminatedWhenPostgresReportsAnotherSessionRole() throws Exception {
         AtomicReference<String> backendQuery = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(), backendQuery,
-                            "approle", true, (in, out) -> {
-                                answerRoleAdmission(in, out, "approle", true, true);
-                                readSimpleQuery(in);
-                                // What PostgreSQL reports after RESET SESSION AUTHORIZATION and
-                                // friends hand the session back to the connection's master role.
-                                writeParameterStatus(out, "session_authorization", "masteruser");
-                                writeParameterStatus(out, "is_superuser", "on");
-                                writeCommandComplete(out, "RESET");
-                                writeReadyForQuery(out);
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, new AtomicReference<>(), backendQuery,
+                        "approle", true, (in, out) -> {
+                            answerRoleAdmission(in, out, "approle", true, true);
+                            readSimpleQuery(in);
+                            // What PostgreSQL reports after RESET SESSION AUTHORIZATION and
+                            // friends hand the session back to the connection's master role.
+                            writeParameterStatus(out, "session_authorization", "masteruser");
+                            writeParameterStatus(out, "is_superuser", "on");
+                            writeCommandComplete(out, "RESET");
+                            writeReadyForQuery(out);
+                        });
+                return null;
             });
 
             Socket proxyClient;
@@ -1796,7 +1746,7 @@ class PostgresProtocolHandlerTest {
                 assertEquals(-1, clientIn.read(), "session must be closed, not handed back as master");
 
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
             }
         }
@@ -1807,24 +1757,21 @@ class PostgresProtocolHandlerTest {
         byte[] wideRow = new byte[40_000];
         Arrays.fill(wideRow, (byte) 'x');
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(),
-                            new AtomicReference<>(), "approle", true, (in, out) -> {
-                                answerRoleAdmission(in, out, "approle", true, true);
-                                readSimpleQuery(in);
-                                writeParameterStatus(out, "session_authorization", "approle");
-                                writeMessage(out, 'D', wideRow);
-                                writeCommandComplete(out, "SELECT 1");
-                                writeReadyForQuery(out);
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, new AtomicReference<>(),
+                        new AtomicReference<>(), "approle", true, (in, out) -> {
+                            answerRoleAdmission(in, out, "approle", true, true);
+                            readSimpleQuery(in);
+                            writeParameterStatus(out, "session_authorization", "approle");
+                            writeMessage(out, 'D', wideRow);
+                            writeCommandComplete(out, "SELECT 1");
+                            writeReadyForQuery(out);
+                        });
+                return null;
             });
 
             Socket proxyClient;
@@ -1859,7 +1806,7 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
             }
         }
     }
@@ -1868,34 +1815,31 @@ class PostgresProtocolHandlerTest {
     void iamSessionIsTerminatedWhenAnotherSessionRoleFollowsABurstOfRows() throws Exception {
         int rows = 2_000;
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendRoleSwitch(backendServer, new AtomicReference<>(),
-                            new AtomicReference<>(), "approle", true, (in, out) -> {
-                                answerRoleAdmission(in, out, "approle", true, true);
-                                readSimpleQuery(in);
-                                // One write, so the rows and the role switch reach the relay
-                                // together and are parsed out of its buffer, not off the socket.
-                                ByteArrayOutputStream burst = new ByteArrayOutputStream();
-                                DataOutputStream burstOut = new DataOutputStream(burst);
-                                for (int i = 0; i < rows; i++) {
-                                    writeDataRow(burstOut, Integer.toString(i));
-                                }
-                                writeCommandComplete(burstOut, "SELECT " + rows);
-                                writeParameterStatus(burstOut, "session_authorization", "masteruser");
-                                writeParameterStatus(burstOut, "is_superuser", "on");
-                                writeCommandComplete(burstOut, "RESET");
-                                writeReadyForQuery(burstOut);
-                                burst.writeTo(out);
-                                out.flush();
-                            });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendRoleSwitch(backendServer, new AtomicReference<>(),
+                        new AtomicReference<>(), "approle", true, (in, out) -> {
+                            answerRoleAdmission(in, out, "approle", true, true);
+                            readSimpleQuery(in);
+                            // One write, so the rows and the role switch reach the relay
+                            // together and are parsed out of its buffer, not off the socket.
+                            ByteArrayOutputStream burst = new ByteArrayOutputStream();
+                            DataOutputStream burstOut = new DataOutputStream(burst);
+                            for (int i = 0; i < rows; i++) {
+                                writeDataRow(burstOut, Integer.toString(i));
+                            }
+                            writeCommandComplete(burstOut, "SELECT " + rows);
+                            writeParameterStatus(burstOut, "session_authorization", "masteruser");
+                            writeParameterStatus(burstOut, "is_superuser", "on");
+                            writeCommandComplete(burstOut, "RESET");
+                            writeReadyForQuery(burstOut);
+                            burst.writeTo(out);
+                            out.flush();
+                        });
+                return null;
             });
 
             Socket proxyClient;
@@ -1933,7 +1877,7 @@ class PostgresProtocolHandlerTest {
                 assertEquals(-1, clientIn.read(), "session must be closed, not handed back as master");
 
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
             }
         }
@@ -1941,22 +1885,19 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void nonIamSessionRelaysSessionAuthorizationChanges() throws Exception {
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendMasterSession(backendServer, (in, out) -> {
-                        answerRoleAdmission(in, out, "dbadmin", false, false);
-                        readSimpleQuery(in);
-                        writeParameterStatus(out, "session_authorization", "approle");
-                        writeCommandComplete(out, "SET");
-                        writeReadyForQuery(out);
-                    });
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendMasterSession(backendServer, (in, out) -> {
+                    answerRoleAdmission(in, out, "dbadmin", false, false);
+                    readSimpleQuery(in);
+                    writeParameterStatus(out, "session_authorization", "approle");
+                    writeCommandComplete(out, "SET");
+                    writeReadyForQuery(out);
+                });
+                return null;
             });
 
             Socket proxyClient;
@@ -1985,7 +1926,7 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
             }
         }
     }
@@ -1997,8 +1938,8 @@ class PostgresProtocolHandlerTest {
 
     @Test
     void backendThatAcceptsButNeverAnswersFailsWithinTheHandshakeTimeout() throws Exception {
-        try (ServerSocket silentBackend = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket silentBackend = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             PostgresProtocolHandler.BackendConnector connector =
                     () -> connectTestSocket("localhost", silentBackend.getLocalPort());
@@ -2105,8 +2046,7 @@ class PostgresProtocolHandlerTest {
         List<LogRecord> records = LogCapture.capture(PostgresProtocolHandler.class, () ->
                 assertDoesNotThrow(() -> runAdmissionRefused(true, false, user, (in, out) -> {
                     assertEquals(PostgresProtocolHandler.databaseRoleQuery(user, true, false, false), readSimpleQuery(in));
-                    writeErrorResponse(out, "ERROR", "XX000", "SECRET_SQL X-Amz-Credential=SECRET_TOKEN");
-                    writeReadyForQuery(out);
+                    writeErrorAndReadyForQuery(out, "ERROR", "XX000", "SECRET_SQL X-Amz-Credential=SECRET_TOKEN");
                     assertEquals(-1, in.read());
                 })));
         List<String> logs = records.stream().map(LogCapture::formatted).toList();
@@ -2131,17 +2071,14 @@ class PostgresProtocolHandlerTest {
 
     private void runAdmissionRefused(boolean iam, boolean databaseIam, String user, BackendScript script,
                                      String code) throws Exception {
-        AtomicReference<Throwable> backendFailure = new AtomicReference<>();
+
         AtomicReference<Throwable> authFailure = new AtomicReference<>();
         AtomicReference<PostgresProtocolHandler.AuthenticatedSession> result = new AtomicReference<>();
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendMasterSession(backendServer, script);
-                } catch (Throwable failure) {
-                    backendFailure.set(failure);
-                }
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendMasterSession(backendServer, script);
+                return null;
             });
             try (Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
                  Socket proxyClient = acceptTestSocket(clientServer);
@@ -2169,16 +2106,43 @@ class PostgresProtocolHandlerTest {
                         + " authentication failed for user \"" + user + "\"", refusal.get('M'));
                 assertEquals(-1, in.read(), "neither AuthenticationOK nor ReadyForQuery may follow refusal");
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertFalse(authThread.isAlive());
-                assertFalse(backendThread.isAlive());
+
                 assertNull(authFailure.get());
-                assertNull(backendFailure.get());
+
                 assertNull(result.get());
                 assertTrue(proxyClient.isClosed());
                 assertTrue(backend.isClosed());
             }
         }
+    }
+
+    @Test
+    void backendTaskReportsIoFailureToOwningTest() {
+        IOException failure = new IOException("mock backend failed");
+        ProxyTestTask<Void> backend = ProxyTestTask.start(() -> {
+            throw failure;
+        });
+        assertSame(failure, assertThrows(ExecutionException.class, backend::await).getCause());
+    }
+
+    @Test
+    void backendTaskReportsAssertionFailureToOwningTest() {
+        AssertionError failure = new AssertionError("mock backend assertion failed");
+        ProxyTestTask<Void> backend = ProxyTestTask.start(() -> {
+            throw failure;
+        });
+        assertSame(failure, assertThrows(ExecutionException.class, backend::await).getCause());
+    }
+
+    @Test
+    void backendTaskCompletesOnVirtualThread() throws Exception {
+        ProxyTestTask<Void> backend = ProxyTestTask.start(() -> {
+            assertTrue(Thread.currentThread().isVirtual());
+            return null;
+        });
+        backend.await();
     }
 
     private Thread startIamAuth(Socket proxyClient, Socket backend) {
@@ -2231,16 +2195,13 @@ class PostgresProtocolHandlerTest {
                                                   boolean forwardStartupParameters) throws Exception {
         AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             int backendPort = backendServer.getLocalPort();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    mockBackendStartup(backendServer, new AtomicReference<>(), backendStartup, false);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                mockBackendStartup(backendServer, new AtomicReference<>(), backendStartup, false);
+                return null;
             });
 
             Socket proxyClient;
@@ -2263,9 +2224,9 @@ class PostgresProtocolHandlerTest {
                 ourClient.close();
                 proxyClient.close();
                 authThread.join(5_000);
-                backendThread.join(5_000);
+                backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
-                assertEquals(false, backendThread.isAlive(), "backendThread did not terminate");
+
             }
         }
         return backendStartup.get();
@@ -2349,8 +2310,7 @@ class PostgresProtocolHandlerTest {
             backendQuery.set(query);
 
             if (!roleExists) {
-                writeErrorResponse(out, "ERROR", "42704", "role \"" + role + "\" does not exist");
-                writeReadyForQuery(out);
+                writeErrorAndReadyForQuery(out, "ERROR", "42704", "role \"" + role + "\" does not exist");
                 return;
             }
 
@@ -2564,11 +2524,112 @@ class PostgresProtocolHandlerTest {
         out.flush();
     }
 
+    @Test
+    void refusalFramesAreWrittenBeforeThePeerClosesAfterTheError() throws Exception {
+        ByteArrayOutputStream received = new ByteArrayOutputStream();
+        OutputStream peer = new OutputStream() {
+            private boolean closed;
+
+            @Override
+            public void write(int value) throws IOException {
+                if (closed) {
+                    throw new IOException("peer closed after the error response");
+                }
+                received.write(value);
+            }
+
+            @Override
+            public void flush() {
+                closed = true;
+            }
+        };
+        DataOutputStream out = new DataOutputStream(peer);
+        writeErrorAndReadyForQuery(out, "ERROR", "42501", "permission denied");
+
+        DataInputStream in = new DataInputStream(new ByteArrayInputStream(received.toByteArray()));
+        Map<Character, String> error = readErrorResponse(in);
+        assertEquals("ERROR", error.get('S'));
+        assertEquals("42501", error.get('C'));
+        assertEquals("permission denied", error.get('M'));
+        readReadyForQuery(in);
+        assertEquals(-1, in.read());
+        assertThrows(IOException.class, () -> out.writeByte('Z'));
+    }
+
+    private static void writeErrorAndReadyForQuery(DataOutputStream out, String severity,
+                                                   String sqlState, String message) throws IOException {
+        ByteArrayOutputStream response = new ByteArrayOutputStream();
+        DataOutputStream frames = new DataOutputStream(response);
+        writeErrorResponse(frames, severity, sqlState, message);
+        writeReadyForQuery(frames);
+        response.writeTo(out);
+        out.flush();
+    }
+
+    @Test
+    void startupRefusalFramesSurviveAnImmediatePeerDisconnect() throws Exception {
+        CountDownLatch peerClosed = new CountDownLatch(1);
+        AtomicReference<Throwable> peerFailure = new AtomicReference<>();
+        try (ServerSocket server = loopbackServerSocket();
+             Socket peer = connectTestSocket("localhost", server.getLocalPort());
+             Socket backend = acceptTestSocket(server)) {
+            peer.setSoTimeout(5_000);
+            peer.setSoLinger(true, 0);
+            Thread reader = Thread.ofVirtual().start(() -> {
+                try {
+                    Map<Character, String> error = readErrorResponse(new DataInputStream(peer.getInputStream()));
+                    assertEquals("ERROR", error.get('S'));
+                    assertEquals("42501", error.get('C'));
+                    assertEquals("permission denied", error.get('M'));
+                } catch (Throwable failure) {
+                    peerFailure.set(failure);
+                } finally {
+                    try {
+                        peer.close();
+                    } catch (IOException failure) {
+                        peerFailure.compareAndSet(null, failure);
+                    }
+                    peerClosed.countDown();
+                }
+            });
+            DataOutputStream output = new DataOutputStream(new FilterOutputStream(backend.getOutputStream()) {
+                @Override
+                public void write(byte[] data, int offset, int length) throws IOException {
+                    out.write(data, offset, length);
+                }
+
+                @Override
+                public void flush() throws IOException {
+                    super.flush();
+                    try {
+                        if (!peerClosed.await(5, TimeUnit.SECONDS)) {
+                            throw new IOException("peer did not close after the error response");
+                        }
+                    } catch (InterruptedException failure) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(failure);
+                    }
+                }
+            });
+            try {
+                writeErrorAndReadyForQuery(output, "ERROR", "42501", "permission denied");
+            } finally {
+                reader.join(5_000);
+                assertFalse(reader.isAlive(), "peer reader did not finish");
+                assertNull(peerFailure.get(), () -> "peer fixture failed: " + peerFailure.get());
+            }
+        }
+    }
+
     private static void writeReadyForQuery(DataOutputStream out) throws IOException {
         out.writeByte('Z');
         out.writeInt(5);
         out.writeByte('I');
         out.flush();
+    }
+
+    private static ServerSocket loopbackServerSocket() throws IOException {
+        return new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
     }
 
     /** Collects ParameterStatus values the client is handed, stopping at ReadyForQuery. */
@@ -2729,23 +2790,19 @@ class PostgresProtocolHandlerTest {
     /** Authenticates {@code client} with the proxy against {@code backend}, and fails on the backend's failure. */
     private PostgresProtocolHandler.AuthenticatedSession authenticateAgainst(MemorySocket client,
                                                                           MockBackend backend) throws Exception {
-        try (ServerSocket server = new ServerSocket(0)) {
-            AtomicReference<Throwable> backendFailure = new AtomicReference<>();
-            Thread backendThread = Thread.ofVirtual().start(() -> {
-                try {
-                    backend.serve(server);
-                } catch (Throwable e) {
-                    backendFailure.set(e);
-                }
+        try (ServerSocket server = loopbackServerSocket()) {
+
+            ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
+                backend.serve(server);
+                return null;
             });
             PostgresProtocolHandler.AuthenticatedSession session = PostgresProtocolHandler.authenticate(
                     client, () -> connectTestSocket("localhost", server.getLocalPort()),
                     "dbadmin", "adminpass", "postgres",
                     false, testSigV4Validator(), testBinding(), testTlsCertificates(),
                     (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000);
-            backendThread.join(5_000);
-            assertFalse(backendThread.isAlive(), "backend thread did not terminate");
-            assertNull(backendFailure.get(), () -> "backend failed: " + backendFailure.get());
+            backendTask.await();
+
             return session;
         }
     }

@@ -20,6 +20,7 @@ import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.net.SocketAddress;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -166,6 +167,8 @@ class ElbV2TlsCohortTest {
             firstPublication.get(5, TimeUnit.SECONDS);
             secondPublication.get(5, TimeUnit.SECONDS);
             HttpServerRequest request = mock(HttpServerRequest.class);
+            SocketAddress localAddress = SocketAddress.inetSocketAddress(server.actualPort(), "127.0.0.1");
+            when(request.localAddress()).thenReturn(localAddress);
             HttpServerResponse response = mock(HttpServerResponse.class);
             when(request.host()).thenReturn(alias);
             when(request.response()).thenReturn(response);
@@ -177,6 +180,8 @@ class ElbV2TlsCohortTest {
                     servedCertificate(options.getValue(), alias));
             removeRuntime(dataPlane, right.getListenerArn(), right.getPort());
             HttpServerRequest survivingRequest = mock(HttpServerRequest.class);
+            SocketAddress survivingLocalAddress = SocketAddress.inetSocketAddress(server.actualPort(), "127.0.0.1");
+            when(survivingRequest.localAddress()).thenReturn(survivingLocalAddress);
             HttpServerResponse survivingResponse = mock(HttpServerResponse.class);
             when(survivingRequest.host()).thenReturn(alias);
             when(survivingRequest.response()).thenReturn(survivingResponse);

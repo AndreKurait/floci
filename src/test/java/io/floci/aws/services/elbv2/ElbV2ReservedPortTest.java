@@ -22,6 +22,7 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.net.SSLOptions;
+import io.vertx.core.net.SocketAddress;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
@@ -550,6 +551,8 @@ class ElbV2ReservedPortTest {
         ArgumentCaptor<Handler<HttpServerRequest>> handler = ArgumentCaptor.captor();
         verify(server).requestHandler(handler.capture());
         HttpServerRequest request = mock(HttpServerRequest.class);
+            SocketAddress localAddress = SocketAddress.inetSocketAddress(server.actualPort(), "127.0.0.1");
+            when(request.localAddress()).thenReturn(localAddress);
         HttpServerResponse response = mock(HttpServerResponse.class);
         when(request.host()).thenReturn(host);
         when(request.response()).thenReturn(response);
