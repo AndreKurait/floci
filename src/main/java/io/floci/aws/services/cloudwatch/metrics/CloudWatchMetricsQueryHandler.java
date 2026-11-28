@@ -67,6 +67,14 @@ public class CloudWatchMetricsQueryHandler {
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
         String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        if (CloudWatchLegacyProtocol.VERSION.equals(params.getFirst("Version"))) {
+            if (!CloudWatchLegacyProtocol.queryReads().contains(normalizedAction)) {
+                throw new AwsException("UnsupportedOperation",
+                        "CloudWatch " + action + " for API version "
+                                + CloudWatchLegacyProtocol.VERSION + " is not implemented.", 400);
+            }
+            CloudWatchLegacyProtocol.validateQueryMembers(normalizedAction, params);
+        }
         return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(params, region);
             case "ListMetrics" -> handleListMetrics(params, region);
@@ -131,7 +139,7 @@ public class CloudWatchMetricsQueryHandler {
         if (page.nextToken() != null) {
             xml.elem("NextToken", page.nextToken());
         }
-        return Response.ok(AwsQueryResponse.envelope("ListMetrics", null, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("ListMetrics", queryNamespace(params), xml.build())).build();
     }
 
     private Response handleGetMetricStatistics(MultivaluedMap<String, String> params, String region) {
@@ -182,7 +190,7 @@ public class CloudWatchMetricsQueryHandler {
         }
         xml.end("Datapoints");
         return Response.ok(AwsQueryResponse.envelope("GetMetricStatistics",
-                AwsNamespaces.CW, xml.build())).build();
+                queryNamespace(params), xml.build())).build();
     }
 
     private Response handleGetMetricData(MultivaluedMap<String, String> params, String region) {
@@ -299,6 +307,15 @@ public class CloudWatchMetricsQueryHandler {
                 new CloudWatchMetricsService.AlarmFilter(alarmNames, params.getFirst("AlarmNamePrefix"),
                         alarmMembers(params, "AlarmTypes"), params.getFirst("StateValue"),
                         params.getFirst("ActionPrefix"), childrenOf, parentsOf), region);
+        if (CloudWatchLegacyProtocol.VERSION.equals(params.getFirst("Version"))) {
+            for (MetricAlarm alarm : alarms.metricAlarms()) {
+                if (!alarm.getMetrics().isEmpty()) {
+                    throw new AwsException("UnsupportedOperation", "CloudWatch DescribeAlarms of alarm "
+                            + alarm.getAlarmName() + ", which is defined with Metrics, for API version "
+                            + CloudWatchLegacyProtocol.VERSION + " is not implemented.", 400);
+                }
+            }
+        }
         boolean related = childrenOf != null || parentsOf != null;
 
         XmlBuilder xml = new XmlBuilder().start("MetricAlarms");
@@ -320,7 +337,7 @@ public class CloudWatchMetricsQueryHandler {
             }
         }
         xml.end("CompositeAlarms").start("LogAlarms").end("LogAlarms");
-        return Response.ok(AwsQueryResponse.envelope("DescribeAlarms", null, xml.build())).build();
+        return Response.ok(AwsQueryResponse.envelope("DescribeAlarms", queryNamespace(params), xml.build())).build();
     }
 
     /**
@@ -595,6 +612,11 @@ public class CloudWatchMetricsQueryHandler {
     private Response handleStopMetricStreams(MultivaluedMap<String, String> params, String region) {
         metricStreamsService.stopMetricStreams(parseNames(params), region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult("StopMetricStreams", null)).build();
+    }
+
+    private static String queryNamespace(MultivaluedMap<String, String> params) {
+        return CloudWatchLegacyProtocol.VERSION.equals(params.getFirst("Version"))
+                ? AwsNamespaces.CW_2013 : AwsNamespaces.CW;
     }
 
     private List<String> parseNames(MultivaluedMap<String, String> params) {
