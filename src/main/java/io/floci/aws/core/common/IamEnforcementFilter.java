@@ -419,7 +419,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             return;
         }
         // Normalise signing aliases (s3express → s3) before anything keyed by scope runs:
-        // action rules, ARN building and condition keys all match the canonical name, so an
+        // action routes, ARN building and condition keys all match the canonical name, so an
         // alias would resolve to no action and be allowed through without any policy check.
         String claimedScope = catalog.canonicalCredentialScope(rawScope);
         ResolvedOperation resolvedOperation = operationResolver.resolve(auth, claimedScope, ctx, resourceInfo);

@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -725,12 +726,13 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
             return JsonNodeFactory.instance.nullNode();
         }
         JsonNode policy = ctx.engine().resolveNode(props.get("Policy"));
-        if (policy == null || policy.isNull()) {
+        if (policy == null || policy.isNull() || policy.isMissingNode()) {
             return JsonNodeFactory.instance.nullNode();
         }
         if (policy.isTextual()) {
             try {
-                policy = MAPPER.readTree(policy.textValue());
+                policy = MAPPER.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                        .readTree(policy.textValue());
             } catch (JsonProcessingException failure) {
                 throw new AwsException("ValidationError",
                         "AWS::Events::EventBus Policy must contain valid JSON.", 400);
@@ -749,6 +751,10 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         }
         try {
             JsonNode parsed = MAPPER.readTree(policy);
+            // Older stacks stored string policies with an extra layer of JSON quoting.
+            if (parsed != null && parsed.isTextual()) {
+                parsed = MAPPER.readTree(parsed.textValue());
+            }
             return parsed != null ? parsed : JsonNodeFactory.instance.nullNode();
         } catch (Exception e) {
             throw new AwsException("InternalFailure",
