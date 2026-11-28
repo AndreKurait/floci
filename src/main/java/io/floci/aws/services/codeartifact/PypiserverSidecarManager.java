@@ -64,7 +64,7 @@ public class PypiserverSidecarManager implements ContainerTeardown {
      * address to leak into.
      */
     public String ensureReady(String pypiRepositoryId, String publicUrl) {
-        return pool.ensureReady(pypiRepositoryId, () -> startContainer(pypiRepositoryId));
+        return lease.ensureReady(pypiRepositoryId, () -> startContainer(pypiRepositoryId));
     }
 
     /** Stops and removes the container for one pypi repository, if one was ever started. */
@@ -174,7 +174,7 @@ public class PypiserverSidecarManager implements ContainerTeardown {
             LOG.infov("pypiserver sidecar for pypi repository {0} is ready at {1}", pypiRepositoryId, url);
             return new PerKeyContainerPool.StartedContainer(containerId, url);
         } catch (RuntimeException e) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            pool.removeFailedStart(pypiRepositoryId, containerId, e);
             throw e;
         }
     }

@@ -867,18 +867,17 @@ public class CodeArtifactService implements Resettable {
     }
 
     /**
-     * {@link #ensureFormatContainerId} plus {@link RepositorySidecarManager#beginUse}, both under
-     * this same {@code synchronized} monitor {@link #deleteRepository} also holds for its own
-     * sidecar cleanup, so a delete can never run its cleanup in the gap between resolving
-     * {@code repoId} and registering use of it. Used by every caller of {@link
-     * #ensureFormatContainerId} whose sidecar call is bracketed by {@code beginUse}/{@code
-     * endUse}. Exposed so the npm data plane can register use under this service's lock
-     * before its asynchronous fetch starts.
+     * Resolves and registers the lease under the repository deletion lock. Admission may wait
+     * for that repository's readiness, so it runs without holding the service-wide monitor.
+     * If deletion releases the registered lease first, beginUse rejects the stale admission.
      */
-    public synchronized String resolveContainerIdAndBeginUse(String format, String region, String domain,
+    public String resolveContainerIdAndBeginUse(String format, String region, String domain,
             String domainOwner, String repository, RepositorySidecarManager manager) {
-        String id = ensureFormatContainerId(format, region, domain, domainOwner, repository);
-        manager.registerRepository(id);
+        String id;
+        synchronized (this) {
+            id = ensureFormatContainerId(format, region, domain, domainOwner, repository);
+            manager.registerRepository(id);
+        }
         manager.beginUse(id);
         return id;
     }
@@ -894,7 +893,10 @@ public class CodeArtifactService implements Resettable {
         String owner = effectiveOwner(domainOwner);
         String key = repositoryKey(region, domain, repository);
         CodeArtifactRepository r = requireRepository(owner, key, repository);
-        validateDescription(description);
+        // Everything is validated before the stored repository is touched: a refused request changes nothing.
+        if (description != null) {
+            validateDescription(description);
+        }
         if (upstreams != null) {
             if (!upstreams.isEmpty() && !r.getExternalConnections().isEmpty()) {
                 throw conflict("Repository '" + repository + "' has an external connection; "
