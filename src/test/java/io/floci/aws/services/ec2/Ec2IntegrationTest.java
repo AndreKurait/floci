@@ -889,7 +889,7 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .contentType("application/xml")
             .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(1))
-            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo("ami-amazonlinux2023-arm64"))
+            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo("ami-0abcdef1234567894"))
             .body("DescribeImagesResponse.imagesSet.item.architecture", equalTo("arm64"))
             .body("DescribeImagesResponse.imagesSet.item.name",
                     equalTo("al2023-ami-2023.0.20230315.0-kernel-6.1-arm64"));
@@ -1047,6 +1047,10 @@ class Ec2IntegrationTest {
             .formParam("BlockDeviceMapping.1.Ebs.SnapshotId", "snap-1234567890abcdef0")
             .formParam("BlockDeviceMapping.1.Ebs.VolumeSize", "8")
             .formParam("BlockDeviceMapping.1.Ebs.VolumeType", "gp3")
+            .formParam("TagSpecification.1.ResourceType", "image")
+            .formParam("TagSpecification.1.Tag.1.Key", "Build")
+            .formParam("TagSpecification.1.Tag.1.Value", "example")
+            .formParam("TagSpecification.1.Tag.2.Key", "empty-value")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -1058,8 +1062,11 @@ class Ec2IntegrationTest {
 
         given()
             .formParam("Action", "DescribeImages")
+            .formParam("Owner.1", "self")
             .formParam("Filter.1.Name", "name")
             .formParam("Filter.1.Value.1", imageName)
+            .formParam("Filter.2.Name", "tag:Build")
+            .formParam("Filter.2.Value.1", "example")
             .header("Authorization", AUTH_HEADER)
         .when()
             .post("/")
@@ -1067,6 +1074,10 @@ class Ec2IntegrationTest {
             .statusCode(200)
             .contentType("application/xml")
             .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo(registeredImageId))
+            .body("DescribeImagesResponse.imagesSet.item.tagSet.item.find { it.key == 'Build' }.value",
+                    equalTo("example"))
+            .body("DescribeImagesResponse.imagesSet.item.tagSet.item.find { it.key == 'empty-value' }.value",
+                    equalTo(""))
             .body("DescribeImagesResponse.imagesSet.item.blockDeviceMapping.item.ebs.snapshotId",
                     equalTo("snap-1234567890abcdef0"));
     }
@@ -2966,6 +2977,7 @@ class Ec2IntegrationTest {
             .formParam("LaunchTemplate.Version", "$Default")
             .formParam("ImageId", "ami-sample-override")
             .formParam("InstanceType", "c7g.large")
+            .formParam("SubnetId", subnetId)
             .formParam("MinCount", "1")
             .formParam("MaxCount", "1")
             .formParam("TagSpecification.1.ResourceType", "instance")
@@ -2989,17 +3001,21 @@ class Ec2IntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200);
-            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> given()
-                    .formParam("Action", "DescribeInstances")
-                    .formParam("InstanceId.1", launchedInstanceId)
-                    .header("Authorization", AUTH_HEADER)
-                    .post("/").then().statusCode(200)
-                    .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name",
-                            equalTo("terminated")));
+            await().atMost(Duration.ofSeconds(10))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> given()
+                            .formParam("Action", "DescribeInstances")
+                            .formParam("InstanceId.1", launchedInstanceId)
+                            .header("Authorization", AUTH_HEADER)
+                            .post("/").then().statusCode(200)
+                            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name",
+                                    equalTo("terminated")));
         });
         launched.response().then()
             .body("RunInstancesResponse.instancesSet.item.imageId", equalTo("ami-sample-override"))
             .body("RunInstancesResponse.instancesSet.item.instanceType", equalTo("c7g.large"))
+            .body("RunInstancesResponse.instancesSet.item.vpcId", equalTo(vpcId))
+            .body("RunInstancesResponse.instancesSet.item.subnetId", equalTo(subnetId))
             .body("RunInstancesResponse.instancesSet.item.keyName", equalTo("test-key"))
             .body("RunInstancesResponse.instancesSet.item.iamInstanceProfile.arn",
                     equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"))
@@ -5980,25 +5996,27 @@ class Ec2IntegrationTest {
         .then().statusCode(200)
             .extract().path("CreateRouteTableResponse.routeTable.routeTableId");
 
-        given()
-            .formParam("Action", "CreateRoute")
-            .formParam("RouteTableId", rt)
-            .formParam("DestinationCidrBlock", "0.0.0.0/0")
-            .formParam("NatGatewayId", "nat-0123456789abcdef0")
-            .header("Authorization", AUTH_HEADER)
-        .when().post("/")
-        .then().statusCode(200)
-            .body("CreateRouteResponse.return", equalTo("true"));
+        try (NatGatewayFixture nat = new NatGatewayFixture(AUTH_HEADER, vpc, "10.38.0.0/24")) {
+            given()
+                .formParam("Action", "CreateRoute")
+                .formParam("RouteTableId", rt)
+                .formParam("DestinationCidrBlock", "0.0.0.0/0")
+                .formParam("NatGatewayId", nat.id())
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then().statusCode(200)
+                .body("CreateRouteResponse.return", equalTo("true"));
 
-        given()
-            .formParam("Action", "DescribeRouteTables")
-            .formParam("RouteTableId.1", rt)
-            .header("Authorization", AUTH_HEADER)
-        .when().post("/")
-        .then()
-            .statusCode(200)
-            .body("DescribeRouteTablesResponse.routeTableSet.item.routeSet.item.natGatewayId",
-                    equalTo("nat-0123456789abcdef0"));
+            given()
+                .formParam("Action", "DescribeRouteTables")
+                .formParam("RouteTableId.1", rt)
+                .header("Authorization", AUTH_HEADER)
+            .when().post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeRouteTablesResponse.routeTableSet.item.routeSet.item.natGatewayId",
+                        equalTo(nat.id()));
+        }
     }
 
     @Test
@@ -6753,7 +6771,8 @@ class Ec2IntegrationTest {
         assertEquals("io1", rootVolumeType(launch(Map.of(
             "LaunchTemplate.LaunchTemplateId", templateId,
             "BlockDeviceMapping.1.DeviceName", "/dev/xvda",
-            "BlockDeviceMapping.1.Ebs.VolumeType", "io1"))));
+            "BlockDeviceMapping.1.Ebs.VolumeType", "io1",
+            "BlockDeviceMapping.1.Ebs.Iops", "100"))));
     }
 
     @Test
@@ -6796,7 +6815,8 @@ class Ec2IntegrationTest {
             "LaunchTemplate.LaunchTemplateId", templateId,
             "BlockDeviceMapping.1.DeviceName", "/dev/xvdb",
             "BlockDeviceMapping.1.Ebs.VolumeSize", "10",
-            "BlockDeviceMapping.1.Ebs.VolumeType", "io1"))));
+            "BlockDeviceMapping.1.Ebs.VolumeType", "io1",
+            "BlockDeviceMapping.1.Ebs.Iops", "100"))));
     }
 
     @Test
