@@ -30,6 +30,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.core.storage.StorageJson;
 import io.floci.aws.services.ec2.model.Address;
 import io.floci.aws.services.ec2.model.BlockDeviceMapping;
 import io.floci.aws.services.ec2.model.EbsBlockDevice;
@@ -202,6 +203,39 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
+
+    @Test
+    void failedMountMetadataWriteLeavesThePublishedVolumeUnchanged() {
+        AccountAwareStorageBackend<Volume> volumes = spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2ContainerManager containers = mock(Ec2ContainerManager.class);
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        AtomicReference<Supplier<List<Ec2VolumeBlockDeviceManager.PreparedMount>>> preparation =
+                new AtomicReference<>();
+        doAnswer(call -> {
+            preparation.set(call.getArgument(7));
+            return null;
+        }).when(containers).launch(any(), any(ResolvedAmiImage.class), any(), anyString(),
+                any(), anyList(), anyMap(), any(), any(), any());
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage("ami-test")).thenReturn(new ResolvedAmiImage(
+                "guest:local", "image", false, null,
+                List.of(new Ec2ImageCatalog.VolumeMount("sdf", "/data", "ext4"))));
+        Ec2Service service = new Ec2Service(mockConfig(false), containers,
+                mock(Ec2PortForwardManager.class), images, mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(Map.of("ec2-volumes.json", volumes)),
+                null, null, devices);
+        Instance instance = launchKeepingADataVolume(service).getInstances().getFirst();
+        Volume published = volumes.scan(key -> true).stream()
+                .filter(volume -> !volume.getVolumeId().equals(instance.getRootVolumeId()))
+                .findFirst().orElseThrow();
+        doThrow(new IllegalStateException("synthetic checked write refusal"))
+                .when(volumes).putAllDurablyForAccount(anyString(), anyMap());
+
+        assertThrows(IllegalStateException.class, () -> preparation.get().get());
+
+        assertNull(published.getManagedFilesystem(), "Failed write must not modify the published volume");
+        verify(devices, never()).prepareMount(any(), any(), any());
+    }
 
     @Test
     void storedInstanceTagsUseTheArnAccountAndRegionWithoutBorrowingState() {
@@ -3757,6 +3791,118 @@ class Ec2ServiceTest {
         instance.setState(InstanceState.terminated());
         completed.getValue().run();
         assertEquals("available", retained.getStatus());
+    }
+
+    @Test
+    void anInstanceCarriesItsShutdownBehaviorBeforeItsContainerLaunches() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        List<String> behaviorsAtLaunch = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            Instance launched = invocation.getArgument(0);
+            behaviorsAtLaunch.add(launched.getInstanceInitiatedShutdownBehavior());
+            return null;
+        }).when(containerManager).launch(any(), any(ResolvedAmiImage.class), any(), any(), any(), any(), any(), any(), any(), any());
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+
+        service.runInstances("us-east-1", "ami-1234567890abcdef0", "t3.micro", 2, 2, null, List.of(), null, null,
+                List.of(), null, null, null, null, 0, null, null, null, null, false, null, null, null, false, null,
+                null, null, "terminate");
+
+        assertEquals(List.of("terminate", "terminate"), behaviorsAtLaunch);
+    }
+
+    @Test
+    void aGuestShutdownStopsAnInstanceByDefault() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.252.0.0/24"),
+                null);
+
+        service.applyGuestShutdown(instance);
+
+        verify(containerManager).stop(instance);
+        verify(containerManager, never()).terminate(eq(instance), any());
+    }
+
+    @Test
+    void aGuestShutdownRecordsAnInstanceInitiatedShutdownAsTheStateReason() {
+        Ec2Service service = guestShutdownService();
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.250.0.0/24"),
+                null);
+
+        service.applyGuestShutdown(instance);
+
+        Instance described = describedInstance(service, region, instance.getInstanceId());
+        assertEquals("Client.InstanceInitiatedShutdown", described.getStateReasonCode());
+        assertEquals("Client.InstanceInitiatedShutdown: Instance initiated shutdown",
+                described.getStateReasonMessage());
+    }
+
+    @Test
+    void aGuestShutdownThatTerminatesRecordsAnInstanceInitiatedShutdownAsTheStateReason() {
+        Ec2Service service = guestShutdownService();
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.249.0.0/24"),
+                null);
+        service.modifyInstanceAttribute(region, instance.getInstanceId(), "instanceInitiatedShutdownBehavior",
+                "terminate");
+
+        service.applyGuestShutdown(instance);
+
+        assertEquals("Client.InstanceInitiatedShutdown",
+                describedInstance(service, region, instance.getInstanceId()).getStateReasonCode());
+    }
+
+    @Test
+    void anInstanceStartedAfterAGuestShutdownHasNoStateReason() {
+        Ec2Service service = guestShutdownService();
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.248.0.0/24"),
+                null);
+        service.applyGuestShutdown(instance);
+        instance.setState(InstanceState.stopped());
+
+        service.startInstances(region, List.of(instance.getInstanceId()));
+
+        assertNull(describedInstance(service, region, instance.getInstanceId()).getStateReasonCode());
+    }
+
+    private Ec2Service guestShutdownService() {
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        return new Ec2Service(mockConfig(false), mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+    }
+
+    private static Instance describedInstance(Ec2Service service, String region, String instanceId) {
+        return service.describeInstances(region, List.of(instanceId), Map.of()).getFirst().getInstances().getFirst();
+    }
+
+    @Test
+    void aGuestShutdownTerminatesAnInstanceWhoseShutdownBehaviorIsTerminate() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        AmiImageResolver images = mock(AmiImageResolver.class);
+        when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
+        Ec2Service service = new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class),
+                images, mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+        String region = "us-east-1";
+        Instance instance = runningContainerInstance(service, region, publicSubnet(service, region, "10.253.0.0/24"),
+                null);
+        service.modifyInstanceAttribute(region, instance.getInstanceId(), "instanceInitiatedShutdownBehavior",
+                "terminate");
+
+        service.applyGuestShutdown(instance);
+
+        verify(containerManager).terminate(eq(instance), any());
+        verify(containerManager, never()).stop(instance);
     }
 
     /** Ec2Service in container mode, with a container manager whose containers answer on loopback. */
@@ -9264,7 +9410,8 @@ class Ec2ServiceTest {
             assertEquals(original.getClientToken(), published.getClientToken());
             assertEquals(original.getRequestTags(), published.getRequestTags());
             assertEquals(original.getRequestParameters(), published.getRequestParameters());
-            assertEquals(original.getAttachments(), published.getAttachments());
+            assertEquals(StorageJson.mapper().valueToTree(original.getAttachments()),
+                    StorageJson.mapper().valueToTree(published.getAttachments()));
             return mount;
         });
         if ("success".equals(scenario)) {
@@ -9687,6 +9834,7 @@ class Ec2ServiceTest {
 
         verify(forwarding).setPersister(any());
         verify(containers).setPersister(any());
+        verify(containers).setGuestShutdownHandler(any());
         if (enabled) {
             verify(containers).restoreMetadataRegistration(instance);
             verify(containers).reconcileOrphanedContainers(any());

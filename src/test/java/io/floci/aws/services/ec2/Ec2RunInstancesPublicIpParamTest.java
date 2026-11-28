@@ -168,7 +168,7 @@ class Ec2RunInstancesPublicIpParamTest {
                 nullable(Boolean.class), nullable(String.class), anyInt(), nullable(String.class),
                 nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
                 nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
-                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class)))
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class), nullable(String.class)))
                 .thenAnswer(invocation -> {
                     if (rejected) {
                         throw new AssertionError("RunInstances allocated before combined interface tag validation");
@@ -223,7 +223,7 @@ class Ec2RunInstancesPublicIpParamTest {
                 nullable(Boolean.class), nullable(String.class), anyInt(), nullable(String.class),
                 nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
                 nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
-                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class)))
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class), nullable(String.class)))
                 .thenReturn(reservation);
         MultivaluedMap<String, String> p = baseParams();
         p.putSingle("LaunchTemplate.LaunchTemplateId", "lt-tags");
@@ -261,7 +261,7 @@ class Ec2RunInstancesPublicIpParamTest {
                 nullable(Boolean.class), nullable(String.class), anyInt(), nullable(String.class),
                 nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
                 nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
-                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class)))
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class), nullable(String.class)))
                 .thenReturn(new Reservation());
         handler(service).handle("RunInstances", p, REGION);
 
@@ -273,7 +273,7 @@ class Ec2RunInstancesPublicIpParamTest {
                 associatePublicIp.capture(), nullable(String.class), anyInt(), nullable(String.class),
                 nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
                 nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
-                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class));
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class), nullable(String.class));
         return new Forwarded(groups.getValue(), associatePublicIp.getValue());
     }
 
