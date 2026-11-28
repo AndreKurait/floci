@@ -38,6 +38,9 @@ public class EksPodIdentityProfile implements QuarkusTestProfile {
                 "floci.services.eks.pod-identity-webhook", "true",
                 "floci.tls.enabled", "true",
                 "floci.tls.aws-https-port", "0",
+                // Test profile TLS overrides do not reach TlsConfigSource's early configuration.
+                "quarkus.http.proxy.use-proxy-protocol", "true",
+                "quarkus.http.host", "127.0.0.1",
                 "quarkus.http.test-port", "4510",
                 "quarkus.http.test-ssl-port", "4511",
                 "floci.port", "4595",
