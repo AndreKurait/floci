@@ -296,7 +296,9 @@ behind a Lambda authorizer then always answers `403`.
 
 TOKEN and REQUEST authorizers must return a nonempty `principalId` and an IAM policy. Floci
 checks all statements against `execute-api:Invoke` and the current method ARN, including
-wildcards, conditions and explicit deny precedence. A policy that does not grant the method
+wildcards, conditions and explicit deny precedence. Without an applicable API resource-policy
+grant, a policy that does not grant the method returns `403`. With IAM enforcement enabled,
+the authorizer and API resource-policy grants combine, and an explicit deny in either policy
 returns `403`. Invalid policies or non-scalar context values return `500`. Scalar context keys,
 including keys such as `tenant-id`, are retained in Lambda proxy events.
 The alphanumeric and underscore restriction in the mapping reference applies to properties
@@ -426,10 +428,36 @@ handling; a hand-rolled signer must include it.
 > the full check.
 
 > [!NOTE]
-> Floci authenticates the caller but does not authorize the call: it does not evaluate
-> `execute-api:Invoke` against the caller's IAM policies or a resource policy, so any validly
-> signed, known caller is let through. `principalOrgId` and `cognitoIdentity` are always null -
+> HTTP and WebSocket APIs authenticate signed callers without evaluating `execute-api:Invoke`
+> against IAM or API resource policies. REST APIs also authorize the call when IAM enforcement
+> is enabled, as described below. `principalOrgId` and `cognitoIdentity` are always null:
 > Organizations membership and identity-pool federation are not modelled.
+
+### REST API Resource Policies
+
+With `floci.services.iam.enforcement-enabled=true`, a signed REST `AWS_IAM` request must satisfy
+the shared IAM evaluator before reaching its integration. The evaluator combines the caller's
+current identity policies with the API resource policy and applies session policies, permission
+boundaries, SCPs and explicit denies. Cross-account requests require grants from both sides.
+The local `test` credential retains its account-root identity grant but remains subject to
+resource-policy and SCP denies.
+
+For public `NONE` methods, an attached API policy must explicitly allow the anonymous caller.
+A policy-free public method remains accessible. Supplying a signature to a public method does
+not create an IAM principal. `COGNITO_USER_POOLS` methods require both successful Cognito
+authorization and an anonymous resource-policy grant when a policy is attached.
+
+For `CUSTOM` methods, an explicit API policy deny is checked before invoking the Lambda
+authorizer. After successful authorization, the authorizer policy and resource-policy grants
+combine, with explicit denies taking precedence. The current API policy is evaluated on
+authorizer-cache hits as well.
+
+Policy conditions use the connection's source address, transport security and server time,
+rather than forwarded headers or a caller-supplied date. Resource matching uses the API owner,
+region, stage, HTTP method and request path, including a trailing slash. Shorthand resources such as
+`execute-api:/prod/GET/items` are expanded for evaluation without changing the stored policy.
+Changes to the stored API policy take effect on subsequent requests; policy activation is not
+tied to deployment snapshots.
 
 ### Request Model Validation
 
