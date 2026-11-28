@@ -2,6 +2,10 @@ package io.floci.aws.services.apigatewayv2.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
+import io.floci.aws.core.common.CallerCallAuthorizer;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigateway.AwsServiceRouter;
 import io.floci.aws.services.apigateway.VtlTemplateEngine;
 import io.floci.aws.services.apigatewayv2.model.Integration;
@@ -45,7 +49,7 @@ class WebSocketIntegrationInvokerHttpTargetTest {
                 mock(LambdaService.class),
                 mock(AwsServiceRouter.class),
                 new ObjectMapper(),
-                mock(VtlTemplateEngine.class));
+                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class));
         backend = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         backend.createContext("/", exchange -> {
             receivedHost.set(exchange.getRequestHeaders().getFirst("Host"));
@@ -66,7 +70,7 @@ class WebSocketIntegrationInvokerHttpTargetTest {
         Integration integration = new Integration();
         integration.setIntegrationType(type);
         integration.setIntegrationUri(uri);
-        return invoker.invoke("us-east-1", integration, "{}", Map.of(), Map.of(), Map.of());
+        return invoker.invoke("us-east-1", "api", "prod", "$default", integration, "{}", Map.of(), Map.of(), Map.of());
     }
 
     @Test
@@ -113,7 +117,7 @@ class WebSocketIntegrationInvokerHttpTargetTest {
                 mock(LambdaService.class),
                 mock(AwsServiceRouter.class),
                 new ObjectMapper(),
-                mock(VtlTemplateEngine.class),
+                mock(VtlTemplateEngine.class), mock(ServiceCallAuthorizer.class), mock(RegionResolver.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class),
                 host -> {
                     if (lookups.incrementAndGet() == 1) {
                         return new InetAddress[] {InetAddress.getByName("127.0.0.1")};
@@ -125,7 +129,7 @@ class WebSocketIntegrationInvokerHttpTargetTest {
         integration.setIntegrationType(integrationType);
         integration.setIntegrationUri(uri);
 
-        IntegrationResult result = pinnedInvoker.invoke("us-east-1", integration, "{}", Map.of(), Map.of(), Map.of());
+        IntegrationResult result = pinnedInvoker.invoke("us-east-1", "api", "prod", "$default", integration, "{}", Map.of(), Map.of(), Map.of());
 
         assertEquals(200, result.statusCode());
         assertEquals("ok", result.body());
