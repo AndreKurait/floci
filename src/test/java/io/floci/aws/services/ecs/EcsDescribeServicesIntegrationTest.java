@@ -63,17 +63,6 @@ class EcsDescribeServicesIntegrationTest {
                 + "\"containerDefinitions\":[{\"name\":\"web\",\"image\":\"nginx\",\"memory\":128}]}");
     }
 
-    /**
-     * Epoch seconds carry 10 significant digits, more than a float holds. RestAssured's default
-     * number type is FLOAT_AND_DOUBLE, which silently rounds two timestamps a second apart to the
-     * same value, so read them as BigDecimal.
-     */
-    private static double epochSeconds(Response response, String path) {
-        return ((BigDecimal) response
-                .jsonPath(new JsonPathConfig(JsonPathConfig.NumberReturnType.BIG_DECIMAL))
-                .get(path)).doubleValue();
-    }
-
     private static Response describe(String cluster, String service) {
         return call("DescribeServices",
                 "{\"cluster\":\"" + cluster + "\",\"services\":[\"" + service + "\"]}");
@@ -214,35 +203,6 @@ class EcsDescribeServicesIntegrationTest {
     }
 
     @Test
-    void newDeploymentCarriesItsOwnStartTimeNotTheServiceCreationTime() throws Exception {
-        // A task-definition change mints a new deployment id, so the timestamps have to move with
-        // it. Reporting the service's creation time would contradict the new id and misrepresent
-        // when the deployment actually started.
-        seedClusterAndTaskDef("dep-cluster-11", "dep-td-11a");
-        call("CreateService", "{\"cluster\":\"dep-cluster-11\",\"serviceName\":\"dep-svc-11\","
-                + "\"taskDefinition\":\"dep-td-11a\",\"desiredCount\":0}");
-
-        Response before = describe("dep-cluster-11", "dep-svc-11");
-        double createdAtBefore = epochSeconds(before, "services[0].deployments[0].createdAt");
-        String idBefore = before.path("services[0].deployments[0].id");
-
-        Thread.sleep(1100);
-        registerTaskDef("dep-td-11b");
-        call("UpdateService", "{\"cluster\":\"dep-cluster-11\",\"service\":\"dep-svc-11\","
-                + "\"taskDefinition\":\"dep-td-11b\"}");
-
-        Response after = describe("dep-cluster-11", "dep-svc-11");
-        double createdAtAfter = epochSeconds(after, "services[0].deployments[0].createdAt");
-        double serviceCreatedAt = epochSeconds(after, "services[0].createdAt");
-
-        assertNotEquals(idBefore, after.path("services[0].deployments[0].id"));
-        assertTrue(createdAtAfter > createdAtBefore,
-                "a new deployment must carry a later createdAt than the one it replaced");
-        assertTrue(createdAtAfter > serviceCreatedAt,
-                "the deployment started after the service was created, so its createdAt must be later");
-    }
-
-    @Test
     void createAndUpdateServiceEchoTheSameDeploymentShape() {
         seedClusterAndTaskDef("dep-cluster-6", "dep-td-6");
 
@@ -372,7 +332,7 @@ class EcsDescribeServicesIntegrationTest {
         seedClusterAndTaskDef("dep-cluster-23", "dep-td-23");
         given().contentType(CT).header("X-Amz-Target", TARGET + "CreateService")
                 .body("{\"cluster\":\"dep-cluster-23\",\"serviceName\":\"dep-svc-23\","
-                        + "\"taskDefinition\":\"dep-td-23\",\"schedulingStrategy\":\"DAEMON\"}")
+                        + "\"taskDefinition\":\"dep-td-23\",\"launchType\":\"FARGATE\",\"schedulingStrategy\":\"DAEMON\"}")
                 .when().post("/")
                 .then().statusCode(400)
                 .body("__type", containsString("InvalidParameterException"))
@@ -417,5 +377,39 @@ class EcsDescribeServicesIntegrationTest {
                 .when().post("/")
                 .then().statusCode(400)
                 .body("__type", containsString("InvalidParameterException"));
+    }
+
+private static double epochSeconds(Response response, String path) {
+        return ((BigDecimal) response
+                .jsonPath(new JsonPathConfig(JsonPathConfig.NumberReturnType.BIG_DECIMAL))
+                .get(path)).doubleValue();
+    }
+@Test
+    void newDeploymentCarriesItsOwnStartTimeNotTheServiceCreationTime() throws Exception {
+        // A task-definition change mints a new deployment id, so the timestamps have to move with
+        // it. Reporting the service's creation time would contradict the new id and misrepresent
+        // when the deployment actually started.
+        seedClusterAndTaskDef("dep-cluster-11", "dep-td-11a");
+        call("CreateService", "{\"cluster\":\"dep-cluster-11\",\"serviceName\":\"dep-svc-11\","
+                + "\"taskDefinition\":\"dep-td-11a\",\"desiredCount\":0}");
+
+        Response before = describe("dep-cluster-11", "dep-svc-11");
+        double createdAtBefore = epochSeconds(before, "services[0].deployments[0].createdAt");
+        String idBefore = before.path("services[0].deployments[0].id");
+
+        Thread.sleep(1100);
+        registerTaskDef("dep-td-11b");
+        call("UpdateService", "{\"cluster\":\"dep-cluster-11\",\"service\":\"dep-svc-11\","
+                + "\"taskDefinition\":\"dep-td-11b\"}");
+
+        Response after = describe("dep-cluster-11", "dep-svc-11");
+        double createdAtAfter = epochSeconds(after, "services[0].deployments[0].createdAt");
+        double serviceCreatedAt = epochSeconds(after, "services[0].createdAt");
+
+        assertNotEquals(idBefore, after.path("services[0].deployments[0].id"));
+        assertTrue(createdAtAfter > createdAtBefore,
+                "a new deployment must carry a later createdAt than the one it replaced");
+        assertTrue(createdAtAfter > serviceCreatedAt,
+                "the deployment started after the service was created, so its createdAt must be later");
     }
 }
