@@ -130,7 +130,10 @@ REGISTRY_IMAGE="$(test_image REGISTRY)"
 starts EcsImagePullDockerIntegrationTest && [ -n "$REGISTRY_IMAGE" ] && pull "$REGISTRY_IMAGE"
 PYTHON_ALPINE_IMAGE="$(test_image PYTHON_ALPINE)"
 starts ContainerCaBundleDockerIntegrationTest EcsCredentialsProxyDockerNightlyIntegrationTest SageMakerDockerNightlyIntegrationTest \
+       SecurityGroupFirewallDockerNightlyIntegrationTest \
     && [ -n "$PYTHON_ALPINE_IMAGE" ] && pull "$PYTHON_ALPINE_IMAGE"
+# Firewall fixtures also start lightweight network clients in this pinned Alpine image.
+starts SecurityGroupFirewallDockerNightlyIntegrationTest && pull alpine:3.21
 # DNS lifecycle guests use Python, including inherited protected/shared checks. Their network helpers build
 # from alpine:3.21 locally, so prefetch the base rather than pulling the locally built helper image.
 if starts EcsPrivateDnsGuestDockerNightlyIntegrationTest EcsSharedPrivateDnsGuestDockerNightlyIntegrationTest \
@@ -249,10 +252,10 @@ grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
 starts RdsEndpointsInVpcDockerNightlyIntegrationTest && configured_image ec2 socat-image
 # The template-database restore fixture selects its own PostgreSQL image.
 # Read that override so its first CreateDBInstance does not also have to pull PostGIS.
-POSTGIS_TEST="$(find src/test/java -name RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest.java -print -quit)"
-POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4 }' "${POSTGIS_TEST:-/dev/null}")"
+POSTGIS_PROFILE="$(find src/test/java -path '*/testing/CloudFormationSettingsProfile.java' -print -quit)"
+POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4 }' "${POSTGIS_PROFILE:-/dev/null}")"
 [ -n "$POSTGIS_IMAGE" ] \
-    || echo "$(date -u +%H:%M:%S) prefetch skipped: RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest default-postgres-image not readable" >> "$PREFETCH_LOG"
+    || echo "$(date -u +%H:%M:%S) prefetch skipped: CloudFormationSettingsProfile default-postgres-image not readable" >> "$PREFETCH_LOG"
 starts RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest \
     && [ -n "$POSTGIS_IMAGE" ] && pull "$POSTGIS_IMAGE"
 # These DSQL fixtures start the configured PostgreSQL sidecar; unit-only shards do not.

@@ -1,6 +1,12 @@
 name: CI
 
 on:
+  workflow_call:
+    inputs:
+      release-validation:
+        description: Use separate capacity for image publication qualification.
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -23,6 +29,11 @@ on:
       - '.github/ci/**'
       - '.github/workflows/ci.yml'
 
+  # Runs each merge queue entry against main plus the PRs queued ahead of it. paths does not
+  # apply to merge_group, so a queued PR is always checked.
+  merge_group:
+    types: [checks_requested]
+
 permissions:
   contents: read
 
@@ -41,7 +52,7 @@ env:
   # Hardcoded on purpose: strategy.job-total counts EVERY matrix job, so adding an
   # unrelated matrix entry later would change the modulus and silently leave part
   # of the suite running in no shard. Keep in sync with the matrix below.
-  SHARD_TOTAL: 5
+  SHARD_TOTAL: 8
 
 jobs:
   test:
@@ -54,7 +65,7 @@ jobs:
     # shard's Run tests step was canceled at the 25-minute job limit; leave room for normal variance.
     timeout-minutes: 35
     # Drafts skip the suite to spare runners; it runs once the PR is ready for review.
-    # Written on the job rather than as a gate job so it costs no runner. Pushes to main
+    # Written on the job rather than as a gate job so it costs no runner. Pushes
     # always run; `closed` and `edited` are excluded so widening the trigger types cannot
     # let those events through.
     if: >-
@@ -63,17 +74,18 @@ jobs:
         github.event.pull_request.state != 'closed' &&
         github.event.action != 'edited'
       )
-    # Share four test slots across PRs and main. Queue every shard; the default
-    # single pending job would cancel another PR's required tests.
+    # Share four ordinary test slots across PRs and main. Queue every shard;
+    # the default single pending job would cancel another PR's required tests.
+    # The image publisher opts into separate slots so PR traffic cannot block it.
     concurrency:
-      group: floci-ci-slot-${{ matrix.slot }}
+      group: ${{ inputs.release-validation && format('floci-release-ci-{0}-{1}', github.run_id, matrix.shard) || format('floci-ci-slot-{0}', matrix.slot) }}
       cancel-in-progress: false
       queue: max
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: ${{ inputs.release-validation && 8 || 4 }}
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
         include:
           - shard: 1
             slot: 1
@@ -85,6 +97,12 @@ jobs:
             slot: 4
           - shard: 5
             slot: 1
+          - shard: 6
+            slot: 2
+          - shard: 7
+            slot: 3
+          - shard: 8
+            slot: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -115,7 +133,6 @@ jobs:
         with:
           path: ~/.m2/wrapper/dists
           key: maven-wrapper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
-
       # Derived from test sources, not target/test-classes, so shard.txt exists
       # before Compile and the image prefetch below overlaps the compile instead
       # of starting moments before the tests that need the images. Every test is
@@ -143,6 +160,11 @@ jobs:
         run: |
           grep -v 'NightlyIntegrationTest$' shard.txt > prefetch.txt || true
           .github/ci/prefetch-images.sh prefetch.txt || true
+
+      - name: Test protected workflow helpers
+        if: matrix.shard == 1
+        run: |
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
       - name: Test Maven bootstrap
         if: matrix.shard == 1
@@ -187,6 +209,14 @@ jobs:
       # surefire's thread dump instead of the job being cancelled.
       - name: Run tests
         run: |
+          # Protected workload DNS must reach this host JVM. Bind only the
+          # Docker bridge address, and restore the ephemeral runner's port policy.
+          dns_address="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+          test -n "$dns_address"
+          port_floor="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+          trap 'sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=$port_floor" >/dev/null' EXIT
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          export FLOCI_TEST_HOST_DNS_ADDRESS="$dns_address"
           python3 .github/ci/split-concurrent.py shard.txt quarkus.txt plain.txt
           status=0
           if [ -s plain.txt ]; then
@@ -304,10 +334,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: test
-    # always() so a failed shard still reaches the partition check and report, but not on a
-    # draft: there the shards are skipped and this would fail on them. Same condition as the shards.
+    # Report failed shards, but let canceled revisions release their concurrency slot.
+    # Drafts skip the shards and this summary.
     if: >-
-      always() && (
+      !cancelled() && (
         github.event_name != 'pull_request' || (
           github.event.pull_request.draft == false &&
           github.event.pull_request.state != 'closed' &&
