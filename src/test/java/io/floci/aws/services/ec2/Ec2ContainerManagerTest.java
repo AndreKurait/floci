@@ -52,6 +52,7 @@ import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.ec2instanceconnect.InstanceConnectKeys;
 import io.floci.aws.testing.HelperShellFixture;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -1138,6 +1139,9 @@ class Ec2ContainerManagerTest {
         // Count the submitted work across both entry points without observing unrelated callers.
         // API decoding and guest execution share a budget of at most four active decompressions.
         int concurrentLaunches = 12;
+        CountDownLatch firstFourDecompressions = new CountDownLatch(4);
+        CountDownLatch fifthDecompression = new CountDownLatch(1);
+        CountDownLatch releaseDecompressions = new CountDownLatch(1);
         AtomicInteger totalDecompressions = new AtomicInteger(0);
         AtomicInteger active = new AtomicInteger(0);
         AtomicInteger peakActive = new AtomicInteger(0);
@@ -1155,9 +1159,14 @@ class Ec2ContainerManagerTest {
             int now = active.incrementAndGet();
             peakActive.accumulateAndGet(now, Math::max);
             try {
-                Thread.sleep(75);
+                firstFourDecompressions.countDown();
+                if (now > 4) {
+                    fifthDecompression.countDown();
+                }
+                releaseDecompressions.await();
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted while waiting for concurrent decompressions", ie);
             } finally {
                 active.decrementAndGet();
             }
@@ -1179,10 +1188,22 @@ class Ec2ContainerManagerTest {
                     futures.add(pool.submit(() -> List.of(Ec2UserDataDecoder.decode(gzipped))));
                 }
             }
+            try {
+                assertTrue(firstFourDecompressions.await(10, TimeUnit.SECONDS),
+                        "four decompressions did not enter the shared budget concurrently");
+                for (Thread thread : observedThreads) {
+                    ThreadStates.awaitBlockedOrDone(thread);
+                }
+                assertEquals(1, fifthDecompression.getCount(),
+                        "a fifth decompression entered while four held the shared budget");
+            } finally {
+                releaseDecompressions.countDown();
+            }
             for (Future<List<String>> future : futures) {
                 results.add(future.get(30, TimeUnit.SECONDS));
             }
         } finally {
+            releaseDecompressions.countDown();
             try {
                 pool.shutdownNow();
                 assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
@@ -1776,16 +1797,16 @@ class Ec2ContainerManagerTest {
         List<ResultCallback<WaitResponse>> exitWatches = stubExitWatches(harness);
         List<Instance> shutDown = new CopyOnWriteArrayList<>();
         harness.manager.setGuestShutdownHandler(shutDown::add);
-        Instance instance = launchRunningInstance(harness, "i-reboot", exitWatches);
         RestartContainerCmd restart = mock(RestartContainerCmd.class, RETURNS_SELF);
         when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
-        ResultCallback<WaitResponse> beforeReboot = exitWatches.getLast();
         when(restart.exec()).thenAnswer(invocation -> {
             when(harness.lifecycleManager.probeContainer(TEST_CONTAINER_ID)).thenReturn(ContainerLiveness.NOT_RUNNING);
-            beforeReboot.onNext(exitStatus(0));
+            exitWatches.getFirst().onNext(exitStatus(0));
             when(harness.lifecycleManager.probeContainer(TEST_CONTAINER_ID)).thenReturn(ContainerLiveness.RUNNING);
             return null;
         });
+
+        Instance instance = launchRunningInstance(harness, "i-reboot", exitWatches);
 
         harness.manager.reboot(instance);
         awaitUntil(() -> exitWatches.size() == 2, Duration.ofSeconds(5));
@@ -1801,7 +1822,6 @@ class Ec2ContainerManagerTest {
         List<ResultCallback<WaitResponse>> exitWatches = stubExitWatches(harness);
         List<Instance> shutDown = new CopyOnWriteArrayList<>();
         harness.manager.setGuestShutdownHandler(shutDown::add);
-        Instance instance = launchRunningInstance(harness, "i-tworeboots", exitWatches);
         RestartContainerCmd restart = mock(RestartContainerCmd.class, RETURNS_SELF);
         when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
         CountDownLatch firstRestartMayFinish = new CountDownLatch(1);
@@ -1818,6 +1838,8 @@ class Ec2ContainerManagerTest {
             when(harness.lifecycleManager.probeContainer(TEST_CONTAINER_ID)).thenReturn(ContainerLiveness.RUNNING);
             return null;
         });
+
+        Instance instance = launchRunningInstance(harness, "i-tworeboots", exitWatches);
 
         harness.manager.reboot(instance);
         awaitUntil(() -> restarts.get() == 1, Duration.ofSeconds(5));
@@ -2978,9 +3000,9 @@ class Ec2ContainerManagerTest {
         int removed = harness.manager.reconcileOrphanedContainers(
                 (region, instanceId) -> "i-live".equals(instanceId));
 
-        verify(harness.lifecycleManager, never()).removeIfExists("c-sibling");
-        verify(harness.lifecycleManager, never()).removeIfExists("c-live");
-        verify(harness.lifecycleManager).removeIfExists("c-orphan");
+        verify(harness.lifecycleManager, never()).removeIfExistsStrict("c-sibling");
+        verify(harness.lifecycleManager, never()).removeIfExistsStrict("c-live");
+        verify(harness.lifecycleManager).removeIfExistsStrict("c-orphan");
         assertEquals(1, removed);
     }
 
@@ -2994,7 +3016,7 @@ class Ec2ContainerManagerTest {
         // stop/start across a restart.
         int removed = harness.manager.reconcileOrphanedContainers((region, instanceId) -> true);
 
-        verify(harness.lifecycleManager, never()).removeIfExists(anyString());
+        verify(harness.lifecycleManager, never()).removeIfExistsStrict(anyString());
         assertEquals(0, removed);
     }
 
@@ -3010,7 +3032,7 @@ class Ec2ContainerManagerTest {
 
         int removed = harness.manager.reconcileOrphanedContainers((region, instanceId) -> false);
 
-        verify(harness.lifecycleManager, never()).removeIfExists(anyString());
+        verify(harness.lifecycleManager, never()).removeIfExistsStrict(anyString());
         assertEquals(0, removed);
     }
 
@@ -3027,8 +3049,8 @@ class Ec2ContainerManagerTest {
         int removed = harness.manager.reconcileOrphanedContainers((region, instanceId) -> false);
 
         assertEquals(1, removed);
-        verify(harness.lifecycleManager).removeIfExists("c-ours");
-        verify(harness.lifecycleManager, never()).removeIfExists("c-sibling");
+        verify(harness.lifecycleManager).removeIfExistsStrict("c-ours");
+        verify(harness.lifecycleManager, never()).removeIfExistsStrict("c-sibling");
     }
 
     @Test
@@ -3042,9 +3064,9 @@ class Ec2ContainerManagerTest {
         int removed = harness.manager.reconcileOrphanedContainers((region, instanceId) -> false);
 
         assertEquals(2, removed);
-        verify(harness.lifecycleManager).removeIfExists("c-legacy");
-        verify(harness.lifecycleManager).removeIfExists("c-both");
-        verify(harness.lifecycleManager, never()).removeIfExists("c-legacy-sibling");
+        verify(harness.lifecycleManager).removeIfExistsStrict("c-legacy");
+        verify(harness.lifecycleManager).removeIfExistsStrict("c-both");
+        verify(harness.lifecycleManager, never()).removeIfExistsStrict("c-legacy-sibling");
     }
 
     @Test
@@ -3057,7 +3079,7 @@ class Ec2ContainerManagerTest {
         int removed = harness.manager.reconcileOrphanedContainers((region, instanceId) -> false);
 
         assertEquals(0, removed);
-        verify(harness.lifecycleManager, never()).removeIfExists(anyString());
+        verify(harness.lifecycleManager, never()).removeIfExistsStrict(anyString());
     }
 
     private static Container withOwners(String containerId, Map<String, String> owners, String instanceId) {
@@ -3268,6 +3290,7 @@ class Ec2ContainerManagerTest {
 
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
         assertFalse(ran.get(), "the hook must not run when the container is still present");
+        verify(harness.metadataServer()).revokeInstanceCredentials(instance);
     }
 
     @Test

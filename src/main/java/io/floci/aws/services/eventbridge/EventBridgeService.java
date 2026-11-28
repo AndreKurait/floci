@@ -52,6 +52,7 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -412,6 +413,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                             + stored.get().getName() + " on event bus " + stored.get().getEventBusName()
                             + ". Delete that rule first.", 400);
         }
+        if (stored.isPresent() && stored.get().getManagedBy() != null) {
+            throw EventBridgeErrors.managedRule(name);
+        }
         Rule rule = stored.orElse(new Rule());
         rule.setAccountId(regionResolver.getAccountId());
         rule.setName(name);
@@ -441,6 +445,42 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
 
         LOG.infov("Put rule: {0} on bus {1}", name, effectiveBus);
         return rule;
+    }
+
+    /**
+     * Creates or replaces a rule another AWS service manages on the default bus, with the one target it
+     * forwards to. It bypasses the managed-rule refusals a caller of the public operations meets.
+     */
+    public Rule putManagedRule(String name, String managedBy, String eventPattern, Target target, String region) {
+        getOrCreateDefaultBus(region);
+        String key = ruleKey(region, "default", name);
+        Rule rule = ruleStore.get(key).orElse(new Rule());
+        rule.setAccountId(regionResolver.getAccountId());
+        rule.setName(name);
+        rule.setArn(buildRuleArn(region, "default", name));
+        rule.setEventBusName("default");
+        rule.setEventPattern(eventPattern);
+        rule.setState(RuleState.ENABLED);
+        rule.setManagedBy(managedBy);
+        if (rule.getCreatedAt() == null) {
+            rule.setCreatedAt(Instant.now());
+        }
+        ruleStore.put(key, rule);
+        targetStore.put(key, new ArrayList<>(List.of(target)));
+        return rule;
+    }
+
+    /** Whether the default bus has a rule of this name that another service manages. */
+    public boolean isManagedRule(String name, String region) {
+        return ruleStore.get(ruleKey(region, "default", name)).filter(rule -> rule.getManagedBy() != null).isPresent();
+    }
+
+    /** Removes a managed rule and its targets. A rule that is already gone is not an error. */
+    public void deleteManagedRule(String name, String region) {
+        String key = ruleKey(region, "default", name);
+        ruleStore.get(key).ifPresent(rule -> dispatcher.dropPendingRetries(rule.getArn(), List.of(name)));
+        ruleStore.delete(key);
+        targetStore.delete(key);
     }
 
     private static final Pattern NON_PARTNER_NAME = Pattern.compile("[\\.\\-_A-Za-z0-9]+");
@@ -478,6 +518,10 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     public void deleteRule(String name, String busName, String region) {
+        deleteRule(name, busName, false, region);
+    }
+
+    public void deleteRule(String name, String busName, boolean force, String region) {
         String effectiveBus = resolvedBusName(busName);
         validateRuleReference("name", name, effectiveBus, region);
         ensureBusExists(effectiveBus, region);
@@ -485,6 +529,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         Rule rule = ruleOfBus(key, effectiveBus).orElse(null);
         if (rule == null) {
             return;
+        }
+        if (rule.getManagedBy() != null && !force) {
+            throw EventBridgeErrors.managedRuleNeedsForce(name);
         }
         List<Target> targets = targetStore.get(key).orElse(List.of());
         if (!targets.isEmpty()) {
@@ -575,6 +622,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         String key = ruleKey(region, effectiveBus, name);
         Rule rule = ruleOfBus(key, effectiveBus)
                 .orElseThrow(() -> EventBridgeErrors.ruleNotFound(name, effectiveBus));
+        requireNotManaged(rule);
         rule.setState(RuleState.ENABLED);
         ruleStore.put(key, rule);
         startSchedulerIfNeeded(rule);
@@ -586,6 +634,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         String key = ruleKey(region, effectiveBus, name);
         Rule rule = ruleOfBus(key, effectiveBus)
                 .orElseThrow(() -> EventBridgeErrors.ruleNotFound(name, effectiveBus));
+        requireNotManaged(rule);
         rule.setState(RuleState.DISABLED);
         ruleStore.put(key, rule);
 
@@ -617,6 +666,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         String key = ruleKey(region, effectiveBus, ruleName);
         Rule rule = ruleOfBus(key, effectiveBus)
                 .orElseThrow(() -> EventBridgeErrors.ruleNotFound(ruleName, effectiveBus));
+        requireNotManaged(rule);
         List<Target> existing = new ArrayList<>(targetStore.get(key).orElse(new ArrayList<>()));
         for (Target newTarget : newTargets) {
             EcsParameters ecs = newTarget.getEcsParameters();
@@ -732,11 +782,19 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
 
     public RemoveTargetsResult removeTargets(String ruleName, String busName,
                                              List<String> ids, String region) {
+        return removeTargets(ruleName, busName, ids, false, region);
+    }
+
+    public RemoveTargetsResult removeTargets(String ruleName, String busName,
+                                             List<String> ids, boolean force, String region) {
         String effectiveBus = resolvedBusName(busName);
         validateRuleReference("rule", ruleName, effectiveBus, region);
         String key = ruleKey(region, effectiveBus, ruleName);
         if (ruleStore.get(key).filter(rule -> !effectiveBus.equals(rule.getEventBusName())).isPresent()) {
             return new RemoveTargetsResult(0, ids.size());
+        }
+        if (!force && ruleStore.get(key).filter(rule -> rule.getManagedBy() != null).isPresent()) {
+            throw EventBridgeErrors.managedRuleNeedsForce(ruleName);
         }
         List<Target> existing = new ArrayList<>(targetStore.get(key).orElse(new ArrayList<>()));
         int removed = 0;
@@ -899,10 +957,29 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         return new RuleRef("default", afterRule);
     }
 
+    private void requireTaggable(String resource, String region) {
+        if (!resource.startsWith("rule/")) {
+            return;
+        }
+        RuleRef ref = parseRuleResource(resource);
+        boolean managed = ruleStore.get(ruleKey(region, ref.busName(), ref.ruleName()))
+                .filter(rule -> rule.getManagedBy() != null).isPresent();
+        if (managed) {
+            throw EventBridgeErrors.managedRuleTags(ref.ruleName());
+        }
+    }
+
+    private static void requireNotManaged(Rule rule) {
+        if (rule.getManagedBy() != null) {
+            throw EventBridgeErrors.managedRule(rule.getName());
+        }
+    }
+
     public void tagResource(String resourceArn, Map<String, String> tags, String region) {
         validateTagResourceArn(resourceArn, region);
         String resource = AwsArnUtils.parse(resourceArn).resource();
         TagResource target = requireTagResource(resourceArn, region, resource);
+        requireTaggable(resource, region);
         target.tags().putAll(tags);
         target.save().run();
         resourceGroupsTaggingService.tagResources(List.of(resourceArn), tags, region);
@@ -912,6 +989,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         validateTagResourceArn(resourceArn, region);
         String resource = AwsArnUtils.parse(resourceArn).resource();
         TagResource target = requireTagResource(resourceArn, region, resource);
+        requireTaggable(resource, region);
         tagKeys.forEach(target.tags()::remove);
         target.save().run();
         resourceGroupsTaggingService.untagResources(List.of(resourceArn), tagKeys, region);
@@ -1124,6 +1202,29 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
      * such an entry: the guide's sentence is about the action, and no document says how AWS answers them.
      */
     public PutEventsResult putEventsFromRequest(List<Map<String, Object>> entries, String region) {
+        long size = 0;
+        for (Map<String, Object> entry : entries) {
+            if (entry.get("Time") != null) {
+                size += 14;
+            }
+            for (String field : List.of("Source", "DetailType", "Detail")) {
+                String value = (String) entry.get(field);
+                if (value != null) {
+                    size += value.getBytes(StandardCharsets.UTF_8).length;
+                }
+            }
+            if (entry.get("Resources") instanceof ArrayNode resources) {
+                for (JsonNode resource : resources) {
+                    if (!resource.isNull()) {
+                        size += resource.asText().getBytes(StandardCharsets.UTF_8).length;
+                    }
+                }
+            }
+            if (size > 1_048_576) {
+                throw new AwsException("ValidationException",
+                        "Total size of the entries in the request is over the limit.", 400);
+            }
+        }
         return putEvents(entries, region, null, true);
     }
 
@@ -1298,7 +1399,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         return matchesPattern(entry, eventPattern);
     }
 
-    private void validateEventPattern(String eventPattern) {
+    public void validateEventPattern(String eventPattern) {
         JsonNode pattern;
         try {
             pattern = objectMapper.readTree(eventPattern);
@@ -1734,7 +1835,8 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         return effectiveBus;
     }
 
-    private static String resolvedBusName(String busName) {
+    /** The bus identity used by rule storage, including accepted ARN aliases. */
+    public static String resolvedBusName(String busName) {
         if (busName == null || busName.isBlank()) {
             return "default";
         }
