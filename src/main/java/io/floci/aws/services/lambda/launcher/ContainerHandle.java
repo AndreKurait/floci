@@ -1,11 +1,15 @@
 package io.floci.aws.services.lambda.launcher;
 
+import io.floci.aws.services.lambda.launcher.ExtensionShutdownWait.ExtensionExec;
 import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 
 import java.io.Closeable;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
@@ -25,6 +29,9 @@ public class ContainerHandle {
     private Closeable logStream;
     private Function<Boolean, Supplier<String>> logTailReader = initialization -> () -> "";
     private final AtomicBoolean invoked = new AtomicBoolean();
+    private Map<String, ExtensionExec> extensionExecs = Map.of();
+    private Long extensionShutdownStartedNanos;
+    private ExtensionShutdownWait extensionShutdownWait;
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -64,6 +71,28 @@ public class ContainerHandle {
 
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
+    void setExtensionExecs(Map<String, ExtensionExec> extensionExecs) {
+        this.extensionExecs = Map.copyOf(extensionExecs);
+    }
+
+    synchronized long beginExtensionShutdown(long nowNanos) {
+        if (extensionShutdownStartedNanos == null) {
+            extensionShutdownStartedNanos = nowNanos;
+        }
+        return extensionShutdownStartedNanos;
+    }
+
+    /**
+     * The extension processes a stop of this container waits for. Selected by the first stop,
+     * before it sends SHUTDOWN, and kept for cleanup retries like the deadline.
+     */
+    synchronized ExtensionShutdownWait extensionShutdownWait(Predicate<String> execExited) {
+        if (extensionShutdownWait == null) {
+            extensionShutdownWait = new ExtensionShutdownWait(
+                    runtimeApiServer.extensionShutdownSubscriptions(), extensionExecs, execExited);
+        }
+        return extensionShutdownWait;
+    }
 
     public void setLogTailReader(Function<Boolean, Supplier<String>> reader) { this.logTailReader = reader; }
 
