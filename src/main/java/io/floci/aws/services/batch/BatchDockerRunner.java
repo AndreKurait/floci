@@ -58,6 +58,7 @@ public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvid
     private final VpcContainerLeases vpcLeases;
     /** This run's job containers, so a later run knows the ones a crash leaves for leftovers. */
     private final RunLabelledContainers runContainers;
+    private final RunTimer timer;
 
     @Inject
     public BatchDockerRunner(ContainerBuilder containerBuilder,
@@ -67,6 +68,20 @@ public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvid
                              ContainerDetector containerDetector,
                              RegionResolver regionResolver,
                              Ec2Service ec2Service) {
+        this(containerBuilder, lifecycleManager, logStreamer, config, containerDetector,
+                regionResolver, ec2Service, RunTimer.SYSTEM);
+    }
+
+    BatchDockerRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer, EmulatorConfig config,
+                      ContainerDetector containerDetector, RunTimer timer) {
+        this(containerBuilder, lifecycleManager, logStreamer, config, containerDetector, null, null, timer);
+    }
+
+    BatchDockerRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer, EmulatorConfig config,
+                      ContainerDetector containerDetector, RegionResolver regionResolver,
+                      Ec2Service ec2Service, RunTimer timer) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -75,6 +90,34 @@ public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvid
         this.regionResolver = regionResolver;
         this.vpcLeases = new VpcContainerLeases(ec2Service, "Batch job", () -> lifecycleManager.getDockerClient());
         this.runContainers = new RunLabelledContainers(lifecycleManager, config, "batch", RUN_LABEL, LOG);
+        this.timer = timer;
+    }
+
+    /** The wall clock run results are stamped with, and how a run waits for its container to exit. */
+    interface RunTimer {
+        RunTimer SYSTEM = new RunTimer() {
+            @Override
+            public long currentTimeMillis() {
+                return System.currentTimeMillis();
+            }
+
+            @Override
+            public long nanoTime() {
+                return System.nanoTime();
+            }
+
+            @Override
+            public void sleepMillis(long millis) throws InterruptedException {
+                Thread.sleep(millis);
+            }
+        };
+
+        long currentTimeMillis();
+
+        /** A monotonic reading in nanoseconds, like {@link System#nanoTime()}. */
+        long nanoTime();
+
+        void sleepMillis(long millis) throws InterruptedException;
     }
 
     /**
@@ -110,7 +153,7 @@ public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvid
                                         String logSourceLabel, String image, String missingImageMessage,
                                         List<String> command, List<String> env,
                                         List<BatchResourceRequirement> resourceRequirements, String subnetId) {
-        long startedAt = System.currentTimeMillis();
+        long startedAt = timer.currentTimeMillis();
         Closeable logHandle = null;
         String containerId = null;
 
@@ -157,7 +200,7 @@ public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvid
             }
 
             Integer exitCode = waitForExit(containerId, timeout(job));
-            long stoppedAt = System.currentTimeMillis();
+            long stoppedAt = timer.currentTimeMillis();
             releaseAndStop(inFlightKey, containerId, logHandle);
             if (exitCode == null) {
                 return new BatchRunResult(137, "Job timed out", logStreamName, startedAt, stoppedAt, true);
@@ -255,12 +298,12 @@ public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvid
     }
 
     private BatchRunResult failed(long startedAt, String logStreamName, String reason) {
-        return new BatchRunResult(1, reason, logStreamName, startedAt, System.currentTimeMillis(), false);
+        return new BatchRunResult(1, reason, logStreamName, startedAt, timer.currentTimeMillis(), false);
     }
 
     private BatchRunResult stopped(long startedAt, String logStreamName) {
         return new BatchRunResult(137, "Job terminated", logStreamName,
-                startedAt, System.currentTimeMillis(), false);
+                startedAt, timer.currentTimeMillis(), false);
     }
 
     private List<String> buildEnvironment(BatchJob job, int attemptNumber) {
@@ -344,13 +387,14 @@ public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvid
     }
 
     private Integer waitForExit(String containerId, Duration timeout) throws InterruptedException {
-        long deadline = timeout.isZero() ? Long.MAX_VALUE : System.currentTimeMillis() + timeout.toMillis();
-        while (System.currentTimeMillis() <= deadline) {
+        // Measured on the monotonic timer, so setting the host's clock cannot end or extend an attempt.
+        long started = timer.nanoTime();
+        while (timeout.isZero() || timer.nanoTime() - started <= timeout.toNanos()) {
             Integer exitCode = getExitCodeIfStopped(containerId);
             if (exitCode != null) {
                 return exitCode;
             }
-            Thread.sleep(250);
+            timer.sleepMillis(250);
         }
         return null;
     }

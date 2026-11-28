@@ -22,6 +22,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -31,6 +32,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -158,14 +160,28 @@ public class AppSyncCfnProvisioner implements CfnResourceProvisioner {
      * a wedged worker cannot hang a stack operation forever, and a schema that hits this is reported
      * as a resource failure rather than left in an unknown state.
      */
-    private static final long SCHEMA_TIMEOUT_MILLIS = 120_000L;
-    private static final long SCHEMA_POLL_MILLIS = 25L;
+    private static final Duration SCHEMA_TIMEOUT = Duration.ofSeconds(120);
+    private static final Duration SCHEMA_POLL = Duration.ofMillis(25);
 
     private final AppSyncService appSyncService;
+    private final LongSupplier nanoTime;
+    private final Sleeper sleeper;
 
     @Inject
     public AppSyncCfnProvisioner(AppSyncService appSyncService) {
+        this(appSyncService, System::nanoTime, Thread::sleep);
+    }
+
+    /** For tests that put the wait for schema compilation on a timeline they control. */
+    AppSyncCfnProvisioner(AppSyncService appSyncService, LongSupplier nanoTime, Sleeper sleeper) {
         this.appSyncService = appSyncService;
+        this.nanoTime = nanoTime;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(Duration delay) throws InterruptedException;
     }
 
     @Override
@@ -295,7 +311,7 @@ public class AppSyncCfnProvisioner implements CfnResourceProvisioner {
      * ACTIVE is the status a schema loaded from a previous run carries.
      */
     private void awaitSchemaCreation(String apiId) {
-        long deadline = System.currentTimeMillis() + SCHEMA_TIMEOUT_MILLIS;
+        long started = nanoTime.getAsLong();
         while (true) {
             SchemaCreationStatus status = appSyncService.getSchemaCreationStatus(apiId);
             SchemaCreationStatusType type = status == null ? null : status.getStatus();
@@ -307,13 +323,13 @@ public class AppSyncCfnProvisioner implements CfnResourceProvisioner {
                 throw new AwsException("ValidationError", "Schema creation failed for API " + apiId
                         + (blank(details) ? "" : ": " + details), 400);
             }
-            if (System.currentTimeMillis() >= deadline) {
+            if (nanoTime.getAsLong() - started >= SCHEMA_TIMEOUT.toNanos()) {
                 throw new AwsException("ValidationError", "Schema creation for API " + apiId
-                        + " did not complete within " + (SCHEMA_TIMEOUT_MILLIS / 1000) + "s (status "
+                        + " did not complete within " + SCHEMA_TIMEOUT.toSeconds() + "s (status "
                         + type + ").", 400);
             }
             try {
-                Thread.sleep(SCHEMA_POLL_MILLIS);
+                sleeper.sleep(SCHEMA_POLL);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AwsException("ValidationError",
