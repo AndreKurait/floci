@@ -1,7 +1,7 @@
 {
   "_source": {
     "generator": "tools/aws/regen_iam_authorized_actions.py",
-    "reference": "https://servicereference.us-east-1.amazonaws.com/",
+    "reference": "--source-dir /srv/floci-agent/runs/root-allocator-reconcile-20261125T031857Z/complete-dev-composition/iam-service-reference-observation",
     "retrieved": "2026-11-26",
     "note": "make iam-authorized-actions-verify checks every entry against AWS."
   },

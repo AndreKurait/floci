@@ -22,7 +22,9 @@
     "DescribeRepositoryCreationTemplates": "DescribeRepositoryCreationTemplatesRequest",
     "DeleteRepositoryCreationTemplate": "DeleteRepositoryCreationTemplateRequest",
     "ListImages": "ListImagesRequest",
-    "DescribeImages": "DescribeImagesRequest"
+    "DescribeImages": "DescribeImagesRequest",
+    "StartLifecyclePolicyPreview": "StartLifecyclePolicyPreviewRequest",
+    "GetLifecyclePolicyPreview": "GetLifecyclePolicyPreviewRequest"
   },
   "shapes": {
     "AccountSettingName": {
@@ -567,6 +569,47 @@
         "lifecyclePolicy": "LifecyclePolicyTextForRepositoryCreationTemplate",
         "appliedFor": "RCTAppliedForList",
         "customRoleArn": "CustomRoleArn"
+      }
+    },
+    "GetLifecyclePolicyPreviewRequest": {
+      "type": "structure",
+      "required": [
+        "repositoryName"
+      ],
+      "members": {
+        "registryId": "RegistryId",
+        "repositoryName": "RepositoryName",
+        "imageIds": "ImageIdentifierList",
+        "nextToken": "NextToken",
+        "maxResults": "LifecyclePreviewMaxResults",
+        "filter": "LifecyclePolicyPreviewFilter"
+      }
+    },
+    "LifecyclePolicyPreviewFilter": {
+      "type": "structure",
+      "members": {
+        "tagStatus": "TagStatus"
+      }
+    },
+    "LifecyclePolicyText": {
+      "type": "string",
+      "min": 100,
+      "max": 30720
+    },
+    "LifecyclePreviewMaxResults": {
+      "type": "integer",
+      "min": 1,
+      "max": 100
+    },
+    "StartLifecyclePolicyPreviewRequest": {
+      "type": "structure",
+      "required": [
+        "repositoryName"
+      ],
+      "members": {
+        "registryId": "RegistryId",
+        "repositoryName": "RepositoryName",
+        "lifecyclePolicyText": "LifecyclePolicyText"
       }
     }
   }
