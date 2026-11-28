@@ -64,6 +64,7 @@ public class RoleTrustPolicyProvider implements ResourcePolicyProvider {
         String trustPolicy = iamService.findRole(arn.accountId(), roleName)
                 .filter(role -> IamService.roleArnMatches(resourceArn, role))
                 .map(IamRole::getAssumeRolePolicyDocument)
+                .map(iamService::renderAssumeRolePolicy)
                 .flatMap(document -> attachedTo(document, resourceArn))
                 .orElse(null);
         return List.of(new ResourcePolicy(trustPolicy, arn.accountId()));
