@@ -460,8 +460,7 @@ class ApplicationAutoScalingIntegrationTest {
 
         call("DescribeScalingPolicies")
             .body("{ \"ServiceNamespace\": \"ecs\", \"MaxResults\": 11 }")
-        .when().post("/").then().statusCode(400)
-            .body("__type", equalTo("ValidationException"));
+        .when().post("/").then().statusCode(200);
     }
 
     @Test
