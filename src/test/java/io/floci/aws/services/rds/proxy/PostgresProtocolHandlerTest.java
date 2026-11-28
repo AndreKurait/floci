@@ -343,8 +343,8 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -554,8 +554,8 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -633,8 +633,8 @@ class PostgresProtocolHandlerTest {
                     }
                 }
             } finally {
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 assertFalse(authThread.isAlive(), "authThread did not terminate");
             }
             assertNull(authFailure.get(), "TLS authentication thread failed");
@@ -762,7 +762,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -777,10 +777,10 @@ class PostgresProtocolHandlerTest {
                 assertEquals("off", params.get("is_superuser"));
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
 
@@ -832,8 +832,8 @@ class PostgresProtocolHandlerTest {
                 assertEquals("approle", readParametersUntilReadyForQuery(clientIn).get("session_authorization"));
 
                 ourClient.close();
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 backendTask.await();
                 assertFalse(authThread.isAlive(), "authThread did not terminate");
 
@@ -906,7 +906,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -926,10 +926,10 @@ class PostgresProtocolHandlerTest {
                 assertEquals("svc", params.get("application_name"));
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
 
@@ -974,7 +974,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -999,10 +999,10 @@ class PostgresProtocolHandlerTest {
                 }
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
 
@@ -1047,7 +1047,7 @@ class PostgresProtocolHandlerTest {
                 Socket proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1073,10 +1073,10 @@ class PostgresProtocolHandlerTest {
                 }
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
-                assertFalse(authThread.isAlive(), "authThread did not terminate");
+                assertFalse(authTask.thread().isAlive(), "authThread did not terminate");
 
             }
         }
@@ -1109,7 +1109,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1128,9 +1128,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("permission denied to set role \"dbadmin\"", error.get('M'));
                 assertEquals(-1, clientIn.read(), "the login must fail, not continue without the parameter");
 
-                authThread.join(5_000);
+                authTask.await();
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
         }
@@ -1156,7 +1156,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1175,9 +1175,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("permission denied to set session authorization", error.get('M'));
                 assertEquals(-1, clientIn.read(), "the login must fail");
 
-                authThread.join(5_000);
+                authTask.await();
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
         }
@@ -1208,7 +1208,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1226,9 +1226,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("42501", error.get('C'));
                 assertEquals(-1, clientIn.read(), "the session must not be handed over as the master");
 
-                authThread.join(5_000);
+                authTask.await();
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
         }
@@ -1275,7 +1275,7 @@ class PostgresProtocolHandlerTest {
                         connectTestSocket("localhost", lookupServer.getLocalPort()),
                         connectTestSocket("localhost", backendServer.getLocalPort())));
 
-                Thread authThread = startIamAuth(proxyClient, () -> backends.remove(0));
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, () -> backends.remove(0));
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1298,11 +1298,11 @@ class PostgresProtocolHandlerTest {
                 assertEquals("unrecognized configuration parameter \"no_such_parameter\"", notices.get(0).get('M'));
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 lookupTask.await();
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
         }
@@ -1341,7 +1341,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", lookupServer.getLocalPort());
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1356,9 +1356,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("could not read block 0", error.get('M'));
                 assertEquals(-1, clientIn.read(), "the login must fail");
 
-                authThread.join(5_000);
+                authTask.await();
                 lookupTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
             }
         }
     }
@@ -1606,7 +1606,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1620,9 +1620,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("28P01", error.get('C'));
                 assertEquals("password authentication failed for user \"nosuchrole\"", error.get('M'));
 
-                authThread.join(5_000);
+                authTask.await();
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
 
@@ -1674,7 +1674,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1688,10 +1688,10 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
         }
@@ -1726,7 +1726,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1745,9 +1745,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("permission denied to set session authorization", error.get('M'));
                 assertEquals(-1, clientIn.read(), "session must be closed, not handed back as master");
 
-                authThread.join(5_000);
+                authTask.await();
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
             }
         }
     }
@@ -1780,7 +1780,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1804,8 +1804,8 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
             }
         }
@@ -1848,7 +1848,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1876,9 +1876,9 @@ class PostgresProtocolHandlerTest {
                 assertEquals("permission denied to set session authorization", error.get('M'));
                 assertEquals(-1, clientIn.read(), "session must be closed, not handed back as master");
 
-                authThread.join(5_000);
+                authTask.await();
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
             }
         }
     }
@@ -1906,7 +1906,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -1924,8 +1924,8 @@ class PostgresProtocolHandlerTest {
                 assertEquals("approle", params.get("session_authorization"));
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
             }
         }
@@ -2145,45 +2145,39 @@ class PostgresProtocolHandlerTest {
         backend.await();
     }
 
-    private Thread startIamAuth(Socket proxyClient, Socket backend) {
+    private ProxyTestTask<Void> startIamAuth(Socket proxyClient, Socket backend) {
         return startIamAuth(proxyClient, backend, true, true);
     }
 
-    private Thread startIamAuth(Socket proxyClient, PostgresProtocolHandler.BackendConnector connector) {
-        return Thread.ofVirtual().start(() -> {
-            try {
-                PostgresProtocolHandler.AuthenticatedSession session =
-                        PostgresProtocolHandler.authenticate(
-                        proxyClient, connector,
-                        "dbadmin", "adminpass", "postgres",
-                        true, testSigV4Validator(), testBinding(), testTlsCertificates(),
-                        (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000, true);
-                if (session != null) {
-                    PostgresProtocolHandler.bridge(session);
-                }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+    private ProxyTestTask<Void> startIamAuth(Socket proxyClient, PostgresProtocolHandler.BackendConnector connector) {
+        return ProxyTestTask.start(() -> {
+            PostgresProtocolHandler.AuthenticatedSession session =
+                    PostgresProtocolHandler.authenticate(
+                    proxyClient, connector,
+                    "dbadmin", "adminpass", "postgres",
+                    true, testSigV4Validator(), testBinding(), testTlsCertificates(),
+                    (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000, true);
+            if (session != null) {
+                PostgresProtocolHandler.bridge(session);
             }
+            return null;
         });
     }
 
-    private Thread startIamAuth(Socket proxyClient, Socket backend,
-                                boolean iamEnabled, boolean forwardStartupParameters) {
-        return Thread.ofVirtual().start(() -> {
-            try {
-                PostgresProtocolHandler.AuthenticatedSession session =
-                        PostgresProtocolHandler.authenticate(
-                        proxyClient, () -> backend,
-                        "dbadmin", "adminpass", "postgres",
-                        iamEnabled, testSigV4Validator(), testBinding(), testTlsCertificates(),
-                        (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000,
-                        forwardStartupParameters);
-                if (session != null) {
-                    PostgresProtocolHandler.bridge(session);
-                }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+    private ProxyTestTask<Void> startIamAuth(Socket proxyClient, Socket backend,
+                                           boolean iamEnabled, boolean forwardStartupParameters) {
+        return ProxyTestTask.start(() -> {
+            PostgresProtocolHandler.AuthenticatedSession session =
+                    PostgresProtocolHandler.authenticate(
+                    proxyClient, () -> backend,
+                    "dbadmin", "adminpass", "postgres",
+                    iamEnabled, testSigV4Validator(), testBinding(), testTlsCertificates(),
+                    (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000,
+                    forwardStartupParameters);
+            if (session != null) {
+                PostgresProtocolHandler.bridge(session);
             }
+            return null;
         });
     }
 
@@ -2210,7 +2204,7 @@ class PostgresProtocolHandlerTest {
                 proxyClient = acceptTestSocket(clientServer);
                 Socket backend = connectTestSocket("localhost", backendPort);
 
-                Thread authThread = startIamAuth(proxyClient, backend, false, forwardStartupParameters);
+                ProxyTestTask<Void> authTask = startIamAuth(proxyClient, backend, false, forwardStartupParameters);
 
                 DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
                 DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
@@ -2222,10 +2216,10 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
+                authTask.await();
                 proxyClient.close();
-                authThread.join(5_000);
                 backendTask.await();
-                assertEquals(false, authThread.isAlive(), "authThread did not terminate");
+                assertEquals(false, authTask.thread().isAlive(), "authThread did not terminate");
 
             }
         }
