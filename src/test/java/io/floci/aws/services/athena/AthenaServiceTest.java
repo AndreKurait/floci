@@ -85,6 +85,10 @@ class AthenaServiceTest {
         when(athena.mock()).thenReturn(false);
 
         regionResolver = mock(RegionResolver.class);
+        when(regionResolver.getAccountId()).thenReturn("000000000000");
+        when(regionResolver.getDefaultAccountId()).thenReturn("000000000000");
+        when(regionResolver.getRegion()).thenReturn("us-east-1");
+        when(regionResolver.getDefaultRegion()).thenReturn("us-east-1");
         service = new AthenaService(storageFactory, duckClient, glueService, s3Service,
                 config, vertx, ddlBuilder, regionResolver, icebergStatements,
                 mock(IamEnforcementFilter.class));
