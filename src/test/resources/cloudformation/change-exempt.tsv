@@ -92,6 +92,8 @@ AWS::EC2::SubnetNetworkAclAssociation	update not yet on the engine's changes (#6
 AWS::EC2::SubnetRouteTableAssociation	update not yet on the engine's changes (#6606)
 AWS::EC2::VPC	update not yet on the engine's changes (#6606)
 AWS::EC2::VPCEndpoint	update not yet on the engine's changes (#6606)
+AWS::EC2::VPCEndpointService	reconciles the desired service properties in place through Ec2PrivateLinkService.update
+AWS::EC2::VPCEndpointServicePermissions	replaces the allowed principal set and revokes the prior service on replacement
 AWS::EC2::VPCGatewayAttachment	update not yet on the engine's changes (#6606)
 AWS::ECS::CapacityProvider	update not yet on the engine's changes (#6606)
 AWS::ECS::Cluster	prior entity found by reusesPriorEntity; moves to the engine's decision with the create-only work

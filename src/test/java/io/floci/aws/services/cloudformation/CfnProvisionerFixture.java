@@ -67,6 +67,7 @@ import io.floci.aws.services.cloudformation.provisioners.Ec2SecurityGroupCfnProv
 import io.floci.aws.services.cloudformation.provisioners.Ec2SecurityGroupRuleCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2VpcCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2VpcEndpointCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.Ec2VpcEndpointServiceCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2VpcGatewayAttachmentCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.EcrCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.EcsCapacityCfnProvisioner;
@@ -146,6 +147,7 @@ import io.floci.aws.services.dsql.DsqlService;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
+import io.floci.aws.services.ec2.Ec2PrivateLinkService;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.FlowLogService;
 import io.floci.aws.services.ecr.EcrService;
@@ -300,6 +302,7 @@ final class CfnProvisionerFixture {
         // Services that back a provisioner without being a constructor argument of the
         // dispatcher. They exist only so inferredProvisioners() can wire their provisioner.
         private FlowLogService flowLogService;
+        private Ec2PrivateLinkService privateLinkService;
         private CloudWatchDashboardsService cloudWatchDashboardsService;
         private CloudWatchLogsMetricFilterService logsMetricFilterService;
         private IotAuthorizerService iotAuthorizerService;
@@ -509,6 +512,9 @@ final class CfnProvisionerFixture {
             }
             if (flowLogService != null) {
                 discovered.add(new Ec2FlowLogCfnProvisioner(flowLogService, ec2Service));
+            }
+            if (privateLinkService != null) {
+                discovered.add(new Ec2VpcEndpointServiceCfnProvisioner(privateLinkService, ec2Service));
             }
             if (iotAuthorizerService != null) {
                 discovered.add(new IotAuthorizerCfnProvisioner(iotAuthorizerService));
@@ -914,6 +920,11 @@ final class CfnProvisionerFixture {
 
         public Builder flowLog(FlowLogService v) {
             this.flowLogService = v;
+            return this;
+        }
+
+        public Builder privateLink(Ec2PrivateLinkService v) {
+            this.privateLinkService = v;
             return this;
         }
 

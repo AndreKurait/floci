@@ -674,6 +674,45 @@ RAM-shared IPAM resources. `AcceptVpcPeeringConnection` additionally enforces th
 connection's accepter — reporting a connection it cannot see as absent, not as a permission error,
 matching how AWS itself responds.
 
+### VPC Endpoint Services
+
+| Action | Description |
+|--------|-------------|
+| CreateVpcEndpointServiceConfiguration | Creates an endpoint service, `Available` at once, for one or more Network Load Balancers (an `Interface` service) or Gateway Load Balancers (a `GatewayLoadBalancer` service), never both. Its name is `com.amazonaws.vpce.<region>.vpce-svc-<id>` (the partition's own prefix outside `aws`), its zones are those of its load balancers, and `SupportedIpAddressType` defaults to `ipv4`. A malformed or unknown Network Load Balancer is `InvalidNetworkLoadBalancerArn.Malformed` or `.NotFound`; neither or both load balancer kinds is `InvalidParameterCombination`. `ClientToken` returns the service an earlier request with the same token created. |
+| DescribeVpcEndpointServiceConfigurations | Lists the caller's services in the Region, by `ServiceId.N` or the filters `service-name`, `service-id`, `service-state`, `supported-ip-address-types`, `tag:<key>` and `tag-key`. Results are not paged. |
+| ModifyVpcEndpointServiceConfiguration | Changes `AcceptanceRequired`, the private DNS name, the supported IP address types and Regions, and the load balancers. The load balancers cannot change while an endpoint is `available` or `pendingAcceptance` (`ExistingVpcEndpointConnections`), and the hosting Region cannot be removed. |
+| DeleteVpcEndpointServiceConfigurations | Deletes services. A service with an `available` or `pendingAcceptance` endpoint is reported in `unsuccessful` with `ExistingVpcEndpointConnections`, an unknown one with `InvalidVpcEndpointServiceId.NotFound`. |
+| DescribeVpcEndpointServicePermissions | Lists a service's allowed principals, filtered by `principal` or `principal-type`. |
+| ModifyVpcEndpointServicePermissions | Adds and removes allowed principals: `*` (`All`), an account's `root` ARN (`Account`), and IAM role (`Role`) and user (`User`) ARNs without a path. A path is `InvalidParameterValue`; any other principal is `UnknownPrincipalType.Unsupported`. |
+| DescribeVpcEndpointConnections | Lists the endpoints, in any account, connected to the caller's services, filtered by `service-id`, `vpc-endpoint-id`, `vpc-endpoint-owner`, `vpc-endpoint-state`, `vpc-endpoint-region` and `ip-address-type`. |
+| AcceptVpcEndpointConnections | Makes `pendingAcceptance` endpoints `available`. An endpoint not connected to the service is reported in `unsuccessful` with `InvalidVpcEndpoint.NotFound`, a `rejected` one with `InvalidState`. |
+| RejectVpcEndpointConnections | Makes `pendingAcceptance` and `available` endpoints `rejected`. |
+
+A connection is the consumer's own endpoint: its state, as the consumer's `DescribeVpcEndpoints`
+reports it, is what the provider sees, accepts and rejects. A consumer can discover and connect to a
+service when it is in the service's account, or when an allowed principal names its account, its IAM
+user or role, or `*`; otherwise the service's name is refused with `InvalidServiceName`. Endpoints
+from the service's own account are `available` at once; others start `pendingAcceptance` while
+`AcceptanceRequired` is set. Removing a permission leaves existing connections as they are.
+
+A `CreateVpcEndpoint` to a service name Floci holds no endpoint service for is accepted as before,
+so endpoints to AWS services and to services outside the emulator keep working.
+
+Not emulated:
+
+- Traffic. An endpoint's interfaces are synthesized, so nothing sent to them reaches the service's
+  load balancer; this is the control plane only.
+- Private DNS verification. A private DNS name stays `pendingVerification`, with a generated TXT
+  record name and value, and consumers' endpoints get no private DNS name for it.
+  `StartVpcEndpointServicePrivateDnsVerification` is not implemented.
+- Organization and service principals, cross-Region access (`SupportedRegions` is stored only),
+  payer responsibility, connection notifications and consumers' zone checks.
+
+CloudFormation provisions `AWS::EC2::VPCEndpointService` (`Ref` and `ServiceId` are the service id;
+`PrivateDnsNameConfiguration.*` is set when `PrivateDnsName` is) and
+`AWS::EC2::VPCEndpointServicePermissions`, whose `AllowedPrincipals` becomes the whole set. Both
+update in place.
+
 ### Network ACLs
 
 | Action | Description |

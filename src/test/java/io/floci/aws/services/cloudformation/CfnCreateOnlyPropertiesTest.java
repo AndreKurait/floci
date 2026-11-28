@@ -41,6 +41,26 @@ class CfnCreateOnlyPropertiesTest {
     }
 
     @Test
+    void endpointServicePermissionsReplaceOnlyWhenTheServiceChanges() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode previous = mapper.readTree("""
+                {"ServiceId":"vpce-svc-first","AllowedPrincipals":["first"]}
+                """);
+        JsonNode serviceChanged = mapper.readTree("""
+                {"ServiceId":"vpce-svc-second","AllowedPrincipals":["first"]}
+                """);
+        JsonNode principalsChanged = mapper.readTree("""
+                {"ServiceId":"vpce-svc-first","AllowedPrincipals":["second"]}
+                """);
+
+        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged(
+                "AWS::EC2::VPCEndpointServicePermissions", previous, serviceChanged));
+        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged(
+                "AWS::EC2::VPCEndpointServicePermissions", previous, principalsChanged));
+        assertEquals(Set.of(), CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::EC2::VPCEndpointService"));
+    }
+
+    @Test
     void healthCheckEndpointTypeChangesRequireReplacement() throws IOException {
         ObjectMapper mapper = new ObjectMapper();
         JsonNode previous = mapper.readTree("""
