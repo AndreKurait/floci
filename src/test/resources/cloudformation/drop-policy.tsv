@@ -103,6 +103,27 @@ AWS::CloudTrail::Trail	S3BucketName	keep:the update skips a null, so the stored 
 AWS::CloudTrail::Trail	S3KeyPrefix	clear
 AWS::CloudTrail::Trail	SnsTopicName	keep:the update skips a null, so the stored topic stays
 AWS::CloudTrail::Trail	TrailName	keep:the update finds the trail by its physical id
+AWS::CodeDeploy::DeploymentGroup	AlarmConfiguration	clear
+AWS::CodeDeploy::DeploymentGroup	ApplicationName	keep:required; dropping is refused before mutation
+AWS::CodeDeploy::DeploymentGroup	AutoRollbackConfiguration	clear
+AWS::CodeDeploy::DeploymentGroup	AutoScalingGroups	clear
+AWS::CodeDeploy::DeploymentGroup	BlueGreenDeploymentConfiguration	clear
+AWS::CodeDeploy::DeploymentGroup	Deployment	clear	inline execution is refused whenever declared and is never provisioned
+AWS::CodeDeploy::DeploymentGroup	DeploymentConfigName	default:CodeDeployDefault.OneAtATime
+AWS::CodeDeploy::DeploymentGroup	DeploymentGroupName	create-only	dropping a declared name replaces the group under a generated identity
+AWS::CodeDeploy::DeploymentGroup	DeploymentStyle	clear
+AWS::CodeDeploy::DeploymentGroup	ECSServices	clear
+AWS::CodeDeploy::DeploymentGroup	Ec2DeploymentOptions	clear	inline execution options are refused whenever declared and are never provisioned
+AWS::CodeDeploy::DeploymentGroup	Ec2TagFilters	clear
+AWS::CodeDeploy::DeploymentGroup	Ec2TagSet	clear
+AWS::CodeDeploy::DeploymentGroup	LoadBalancerInfo	clear
+AWS::CodeDeploy::DeploymentGroup	OnPremisesInstanceTagFilters	clear
+AWS::CodeDeploy::DeploymentGroup	OnPremisesTagSet	clear
+AWS::CodeDeploy::DeploymentGroup	OutdatedInstancesStrategy	clear
+AWS::CodeDeploy::DeploymentGroup	ServiceRoleArn	keep:required; dropping is refused before mutation
+AWS::CodeDeploy::DeploymentGroup	Tags	clear
+AWS::CodeDeploy::DeploymentGroup	TerminationHookEnabled	clear
+AWS::CodeDeploy::DeploymentGroup	TriggerConfigurations	clear
 AWS::Cognito::UserPoolGroup	Description	clear
 AWS::Cognito::UserPoolGroup	GroupName	create-only	a drop gives the group a generated name, so the group is replaced
 AWS::Cognito::UserPoolGroup	Precedence	keep:the update skips a null, so the stored value stays

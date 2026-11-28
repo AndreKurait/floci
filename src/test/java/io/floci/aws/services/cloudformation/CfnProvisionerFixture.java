@@ -47,6 +47,7 @@ import io.floci.aws.services.cloudformation.provisioners.CloudWatchCfnProvisione
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchCompositeAlarmCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CodeDeployCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.CodeDeployDeploymentGroupCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CognitoCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CognitoIdentityProviderCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CognitoResourceServerCfnProvisioner;
@@ -584,6 +585,7 @@ final class CfnProvisionerFixture {
             }
             if (codeDeployService != null) {
                 discovered.add(new CodeDeployCfnProvisioner(codeDeployService));
+                discovered.add(new CodeDeployDeploymentGroupCfnProvisioner(codeDeployService));
             }
             if (emrService != null && emrHandler != null) {
                 discovered.add(new EmrCfnProvisioner(emrService, emrHandler));

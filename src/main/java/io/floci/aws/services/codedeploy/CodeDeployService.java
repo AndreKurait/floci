@@ -49,6 +49,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -290,12 +291,12 @@ public class CodeDeployService {
             cfg.setComputePlatform("Lambda");
             if (name.equals("CodeDeployDefault.LambdaAllAtOnce")) {
                 cfg.setTrafficRoutingConfig(Map.of("type", "AllAtOnce"));
-            } else if (name.contains("Canary")) {
+           } else if (name.contains("Canary")) {
                 int pct = 10;
                 int minutes = extractMinutes(name);
                 cfg.setTrafficRoutingConfig(Map.of("type", "TimeBasedCanary",
                         "timeBasedCanary", Map.of("canaryPercentage", pct, "canaryInterval", minutes)));
-            } else if (name.contains("Linear")) {
+           } else if (name.contains("Linear")) {
                 int pct = 10;
                 int minutes = extractMinutes(name);
                 cfg.setTrafficRoutingConfig(Map.of("type", "TimeBasedLinear",
@@ -305,12 +306,12 @@ public class CodeDeployService {
             cfg.setComputePlatform("ECS");
             if (name.equals("CodeDeployDefault.ECSAllAtOnce")) {
                 cfg.setTrafficRoutingConfig(Map.of("type", "AllAtOnce"));
-            } else if (name.contains("Canary")) {
+           } else if (name.contains("Canary")) {
                 int pct = 10;
                 int minutes = extractMinutes(name);
                 cfg.setTrafficRoutingConfig(Map.of("type", "TimeBasedCanary",
                         "timeBasedCanary", Map.of("canaryPercentage", pct, "canaryInterval", minutes)));
-            } else if (name.contains("Linear")) {
+           } else if (name.contains("Linear")) {
                 int pct = 10;
                 int minutes = extractMinutes(name);
                 cfg.setTrafficRoutingConfig(Map.of("type", "TimeBasedLinear",
@@ -320,7 +321,7 @@ public class CodeDeployService {
             cfg.setComputePlatform("Server");
             if (name.equals("CodeDeployDefault.AllAtOnce")) {
                 cfg.setMinimumHealthyHosts(Map.of("type", "FLEET_PERCENT", "value", 0));
-            } else if (name.equals("CodeDeployDefault.HalfAtATime")) {
+           } else if (name.equals("CodeDeployDefault.HalfAtATime")) {
                 cfg.setMinimumHealthyHosts(Map.of("type", "FLEET_PERCENT", "value", 50));
             } else {
                 cfg.setMinimumHealthyHosts(Map.of("type", "HOST_COUNT", "value", 1));
@@ -452,7 +453,7 @@ public class CodeDeployService {
     public DeploymentGroup createDeploymentGroup(String region, String appName, String groupName,
                                                   String deploymentConfigName, String serviceRoleArn,
                                                   Map<String, Object> fields, List<Map<String, String>> tags) {
-        getApplication(region, appName);
+        Application application = getApplication(region, appName);
         Map<String, Map<String, DeploymentGroup>> appGroups = deploymentGroupsFor(region);
         Map<String, DeploymentGroup> groupStore = appGroups.computeIfAbsent(appName, a -> new ConcurrentHashMap<>());
         if (groupStore.containsKey(groupName)) {
@@ -466,6 +467,7 @@ public class CodeDeployService {
         group.setDeploymentGroupName(groupName);
         group.setDeploymentConfigName(deploymentConfigName != null ? deploymentConfigName : "CodeDeployDefault.OneAtATime");
         group.setServiceRoleArn(serviceRoleArn);
+        group.setComputePlatform(application.getComputePlatform());
         applyGroupFields(group, fields);
         groupStore.put(groupName, group);
         persistRegion(deploymentGroups, region);
@@ -1951,14 +1953,23 @@ public class CodeDeployService {
         Object ec2TagFilters = fields.get("ec2TagFilters");
         if (ec2TagFilters instanceof List<?> list) {
             group.setEc2TagFilters((List<Map<String, String>>) list);
+        } else if (fields.containsKey("ec2TagFilters") && ec2TagFilters == null) {
+            group.setEc2TagFilters(null);
         }
         Object onPremTagFilters = fields.get("onPremisesInstanceTagFilters");
         if (onPremTagFilters instanceof List<?> list) {
             group.setOnPremisesInstanceTagFilters((List<Map<String, String>>) list);
+        } else if (fields.containsKey("onPremisesInstanceTagFilters") && onPremTagFilters == null) {
+            group.setOnPremisesInstanceTagFilters(null);
         }
         Object asg = fields.get("autoScalingGroups");
         if (asg instanceof List<?> list) {
-            group.setAutoScalingGroups((List<Map<String, Object>>) list);
+            group.setAutoScalingGroups(list.stream()
+                    .map(value -> value instanceof String name
+                            ? Map.<String, Object>of("name", name) : (Map<String, Object>) value)
+                    .toList());
+        } else if (fields.containsKey("autoScalingGroups") && asg == null) {
+            group.setAutoScalingGroups(null);
         }
         setMapField(group, fields, "deploymentStyle", DeploymentGroup::setDeploymentStyle);
         setMapField(group, fields, "blueGreenDeploymentConfiguration", DeploymentGroup::setBlueGreenDeploymentConfiguration);
@@ -1970,10 +1981,14 @@ public class CodeDeployService {
         Object triggerConfigs = fields.get("triggerConfigurations");
         if (triggerConfigs instanceof List<?> list) {
             group.setTriggerConfigurations((List<Map<String, Object>>) list);
+        } else if (fields.containsKey("triggerConfigurations") && triggerConfigs == null) {
+            group.setTriggerConfigurations(null);
         }
         Object ecsServices = fields.get("ecsServices");
         if (ecsServices instanceof List<?> list) {
             group.setEcsServices((List<Map<String, Object>>) list);
+        } else if (fields.containsKey("ecsServices") && ecsServices == null) {
+            group.setEcsServices(null);
         }
         if (fields.containsKey("computePlatform")) {
             group.setComputePlatform((String) fields.get("computePlatform"));
@@ -1988,10 +2003,12 @@ public class CodeDeployService {
 
     @SuppressWarnings("unchecked")
     private void setMapField(DeploymentGroup group, Map<String, Object> fields, String key,
-                              java.util.function.BiConsumer<DeploymentGroup, Map<String, Object>> setter) {
+                              BiConsumer<DeploymentGroup, Map<String, Object>> setter) {
         Object val = fields.get(key);
         if (val instanceof Map<?, ?> m) {
             setter.accept(group, (Map<String, Object>) m);
+        } else if (fields.containsKey(key) && val == null) {
+            setter.accept(group, null);
         }
     }
 }
