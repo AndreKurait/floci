@@ -70,6 +70,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
@@ -185,18 +186,25 @@ class ElbV2ServiceTest {
 
     @ParameterizedTest
     @CsvSource({
-        "ap-northeast-3,AWS,none,false",
-        "us-east-1,AWS,none,false",
-        "us-east-1,ALLOW_SINGLE_ZONE,none,true",
-        "us-east-1,AWS,ALLOW_SINGLE_ZONE,true",
-        "ap-northeast-3,ALLOW_SINGLE_ZONE,AWS,false",
-        "us-east-1,ALLOW_SINGLE_ZONE,AWS,false"
+        "ap-northeast-3,AWS,none,false,false",
+        "us-east-1,AWS,none,false,false",
+        "us-east-1,ALLOW_SINGLE_ZONE,none,true,false",
+        "us-east-1,AWS,ALLOW_SINGLE_ZONE,true,false",
+        "ap-northeast-3,ALLOW_SINGLE_ZONE,AWS,false,false",
+        "us-east-1,ALLOW_SINGLE_ZONE,AWS,false,false",
+        "us-east-1,AWS,none,true,true",
+        "ap-northeast-3,AWS,none,true,true",
+        "us-east-1,ALLOW_SINGLE_ZONE,AWS,false,true",
+        "ap-northeast-3,ALLOW_SINGLE_ZONE,AWS,false,true"
     })
     void albZonePolicyAppliesToCreateAndSetSubnets(String region, EmulatorConfig.AlbZoneRule global,
-                                                  String regional, boolean allowed) {
+                                                  String regional, boolean allowed, boolean listed) {
         Map<String, EmulatorConfig.AlbZoneRule> overrides = "none".equals(regional) ? Map.of()
                 : Map.of(region, EmulatorConfig.AlbZoneRule.valueOf(regional));
         service.config = albZoneConfig(global, overrides);
+        when(service.config.services().elbv2().singleZoneAlbAccounts()).thenReturn(listed
+                ? Optional.of(List.of(" 000000000000 ", "", "111111111111")) : Optional.empty());
+        service.readSingleZoneAlbAccounts();
         service.regionResolver = new RegionResolver(region, "000000000000");
         lenient().when(ec2Service.describeSubnets(eq(region), anyList(), eq(Map.of())))
                 .thenAnswer(invocation -> invocation.<List<String>>getArgument(1).stream()
@@ -222,6 +230,15 @@ class ElbV2ServiceTest {
                 "application", "ipv4", List.of(), List.of(), Map.of()));
         assertThrows(AwsException.class, () -> service.setSubnetsFromRequest(region,
                 twoZones.getLoadBalancerArn(), List.of()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "1234567890123", "12345678901x", "-12345678901"})
+    void singleZoneAccountConfigurationRejectsMalformedAccounts(String account) {
+        EmulatorConfig settings = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(settings.services().elbv2().singleZoneAlbAccounts()).thenReturn(Optional.of(List.of(account)));
+        service.config = settings;
+        assertThrows(IllegalStateException.class, service::readSingleZoneAlbAccounts);
     }
 
     @Test

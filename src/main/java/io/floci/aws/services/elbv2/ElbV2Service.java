@@ -23,8 +23,10 @@ import io.floci.aws.services.ec2.VpcDependencyProvider;
 import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.elbv2.model.*;
 import io.floci.aws.services.iam.ServerCertificateReferenceProvider;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -104,6 +106,30 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
+
+    private Set<String> singleZoneAlbAccounts = Set.of();
+
+    void validateAlbZoneConfiguration(@Observes StartupEvent event) {
+        readSingleZoneAlbAccounts();
+    }
+
+    void readSingleZoneAlbAccounts() {
+        if (config == null) {
+            singleZoneAlbAccounts = Set.of();
+            return;
+        }
+        List<String> accounts = config.services().elbv2().singleZoneAlbAccounts().orElse(List.of()).stream()
+                .filter(account -> account != null && !account.isBlank())
+                .map(String::trim)
+                .toList();
+        for (String account : accounts) {
+            if (!account.matches("[0-9]{12}")) {
+                throw new IllegalStateException("floci.services.elbv2.single-zone-alb-accounts must list"
+                        + " 12-digit account ids, not '" + account + "'");
+            }
+        }
+        singleZoneAlbAccounts = Set.copyOf(accounts);
+    }
 
     /** DNS selects the resource owner independently of a management request's account. */
     List<LoadBalancer> findByDnsName(String name) {
@@ -357,10 +383,11 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
      * balancer's type; whether the subnets span two Availability Zones is checked after they are looked
      * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
      * message and order. Explicit global or regional single-zone overrides reduce the minimum to one.
+     * The account override permits one subnet but preserves this refusal when no subnet is named.
      */
     private void requireSubnets(String region, String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
-        if ("application".equals(lbType) && requiresTwoAlbZones(region) && count < 2) {
+        if ("application".equals(lbType) && requiresTwoAlbZones(region, count > 0) && count < 2) {
             throw new AwsException("ValidationError",
                     "At least two subnets in two different Availability Zones must be specified", 400);
         }
@@ -370,6 +397,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     }
 
     private boolean requiresTwoAlbZones(String region) {
+        return requiresTwoAlbZones(region, true);
+    }
+
+    private boolean requiresTwoAlbZones(String region, boolean includeAccountOverride) {
         EmulatorConfig.AlbZoneRule rule = EmulatorConfig.AlbZoneRule.AWS;
         if (config != null) {
             EmulatorConfig.ElbV2ServiceConfig settings = config.services().elbv2();
@@ -377,8 +408,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 rule = settings.albZoneRule();
             }
             Map<String, EmulatorConfig.AlbZoneRule> regions = settings.albZoneRuleByRegion();
-            if (regions != null) {
-                rule = regions.getOrDefault(region, rule);
+            if (regions != null && regions.containsKey(region)) {
+                rule = regions.get(region);
+            } else if (includeAccountOverride && singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
+                return false;
             }
         }
         return switch (rule) {

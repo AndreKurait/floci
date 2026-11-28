@@ -1,9 +1,12 @@
 package io.floci.aws.services.eks;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectImageResponse;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ElasticLoadBalancing;
 import io.floci.aws.services.eks.model.KubernetesNetworkConfig;
@@ -125,7 +128,7 @@ class EksAutoModeNlbDockerNightlyIntegrationTest {
         assertEquals(nodePort, groups.getFirst().getPort());
         assertEquals("instance", groups.getFirst().getTargetType());
         assertEquals(lb.getDnsName(), node.kubectlOutput("get", "service", "web", "-n", "default",
-                "-o", "jsonpath={.status.loadBalancer.ingress[0].hostname}"));
+                "-o", "jsonpath={.status.loadBalancer.ingress[0].hostname}"), () -> serviceDiagnostics(node, "web"));
 
         node.kubectl("delete", "service", "web", "-n", "default");
         RequestScopes.runAs(ACCOUNT, REGION, () -> loadBalancers.reconcile(cluster, REGION));
@@ -135,6 +138,31 @@ class EksAutoModeNlbDockerNightlyIntegrationTest {
         AwsException gone = assertThrows(AwsException.class, () -> RequestScopes.callAs(ACCOUNT, REGION,
                 () -> elb.describeTargetGroups(REGION, null, List.of(groups.getFirst().getTargetGroupArn()), null)));
         assertEquals("TargetGroupNotFound", gone.getErrorCode());
+    }
+
+    private String serviceDiagnostics(EksTestNode node, String service) {
+        StringBuilder details = new StringBuilder("EKS NLB hostname diagnostics");
+        Instance registered = eksClusterManager.getRegisteredClusterNodeInstance(cluster);
+        details.append("\nregisteredInstance=").append(registered == null ? "absent" : registered.getInstanceId());
+        try {
+            InspectContainerResponse container = dockerClient.inspectContainerCmd(node.containerId()).exec();
+            details.append("\ncontainerId=").append(container.getId());
+            details.append("\nimageId=").append(container.getImageId());
+            InspectImageResponse image = dockerClient.inspectImageCmd(container.getImageId()).exec();
+            details.append("\nimageDigests=").append(image.getRepoDigests());
+        } catch (RuntimeException e) {
+            details.append("\nimageInspectionFailed=").append(e.getClass().getSimpleName());
+        }
+        try {
+            details.append("\nserviceWithStatusWriters=").append(node.kubectl("get", "service", service,
+                    "-n", "default", "-o", "json", "--show-managed-fields=true").summary());
+            details.append("\nnodes=").append(node.kubectl("get", "nodes", "-o",
+                    "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.spec.providerID}{\" \"}"
+                            + "{.status.conditions}{\"\\n\"}{end}").summary());
+        } catch (RuntimeException e) {
+            details.append("\nnodeInspectionFailed=").append(e.getClass().getSimpleName());
+        }
+        return details.toString();
     }
 
     @Test

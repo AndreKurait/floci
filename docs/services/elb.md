@@ -418,3 +418,19 @@ These explicit overrides intentionally change local compatibility; they do not
 change the AWS API shape or require a separate Floci process for each region.
 
 CloudFormation rollback can restore a saved legacy ALB subnet list with repeated Availability Zones. This internal snapshot path still checks subnet existence, the zone minimum, and VPC membership; new API and stack-update requests continue to reject repeated zones.
+
+### Account-specific single-zone ALBs
+
+`floci.services.elbv2.single-zone-alb-accounts`
+(`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS`) retains the account allowlist for
+local single-zone deployments. It accepts comma-separated 12-digit account IDs;
+spaces and empty entries are ignored, and malformed IDs fail startup.
+
+An explicit regional rule takes precedence, including `aws` to restore that
+region's AWS default. Otherwise a listed account permits one zone, followed by
+the global rule and AWS defaults. Unlisted accounts keep the global or regional
+behavior. Both `CreateLoadBalancer` and `SetSubnets`, including CloudFormation,
+apply the rule. An account grant permits one subnet but keeps the original
+Application Load Balancer error when no subnet is named. Explicit global and
+regional single-zone rules retain their one-subnet error. Network and Gateway
+Load Balancers are unchanged.
