@@ -8,6 +8,7 @@ import io.floci.aws.services.iam.model.IamUser;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -144,6 +145,66 @@ class IamBootstrapPrincipalsTest {
         IamUser user = users.getForAccount(ACCOUNT, "bootstrap-admin").orElseThrow();
         assertEquals("arn:aws-us-gov:iam::222222222222:user/bootstrap-admin", user.getArn());
         assertTrue(user.getAttachedPolicyArns().contains("arn:aws-us-gov:iam::aws:policy/AdministratorAccess"));
+    }
+
+    @Test
+    void readRejectsReplacementSymlink() throws Exception {
+        Path input = file("[]");
+        Path replacement = directory.resolve("replacement.json");
+        Files.writeString(replacement, "[]");
+        Files.delete(input);
+        Files.createSymbolicLink(input, replacement);
+        assertThrows(IOException.class, () -> IamBootstrapPrincipals.readBytes(input));
+    }
+
+    @Test
+    void readEnforcesLimitIncludingGrowthAfterMetadataCheck() throws Exception {
+        Path input = file(" ".repeat(65536));
+        assertEquals(65536, IamBootstrapPrincipals.readBytes(input).length);
+        Files.writeString(input, " ".repeat(65537));
+        assertThrows(IllegalStateException.class, () -> IamBootstrapPrincipals.readBytes(input));
+    }
+
+    @Test
+    void canonicalPartitionSurvivesCorrectedSpellingOnRestart() throws Exception {
+        Path input = file(("[" + entry(ACCOUNT, KEY) + "]").replace("\"aws\"", "\" AWS-US-GOV \""));
+        IamBootstrapPrincipals first = bootstrap(input);
+        first.validateStoredIdentities();
+        first.seed();
+        IamUser user = users.getForAccount(ACCOUNT, "bootstrap-admin").orElseThrow();
+        assertEquals("arn:aws-us-gov:iam::222222222222:user/bootstrap-admin", user.getArn());
+        assertTrue(user.getAttachedPolicyArns().contains("arn:aws-us-gov:iam::aws:policy/AdministratorAccess"));
+        Files.writeString(input, Files.readString(input).replace(" AWS-US-GOV ", "aws-us-gov"));
+        IamBootstrapPrincipals restart = bootstrap(input);
+        restart.validateStoredIdentities();
+        restart.seed();
+        assertSame(user, users.getForAccount(ACCOUNT, "bootstrap-admin").orElseThrow());
+    }
+
+    @Test
+    void persistentPublicDeployerBlocksBootstrapUntilDeactivated() throws Exception {
+        Path input = file("[" + entry(ACCOUNT, KEY) + "]");
+        Path keyFile = directory.resolve("public-keys.json");
+        PersistentStorage<String, AccessKey> store = new PersistentStorage<>(keyFile, new TypeReference<>() {});
+        AccountAwareStorageBackend<AccessKey> original = new AccountAwareStorageBackend<>(store, null, ACCOUNT);
+        original.putAllDurablyForAccount("333333333333",
+                Map.of("floci", new AccessKey("floci", "floci", "floci-deployer")));
+        byte[] before = Files.readAllBytes(keyFile);
+        PersistentStorage<String, AccessKey> reloaded = new PersistentStorage<>(keyFile, new TypeReference<>() {});
+        reloaded.load();
+        AccountAwareStorageBackend<AccessKey> persisted = new AccountAwareStorageBackend<>(reloaded, null, ACCOUNT);
+        IamBootstrapPrincipals restart = new IamBootstrapPrincipals(input.toString(), users, persisted, markers);
+        assertThrows(IllegalStateException.class, restart::validateStoredIdentities);
+        assertArrayEquals(before, Files.readAllBytes(keyFile));
+        assertTrue(users.getForAccount(ACCOUNT, "bootstrap-admin").isEmpty());
+        assertTrue(markers.getForAccount(ACCOUNT, "bootstrap-admin").isEmpty());
+        AccessKey publicKey = persisted.getForAccount("333333333333", "floci").orElseThrow();
+        publicKey.setStatus("Inactive");
+        persisted.putAllDurablyForAccount("333333333333", Map.of("floci", publicKey));
+        restart.validateStoredIdentities();
+        restart.seed();
+        assertEquals("Inactive", persisted.getForAccount("333333333333", "floci").orElseThrow().getStatus());
+        assertTrue(users.getForAccount(ACCOUNT, "bootstrap-admin").isPresent());
     }
 
     @Test

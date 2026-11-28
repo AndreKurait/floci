@@ -631,8 +631,6 @@ class EventsCfnProvisionerTest {
         verify(events, never()).putPermission(any(), any(), any(), any(), any(), any(), any());
     }
 
-    // ── the policy statement id is held to the modeled pattern ────────────────
-
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void eventBusPolicyPreservesResolvedJson(boolean text) throws Exception {
@@ -654,7 +652,7 @@ class EventsCfnProvisionerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"", "{", "null", "[]", "true", "\"policy\""})
+    @ValueSource(strings = {"", "{", "null", "[]", "true", "\"policy\"", "{} {}"})
     void eventBusRejectsInvalidResolvedPolicyBeforeCreatingTheBus(String policy) {
         ObjectNode props = mapper.createObjectNode().put("Name", "orders-bus").put("Policy", policy);
 
@@ -682,6 +680,11 @@ class EventsCfnProvisionerTest {
         assertEquals("orders-bus", bus.getPhysicalId());
         verify(events, never()).putPermission(any(), any(), any(), any(), any(), any(), any());
     }
+
+    // ── the policy statement id is held to the modeled pattern ────────────────
+
+
+
 
     @Test
     void aStatementIdCarryingTheIdSeparatorIsRejected() {

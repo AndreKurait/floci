@@ -1,5 +1,6 @@
 package io.floci.aws.services.iam;
 
+import io.floci.aws.core.common.AbstractTagsController;
 import io.floci.aws.core.common.AwsProtocolClaimFilter;
 import io.floci.aws.core.common.AwsQueryServiceResolver;
 import io.floci.aws.core.common.IamOperation;
@@ -53,9 +54,8 @@ import java.util.regex.Pattern;
  * parameter, or the controller's Operation fallback, is mapped directly to
  * {@code <service>:<Action>}.
  *
- * For REST-JSON services the first matching rule wins (specific before wildcard), and a request no
- * rule matches is the operation whose route in botocore's model it matches ({@link IamRestRoutes}),
- * when Floci can check that operation as AWS does.
+ * For REST-JSON services a request is the operation whose route in botocore's model it matches
+ * ({@link IamRestRoutes}), when Floci can check that operation as AWS does.
  */
 @ApplicationScoped
 public class IamActionRegistry {
@@ -119,191 +119,11 @@ public class IamActionRegistry {
     /** The routes the registry checks as an action of its own, each a rule of the scope it serves. */
     private static final List<ActionRule> RULES = List.of(
         rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
-
         rule("batch", "POST", "^/v1/createschedulingpolicy$", "batch:CreateSchedulingPolicy"),
         rule("batch", "POST", "^/v1/deleteschedulingpolicy$", "batch:DeleteSchedulingPolicy"),
         rule("batch", "POST", "^/v1/describeschedulingpolicies$", "batch:DescribeSchedulingPolicies"),
         rule("batch", "POST", "^/v1/listschedulingpolicies$", "batch:ListSchedulingPolicies"),
-        rule("batch", "POST", "^/v1/updateschedulingpolicy$", "batch:UpdateSchedulingPolicy"),
-        // ── Lambda ──────────────────────────────────────────────────────────────
-        // Code signing configs first: a config's function list ends in /functions, as ListFunctions does.
-        rule("lambda", "GET",    "^/2020-04-22/code-signing-configs/[^/]+/functions$",
-                "lambda:ListFunctionsByCodeSigningConfig"),
-        rule("lambda", "GET",    "^/2020-04-22/code-signing-configs/[^/]+$",  "lambda:GetCodeSigningConfig"),
-        rule("lambda", "PUT",    "^/2020-04-22/code-signing-configs/[^/]+$",  "lambda:UpdateCodeSigningConfig"),
-        rule("lambda", "DELETE", "^/2020-04-22/code-signing-configs/[^/]+$",  "lambda:DeleteCodeSigningConfig"),
-        rule("lambda", "GET",    "^/2020-04-22/code-signing-configs$",        "lambda:ListCodeSigningConfigs"),
-        rule("lambda", "POST",   "^/2020-04-22/code-signing-configs$",        "lambda:CreateCodeSigningConfig"),
-        rule("lambda", "GET",    ".*/functions$",                          "lambda:ListFunctions"),
-        rule("lambda", "POST",   ".*/functions$",                          "lambda:CreateFunction"),
-        rule("lambda", "GET",    ".*/functions/[^/]+$",                    "lambda:GetFunction"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/code$",               "lambda:UpdateFunctionCode"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/configuration$",      "lambda:UpdateFunctionConfiguration"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+$",                    "lambda:DeleteFunction"),
-        rule("lambda", "POST",   ".*/functions/[^/]+/invocations$",        "lambda:InvokeFunction"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/aliases$",            "lambda:ListAliases"),
-        rule("lambda", "POST",   ".*/functions/[^/]+/aliases$",            "lambda:CreateAlias"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/aliases/[^/]+$",      "lambda:GetAlias"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/aliases/[^/]+$",      "lambda:UpdateAlias"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+/aliases/[^/]+$",      "lambda:DeleteAlias"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/policy$",             "lambda:GetPolicy"),
-        rule("lambda", "POST",   ".*/functions/[^/]+/policy$",             "lambda:AddPermission"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+/policy/.+",           "lambda:RemovePermission"),
-        rule("lambda", "GET",    ".*/event-source-mappings$",              "lambda:ListEventSourceMappings"),
-        rule("lambda", "POST",   ".*/event-source-mappings$",              "lambda:CreateEventSourceMapping"),
-        rule("lambda", "DELETE", ".*/event-source-mappings/[^/]+$",        "lambda:DeleteEventSourceMapping"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/url$",                "lambda:GetFunctionUrlConfig"),
-        rule("lambda", "POST",   ".*/functions/[^/]+/url$",                "lambda:CreateFunctionUrlConfig"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/url$",                "lambda:UpdateFunctionUrlConfig"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+/url$",                "lambda:DeleteFunctionUrlConfig"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/durable-executions$", "lambda:ListDurableExecutionsByFunction"),
-        rule("lambda", "POST",   ".*/durable-executions/.+/checkpoint$",   "lambda:CheckpointDurableExecution"),
-        rule("lambda", "GET",    ".*/durable-executions/.+/state$",        "lambda:GetDurableExecutionState"),
-        rule("lambda", "GET",    ".*/durable-executions/.+/history$",      "lambda:GetDurableExecutionHistory"),
-        rule("lambda", "POST",   ".*/durable-executions/.+/stop$",         "lambda:StopDurableExecution"),
-        rule("lambda", "GET",    ".*/durable-executions/.+$",              "lambda:GetDurableExecution"),
-        rule("lambda", "POST",   ".*/durable-execution-callbacks/.+/succeed$",
-                "lambda:SendDurableExecutionCallbackSuccess"),
-        rule("lambda", "POST",   ".*/durable-execution-callbacks/.+/fail$", "lambda:SendDurableExecutionCallbackFailure"),
-        rule("lambda", "POST",   ".*/durable-execution-callbacks/.+/heartbeat$",
-                "lambda:SendDurableExecutionCallbackHeartbeat"),
-        rule("lambda", "GET",    ".*/event-source-mappings/[^/]+$",        "lambda:GetEventSourceMapping"),
-        rule("lambda", "PUT",    ".*/event-source-mappings/[^/]+$",        "lambda:UpdateEventSourceMapping"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/configuration$",      "lambda:GetFunctionConfiguration"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/versions$",           "lambda:ListVersionsByFunction"),
-        rule("lambda", "POST",   ".*/functions/[^/]+/versions$",           "lambda:PublishVersion"),
-        rule("lambda", "POST",   ".*/functions/[^/]+/invoke-async$",       "lambda:InvokeAsync"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/urls$",               "lambda:ListFunctionUrlConfigs"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/concurrency$",        "lambda:GetFunctionConcurrency"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/concurrency$",        "lambda:PutFunctionConcurrency"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+/concurrency$",        "lambda:DeleteFunctionConcurrency"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/provisioned-concurrency$", "List", "ALL",
-                "lambda:ListProvisionedConcurrencyConfigs"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/provisioned-concurrency$",
-                "lambda:GetProvisionedConcurrencyConfig"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/provisioned-concurrency$",
-                "lambda:PutProvisionedConcurrencyConfig"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+/provisioned-concurrency$",
-                "lambda:DeleteProvisionedConcurrencyConfig"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/event-invoke-config/list$",
-                "lambda:ListFunctionEventInvokeConfigs"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/event-invoke-config$", "lambda:GetFunctionEventInvokeConfig"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/event-invoke-config$", "lambda:PutFunctionEventInvokeConfig"),
-        rule("lambda", "POST",   ".*/functions/[^/]+/event-invoke-config$", "lambda:UpdateFunctionEventInvokeConfig"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+/event-invoke-config$", "lambda:DeleteFunctionEventInvokeConfig"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/code-signing-config$", "lambda:GetFunctionCodeSigningConfig"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/code-signing-config$", "lambda:PutFunctionCodeSigningConfig"),
-        rule("lambda", "DELETE", ".*/functions/[^/]+/code-signing-config$", "lambda:DeleteFunctionCodeSigningConfig"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/recursion-config$",   "lambda:GetFunctionRecursionConfig"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/recursion-config$",   "lambda:PutFunctionRecursionConfig"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/function-scaling-config$", "lambda:GetFunctionScalingConfig"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/function-scaling-config$", "lambda:PutFunctionScalingConfig"),
-        rule("lambda", "GET",    ".*/functions/[^/]+/runtime-management-config$", "lambda:GetRuntimeManagementConfig"),
-        rule("lambda", "PUT",    ".*/functions/[^/]+/runtime-management-config$", "lambda:PutRuntimeManagementConfig"),
-        rule("lambda", "GET",    "^/2016-08-19/account-settings/?$",       "lambda:GetAccountSettings"),
-        rule("lambda", "GET",    "^/2018-10-31/layers/[^/]+/versions/[^/]+/policy$", "lambda:GetLayerVersionPolicy"),
-        rule("lambda", "POST",   "^/2018-10-31/layers/[^/]+/versions/[^/]+/policy$",
-                "lambda:AddLayerVersionPermission"),
-        rule("lambda", "DELETE", "^/2018-10-31/layers/[^/]+/versions/[^/]+/policy/[^/]+$",
-                "lambda:RemoveLayerVersionPermission"),
-        rule("lambda", "GET",    "^/2018-10-31/layers/[^/]+/versions/[^/]+$", "lambda:GetLayerVersion"),
-        rule("lambda", "DELETE", "^/2018-10-31/layers/[^/]+/versions/[^/]+$", "lambda:DeleteLayerVersion"),
-        rule("lambda", "GET",    "^/2018-10-31/layers/[^/]+/versions$",    "lambda:ListLayerVersions"),
-        rule("lambda", "POST",   "^/2018-10-31/layers/[^/]+/versions$",    "lambda:PublishLayerVersion"),
-        rule("lambda", "GET",    "^/2025-11-30/capacity-providers/[^/]+/function-versions$",
-                "lambda:ListFunctionVersionsByCapacityProvider"),
-        rule("lambda", "GET",    "^/2025-11-30/capacity-providers/[^/]+$", "lambda:GetCapacityProvider"),
-        rule("lambda", "PUT",    "^/2025-11-30/capacity-providers/[^/]+$", "lambda:UpdateCapacityProvider"),
-        rule("lambda", "DELETE", "^/2025-11-30/capacity-providers/[^/]+$", "lambda:DeleteCapacityProvider"),
-        rule("lambda", "GET",    "^/2025-11-30/capacity-providers$",       "lambda:ListCapacityProviders"),
-        rule("lambda", "POST",   "^/2025-11-30/capacity-providers$",       "lambda:CreateCapacityProvider"),
-        // The resource policy routes of the function API (2026-07-09) and of Web Functions (2025-03-07).
-        rule("lambda", "PUT",    "^/2026-07-09/resource-policy/.+",        "lambda:PutResourcePolicy"),
-        rule("lambda", "GET",    "^/2026-07-09/resource-policy/.+",        "lambda:GetResourcePolicy"),
-        rule("lambda", "DELETE", "^/2026-07-09/resource-policy/.+",        "lambda:DeleteResourcePolicy"),
-
-        // ── Lambda Web Functions (/2025-03-07, signs as lambda) ─────────────────
-        rule("lambda", "PUT",    "^/2025-03-07/web-functions$",                       "lambda:CreateWebFunction"),
-        rule("lambda", "POST",   "^/2025-03-07/web-functions$",                       "lambda:ListWebFunctions"),
-        rule("lambda", "GET",    "^/2025-03-07/web-functions/[^/]+$",                 "lambda:GetWebFunction"),
-        rule("lambda", "DELETE", "^/2025-03-07/web-functions/[^/]+$",                 "lambda:DeleteWebFunction"),
-        rule("lambda", "POST",   "^/2025-03-07/web-functions/[^/]+/revisions$",       "lambda:CreateWebFunctionRevision"),
-        rule("lambda", "POST",   "^/2025-03-07/web-functions/[^/]+/list-revisions$",  "lambda:ListWebFunctionRevisions"),
-        rule("lambda", "GET",    "^/2025-03-07/web-functions/[^/]+/revisions/[^/]+$", "lambda:GetWebFunctionRevision"),
-        rule("lambda", "DELETE", "^/2025-03-07/web-functions/[^/]+/revisions/[^/]+$", "lambda:DeleteWebFunctionRevision"),
-        rule("lambda", "PUT",    "^/2025-03-07/web-functions/[^/]+/endpoints$",       "lambda:CreateWebFunctionEndpoint"),
-        rule("lambda", "POST",   "^/2025-03-07/web-functions/[^/]+/list-endpoints$",  "lambda:ListWebFunctionEndpoints"),
-        rule("lambda", "GET",    "^/2025-03-07/web-functions/[^/]+/endpoints/[^/]+$", "lambda:GetWebFunctionEndpoint"),
-        rule("lambda", "PATCH",  "^/2025-03-07/web-functions/[^/]+/endpoints/[^/]+$", "lambda:UpdateWebFunctionEndpoint"),
-        rule("lambda", "DELETE", "^/2025-03-07/web-functions/[^/]+/endpoints/[^/]+$", "lambda:DeleteWebFunctionEndpoint"),
-        rule("lambda", "GET",    "^/2025-03-07/web-account-settings$",                "lambda:GetWebAccountSettings"),
-        rule("lambda", "GET",    "^/2025-03-07/tags/.+",                              "lambda:ListTags"),
-        rule("lambda", "POST",   "^/2025-03-07/tags/.+",                              "lambda:TagResource"),
-        rule("lambda", "DELETE", "^/2025-03-07/tags/.+",                              "lambda:UntagResource"),
-        rule("lambda", "PUT",    "^/2025-03-07/resource-policy/.+",                   "lambda:PutResourcePolicy"),
-        rule("lambda", "GET",    "^/2025-03-07/resource-policy/.+",                   "lambda:GetResourcePolicy"),
-        rule("lambda", "DELETE", "^/2025-03-07/resource-policy/.+",                   "lambda:DeleteResourcePolicy"),
-        // InvokeWithResponseStream and GetLayerVersionByArn are authorized as the action they share with
-        // Invoke and GetLayerVersion (iam-authorized-actions.json).
-        rule("lambda", "POST",   ".*/functions/[^/]+/response-streaming-invocations$", "lambda:InvokeFunction"),
-        rule("lambda", "GET",    "^/2018-10-31/layers$", "find", "LayerVersion",     "lambda:GetLayerVersion"),
-        rule("lambda", "GET",    "^/2018-10-31/layers$",                              "lambda:ListLayers"),
-        // Lambda MicroVMs (2025-09-09) and their tags, and network connectors (2026-04-04).
-        rule("lambda", "POST",   "^/2025-09-09/microvms/[^/]+/auth-token$",            "lambda:CreateMicrovmAuthToken"),
-        rule("lambda", "POST",   "^/2025-09-09/microvms/[^/]+/shell-auth-token$",      "lambda:CreateMicrovmShellAuthToken"),
-        rule("lambda", "POST",   "^/2025-09-09/microvms/[^/]+/resume$",                "lambda:ResumeMicrovm"),
-        rule("lambda", "POST",   "^/2025-09-09/microvms/[^/]+/suspend$",               "lambda:SuspendMicrovm"),
-        rule("lambda", "GET",    "^/2025-09-09/microvms/[^/]+$",                       "lambda:GetMicrovm"),
-        rule("lambda", "DELETE", "^/2025-09-09/microvms/[^/]+$",                       "lambda:TerminateMicrovm"),
-        rule("lambda", "GET",    "^/2025-09-09/microvms$",                             "lambda:ListMicrovms"),
-        rule("lambda", "POST",   "^/2025-09-09/microvms$",                             "lambda:RunMicrovm"),
-        rule("lambda", "GET",    "^/2025-09-09/microvm-images/[^/]+/versions/[^/]+/builds/[^/]+$",
-                "lambda:GetMicrovmImageBuild"),
-        rule("lambda", "GET",    "^/2025-09-09/microvm-images/[^/]+/versions/[^/]+/builds$",
-                "lambda:ListMicrovmImageBuilds"),
-        rule("lambda", "GET",    "^/2025-09-09/microvm-images/[^/]+/versions/[^/]+$",  "lambda:GetMicrovmImageVersion"),
-        rule("lambda", "PATCH",  "^/2025-09-09/microvm-images/[^/]+/versions/[^/]+$",  "lambda:UpdateMicrovmImageVersion"),
-        rule("lambda", "DELETE", "^/2025-09-09/microvm-images/[^/]+/versions/[^/]+$",  "lambda:DeleteMicrovmImageVersion"),
-        rule("lambda", "GET",    "^/2025-09-09/microvm-images/[^/]+/versions$",        "lambda:ListMicrovmImageVersions"),
-        rule("lambda", "GET",    "^/2025-09-09/microvm-images/[^/]+$",                 "lambda:GetMicrovmImage"),
-        rule("lambda", "PUT",    "^/2025-09-09/microvm-images/[^/]+$",                 "lambda:UpdateMicrovmImage"),
-        rule("lambda", "DELETE", "^/2025-09-09/microvm-images/[^/]+$",                 "lambda:DeleteMicrovmImage"),
-        rule("lambda", "GET",    "^/2025-09-09/microvm-images$",                       "lambda:ListMicrovmImages"),
-        rule("lambda", "POST",   "^/2025-09-09/microvm-images$",                       "lambda:CreateMicrovmImage"),
-        rule("lambda", "GET",    "^/2025-09-09/managed-microvm-images/[^/]+/versions$",
-                "lambda:ListManagedMicrovmImageVersions"),
-        rule("lambda", "GET",    "^/2025-09-09/managed-microvm-images$",               "lambda:ListManagedMicrovmImages"),
-        rule("lambda", "GET",    "^/2017-03-31/tags/.+",                               "lambda:ListTags"),
-        rule("lambda", "POST",   "^/2017-03-31/tags/.+",                               "lambda:TagResource"),
-        rule("lambda", "DELETE", "^/2017-03-31/tags/.+",                               "lambda:UntagResource"),
-        rule("lambda", "GET",    "^/2026-04-04/network-connectors/[^/]+/versions$",    "lambda:ListNetworkConnectorVersions"),
-        rule("lambda", "GET",    "^/2026-04-04/network-connectors/[^/]+$",             "lambda:GetNetworkConnector"),
-        rule("lambda", "PUT",    "^/2026-04-04/network-connectors/[^/]+$",             "lambda:UpdateNetworkConnector"),
-        rule("lambda", "DELETE", "^/2026-04-04/network-connectors/[^/]+$",             "lambda:DeleteNetworkConnector"),
-        rule("lambda", "GET",    "^/2026-04-04/network-connectors$",                   "lambda:ListNetworkConnectors"),
-        rule("lambda", "POST",   "^/2026-04-04/network-connectors$",                   "lambda:CreateNetworkConnector"),
-
-        // ── DynamoDB (JSON 1.1, action from X-Amz-Target handled separately) ──
-        // Handled via Query-style action extraction in the filter
-
-        // ── RDS Data API ───────────────────────────────────────────────────────
-        rule("rds-data", "POST", "^/Execute/?$",              "rds-data:ExecuteStatement"),
-        rule("rds-data", "POST", "^/ExecuteSql/?$",           "rds-data:ExecuteSql"),
-        rule("rds-data", "POST", "^/BatchExecute/?$",         "rds-data:BatchExecuteStatement"),
-        rule("rds-data", "POST", "^/BeginTransaction/?$",     "rds-data:BeginTransaction"),
-        rule("rds-data", "POST", "^/CommitTransaction/?$",    "rds-data:CommitTransaction"),
-        rule("rds-data", "POST", "^/RollbackTransaction/?$",  "rds-data:RollbackTransaction"),
-
-        // ── Resource Groups ─────────────────────────────────────────────────────
-        rule("resource-groups", "POST", "^/_rg/groups/?$", "resource-groups:CreateGroup"),
-        rule("resource-groups", "POST", "^/_rg/get-group/?$", "resource-groups:GetGroup"),
-        rule("resource-groups", "POST", "^/_rg/delete-group/?$", "resource-groups:DeleteGroup"),
-        rule("resource-groups", "POST", "^/_rg/group-resources/?$", "resource-groups:GroupResources"),
-        rule("resource-groups", "POST", "^/_rg/list-group-resources/?$", "resource-groups:ListGroupResources"),
-        rule("resource-groups", "POST", "^/_rg/groups-list/?$", "resource-groups:ListGroups"),
-
-        // ── Kinesis ────────────────────────────────────────────────────────────
-        rule("kinesis", "POST", ".*", "kinesis:*")
+        rule("batch", "POST", "^/v1/updateschedulingpolicy$", "batch:UpdateSchedulingPolicy")
     );
 
     private static ActionRule rule(String service, String method, String path, String action) {
@@ -341,13 +161,13 @@ public class IamActionRegistry {
      * For JSON 1.1 protocol the action comes from {@code X-Amz-Target}
      * (e.g. {@code DynamoDB_20120810.PutItem} → {@code dynamodb:PutItem}).
      *
-     * For REST-JSON services the action is derived from the path rule table, or else from the
-     * operation whose botocore route the request matches.
+     * For REST-JSON services the action is that of the operation whose botocore route the request
+     * matches.
      *
      * Returns {@code null} when the action is unknown (caller treats this as ALLOW).
      */
     public String resolve(String credentialScope, ContainerRequestContext ctx) {
-        // REST requests with Action or Operation fields still use their method and path rules.
+        // REST requests with Action or Operation fields are still checked by their method and path.
         if (isQueryRequest(ctx)) {
             String queryAction = queryAction(ctx);
             if (queryAction != null && !queryAction.isBlank()) {
@@ -512,15 +332,24 @@ public class IamActionRegistry {
     }
 
     /**
+     * The scope a request Floci serves under {@code credentialScope} is checked under: the signing name AWS signs its
+     * model's requests with, where the scope is a vendored model's own name the routes file does not route
+     * ({@link IamRestRoutes#signedScope}), and the scope itself otherwise.
+     */
+    public String routedScope(String credentialScope) {
+        return restRoutes.signedScope(credentialScope);
+    }
+
+    /**
      * The action of a REST request, from its method and path alone. A REST request is the operation
      * whose route it reached, so neither an {@code X-Amz-Target} header nor a Query {@code Action}
      * field may name another one: a caller could attach either to have the call checked as an
      * action they hold. The path is matched as sent, still percent-encoded, which is the form the
      * router matched: decoded, an encoded {@code /} inside a parameter splits it into two segments,
-     * so the route's rule would not match and the call would pass as an unknown action. It is read
+     * so its route would not match and the call would pass as an unknown action. It is read
      * from the request URI because RESTEasy Reactive does not serve {@code UriInfo.getPath(false)}.
      *
-     * <p>A request no rule matches is the operation whose route, in botocore's model of its service, it
+     * <p>The request is the operation whose route, in botocore's model of its service, it
      * matches, and is checked as that operation's action for the request's method
      * ({@link IamAuthorizedActions#actionFor(String, String, String)}): the one a request naming the operation
      * is checked as, or, for an operation AWS authorizes by method as it does API Gateway's management API,
@@ -530,15 +359,6 @@ public class IamActionRegistry {
      * path without the prefix ({@link #withoutInternalPrefix}), the path the model gives it. Returns {@code null}
      * when nothing maps the request (caller treats this as ALLOW).
      */
-    /**
-     * The scope a request Floci serves under {@code credentialScope} is checked under: the signing name AWS signs its
-     * model's requests with, where the scope is a vendored model's own name the routes file does not route
-     * ({@link IamRestRoutes#signedScope}), and the scope itself otherwise.
-     */
-    public String routedScope(String credentialScope) {
-        return restRoutes.signedScope(credentialScope);
-    }
-
     public String resolveRoute(String credentialScope, ContainerRequestContext ctx) {
         if ("cloudfront".equals(credentialScope) && CloudFrontFunctionTestRoute.matches(ctx)) {
             return "cloudfront:TestFunction";
@@ -747,7 +567,7 @@ public class IamActionRegistry {
 
     /**
      * {@link #rawPath} without a trailing slash: the router matches {@code /clusters/} as {@code /clusters},
-     * so a rule ending at the route's last segment has to match it too, or the request would pass as an
+     * so a route ending at its last segment has to match it too, or the request would pass as an
      * unknown action.
      */
     public static String routedPath(ContainerRequestContext ctx) {
@@ -773,9 +593,16 @@ public class IamActionRegistry {
 
     /**
      * The values the router gave the path parameters of the method it dispatched the request to, which tell apart the
-     * vendored routes the request matches ({@link IamRestRoutes#match}); none for a request it has not dispatched.
+     * vendored routes the request matches ({@link IamRestRoutes#match}); none for a request it has not dispatched. Nor
+     * for one a shared tagging controller serves: it serves a service only on the routes the service's model gives
+     * ({@code TagDispatcher#resolveHandler}), so the values its own path takes name no route of the service's.
      */
     private static List<String> routedLabels(ContainerRequestContext ctx) {
+        ResteasyReactiveRequestContext request = ResteasyRequests.of(ctx);
+        if (request != null && request.getTarget() != null
+                && AbstractTagsController.class.isAssignableFrom(request.getTarget().getResourceClass())) {
+            return List.of();
+        }
         UriInfo uriInfo = ctx.getUriInfo();
         MultivaluedMap<String, String> parameters = uriInfo == null ? null : uriInfo.getPathParameters();
         List<String> values = new ArrayList<>();
