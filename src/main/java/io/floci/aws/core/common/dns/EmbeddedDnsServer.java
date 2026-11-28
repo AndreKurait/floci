@@ -754,6 +754,10 @@ public class EmbeddedDnsServer {
     }
 
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type, boolean standardQuery) {
+        ClientOrigin clientOrigin = originForClient(clientAddress);
+        if (clientOrigin.conflicting()) {
+            return QueryPlan.answering(DnsAnswer.refused());
+        }
         Optional<DnsAnswer> control = Optional.empty();
         for (DnsClientVpcSource source : clientVpcSources) {
             Optional<DnsAnswer> answer = source.controlDependency(name, type, clientAddress);
@@ -767,7 +771,7 @@ public class EmbeddedDnsServer {
         if (control.isPresent()) {
             return QueryPlan.answering(control.orElseThrow());
         }
-        DnsClientVpcSource.ClientVpc origin = vpcForClient(clientAddress).orElse(null);
+        DnsClientVpcSource.ClientVpc origin = clientOrigin.vpc();
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp, origin);
         boolean awsEndpointName = isAwsEndpointName(name);
         boolean routedApi = publicAwsApi && origin != null && awsEndpointName;
@@ -880,7 +884,7 @@ public class EmbeddedDnsServer {
      * than allowed to fail the query, which is how {@link #resolveFromRecordSources} treats one too.
      */
     Optional<DnsForwardingRule> matchingRule(String name, String clientAddress) {
-        return matchingRule(name, vpcForClient(clientAddress).orElse(null));
+        return matchingRule(name, originForClient(clientAddress).vpc());
     }
 
     private Optional<DnsForwardingRule> matchingRule(String name, DnsClientVpcSource.ClientVpc origin) {
@@ -907,23 +911,31 @@ public class EmbeddedDnsServer {
         return Optional.ofNullable(best);
     }
 
-    private Optional<DnsClientVpcSource.ClientVpc> vpcForClient(String clientAddress) {
+    private record ClientOrigin(DnsClientVpcSource.ClientVpc vpc, boolean conflicting) {
+    }
+
+    private ClientOrigin originForClient(String clientAddress) {
         if (clientVpcSources == null || clientAddress == null || clientAddress.isBlank()) {
-            return Optional.empty();
+            return new ClientOrigin(null, false);
         }
+        DnsClientVpcSource.ClientVpc result = null;
         for (DnsClientVpcSource source : clientVpcSources) {
             try {
                 Optional<DnsClientVpcSource.ClientVpc> clientVpc =
                         source.vpcForClient(clientAddress.trim());
                 if (clientVpc != null && clientVpc.isPresent() && isUsableOrigin(clientVpc.orElseThrow())) {
-                    return clientVpc;
+                    DnsClientVpcSource.ClientVpc found = clientVpc.orElseThrow();
+                    if (result != null && !result.equals(found)) {
+                        return new ClientOrigin(null, true);
+                    }
+                    result = found;
                 }
             } catch (Exception e) {
                 LOG.debugv("DNS client VPC source {0} failed for {1}: {2}",
                         source.getClass().getSimpleName(), clientAddress, e.getMessage());
             }
         }
-        return Optional.empty();
+        return new ClientOrigin(result, false);
     }
 
     private static boolean isUsableOrigin(DnsClientVpcSource.ClientVpc clientVpc) {
