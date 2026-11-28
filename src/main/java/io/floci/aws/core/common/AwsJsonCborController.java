@@ -16,6 +16,7 @@ import io.floci.aws.services.dynamodb.DynamoDbStreamsJsonHandler;
 import io.floci.aws.services.eventbridgev2.EventBridgeV2Handler;
 import io.floci.aws.services.kinesis.KinesisJsonHandler;
 import io.floci.aws.services.marketplace.MarketplaceEntitlementController;
+import io.floci.aws.services.resourcegroupstagging.ResourceGroupsTaggingJsonHandler;
 import io.floci.aws.services.sns.SnsJsonHandler;
 import io.floci.aws.services.sqs.SqsJsonHandler;
 import io.floci.aws.services.stepfunctions.StepFunctionsJsonHandler;
@@ -86,6 +87,7 @@ public class AwsJsonCborController {
     private final MarketplaceEntitlementController marketplaceEntitlementController;
     private final EventBridgeV2Handler eventBridgeV2Handler;
     private final TranslateJsonHandler translateJsonHandler;
+    private final ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler;
 
     @Inject
     public AwsJsonCborController(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -99,6 +101,7 @@ public class AwsJsonCborController {
                                  MarketplaceEntitlementController marketplaceEntitlementController,
                                  EventBridgeV2Handler eventBridgeV2Handler,
                                  TranslateJsonHandler translateJsonHandler,
+                                 ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler,
                                  AwsJsonController jsonController, AwsJson11Controller json11Controller) {
         this.objectMapper = objectMapper;
         this.catalog = catalog;
@@ -115,6 +118,7 @@ public class AwsJsonCborController {
         this.marketplaceEntitlementController = marketplaceEntitlementController;
         this.eventBridgeV2Handler = eventBridgeV2Handler;
         this.translateJsonHandler = translateJsonHandler;
+        this.resourceGroupsTaggingJsonHandler = resourceGroupsTaggingJsonHandler;
     }
 
 
@@ -563,6 +567,7 @@ public class AwsJsonCborController {
                     : dispatchJson(serviceId, operation, request, region, headers, uriInfo);
             case "eventsv2" -> eventBridgeV2Handler.handle(operation, request, region);
             case "translate" -> translateJsonHandler.handleCbor(operation, request, region);
+            case "tagging" -> resourceGroupsTaggingJsonHandler.handle(operation, request, region);
             default -> dispatchJson(serviceId, operation, request, region, headers, uriInfo);
         };
     }
@@ -596,10 +601,10 @@ public class AwsJsonCborController {
 
     /** The timestamp members a service's responses carry under names {@link #isTimestampField} does not match. */
     private Set<String> timestampMembers(String serviceId) {
-        return catalog.byCborSdkServiceId(serviceId)
+        boolean eventBridgeV2 = catalog.byCborSdkServiceId(serviceId)
                 .filter(descriptor -> "eventsv2".equals(descriptor.externalKey()))
-                .map(descriptor -> EventBridgeV2Handler.TIMESTAMP_MEMBERS)
-                .orElse(Set.of());
+                .isPresent();
+        return eventBridgeV2 ? EventBridgeV2Handler.TIMESTAMP_MEMBERS : RpcV2CborTimestamps.of(serviceId);
     }
 
     private Response cborUnknownOperationError(String message, HttpHeaders httpHeaders) {
