@@ -9,14 +9,12 @@ import software.amazon.awssdk.core.retry.backoff.FixedDelayBackoffStrategy;
 import software.amazon.awssdk.core.waiters.WaiterOverrideConfiguration;
 import software.amazon.awssdk.endpoints.Endpoint;
 import software.amazon.awssdk.http.Protocol;
-import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.regions.RegionMetadata;
 import software.amazon.awssdk.services.accessanalyzer.AccessAnalyzerClient;
 import software.amazon.awssdk.services.account.AccountClient;
 import software.amazon.awssdk.services.acm.AcmClient;
-import software.amazon.awssdk.services.acmpca.AcmPcaClient;
 import software.amazon.awssdk.services.amp.AmpClient;
 import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
 import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
@@ -118,7 +116,6 @@ import software.amazon.awssdk.services.pipes.PipesClient;
 import software.amazon.awssdk.services.quicksight.QuickSightClient;
 import software.amazon.awssdk.services.ram.RamClient;
 import software.amazon.awssdk.services.rds.RdsClient;
-import software.amazon.awssdk.services.rds.RdsClientBuilder;
 import software.amazon.awssdk.services.rds.model.DescribeDbInstancesRequest;
 import software.amazon.awssdk.services.redshift.RedshiftClient;
 import software.amazon.awssdk.services.redshiftdata.RedshiftDataClient;
@@ -1464,17 +1461,11 @@ public final class TestFixtures {
     }
 
     public static RdsClient rdsClient() {
-        RdsClientBuilder builder = RdsClient.builder()
+        return RdsClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
-                .credentialsProvider(CREDENTIALS);
-        if (!isRealAws()) {
-            // Local RDS creates wait for their Docker backend. A short read timeout can retry
-            // an accepted create and surface AlreadyExists instead of its first acknowledgement.
-            builder.httpClientBuilder(ApacheHttpClient.builder().socketTimeout(Duration.ofMinutes(2)))
-                    .overrideConfiguration(configuration -> configuration.apiCallTimeout(Duration.ofMinutes(3)));
-        }
-        return builder.build();
+                .credentialsProvider(CREDENTIALS)
+                .build();
     }
 
     public static void waitForAvailableDbInstance(RdsClient client, String id) {
@@ -1598,22 +1589,6 @@ public final class TestFixtures {
                 .region(REGION)
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKeyId, "test")))
-                .build();
-    }
-
-    public static AcmPcaClient acmPcaClient() {
-        return AcmPcaClient.builder()
-                .endpointOverride(ENDPOINT)
-                .region(REGION)
-                .credentialsProvider(CREDENTIALS)
-                .build();
-    }
-
-    public static AcmPcaClient acmPcaClient(String accountId) {
-        return AcmPcaClient.builder()
-                .endpointOverride(ENDPOINT)
-                .region(REGION)
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accountId, "test")))
                 .build();
     }
 
@@ -2018,5 +1993,4 @@ public final class TestFixtures {
                 .credentialsProvider(CREDENTIALS)
                 .build();
     }
-
 }
