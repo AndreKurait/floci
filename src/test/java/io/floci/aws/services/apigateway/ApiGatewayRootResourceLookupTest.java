@@ -103,7 +103,7 @@ class ApiGatewayRootResourceLookupTest {
         ObjectMapper objectMapper = new ObjectMapper();
         ApiGatewayController controller = new ApiGatewayController(mockedService,
                 mock(ApiGatewayV2Service.class), mock(ApiGatewayV2OpenApiImporter.class),
-                regionResolver, objectMapper, null);
+                regionResolver, objectMapper, null, null);
 
         UriInfo uriInfo = mock(UriInfo.class);
         when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
