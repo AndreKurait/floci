@@ -1,5 +1,6 @@
 package io.floci.aws.services.apigateway;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 
@@ -22,14 +23,23 @@ import java.time.Instant;
  */
 public final class VtlExecutionGuard {
 
-    private static final ThreadLocal<Instant> DEADLINE = new ThreadLocal<>();
+    private static final ThreadLocal<Deadline> DEADLINE = new ThreadLocal<>();
+
+    /** A deadline and the clock it is measured on. */
+    private record Deadline(Clock clock, Instant instant) {
+    }
 
     private VtlExecutionGuard() {
     }
 
     /** Starts a new deadline, {@code timeout} from now, for the current thread. */
     public static void begin(Duration timeout) {
-        DEADLINE.set(Instant.now().plus(timeout));
+        begin(timeout, Clock.systemUTC());
+    }
+
+    /** Starts a new deadline measured on {@code clock}, so tests can control when it passes. */
+    static void begin(Duration timeout, Clock clock) {
+        DEADLINE.set(new Deadline(clock, clock.instant().plus(timeout)));
     }
 
     /** Clears the current thread's deadline. Must be called after every {@link #begin(Duration)}. */
@@ -42,8 +52,8 @@ public final class VtlExecutionGuard {
      * has already passed. Does nothing if no deadline is active.
      */
     public static void checkDeadline() {
-        Instant deadline = DEADLINE.get();
-        if (deadline != null && Instant.now().isAfter(deadline)) {
+        Deadline deadline = DEADLINE.get();
+        if (deadline != null && deadline.clock().instant().isAfter(deadline.instant())) {
             throw new VtlLimitExceededException("VTL template execution exceeded the configured time limit");
         }
     }

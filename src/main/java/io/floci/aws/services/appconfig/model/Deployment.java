@@ -5,6 +5,8 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.List;
+
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class Deployment {
@@ -24,6 +26,9 @@ public class Deployment {
     private String configurationLocationUri;
     @JsonProperty("ConfigurationVersion")
     private String configurationVersion;
+    @JsonProperty("VersionLabel")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String versionLabel;
     @JsonProperty("DeploymentStrategyId")
     private String deploymentStrategyId;
     // The strategy's settings as the deployment started with them, so changing or deleting the strategy
@@ -53,6 +58,9 @@ public class Deployment {
     @JsonProperty("PercentageComplete")
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private Float percentageComplete;
+    @JsonProperty("EventLog")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private List<DeploymentEvent> eventLog = List.of();
 
     public Deployment() {}
 
@@ -76,6 +84,9 @@ public class Deployment {
 
     public String getConfigurationVersion() { return configurationVersion; }
     public void setConfigurationVersion(String configurationVersion) { this.configurationVersion = configurationVersion; }
+
+    public String getVersionLabel() { return versionLabel; }
+    public void setVersionLabel(String versionLabel) { this.versionLabel = versionLabel; }
 
     public String getDeploymentStrategyId() { return deploymentStrategyId; }
     public void setDeploymentStrategyId(String deploymentStrategyId) { this.deploymentStrategyId = deploymentStrategyId; }
@@ -106,4 +117,9 @@ public class Deployment {
 
     public Float getPercentageComplete() { return percentageComplete; }
     public void setPercentageComplete(Float percentageComplete) { this.percentageComplete = percentageComplete; }
+
+    public List<DeploymentEvent> getEventLog() { return eventLog; }
+    public void setEventLog(List<DeploymentEvent> eventLog) {
+        this.eventLog = eventLog == null ? List.of() : List.copyOf(eventLog);
+    }
 }
