@@ -303,7 +303,7 @@ class WalStorageWriteFailureTest {
         }
     }
 
-    enum AtomicMutation { PUT_ALL, DELETE_ALL }
+    enum AtomicMutation { PUT_ALL, DELETE_ALL, MIXED }
 
     @ParameterizedTest
     @EnumSource(AtomicMutation.class)
@@ -331,6 +331,8 @@ class WalStorageWriteFailureTest {
                     directory.resolve("data.wal"), STRINGS);
             if (mutation == AtomicMutation.DELETE_ALL) {
                 assertTrue(replayed.isEmpty());
+            } else if (mutation == AtomicMutation.MIXED) {
+                assertEquals(Map.of("added", "value"), replayed);
             } else {
                 assertEquals("new", replayed.get("keep"));
             }
@@ -398,6 +400,7 @@ class WalStorageWriteFailureTest {
         switch (mutation) {
             case PUT_ALL -> store.putAllAtomically(Map.of("keep", "new", "added", "value"));
             case DELETE_ALL -> store.deleteAllAtomically(Set.of("keep"));
+            case MIXED -> store.applyAtomically(Map.of("keep", "new", "added", "value"), Set.of("keep"));
         }
     }
 
