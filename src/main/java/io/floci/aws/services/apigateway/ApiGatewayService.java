@@ -545,6 +545,7 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
         documentationPartKeys.removeIf(key -> !key.startsWith(prefix));
         documentationPartStore.deleteAllAtomically(documentationPartKeys);
         requestValidatorStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(requestValidatorStore::delete);
+        authorizerStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(authorizerStore::delete);
         gatewayResponseStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(gatewayResponseStore::delete);
         LOG.infov("Deleted REST API: {0} in {1}", apiId, region);
     }
@@ -612,7 +613,24 @@ public class ApiGatewayService implements ResourceProvider, Resettable, PassedRo
             throw new AwsException("BadRequestException",
                     "Invalid resource identifier specified: the root resource cannot be deleted", 400);
         }
-        resourceStore.delete(resourceKey(region, apiId, resourceId));
+        // Deleting a resource deletes the whole subtree below it; a child left behind would keep
+        // serving its path and could never be reached through its parent again.
+        List<ApiGatewayResource> all = getResources(region, apiId);
+        Set<String> doomed = new HashSet<>();
+        doomed.add(resourceId);
+        boolean grew = true;
+        while (grew) {
+            grew = false;
+            for (ApiGatewayResource candidate : all) {
+                if (candidate.getParentId() != null && doomed.contains(candidate.getParentId())
+                        && doomed.add(candidate.getId())) {
+                    grew = true;
+                }
+            }
+        }
+        for (String id : doomed) {
+            resourceStore.delete(resourceKey(region, apiId, id));
+        }
     }
 
     // ──────────────────────────── Method CRUD ────────────────────────────
