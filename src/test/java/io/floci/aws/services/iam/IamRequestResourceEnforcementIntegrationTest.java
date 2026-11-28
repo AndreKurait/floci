@@ -1,8 +1,12 @@
 package io.floci.aws.services.iam;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.redshift.model.Endpoint;
 import io.floci.aws.services.redshiftserverless.RedshiftServerlessRuntime;
@@ -18,6 +22,7 @@ import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.json.config.JsonPathConfig;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -92,6 +97,9 @@ class IamRequestResourceEnforcementIntegrationTest {
 
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
+
+    @Inject
+    StorageFactory storage;
 
     /** A serverless workgroup's PostgreSQL container is not needed to check a request on it, so none starts. */
     @InjectMock
@@ -737,8 +745,24 @@ class IamRequestResourceEnforcementIntegrationTest {
         String other = "111122223333";
         User user = user("res-repo-registry");
         user.policy(allowOn("ecr:DescribeRepositories", "arn:aws:ecr:" + REGION + ":" + other + ":repository/" + name));
-        describeRepositoriesWith(user, "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name + "\"]}")
-                .statusCode(400).body(containsString("RepositoryNotFoundException"));
+        String request = "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name + "\"]}";
+        refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+
+        // A foreign identity grant also needs the repository owner's policy.
+        AccountAwareStorageBackend<Repository> repositories = storage.create("ecr", "repositories.json", new TypeReference<>() {});
+        String key = REGION + "::" + other + "::" + name;
+        Repository repository = new Repository();
+        repository.setRepositoryName(name);
+        repository.setRegistryId(other);
+        repository.setRepositoryArn("arn:aws:ecr:" + REGION + ":" + other + ":repository/" + name);
+        repository.setRepositoryPolicyText("{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Principal\":{\"AWS\":\"arn:aws:iam::" + ACCOUNT + ":user/" + user.name() + "\"},"
+                + "\"Action\":\"ecr:DescribeRepositories\",\"Resource\":\"" + repository.getRepositoryArn() + "\"}]}");
+        cleanup.register(() -> repositories.deleteForAccount(other, key));
+        repositories.putAllAtomicallyForAccount(other, Map.of(key, repository));
+        describeRepositoriesWith(user, request).statusCode(200)
+                .body("repositories[0].registryId", equalTo(other))
+                .body("repositories[0].repositoryArn", equalTo(repository.getRepositoryArn()));
         refusedJson(describeRepositories(user, name), "ecr:DescribeRepositories");
 
         user.policy(allowOn("ecr:DescribeRepositories", "arn:aws:ecr:" + REGION + ":" + ACCOUNT + ":repository/" + name));
