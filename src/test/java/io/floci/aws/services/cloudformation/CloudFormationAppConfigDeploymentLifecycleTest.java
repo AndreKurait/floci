@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudformation;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.appconfig.AppConfigAlarmMonitor;
 import io.floci.aws.services.appconfig.AppConfigS3Source;
@@ -77,6 +78,34 @@ class CloudFormationAppConfigDeploymentLifecycleTest {
 
         assertEquals("1", appconfig.getActiveVersion(environment, profile));
         assertEquals("REVERTED", appconfig.getDeployment(app, environment, Integer.parseInt(number)).getState());
+    }
+
+    @Test
+    void deploymentPropertiesResolveHostedVersionReferencesWithoutLosingInternalIdentity() throws Exception {
+        ObjectNode template = template("4");
+        ((ObjectNode) template.path("Resources")).set("Hosted", JSON.valueToTree(Map.of(
+                "Type", "AWS::AppConfig::HostedConfigurationVersion", "Properties", Map.of(
+                        "ApplicationId", app, "ConfigurationProfileId", profile,
+                        "Content", "four", "ContentType", "text/plain"))));
+        ((ObjectNode) template.path("Resources").path("Deployment").path("Properties"))
+                .set("ConfigurationVersion", JSON.valueToTree(Map.of("Ref", "Hosted")));
+
+        deploy("CREATE", template);
+
+        assertEquals("CREATE_COMPLETE", stack().getStatus(), stack().getStatusReason());
+        assertEquals(app + "|" + profile + "|4", stack().getResources().get("Hosted").getPhysicalId());
+        assertEquals("4", appconfig.getActiveVersion(environment, profile));
+        String number = stack().getOutputs().get("Number");
+        assertEquals(number, stack().getOutputs().get("Reference"));
+        assertEquals(app + "|" + environment + "|" + number,
+                stack().getResources().get("Deployment").getPhysicalId());
+
+        cfn.deleteStack("deployment", REGION, ACCOUNT).get(30, TimeUnit.SECONDS);
+
+        assertEquals("1", appconfig.getActiveVersion(environment, profile));
+        assertEquals("REVERTED", appconfig.getDeployment(app, environment, Integer.parseInt(number)).getState());
+        assertThrows(AwsException.class,
+                () -> appconfig.getHostedConfigurationVersion(app, profile, 4));
     }
 
     @Test

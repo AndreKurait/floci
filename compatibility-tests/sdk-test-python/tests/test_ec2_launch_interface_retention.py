@@ -271,7 +271,14 @@ def test_instance_group_update_preserves_secondary_interface_groups(ec2_client, 
         ec2.get_waiter("instance_running").wait(
             InstanceIds=[instance_id], WaiterConfig={"Delay": 1, "MaxAttempts": 30})
         ec2.attach_network_interface(NetworkInterfaceId=secondary_id, InstanceId=instance_id, DeviceIndex=1)
-        ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[groups[2]])
+        with pytest.raises(ClientError) as rejected:
+            ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[groups[2]])
+        assert rejected.value.response["Error"]["Code"] == "InvalidInstanceID"
+        original = {primary_id: [groups[0]], secondary_id: [groups[1]]}
+        unchanged = ec2.describe_network_interfaces(NetworkInterfaceIds=interfaces)["NetworkInterfaces"]
+        assert {eni["NetworkInterfaceId"]: [g["GroupId"] for g in eni["Groups"]]
+                for eni in unchanged} == original
+        ec2.modify_network_interface_attribute(NetworkInterfaceId=primary_id, Groups=[groups[2]])
         expected = {primary_id: [groups[2]], secondary_id: [groups[1]]}
         described = ec2.describe_network_interfaces(NetworkInterfaceIds=interfaces)["NetworkInterfaces"]
         assert {eni["NetworkInterfaceId"]: [g["GroupId"] for g in eni["Groups"]]
