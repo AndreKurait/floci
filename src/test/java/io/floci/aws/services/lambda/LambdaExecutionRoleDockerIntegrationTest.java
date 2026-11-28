@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.IamEnforcedServiceSettingsProfile;
 import io.floci.aws.testing.LambdaCodeFixtures;
+import io.floci.aws.testutil.AwsRequestSigner;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
@@ -58,6 +59,7 @@ class LambdaExecutionRoleDockerIntegrationTest {
 
         try {
             given()
+                    .filter(AwsRequestSigner.signedAs(ACCOUNT_ID, "test", "lambda"))
                     .contentType("application/json")
                     .body("""
                         {
@@ -80,6 +82,7 @@ class LambdaExecutionRoleDockerIntegrationTest {
                     .statusCode(201);
 
             Response response = given()
+                    .filter(AwsRequestSigner.signedAs(ACCOUNT_ID, "test", "lambda"))
                     .contentType("application/json")
                     .body("{}")
             .when()
@@ -98,7 +101,8 @@ class LambdaExecutionRoleDockerIntegrationTest {
             assertNull(iamService.resolveCallerContext(accessKeyId),
                     "ephemeral container stop should unregister its execution-role session");
         } finally {
-            given().when().delete(BASE_PATH + "/functions/" + functionName);
+            given().filter(AwsRequestSigner.signedAs(ACCOUNT_ID, "test", "lambda"))
+                    .when().delete(BASE_PATH + "/functions/" + functionName);
             iamService.deleteRolePolicy(roleName, "RuntimePolicy");
             iamService.deleteRole(roleName);
         }

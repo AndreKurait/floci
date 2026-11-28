@@ -8,6 +8,9 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.model.SecurityGroup;
+import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.lambda.model.EventSourceMapping;
 import io.floci.aws.services.lambda.model.LambdaAlias;
 import io.floci.aws.services.lambda.model.LambdaFileSystemConfig;
@@ -20,7 +23,9 @@ import io.floci.aws.services.s3.model.S3Object;
 import io.floci.aws.services.s3.model.S3ObjectUpdatedEvent;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import io.floci.aws.testing.LambdaCodeFixtures;
+import io.floci.aws.testing.LockWaits;
 import io.floci.aws.testing.ParallelLocks;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,6 +39,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.ArrayList;
@@ -86,7 +92,25 @@ class LambdaServiceTest {
         StorageFactory storageFactory = mock(StorageFactory.class);
         when(storageFactory.create(anyString(), anyString(), any()))
                 .thenAnswer(inv -> AccountAwareStorageBackend.inMemory("000000000000"));
-        service = new LambdaService(store, warmPool, codeStore, zipExtractor, null, regionResolver, storageFactory);
+        Ec2Service ec2 = mock(Ec2Service.class);
+        doAnswer(call -> {
+            Runnable save = call.getArgument(1);
+            save.run();
+            return null;
+        }).when(ec2).runWithSubnetReferencesHeld(eq(REGION), any());
+        for (String suffix : List.of("0", "1")) {
+            Subnet subnet = new Subnet();
+            subnet.setSubnetId("subnet-0123456789abcdef" + suffix);
+            subnet.setVpcId("vpc-0123456789abcdef" + suffix);
+            SecurityGroup group = new SecurityGroup();
+            group.setGroupId("sg-0123456789abcdef" + suffix);
+            group.setVpcId(subnet.getVpcId());
+            when(ec2.describeSubnets(REGION, List.of(subnet.getSubnetId()), Map.of()))
+                    .thenReturn(List.of(subnet));
+            when(ec2.describeSecurityGroups(REGION, List.of(group.getGroupId()), List.of(), Map.of()))
+                    .thenReturn(List.of(group));
+        }
+        service = new LambdaService(store, warmPool, codeStore, zipExtractor, null, regionResolver, storageFactory, ec2);
     }
 
     private Map<String, Object> baseRequest(String name) {
@@ -248,8 +272,8 @@ class LambdaServiceTest {
                 Map.of(
                         "FileSystemConfigs", List.of(),
                         "VpcConfig", Map.of(
-                                "SubnetIds", List.of("subnet-updated"),
-                                "SecurityGroupIds", List.of("sg-updated"))));
+                                "SubnetIds", List.of("subnet-0123456789abcdef1"),
+                                "SecurityGroupIds", List.of("sg-0123456789abcdef1"))));
 
         assertEquals(vpcConfig(), version.getVpcConfig());
         assertEquals(1, version.getFileSystemConfigs().size());
@@ -1009,22 +1033,23 @@ class LambdaServiceTest {
         service.putFunctionConcurrency(REGION, "persisted-b", 200);
 
         // Build a second service over the same store with a fresh limiter.
-        LambdaFunctionStore store = new LambdaFunctionStore(new InMemoryStorage<>());
-        // Copy the two persisted functions into the new store to emulate a
-        // restart with the same disk state.
+        InMemoryStorage<String, LambdaFunction> persisted = new InMemoryStorage<>();
+        // Seed the persisted rows before construction, as a restart loads existing state
+        // without issuing a guarded update or assigning a new function lifetime.
         for (LambdaFunction fn : new ArrayList<>(
                 service.listFunctions(REGION))) {
-            store.save(REGION, fn);
+            persisted.put("lambda::" + REGION + "::" + fn.getFunctionName() + "::" + fn.getVersion(), fn);
         }
+        LambdaFunctionStore store = new LambdaFunctionStore(persisted);
         LambdaService rebooted = new LambdaService(store, new WarmPool(),
                 new CodeStore(Path.of("target/test-data/lambda-code")),
                 new ZipExtractor(), new RegionResolver(REGION, "000000000000"));
 
         // Starts empty…
-        assertEquals(0, rebooted.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(0, rebooted.concurrencyLimiter().totalReserved("000000000000", REGION));
         // …until rehydrate walks the store and re-registers the reserved values.
         rebooted.rehydrateConcurrency();
-        assertEquals(500, rebooted.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(500, rebooted.concurrencyLimiter().totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -1068,7 +1093,7 @@ class LambdaServiceTest {
                             && "LimitExceededException".equals(((AwsException) rejected).getErrorCode()),
                     "other Put must be rejected, got " + rejected);
             assertEquals(500,
-                    service.concurrencyLimiter().totalReserved(REGION),
+                    service.concurrencyLimiter().totalReserved("000000000000", REGION),
                     "limiter total must reflect only the winning Put");
         } finally {
             pool.shutdownNow();
@@ -1087,7 +1112,7 @@ class LambdaServiceTest {
         svc.createFunction(REGION, baseRequest("rb-fn"));
         // Baseline: Put of 300 succeeds
         svc.putFunctionConcurrency(REGION, "rb-fn", 300);
-        assertEquals(300, svc.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(300, svc.concurrencyLimiter().totalReserved("000000000000", REGION));
 
         // Now make the next save() explode and try to Put 500
         failing.shouldFail = true;
@@ -1095,8 +1120,25 @@ class LambdaServiceTest {
                 () -> svc.putFunctionConcurrency(REGION, "rb-fn", 500));
 
         // Limiter must have rolled back to the previous 300
-        assertEquals(300, svc.concurrencyLimiter().totalReserved(REGION),
+        assertEquals(300, svc.concurrencyLimiter().totalReserved("000000000000", REGION),
                 "limiter must unwind on save failure");
+        assertEquals(300, svc.getFunctionConcurrency(REGION, "rb-fn"));
+    }
+
+    @Test
+    void deleteFunctionConcurrencyPreservesTheReservationWhenSaveFails() {
+        FailingStore failing = new FailingStore();
+        LambdaService svc = new LambdaService(failing, new WarmPool(),
+                new CodeStore(Path.of("target/test-data/lambda-code")),
+                new ZipExtractor(), new RegionResolver(REGION, "000000000000"));
+        svc.createFunction(REGION, baseRequest("delete-reservation-failure"));
+        svc.putFunctionConcurrency(REGION, "delete-reservation-failure", 300);
+        failing.shouldFail = true;
+
+        assertThrows(RuntimeException.class, () -> svc.deleteFunctionConcurrency(REGION, "delete-reservation-failure"));
+
+        assertEquals(300, svc.getFunctionConcurrency(REGION, "delete-reservation-failure"));
+        assertEquals(300, svc.concurrencyLimiter().totalReserved("000000000000", REGION));
     }
 
     @Test
@@ -1117,7 +1159,7 @@ class LambdaServiceTest {
 
         // Reserved is cleared from the limiter, but the inflight counter
         // must still be live for the held permit to decrement into.
-        assertEquals(0, service.concurrencyLimiter().totalReserved(REGION));
+        assertEquals(0, service.concurrencyLimiter().totalReserved("000000000000", REGION));
         assertEquals(1, service.concurrencyLimiter().inflightCount(arn),
                 "inflight must survive delete until the permit closes");
 
@@ -1531,7 +1573,7 @@ class LambdaServiceTest {
                 // both read the same LambdaFunction field — so assert
                 // against the limiter's independently-maintained total.
                 assertEquals(stored.intValue(),
-                        service.concurrencyLimiter().totalReserved(REGION),
+                        service.concurrencyLimiter().totalReserved("000000000000", REGION),
                         "limiter totalReserved must match persisted reserved value");
             }
         } finally {
@@ -1640,10 +1682,14 @@ class LambdaServiceTest {
             holder.start();
             assertTrue(acquired.await(2, TimeUnit.SECONDS));
 
-            Future<LambdaFunction> publishFuture = pool.submit(
-                    () -> service.publishVersion(REGION, "lock-race-fn", null));
-            assertThrows(TimeoutException.class,
-                    () -> publishFuture.get(200, TimeUnit.MILLISECONDS),
+            AtomicReference<Thread> publisher = new AtomicReference<>();
+            Future<LambdaFunction> publishFuture = pool.submit(() -> {
+                publisher.set(Thread.currentThread());
+                return service.publishVersion(REGION, "lock-race-fn", null);
+            });
+            // Fails if publishVersion finishes instead of waiting behind the lock's holder.
+            LockWaits.awaitBlockedBehind(publisher, new AtomicReference<>(holder), publishFuture);
+            assertFalse(publishFuture.isDone(),
                     "publishVersion must block while another operation holds this function's lock");
 
             release.countDown();
@@ -2532,6 +2578,7 @@ class LambdaServiceTest {
         LambdaFunction first = backed.createFunction(REGION, firstRequest);
         LambdaFunction second = backed.createFunction(REGION, secondRequest);
         String bucket = LambdaService.tasksBucketName(REGION);
+        assertTrue(s3.isServiceOwnedBucket(bucket));
         assertEquals(List.of("customer-code"), s3.listBuckets().stream().map(b -> b.getName()).toList());
         assertArrayEquals(Base64.getDecoder().decode(zip),
                 s3.getObject(bucket, LambdaService.codeObjectKey(first)).getData());
@@ -2541,6 +2588,7 @@ class LambdaServiceTest {
                 s3.getObject(bucket, LambdaService.codeObjectKey(second)).getData());
         backed.deleteFunction(REGION, second.getFunctionName());
         assertTrue(s3.listObjects(bucket, "", null, 100).isEmpty());
+        assertTrue(s3.isServiceOwnedBucket(bucket));
         assertEquals(List.of("customer-code"), s3.listBuckets().stream().map(b -> b.getName()).toList());
     }
 
@@ -2816,13 +2864,10 @@ class LambdaServiceTest {
         return cfg;
     }
 
-    private static void awaitLastUpdateStatus(LambdaService service, LambdaFunction fn, String expected)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (!expected.equals(service.lastUpdateStatus(fn)) && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
-        assertEquals(expected, service.lastUpdateStatus(fn));
+    private static void awaitLastUpdateStatus(LambdaService service, LambdaFunction fn, String expected) {
+        Awaitility.await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertEquals(expected, service.lastUpdateStatus(fn)));
     }
 
     @Test
@@ -2975,9 +3020,14 @@ class LambdaServiceTest {
             holder.start();
             assertTrue(acquired.await(2, TimeUnit.SECONDS));
 
-            Future<LambdaFunction> updateFuture = pool.submit(() -> updater.apply(service, functionName));
-            assertThrows(TimeoutException.class,
-                    () -> updateFuture.get(200, TimeUnit.MILLISECONDS),
+            AtomicReference<Thread> updating = new AtomicReference<>();
+            Future<LambdaFunction> updateFuture = pool.submit(() -> {
+                updating.set(Thread.currentThread());
+                return updater.apply(service, functionName);
+            });
+            // Fails if the updater finishes instead of waiting behind the lock's holder.
+            LockWaits.awaitBlockedBehind(updating, new AtomicReference<>(holder), updateFuture);
+            assertFalse(updateFuture.isDone(),
                     "the updater must block while another operation holds this function's lock");
 
             release.countDown();
