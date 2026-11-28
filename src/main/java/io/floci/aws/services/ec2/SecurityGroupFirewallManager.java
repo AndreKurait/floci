@@ -9,27 +9,36 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.SweepWorker;
+import io.floci.aws.core.common.dns.DnsClientVpcSource;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
 import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
 import io.floci.aws.services.ec2.model.SecurityGroup;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -40,7 +49,7 @@ import java.util.function.Function;
  * containers on one {@code localhost}.
  */
 @ApplicationScoped
-public class SecurityGroupFirewallManager {
+public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
     private static final String PROTECTED_HELPER_PREFIX = "sg";
@@ -51,6 +60,11 @@ public class SecurityGroupFirewallManager {
     private final EmulatorConfig config;
     private final EmbeddedDnsServer embeddedDnsServer;
     private final Map<String, ProtectedEndpoint> endpoints = new HashMap<>();
+    private final Map<String, Set<String>> pendingHelperCleanup = new HashMap<>();
+    private final ConcurrentMap<String, DnsOrigin> dnsOrigins = new ConcurrentHashMap<>();
+    private boolean peerPoliciesNeedRefresh;
+    private final SweepWorker dnsOriginObserver = new SweepWorker(
+            "protected-namespace-dns", true, 1, false, ignored -> retireDnsOrigins());
 
     @Inject
     public SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
@@ -65,6 +79,86 @@ public class SecurityGroupFirewallManager {
 
     public boolean enabled() {
         return config.network().securityGroupEnforcement().enabled();
+    }
+
+    /** The DNS packet carries the helper's transport address, not the ENI's logical private IP. */
+    @Override
+    public Optional<ClientVpc> vpcForClient(String clientAddress) {
+        if (clientAddress == null || clientAddress.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(dnsOrigins.get(clientAddress)).map(DnsOrigin::vpc);
+    }
+
+    void startDnsOriginObserver(@Observes StartupEvent event) {
+        if (enabled()) {
+            dnsOriginObserver.start();
+        }
+    }
+
+    @PreDestroy
+    void stopDnsOriginObserver() {
+        dnsOriginObserver.stop();
+        dnsOrigins.clear();
+    }
+
+    /** Observe Docker outside the firewall monitor; never inspect a container on a DNS query. */
+    void retireDnsOrigins() {
+        Map<String, DnsOrigin> observed = Map.copyOf(dnsOrigins);
+        if (observed.isEmpty()) {
+            retireEndpoints(List.of());
+            return;
+        }
+        Map<String, Set<String>> liveAddresses = new HashMap<>();
+        List<String> helperIds = observed.values().stream().map(DnsOrigin::helperId).distinct().toList();
+        for (Container container : dockerClient.listContainersCmd().withShowAll(true).withIdFilter(helperIds).exec()) {
+            if ("running".equals(container.getState()) && container.getNetworkSettings() != null
+                    && container.getNetworkSettings().getNetworks() != null) {
+                Set<String> addresses = new HashSet<>();
+                container.getNetworkSettings().getNetworks().values().stream()
+                        .map(ContainerNetwork::getIpAddress)
+                        .filter(address -> address != null && !address.isBlank()).forEach(addresses::add);
+                liveAddresses.put(container.getId(), addresses);
+            }
+        }
+        List<DnsOrigin> retired = new ArrayList<>();
+        observed.forEach((address, origin) -> {
+            if (!liveAddresses.getOrDefault(origin.helperId(), Set.of()).contains(address)) {
+                // A new registration may already own this address; retire only the observed identity.
+                dnsOrigins.computeIfPresent(address, (key, current) -> {
+                    if (current != origin) {
+                        return current;
+                    }
+                    retired.add(origin);
+                    return null;
+                });
+            }
+        });
+        retireEndpoints(retired);
+    }
+
+    private synchronized void retireEndpoints(List<DnsOrigin> retired) {
+        for (DnsOrigin origin : retired) {
+            ProtectedEndpoint current = endpoints.get(origin.eniId());
+            if (current != null && current.dnsOrigin() == origin) {
+                endpoints.remove(origin.eniId());
+                pendingHelperCleanup.computeIfAbsent(origin.eniId(), ignored -> new HashSet<>())
+                        .add(current.helperId());
+                peerPoliciesNeedRefresh = true;
+                quarantine(current.helperId());
+            }
+        }
+        if (peerPoliciesNeedRefresh) {
+            // A failed installation quarantines peers. Retry even when the last DNS origin is gone.
+            reconcileAll();
+            peerPoliciesNeedRefresh = false;
+        }
+    }
+
+    private void removeDnsOrigin(ProtectedEndpoint protectedEndpoint) {
+        SecurityGroupNftCompiler.Endpoint endpoint = protectedEndpoint.endpoint();
+        dnsOrigins.computeIfPresent(endpoint.transportAddress(),
+                (address, current) -> current == protectedEndpoint.dnsOrigin() ? null : current);
     }
 
     @PostConstruct
@@ -144,7 +238,24 @@ public class SecurityGroupFirewallManager {
                 .withLabels(extraLabels);
         linkLocalIps.forEach(builder::withLinkLocalIp);
         return startHelper(builder, resourceId, "protected",
-                helperId -> apply(helperId, SecurityGroupNftCompiler.initialRuleset()));
+                helperId -> {
+                    apply(helperId, SecurityGroupNftCompiler.initialRuleset());
+                    configureProtectedResolver(helperId);
+                });
+    }
+
+    private void configureProtectedResolver(String helperId) {
+        String resolver = embeddedDnsServer.getServerIp().orElse(null);
+        if (resolver != null) {
+            // Docker's resolver does not forward from internal networks. Workloads inherit
+            // this file, so finish configuring the VPC resolver before admitting any workload.
+            ContainerExec.Result result = ContainerExec.run(dockerClient, helperId, new String[]{
+                    "sh", "-c", "printf 'nameserver %s\\noptions ndots:0\\n' \"$1\" > /etc/resolv.conf",
+                    "floci-vpc-dns", resolver}, 10).throwIfTimedOut(helperId);
+            if (result.exitCode() != 0) {
+                throw new IllegalStateException("Cannot configure namespace DNS: " + result.summary());
+            }
+        }
     }
 
     /**
@@ -258,6 +369,15 @@ public class SecurityGroupFirewallManager {
                 new ProtectedEndpoint(endpoint, helperId, Map.copyOf(prefixLists)));
         try {
             reconcileAll();
+            if (previous != null) {
+                removeDnsOrigin(previous);
+            }
+            ProtectedEndpoint admitted = endpoints.get(endpoint.eniId());
+            if (admitted != null) {
+                dnsOrigins.put(endpoint.transportAddress(), admitted.dnsOrigin());
+                pendingHelperCleanup.values().forEach(helpers -> helpers.remove(helperId));
+                pendingHelperCleanup.values().removeIf(Set::isEmpty);
+            }
         } catch (RuntimeException e) {
             if (previous == null) {
                 endpoints.remove(endpoint.eniId());
@@ -283,9 +403,21 @@ public class SecurityGroupFirewallManager {
     public synchronized void unregister(String eniId) {
         ProtectedEndpoint removed = endpoints.remove(eniId);
         if (removed != null) {
-            lifecycleManager.removeIfExists(removed.helperId());
-            reconcileAll();
+            removeDnsOrigin(removed);
+            pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(removed.helperId());
+            peerPoliciesNeedRefresh = true;
         }
+        if (peerPoliciesNeedRefresh) {
+            reconcileAll();
+            peerPoliciesNeedRefresh = false;
+        }
+        // Retiring peer permissions must not discard the owning service's later cleanup obligation.
+        Set<String> helpers = pendingHelperCleanup.getOrDefault(eniId, Set.of());
+        for (String helper : new ArrayList<>(helpers)) {
+            lifecycleManager.removeIfExistsStrict(helper);
+            helpers.remove(helper);
+        }
+        pendingHelperCleanup.remove(eniId);
     }
 
     public synchronized void updateGroups(String eniId, Set<String> groupIds,
@@ -302,7 +434,8 @@ public class SecurityGroupFirewallManager {
             throw new IllegalArgumentException("Protected endpoint needs valid security groups");
         }
         SecurityGroupNftCompiler.Endpoint updated = identity.withPolicy(Set.copyOf(groupIds), attached);
-        endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists)));
+        endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists),
+                current.dnsOrigin()));
         reconcileAll();
     }
 
@@ -316,7 +449,7 @@ public class SecurityGroupFirewallManager {
             return;
         }
         endpoints.put(eniId, new ProtectedEndpoint(current.endpoint().withIpv6Addresses(addresses),
-                current.helperId(), current.prefixLists()));
+                current.helperId(), current.prefixLists(), current.dnsOrigin()));
         try {
             reconcileAll();
         } catch (RuntimeException e) {
@@ -336,8 +469,12 @@ public class SecurityGroupFirewallManager {
                 running = false;
             }
             if (!running) {
-                quarantine(entry.getValue().helperId());
+                removeDnsOrigin(entry.getValue());
                 endpoints.remove(entry.getKey());
+                pendingHelperCleanup.computeIfAbsent(entry.getKey(), ignored -> new HashSet<>())
+                        .add(entry.getValue().helperId());
+                peerPoliciesNeedRefresh = true;
+                quarantine(entry.getValue().helperId());
             }
         }
         List<SecurityGroupNftCompiler.Endpoint> peers = endpoints.values().stream()
@@ -355,6 +492,8 @@ public class SecurityGroupFirewallManager {
         }
     }
 
+    private record DnsOrigin(String eniId, String helperId, ClientVpc vpc) {}
+
     /** Refreshes every affected EC2 instance and ECS task after a control-plane rule change. */
     public synchronized void refreshPolicies(String region, Map<String, SecurityGroup> groups,
                                              Map<String, List<String>> prefixLists) {
@@ -370,8 +509,9 @@ public class SecurityGroupFirewallManager {
                 throw new IllegalStateException("A protected endpoint's security group disappeared");
             }
             SecurityGroupNftCompiler.Endpoint updated = identity.withPolicy(identity.groupIds(), attached);
+
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
-                    Map.copyOf(prefixLists)));
+                    Map.copyOf(prefixLists), current.dnsOrigin()));
         }
         reconcileAll();
     }
@@ -470,5 +610,11 @@ public class SecurityGroupFirewallManager {
         }
     }
     private record ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
-                                     Map<String, List<String>> prefixLists) {}
+                                     Map<String, List<String>> prefixLists, DnsOrigin dnsOrigin) {
+        private ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
+                                  Map<String, List<String>> prefixLists) {
+            this(endpoint, helperId, prefixLists, new DnsOrigin(endpoint.eniId(), helperId,
+                    new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId())));
+        }
+    }
 }
