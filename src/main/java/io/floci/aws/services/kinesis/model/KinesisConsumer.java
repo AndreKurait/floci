@@ -4,7 +4,6 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.Map;
 
 @RegisterForReflection
@@ -15,7 +14,8 @@ public class KinesisConsumer {
     private String consumerStatus;
     private Instant consumerCreationTimestamp;
     private String streamArn;
-    private volatile Map<String, String> tags = new HashMap<>();
+    private String policyStreamGeneration;
+    private volatile Map<String, String> tags = Map.of();
 
     public KinesisConsumer() {}
 
@@ -26,6 +26,12 @@ public class KinesisConsumer {
         this.consumerStatus = "ACTIVE";
         this.consumerCreationTimestamp = Instant.now();
     }
+
+    public String getPolicyStreamGeneration() { return policyStreamGeneration; }
+    public void setPolicyStreamGeneration(String generation) { this.policyStreamGeneration = generation; }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) { this.tags = tags == null ? Map.of() : Map.copyOf(tags); }
 
     public String getConsumerName() { return consumerName; }
     public void setConsumerName(String consumerName) { this.consumerName = consumerName; }
@@ -42,6 +48,4 @@ public class KinesisConsumer {
     public String getStreamArn() { return streamArn; }
     public void setStreamArn(String streamArn) { this.streamArn = streamArn; }
 
-    public Map<String, String> getTags() { return tags; }
-    public void setTags(Map<String, String> tags) { this.tags = tags == null ? new HashMap<>() : tags; }
 }
