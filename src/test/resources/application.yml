@@ -422,6 +422,7 @@ floci:
       enabled: true
       mock: true
     elbv2:
+      max-health-check-interval-millis: 0
       enabled: true
       mock: true
       backend-keep-alive: true

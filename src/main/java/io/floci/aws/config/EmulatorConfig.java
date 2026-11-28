@@ -4252,6 +4252,10 @@ public interface EmulatorConfig {
     }
 
     interface ElbV2ServiceConfig {
+        /** Optional local probe interval ceiling; zero preserves each target group's interval. */
+        @WithDefault("0")
+        long maxHealthCheckIntervalMillis();
+
         @WithDefault("true")
         boolean enabled();
 
