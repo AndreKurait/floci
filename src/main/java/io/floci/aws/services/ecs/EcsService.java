@@ -146,6 +146,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private final EcsServiceDiscoveryRegistrar discoveryRegistrar;
     private final CloudWatchMetricsService cloudWatchMetricsService;
     private final Clock clock;
+    private final WaitTimer waitTimer;
     private final boolean dockerMode;
     private final boolean publishAwsvpcPortsToHost;
     private final boolean dynamicAwsvpcHostPorts;
@@ -304,7 +305,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 execSessions, discoveryRegistrar, cloudWatchMetricsService, Clock.systemUTC());
     }
 
-    /** With the clock for Container Insights samples, task protection deadlines and target drains. */
+    /** With the clock for metrics, protection, drains and deployment start times. */
     EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
                EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
                StorageFactory storageFactory, EcsEventPublisher eventPublisher,
@@ -312,7 +313,19 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                EcsServiceDiscoveryRegistrar discoveryRegistrar,
                CloudWatchMetricsService cloudWatchMetricsService, Clock clock) {
         this(regionResolver, containerManager, config, lbRegistrar, storageFactory, eventPublisher,
-                execSessions, discoveryRegistrar, cloudWatchMetricsService, clock, newTaskLauncher(), newTaskStopper());
+                execSessions, discoveryRegistrar, cloudWatchMetricsService, clock, newTaskLauncher(), newTaskStopper(),
+                WaitTimer.SYSTEM);
+    }
+
+    /** With the timer {@link #awaitServiceStable} measures its timeout and sleeps between polls on. */
+    EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
+               EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
+               StorageFactory storageFactory, EcsEventPublisher eventPublisher,
+               EcsExecSessionRegistry execSessions,
+               EcsServiceDiscoveryRegistrar discoveryRegistrar,
+               CloudWatchMetricsService cloudWatchMetricsService, Clock clock, WaitTimer waitTimer) {
+        this(regionResolver, containerManager, config, lbRegistrar, storageFactory, eventPublisher,
+                execSessions, discoveryRegistrar, cloudWatchMetricsService, clock, newTaskLauncher(), newTaskStopper(), waitTimer);
     }
 
     /** With explicit task executors for deterministic lifecycle tests. */
@@ -323,6 +336,17 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                EcsServiceDiscoveryRegistrar discoveryRegistrar,
                CloudWatchMetricsService cloudWatchMetricsService, Clock clock,
                ExecutorService taskLauncher, ExecutorService taskStopper) {
+        this(regionResolver, containerManager, config, lbRegistrar, storageFactory, eventPublisher,
+                execSessions, discoveryRegistrar, cloudWatchMetricsService, clock, taskLauncher, taskStopper, WaitTimer.SYSTEM);
+    }
+
+    private EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
+               EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
+               StorageFactory storageFactory, EcsEventPublisher eventPublisher,
+               EcsExecSessionRegistry execSessions,
+               EcsServiceDiscoveryRegistrar discoveryRegistrar,
+               CloudWatchMetricsService cloudWatchMetricsService, Clock clock,
+                       ExecutorService taskLauncher, ExecutorService taskStopper, WaitTimer waitTimer) {
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
         this.dockerMode = !config.services().ecs().mock();
@@ -340,6 +364,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         this.clock = clock;
         this.taskLauncher = taskLauncher;
         this.taskStopper = taskStopper;
+        this.waitTimer = waitTimer;
     }
 
     public EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
@@ -651,7 +676,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         String serviceArn = svc.getServiceArn();
         recordLaunchFailure(svc, null, null);
         Instant waitStarted = Instant.now();
-        long deadline = System.nanoTime() + timeout.toNanos();
+        long deadline = waitTimer.nanoTime() + timeout.toNanos();
         Future<?> pass = null;
         int passes = 0;
         while (true) {
@@ -671,17 +696,36 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 pass = reconcileNow();
                 passes++;
             }
-            if (System.nanoTime() - deadline >= 0) {
+            if (waitTimer.nanoTime() - deadline >= 0) {
                 throw notStabilized(serviceArn, "");
             }
             try {
-                Thread.sleep(SERVICE_STABLE_POLL_MILLIS);
+                waitTimer.sleepMillis(SERVICE_STABLE_POLL_MILLIS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AwsException("InternalError", "Interrupted while waiting for ECS service "
                         + serviceArn + " to stabilize", 500);
             }
         }
+    }
+
+    /** Monotonic time and the sleep between polls of {@link #awaitServiceStable}; tests pass a controlled one. */
+    interface WaitTimer {
+        WaitTimer SYSTEM = new WaitTimer() {
+            @Override
+            public long nanoTime() {
+                return System.nanoTime();
+            }
+
+            @Override
+            public void sleepMillis(long millis) throws InterruptedException {
+                Thread.sleep(millis);
+            }
+        };
+
+        long nanoTime();
+
+        void sleepMillis(long millis) throws InterruptedException;
     }
 
     /**
@@ -2290,6 +2334,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         return stopTask(clusterRef, taskRef, reason, STOP_CODE_USER_INITIATED, region);
     }
 
+    /** Waits for one task's background stop, when one is in flight, while other stops keep running. */
+    void awaitPendingStop(String taskArn) throws Exception {
+        CompletableFuture<Void> stop = taskStops.get(taskArn);
+        if (stop != null) {
+            stop.get(60, TimeUnit.SECONDS);
+        }
+    }
+
     /**
      * @param stopCode why the task is going away, as the {@code stopCode} AWS reports: a caller's
      *                 StopTask is {@code UserInitiated}, anything the reconciler decides is
@@ -3163,7 +3215,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             svc.setUnparsed(request.getUnparsed());
             applyServicePlatform(svc, taskDef, request.getPlatformVersion());
             svc.setStatus("ACTIVE");
-            svc.setCreatedAt(Instant.now());
+            svc.setCreatedAt(clock.instant());
             svc.setLastDeploymentAt(svc.getCreatedAt());
             svc.setDeploymentId(newDeploymentId());
             if (request.getTags() != null && !request.getTags().isEmpty()) {
@@ -3397,7 +3449,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                         resolvePlatformVersion(svc.getPlatformVersion()));
                 if (taskDefChanged || forceNewDeployment || serviceConnectChanged || rollingChange) {
                     svc.setDeploymentId(newDeploymentId());
-                    svc.setLastDeploymentAt(Instant.now());
+                    svc.setLastDeploymentAt(clock.instant());
                     recordServiceDeployment(svc, svc.getTaskDefinition(), region);
                     if (eventPublisher != null) {
                         eventPublisher.emitDeploymentStateChange(svc, "SERVICE_DEPLOYMENT_STARTED",
