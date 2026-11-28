@@ -167,3 +167,34 @@ docker run --rm -e FLOCI_ENDPOINT=http://host.docker.internal:4566 floci-sdk-pyt
 ## Exit Codes
 
 All test runners exit `0` on full pass and non-zero if any test fails — suitable for CI pipelines.
+
+## HTTP API JWT fixture
+
+The Java HTTP API execution test serves a local OIDC discovery document and JWKS
+endpoint and signs its tokens with an ephemeral RSA key. Run Floci with
+`FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true` for this suite so it can fetch the
+fixture on the test client's private address. The compatibility workflows enable
+this only for the Java SDK job. Normal Floci configurations keep private JWT
+issuer targets disabled. The client and Floci must be able to reach each other,
+as they can on the workflow's shared container network.
+
+The local Docker launchers (`make docker-tests`, `make native-up`) start one
+Floci for every suite and publish its port, so they do not set the flag and the
+valid-token cases of this test fail there. To run them locally, start a
+dedicated Floci with the flag and its port published on `127.0.0.1` only.
+
+The fixture verifies a valid signature through an HTTP proxy integration. That
+check does not need Lambda: it still runs when the Lambda dispatch probe reports
+Lambda unavailable or the warmup invocation times out. A failed function create
+or a warmup that returns an error fails the class. Missing tokens, wrong
+audiences, a different signing key, an unsigned `alg: none` token and an expired
+token must fail. The positive case also requires a real JWKS fetch. Setup and
+signature verification failures fail the suite.
+
+The issuer binds the client's specific interface used to reach Floci, which is
+loopback when both processes run on the same host. When testing a containerized
+Floci from the host, use `FLOCI_TEST_JWT_ISSUER_BIND_ADDRESS` to choose a specific
+local interface reachable from that container, and `FLOCI_TEST_JWT_ISSUER_HOST`
+to override the hostname Floci should use for callbacks. Wildcard binds are
+rejected. Keep the fixture on a private test network, and enable the private-JWT
+flag only on that test Floci instance, including when using a local launcher.
