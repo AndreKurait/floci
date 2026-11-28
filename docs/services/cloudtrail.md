@@ -40,6 +40,15 @@ and `AWS::S3::Object` data resource ARNs in any of these forms:
 - `arn:aws:s3:::bucket/prefix` — keys with the given prefix
 - `arn:aws:s3:::bucket/prefix/key` — exact key match
 
+## Caller identity
+
+A request signed with an STS role session is recorded with `userIdentity.type: "AssumedRole"`, the session ARN,
+its `RoleId:SessionName` principal ID and access key ID. `sessionContext` names the issuing role and includes the
+session's creation time and MFA state, as described in the
+[CloudTrail identity reference](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-event-reference-user-identity.html).
+Management and S3 data events use the same identity resolution. IAM users, the local root stand-in and unknown
+keys keep their existing identity records.
+
 ## Source address
 
 `sourceIPAddress` is "the IP address that the request was made from"
