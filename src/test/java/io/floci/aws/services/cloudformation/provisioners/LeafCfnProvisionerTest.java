@@ -208,6 +208,7 @@ class LeafCfnProvisionerTest {
 
             verify(kms).createAlias("alias/new", "k-456", REGION);
             verify(kms, never()).updateAlias(anyString(), anyString(), anyString());
+            assertEquals("alias/new", r.getPhysicalId());
         }
 
         @Test
