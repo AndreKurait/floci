@@ -324,6 +324,15 @@ public class IamConditionContextResolver {
      * request names come from Logs' {@link StoredResourceArns}, as for every namespace the table reads.
      */
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
+        if ("logs:PutLogEvents".equals(action)) {
+            JsonNode body = bufferedJsonBody(ctx);
+            String group = body == null ? null : body.path("logGroupName").asText(null);
+            if (group == null || group.isBlank()) {
+                return null;
+            }
+            // Publications inherit their owning group's tags; the stream ARN still scopes the permission.
+            return resourceTags(regionResolver.buildArn("logs", requestRegion(), "log-group:" + group + ":*"));
+        }
         if (!("logs:CreateLogGroup".equals(action) || "logs:TagResource".equals(action)
                 || "logs:UntagResource".equals(action))) {
             return null;
