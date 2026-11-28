@@ -11,6 +11,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -24,8 +25,8 @@ import java.util.regex.Pattern;
 
 /**
  * The routes of the REST operations botocore models, read once from the vendored {@code aws/rest-routes.json}:
- * the operation a REST request is, from its method, its path and the query its route requires, for a request
- * {@link IamActionRegistry}'s rules give no action.
+ * the operation a REST request is, from its method, its path and the query its route requires, which
+ * {@link IamActionRegistry} checks it as.
  *
  * <p>A route is its operation's {@code requestUri}: literal segments, a {@code {label}} taking one segment, and a
  * greedy {@code {label+}} taking the rest of the path, and a query it names ({@code ?tagging},
@@ -40,7 +41,9 @@ import java.util.regex.Pattern;
  * without the prefix, which is the path the model gives its operation. The router matched it decoded, so a label's
  * value holds the slashes its encoding hid (a key ARN on the Payment Cryptography data plane), and the controller's
  * route takes them: a path that matches no route with each label taking one segment is matched again with each
- * label taking as many as its value spans.
+ * label taking as many as its value spans. So is a request whose controller takes a label's value with the slashes
+ * it was sent with unencoded (a durable execution's ARN, an EKS access entry's principal), the route whose labels
+ * the path then gives the values the router gave the path parameters of the method it dispatched to being its own.
  *
  * <p>An operation may have alternative routes, the bare paths a shared controller also serves it on, with where
  * the request carries the members the path no longer holds, and the alternative's own method when it is not the
@@ -171,12 +174,34 @@ final class IamRestRoutes {
     private final Map<String, Integer> accessDeniedStatuses;
     /** The credential scopes a documented model routes. */
     private final Set<String> documentedScopes;
+    /** Each botocore model's API version, by model. */
+    private final Map<String, String> apiVersions;
+    /** Each botocore model's credential scope, the signing name AWS signs its requests with, by model. */
+    private final Map<String, String> modelScopes;
 
     private IamRestRoutes(Map<String, Map<String, List<Route>>> routes, Map<String, Integer> accessDeniedStatuses,
-                          Set<String> documentedScopes) {
+                          Set<String> documentedScopes, Map<String, String> apiVersions,
+                          Map<String, String> modelScopes) {
         this.routes = routes;
         this.accessDeniedStatuses = accessDeniedStatuses;
         this.documentedScopes = documentedScopes;
+        this.apiVersions = apiVersions;
+        this.modelScopes = modelScopes;
+    }
+
+    /**
+     * The scope a request of {@code scope} is matched under: the scope itself when the file routes it, and else, for
+     * the name of a botocore model the file vendors, the scope its model gives, the signing name AWS signs that
+     * model's requests with. AppConfig Data's model, {@code appconfigdata}, is signed {@code appconfig}, so a request
+     * Floci serves under the model's name is matched to that model's routes, as one an SDK signs is.
+     */
+    String signedScope(String scope) {
+        return scope == null || routes.containsKey(scope) ? scope : modelScopes.getOrDefault(scope, scope);
+    }
+
+    /** The API version of the botocore model of that name, null for a model the file does not give one. */
+    String apiVersion(String model) {
+        return model == null ? null : apiVersions.get(model);
     }
 
     /** The vendored routes. */
@@ -218,14 +243,31 @@ final class IamRestRoutes {
      */
     Optional<Match> match(String scope, String method, String path, MultivaluedMap<String, String> query,
                           boolean movedUnderPrefix, MultivaluedMap<String, String> headers) {
+        return match(scope, method, path, query, movedUnderPrefix, headers, List.of());
+    }
+
+    /**
+     * As {@link #match(String, String, String, MultivaluedMap, boolean, MultivaluedMap)}, for a request the router
+     * dispatched giving the path parameters of the method serving it the values {@code routed}: of the routes the
+     * request matches, one whose labels the path gives those values is the route of the operation the router chose,
+     * so it is the match when there is one. EKS takes a principal whose IAM path holds an {@code access-policies}
+     * segment as an access entry, whose DeleteAccessEntry route the DisassociateAccessPolicy one would outrank. A
+     * request that matches no route with each label taking one segment is the route whose labels, each taking as
+     * many segments as it spans, the path gives those values, when one does: its controller took a value's slashes
+     * unencoded.
+     */
+    Optional<Match> match(String scope, String method, String path, MultivaluedMap<String, String> query,
+                          boolean movedUnderPrefix, MultivaluedMap<String, String> headers, Collection<String> routed) {
         String requestPath = IamActionRegistry.withoutTrailingSlash(path);
-        Optional<Match> match = best(scope, method, requestPath, query, false, headers);
-        return match.isPresent() || !movedUnderPrefix ? match : best(scope, method, requestPath, query, true, headers);
+        Optional<Match> match = best(scope, method, requestPath, query, false, headers, routed, false);
+        return match.isPresent() ? match : best(scope, method, requestPath, query, true, headers, routed,
+                !movedUnderPrefix);
     }
 
     private Optional<Match> best(String scope, String method, String requestPath, MultivaluedMap<String, String> query,
-                                 boolean spanned, MultivaluedMap<String, String> headers) {
-        Route best = ranked(scope, method, requestPath, query, spanned, headers).best();
+                                 boolean spanned, MultivaluedMap<String, String> headers, Collection<String> routed,
+                                 boolean routedOnly) {
+        Route best = ranked(scope, method, requestPath, query, spanned, headers, routed, routedOnly).best();
         return best == null ? Optional.empty()
                 : Optional.of(new Match(best.operation(), best.labelValues(requestPath, spanned), best.located(),
                         best.documented(), best.model()));
@@ -238,26 +280,51 @@ final class IamRestRoutes {
      */
     boolean ambiguous(String scope, String method, String path, MultivaluedMap<String, String> query,
                       boolean movedUnderPrefix, MultivaluedMap<String, String> headers) {
+        return ambiguous(scope, method, path, query, movedUnderPrefix, headers, List.of());
+    }
+
+    /**
+     * As {@link #ambiguous(String, String, String, MultivaluedMap, boolean, MultivaluedMap)}, of the routes whose labels
+     * the router gave the values {@code routed}, when the request matches one.
+     */
+    boolean ambiguous(String scope, String method, String path, MultivaluedMap<String, String> query,
+                      boolean movedUnderPrefix, MultivaluedMap<String, String> headers, Collection<String> routed) {
         String requestPath = IamActionRegistry.withoutTrailingSlash(path);
-        Ranked ranked = ranked(scope, method, requestPath, query, false, headers);
-        return ranked.best() == null && movedUnderPrefix
-                ? ranked(scope, method, requestPath, query, true, headers).tied() : ranked.tied();
+        Ranked ranked = ranked(scope, method, requestPath, query, false, headers, routed, false);
+        return ranked.best() == null
+                ? ranked(scope, method, requestPath, query, true, headers, routed, !movedUnderPrefix).tied()
+                : ranked.tied();
     }
 
     /** The route a request matches that outranks the others it matches, and whether another operation's ties it. */
     private record Ranked(Route best, boolean tied) {
     }
 
+    /**
+     * The routes a request matches, ranked: those whose labels the path gives the values {@code routed} when any does,
+     * and only those when {@code routedOnly}.
+     */
     private Ranked ranked(String scope, String method, String requestPath, MultivaluedMap<String, String> query,
-                          boolean spanned, MultivaluedMap<String, String> headers) {
+                          boolean spanned, MultivaluedMap<String, String> headers, Collection<String> routed,
+                          boolean routedOnly) {
         List<Route> matching = new ArrayList<>();
-        Route best = null;
         for (Route route : routes.getOrDefault(scope, Map.of()).getOrDefault(method, List.of())) {
             if (route.matches(requestPath, query, spanned) && route.carries(headers)) {
                 matching.add(route);
-                if (best == null || route.outranks(best)) {
-                    best = route;
-                }
+            }
+        }
+        List<String> routedValues = routed.stream().sorted().toList();
+        List<Route> agreeing = routedValues.isEmpty() ? List.of() : matching.stream()
+                .filter(route -> route.labelValues(requestPath, spanned).values().stream().sorted().toList()
+                        .equals(routedValues))
+                .toList();
+        if (!agreeing.isEmpty() || routedOnly) {
+            matching = agreeing;
+        }
+        Route best = null;
+        for (Route route : matching) {
+            if (best == null || route.outranks(best)) {
+                best = route;
             }
         }
         Route winner = best;
@@ -299,8 +366,16 @@ final class IamRestRoutes {
         Map<String, Map<String, List<Route>>> routes = new HashMap<>();
         Map<String, Integer> denialStatuses = new HashMap<>();
         Set<String> documentedScopes = new HashSet<>();
+        Map<String, String> apiVersions = new HashMap<>();
+        Map<String, String> modelScopes = new HashMap<>();
         models.properties().forEach(model -> {
             String scope = model.getValue().path("credentialScope").asText("");
+            if (!scope.isEmpty()) {
+                modelScopes.put(model.getKey(), scope);
+            }
+            if (model.getValue().path("apiVersion").isTextual()) {
+                apiVersions.put(model.getKey(), model.getValue().path("apiVersion").asText());
+            }
             JsonNode operations = model.getValue().path("operations");
             if (scope.isEmpty() || !operations.isObject() || operations.isEmpty()) {
                 throw new IllegalStateException(RESOURCE_NAME + " gives model " + model.getKey()
@@ -375,7 +450,8 @@ final class IamRestRoutes {
             byMethod.forEach((method, list) -> methods.put(method, List.copyOf(list)));
             copied.put(scope, Map.copyOf(methods));
         });
-        return new IamRestRoutes(Map.copyOf(copied), Map.copyOf(denialStatuses), Set.copyOf(documentedScopes));
+        return new IamRestRoutes(Map.copyOf(copied), Map.copyOf(denialStatuses), Set.copyOf(documentedScopes),
+                Map.copyOf(apiVersions), Map.copyOf(modelScopes));
     }
 
     /** The strings of a JSON array, none when it is missing. */

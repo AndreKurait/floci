@@ -40,6 +40,7 @@ import io.floci.aws.services.memorydb.MemoryDbService;
 import io.floci.aws.services.memorydb.container.MemoryDbContainerManager;
 import io.floci.aws.services.memorydb.proxy.MemoryDbProxyManager;
 import io.floci.aws.services.mwaa.MwaaService;
+import io.floci.aws.services.neptune.NeptuneService;
 import io.floci.aws.services.neptune.container.NeptuneContainerManager;
 import io.floci.aws.services.neptune.proxy.NeptuneProxyManager;
 import io.floci.aws.services.opensearch.OpenSearchService;
@@ -108,6 +109,7 @@ public class EmulatorLifecycle {
     private final DocDbService docDbService;
     private final NeptuneContainerManager neptuneContainerManager;
     private final NeptuneProxyManager neptuneProxyManager;
+    private final NeptuneService neptuneService;
     private final RabbitMqManager rabbitMqManager;
     private final AmazonMqService amazonMqService;
     private final FlinkContainerManager flinkContainerManager;
@@ -162,6 +164,7 @@ public class EmulatorLifecycle {
                              DocDbService docDbService,
                              NeptuneContainerManager neptuneContainerManager,
                              NeptuneProxyManager neptuneProxyManager,
+                             NeptuneService neptuneService,
                              RabbitMqManager rabbitMqManager,
                              AmazonMqService amazonMqService,
                              FlinkContainerManager flinkContainerManager,
@@ -213,6 +216,7 @@ public class EmulatorLifecycle {
         this.docDbService = docDbService;
         this.neptuneContainerManager = neptuneContainerManager;
         this.neptuneProxyManager = neptuneProxyManager;
+        this.neptuneService = neptuneService;
         this.rabbitMqManager = rabbitMqManager;
         this.amazonMqService = amazonMqService;
         this.flinkContainerManager = flinkContainerManager;
@@ -366,6 +370,13 @@ public class EmulatorLifecycle {
                 return null;
             });
         }
+        if (config.services().neptune().enabled()) {
+            // Starts the clusters' containers and proxies in the background, failing the future with the ones it could not.
+            neptuneService.restorePersistedRuntime().exceptionally(ex -> {
+                LOG.error("Failed to restore persisted Neptune clusters at startup", ex);
+                return null;
+            });
+        }
         if (config.services().elbv2().enabled()) {
             elbV2Service.restorePersistedRuntime();
         }
@@ -499,6 +510,7 @@ public class EmulatorLifecycle {
         runCleanup("Redshift zero-ETL consumer", redshiftZeroEtlConsumer::shutdown);
         runCleanup("storage flush", storageFactory::flushAll);
         List<ContainerTeardown> prepared = ContainerTeardowns.prepareAll(containerTeardowns, LOG);
+        runCleanup("RDS instance starts", rdsService::shutdownInstanceStarts);
         runCleanup("EC2 metadata server", () -> {
             if (isMetadataServerNeeded()) {
                 ec2MetadataServer.stop();
