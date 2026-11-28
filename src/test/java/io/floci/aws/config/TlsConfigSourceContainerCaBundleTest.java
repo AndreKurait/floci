@@ -161,12 +161,14 @@ class TlsConfigSourceContainerCaBundleTest {
     void extraCertificatesReachPemAndJavaTrustWithoutLeakingKeys(boolean customServer) throws Exception {
         FlociCertificateAuthority peer = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("peer"));
         FlociCertificateAuthority otherPeer = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("other-peer"));
+        FlociCertificateAuthority outbound = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("outbound"));
         CertificateGenerator.GeneratedCertificate peerLeaf = peer.issueServerCertificate(
                 "peer.test", List.of("peer.test"), KeyAlgorithm.RSA_2048, null);
         Path extra = Files.writeString(tempDir.resolve("extra.pem"),
                 peer.caPem() + peerLeaf.privateKeyPem() + otherPeer.caPem());
         System.setProperty("floci.tls.enabled", "true");
         System.setProperty("floci.tls.extra-ca-certs", extra.toString());
+        System.setProperty("floci.tls.extra-ca-path", outbound.certificatePath().toString());
         System.setProperty("floci.storage.persistent-path", tempDir.resolve("floci").toString());
         if (customServer) {
             CertificateGenerator.GeneratedCertificate server = new CertificateGenerator()
@@ -183,6 +185,7 @@ class TlsConfigSourceContainerCaBundleTest {
         String pem = Files.readString(tls.resolve(ContainerCaBundle.FILE_NAME));
         assertTrue(pem.contains(peer.caPem().strip()));
         assertTrue(pem.contains(otherPeer.caPem().strip()));
+        assertFalse(pem.contains(outbound.caPem().strip()));
         assertFalse(pem.contains("PRIVATE KEY"));
         KeyStore store = KeyStore.getInstance("PKCS12");
         try (InputStream input = Files.newInputStream(tls.resolve(ContainerCaBundle.JAVA_TRUST_STORE_FILE_NAME))) {
@@ -193,6 +196,10 @@ class TlsConfigSourceContainerCaBundleTest {
         factory.init(store);
         X509TrustManager trust = (X509TrustManager) factory.getTrustManagers()[0];
         trust.checkServerTrusted(new X509Certificate[]{Pem.parseCertificate(peerLeaf.certificatePem())}, "RSA");
+        CertificateGenerator.GeneratedCertificate outboundLeaf = outbound.issueServerCertificate(
+                "outbound.test", List.of("outbound.test"), KeyAlgorithm.RSA_2048, null);
+        assertThrows(CertificateException.class, () -> trust.checkServerTrusted(
+                new X509Certificate[]{Pem.parseCertificate(outboundLeaf.certificatePem())}, "RSA"));
         FlociCertificateAuthority foreign = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("foreign"));
         CertificateGenerator.GeneratedCertificate foreignLeaf = foreign.issueServerCertificate(
                 "foreign.test", List.of("foreign.test"), KeyAlgorithm.RSA_2048, null);
