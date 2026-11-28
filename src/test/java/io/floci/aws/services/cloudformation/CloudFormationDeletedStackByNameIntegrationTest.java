@@ -6,6 +6,8 @@ import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -98,18 +100,8 @@ class CloudFormationDeletedStackByNameIntegrationTest {
 
     /** Deletion runs on an executor; wait until the name no longer resolves. */
     private static void awaitGone(String stackName) {
-        long deadline = System.currentTimeMillis() + 30_000;
-        while (System.currentTimeMillis() < deadline) {
-            if (cfn("DescribeStacks", stackName, null).statusCode() == 400) {
-                return;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-        }
-        throw new AssertionError("stack " + stackName + " still resolves by name after its delete");
+        CfnStackWaits.awaitState(Duration.ofSeconds(30), () -> cfn("DescribeStacks", stackName, null).statusCode(),
+                status -> status == 400,
+                status -> "stack " + stackName + " still resolves by name after its delete");
     }
 }
