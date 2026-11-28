@@ -146,7 +146,7 @@ class S3LegacyNumericBucketTest {
 
         assertEquals("old-version-id", service.headObject(BUCKET, KEY, "old-version-id").getVersionId());
         assertFalse(raw.get(versionKey).isPresent());
-        assertTrue(raw.get(OWNER + "/" + versionKey).isPresent());
+        assertTrue(raw.get(OWNER + "/" + S3HistoryKeys.key(BUCKET, KEY, "old-version-id")).isPresent());
     }
 
     private PersistentStorage<String, S3Object> persistedObject(String bucket, String key) {

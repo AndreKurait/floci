@@ -596,7 +596,7 @@ class S3ServiceTest {
                 "application/octet-stream", null);
 
         S3Object latest = objectStore.get("versioned-leak-bucket/big.bin").orElseThrow();
-        S3Object versioned = objectStore.get("versioned-leak-bucket/big.bin#v#" + put.getVersionId())
+        S3Object versioned = objectStore.get(S3HistoryKeys.key("versioned-leak-bucket", "big.bin", put.getVersionId()))
                 .orElseThrow();
         assertNull(latest.getData(),
                 "Latest S3Object cached in objectStore must not retain byte[] after disk persistence");
