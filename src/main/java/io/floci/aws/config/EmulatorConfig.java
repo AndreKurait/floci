@@ -4565,6 +4565,9 @@ public interface EmulatorConfig {
         /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
         Optional<String> keyPath();
 
+        /** PEM certificates appended to workload trust bundles. Env: FLOCI_TLS_EXTRA_CA_CERTS */
+        Optional<String> extraCaCerts();
+
         /**
          * PEM file of extra CA certificates that Floci's own outbound HTTPS clients trust, on top of
          * the JVM's default roots (and Floci's CA when TLS is on). Applies whether or not TLS is enabled.
