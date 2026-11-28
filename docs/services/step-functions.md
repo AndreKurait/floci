@@ -11,6 +11,7 @@
 | `CreateStateMachine` | Create a state machine (Standard or Express) |
 | `UpdateStateMachine` | Update definition, role, logging, tracing, or encryption settings and optionally publish a version |
 | `DescribeStateMachine` | Get state machine definition and metadata |
+| `DescribeStateMachineForExecution` | - |
 | `ListStateMachines` | List all state machines |
 | `DeleteStateMachine` | Delete a state machine |
 | `PublishStateMachineVersion` | - |
@@ -45,6 +46,35 @@
 `UpdateStateMachine` returns the new revision ID and update timestamp. CloudFormation updates
 definition, role, logging, tracing, encryption, and tags without replacing the state machine;
 changes to `StateMachineName` or `StateMachineType` use replacement semantics.
+
+`DescribeStateMachineForExecution` reads the configuration captured before a Standard
+execution starts, including the resolved version when invoked through an alias.
+Later updates preserve that definition, execution role, configuration date and
+logging/tracing/encryption metadata. The response names the base state-machine ARN.
+Its revision is omitted for an unupdated configuration; after an update, the date
+and revision belong to that update, including when a version is published later.
+`METADATA_ONLY` returns the definition as `"{}"` and preserves the other fields.
+
+Both public execution readers enforce the signing Region, partition and account.
+After the owning state machine is deleted, `DescribeExecution` and
+`DescribeStateMachineForExecution` return `ExecutionDoesNotExist` for its Standard
+executions. Creating another machine with the same name does not make those old
+executions visible. Internal execution rows and callbacks retain their existing
+lifecycle; this does not add cancellation or change execution-history retention.
+
+The snapshot and machine identity use the existing storage backends. Older
+persisted executions without a captured configuration return `UnsupportedOperation`
+while their owner remains visible; the current mutable definition is never
+substituted. Legacy machines and executions without identity fields remain
+compatible, but cannot distinguish recreations that preceded those fields.
+Older published versions without a captured configuration date retain their
+recorded publication date and revision as a compatibility fallback.
+
+Express and Distributed Map child lookups, variable-reference summaries and
+KMS decryption enforcement are not implemented by this action. Existing Express
+`DescribeExecution` behavior is unchanged. Execution-name reuse after machine
+recreation and atomic deletion against concurrent machine mutation are not
+addressed by these reader checks.
 
 `ListExecutions` honors `statusFilter` when listing a state machine's executions.
 Omitting the filter returns all statuses. Invalid filter values or types return
