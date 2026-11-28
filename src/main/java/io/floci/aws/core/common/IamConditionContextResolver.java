@@ -7,7 +7,9 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.dynamodb.DynamoDbConditionKeys;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
+import io.floci.aws.services.ec2.Ec2PlacementGroupService;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.model.Ec2PlacementGroup;
 import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.iam.IamActionRegistry;
 import io.floci.aws.services.iam.IamService;
@@ -102,6 +104,9 @@ public class IamConditionContextResolver {
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
+    /** Lazy to keep the existing IAM construction graph independent of EC2 storage creation. */
+    @Inject
+    Instance<Ec2PlacementGroupService> placementGroupService;
     private final Instance<S3Service> s3Service;
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
@@ -964,6 +969,10 @@ public class IamConditionContextResolver {
     // ── EC2 ─────────────────────────────────────────────────────────────────────
 
     private Map<String, List<String>> ec2ConditionContext(String action, ContainerRequestContext ctx) {
+        if ("ec2:CreatePlacementGroup".equals(action) || "ec2:DeletePlacementGroup".equals(action)
+                || "ec2:DescribePlacementGroups".equals(action)) {
+            return placementGroupConditionContext(action, ctx);
+        }
         if ("ec2:RunInstances".equals(action)) {
             return ec2RunInstancesConditionContext(ctx);
         }
@@ -979,6 +988,43 @@ public class IamConditionContextResolver {
                     heldTargets(action, ctx, form, targets));
         }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    private Map<String, List<String>> placementGroupConditionContext(String action, ContainerRequestContext ctx) {
+        Map<String, String> form = formParameters(ctx);
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("ec2:Region", List.of(region));
+        if ("ec2:DescribePlacementGroups".equals(action)) {
+            return conditions;
+        }
+        String name = form.get("GroupName");
+        if (name != null) {
+            conditions.put("ec2:PlacementGroupName", List.of(name));
+        }
+        if ("ec2:CreatePlacementGroup".equals(action)) {
+            String strategy = form.get("Strategy");
+            if (strategy != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(strategy));
+            }
+            for (String prefix : List.of("TagSpecification.", "TagSpecifications.")) {
+                for (int spec = 1; form.containsKey(prefix + spec + ".ResourceType"); spec++) {
+                    if ("placement-group".equals(form.get(prefix + spec + ".ResourceType"))) {
+                        addRequestTags(conditions, form, prefix + spec + ".Tag.");
+                    }
+                }
+            }
+        } else if (placementGroupService != null && placementGroupService.isResolvable()) {
+            Ec2PlacementGroup group = placementGroupService.get().authorizationTarget(region, name);
+            if (group != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(group.strategy()));
+                group.tags().forEach((key, value) -> {
+                    conditions.put("aws:ResourceTag/" + key, List.of(value));
+                    conditions.put("ec2:ResourceTag/" + key, List.of(value));
+                });
+            }
+        }
+        return conditions;
     }
 
     /**
@@ -1114,7 +1160,17 @@ public class IamConditionContextResolver {
         }
         Map<String, List<String>> result = context == null ? new LinkedHashMap<>() : new LinkedHashMap<>(context);
         result.keySet().removeIf(key -> prefixes.stream().anyMatch(key::startsWith) || keys.containsKey(key));
-        if (!keys.isEmpty()) {
+        if (callerResource && "placement-group".equals(parts[0])
+                && "ec2:DeletePlacementGroup".equals(action)
+                && arn.partition().equals(regionResolver.partitionForRegion(region))
+                && placementGroupService != null && placementGroupService.isResolvable()) {
+            Ec2PlacementGroup group = placementGroupService.get().authorizationTarget(region, parts[1]);
+            if (group != null) {
+                putResourceKeys(result, region, parts[0], group);
+                group.tags().forEach((key, value) -> prefixes.forEach(prefix ->
+                        result.put(prefix + key, List.of(value))));
+            }
+        } else if (!keys.isEmpty()) {
             putResourceKeys(result, region, parts[0],
                     ec2Service.get().heldResources(region, parts[0], List.of(parts[1])).get(parts[1]));
         }
