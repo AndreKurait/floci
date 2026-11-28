@@ -343,8 +343,8 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -554,8 +554,8 @@ class PostgresProtocolHandlerTest {
                 readReadyForQuery(clientIn);
 
                 ourClient.close();
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -633,8 +633,8 @@ class PostgresProtocolHandlerTest {
                     }
                 }
             } finally {
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 assertFalse(authThread.isAlive(), "authThread did not terminate");
             }
             assertNull(authFailure.get(), "TLS authentication thread failed");
@@ -778,8 +778,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -833,8 +833,8 @@ class PostgresProtocolHandlerTest {
                 assertEquals("approle", readParametersUntilReadyForQuery(clientIn).get("session_authorization"));
 
                 ourClient.close();
-                proxyClient.close();
                 authThread.join(5_000);
+                proxyClient.close();
                 backendTask.await();
                 assertFalse(authThread.isAlive(), "authThread did not terminate");
 
@@ -928,8 +928,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -1002,8 +1002,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -1077,8 +1077,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
                 assertFalse(authThread.isAlive(), "authThread did not terminate");
 
@@ -1303,8 +1303,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 lookupTask.await();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
@@ -1694,8 +1694,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
@@ -1811,8 +1811,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
             }
         }
@@ -1932,8 +1932,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
             }
         }
@@ -2212,8 +2212,8 @@ class PostgresProtocolHandlerTest {
 
                 ourClient.close();
                 authThread.awaitAuthentication();
-                proxyClient.close();
                 authThread.await();
+                proxyClient.close();
                 backendTask.await();
                 assertEquals(false, authThread.isAlive(), "authThread did not terminate");
 
