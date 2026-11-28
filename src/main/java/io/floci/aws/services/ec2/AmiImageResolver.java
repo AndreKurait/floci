@@ -58,7 +58,8 @@ public class AmiImageResolver {
                         ? ResolvedAmiImage.DEFAULT_RUNTIME
                         : image.guestRuntime,
                 Boolean.TRUE.equals(image.cloudInit),
-                dockerPlatform(image.architecture));
+                dockerPlatform(image.architecture),
+                image.volumeMounts());
     }
 
     // EC2's i386, which Docker runs as linux/386, beside the two architectures every service names.
