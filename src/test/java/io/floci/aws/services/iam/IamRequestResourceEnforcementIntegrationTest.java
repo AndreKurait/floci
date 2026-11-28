@@ -160,6 +160,25 @@ class IamRequestResourceEnforcementIntegrationTest {
         refused(configureHealthCheck(user, otherLoadBalancer), "elasticloadbalancing:ConfigureHealthCheck");
     }
 
+    /**
+     * A Query request's API is the {@code Version} its handler dispatches it by, its form's on a POST: one naming the
+     * v2 version only in its URL runs as the classic API, so it is checked on the classic load balancer its
+     * {@code LoadBalancerName} names, and a grant on a v2 load balancer's ARN does not delete that one.
+     */
+    @Test
+    void aQueryRequestsApiIsTheVersionItsFormNames() {
+        String name = classicLoadBalancer("data");
+        String v2 = ELB + "loadbalancer/app/res-v2/0123456789abcdef";
+        User user = user("res-elb-version");
+        user.policy(allowOn("elasticloadbalancing:DeleteLoadBalancer", v2));
+        refused(user.query("elasticloadbalancing", "DeleteLoadBalancer").queryParam("Version", "2015-12-01")
+                .formParam("LoadBalancerName", name).formParam("LoadBalancerArn", v2).post("/").then(),
+                "elasticloadbalancing:DeleteLoadBalancer");
+        admin("elasticloadbalancing").formParam("Action", "DescribeLoadBalancers").formParam("Version", "2012-06-01")
+                .formParam("LoadBalancerNames.member.1", name).post("/").then().statusCode(200)
+                .body(containsString(name));
+    }
+
     /** An IP target group an administrator creates, deleted after the test; its ARN. */
     private String elbTargetGroup() {
         String arn = admin("elasticloadbalancing").formParam("Action", "CreateTargetGroup")
@@ -242,8 +261,9 @@ class IamRequestResourceEnforcementIntegrationTest {
 
     /**
      * A v2 {@code CreateLoadBalancer} of a {@code Type} outside the enum names no v2 load balancer for IAM to check,
-     * and Elastic Load Balancing refuses it, as AWS does, so a grant on a classic load balancer's name does not
-     * create a v2 one under another.
+     * and a v2 request is never read for the classic API's {@code LoadBalancerName}, which only a classic request has
+     * (the table's rows name the API they are read for), so a grant on a classic load balancer's name does not create
+     * a v2 one under another: the request is checked on {@code *} and refused.
      */
     @Test
     void aLoadBalancerOfATypeOutsideTheEnumIsNotCreatedUnderAnotherName() {
@@ -253,8 +273,7 @@ class IamRequestResourceEnforcementIntegrationTest {
         user.query("elasticloadbalancing", "CreateLoadBalancer").formParam("Version", "2015-12-01")
                 .formParam("Name", name).formParam("Type", "other").formParam("LoadBalancerName", "res-allowed")
                 .formParam("Subnets.member.1", "subnet-a").formParam("Subnets.member.2", "subnet-b").post("/").then()
-                .statusCode(400).body(containsString("ValidationError"))
-                .body(containsString("Member must satisfy enum value set: [application, network, gateway]"));
+                .statusCode(403).body(containsString("elasticloadbalancing:CreateLoadBalancer"));
         admin("elasticloadbalancing").formParam("Action", "DescribeLoadBalancers").formParam("Version", "2015-12-01")
                 .post("/").then().statusCode(200).body(not(containsString(name)));
     }
@@ -1179,6 +1198,56 @@ class IamRequestResourceEnforcementIntegrationTest {
                 .body("{\"InstanceId\":\"" + instanceId + "\",\"InstanceOSUser\":\"ec2-user\",\"SSHPublicKey\":"
                         + "\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl "
                         + "user@host\"}").post("/").then();
+    }
+
+    /**
+     * CreateTags and DeleteTags check each VPC endpoint their {@code ResourceId} list names on the endpoint's ARN, its
+     * {@code vpce-} prefix taken from the EC2 API reference, so a grant on one endpoint does not reach another in the
+     * batch, and a deny on it holds against a grant on {@code *} before any member of the batch is tagged.
+     */
+    @Test
+    void aVpcEndpointIsTaggedOnItsArn() {
+        String vpc = admin("ec2").formParam("Action", "CreateVpc").formParam("Version", "2016-11-15")
+                .formParam("CidrBlock", "10.71.0.0/16").post("/").then().statusCode(200).extract()
+                .path("CreateVpcResponse.vpc.vpcId");
+        cleanup.register(() -> admin("ec2").formParam("Action", "DeleteVpc").formParam("Version", "2016-11-15")
+                .formParam("VpcId", vpc).post("/"));
+        String endpoint = vpcEndpoint(vpc);
+        String other = vpcEndpoint(vpc);
+        String arn = "arn:aws:ec2:" + REGION + ":" + ACCOUNT + ":vpc-endpoint/" + endpoint;
+
+        User user = user("res-vpce");
+        user.policy(allowOn("ec2:CreateTags", arn) + "," + allowOn("ec2:DeleteTags", arn));
+        ec2Tags(user, "CreateTags", endpoint).statusCode(200);
+        ec2Tags(user, "DeleteTags", endpoint).statusCode(200);
+        refused(ec2Tags(user, "CreateTags", endpoint, other), "ec2:CreateTags");
+        refused(ec2Tags(user, "DeleteTags", other), "ec2:DeleteTags");
+
+        user.policy(allowOn("ec2:CreateTags", "*") + "," + denyOn("ec2:CreateTags", arn));
+        refused(ec2Tags(user, "CreateTags", other, endpoint), "ec2:CreateTags");
+        admin("ec2").formParam("Action", "DescribeTags").formParam("Version", "2016-11-15")
+                .formParam("Filter.1.Name", "resource-id").formParam("Filter.1.Value.1", other).post("/").then()
+                .statusCode(200).body(not(containsString("<key>team</key>")));
+        ec2Tags(user, "CreateTags", other).statusCode(200);
+    }
+
+    private String vpcEndpoint(String vpc) {
+        String id = admin("ec2").formParam("Action", "CreateVpcEndpoint").formParam("Version", "2016-11-15")
+                .formParam("VpcId", vpc).formParam("ServiceName", "com.amazonaws." + REGION + ".s3")
+                .formParam("VpcEndpointType", "Gateway").post("/").then().statusCode(200).extract()
+                .path("CreateVpcEndpointResponse.vpcEndpoint.vpcEndpointId");
+        cleanup.register(() -> admin("ec2").formParam("Action", "DeleteVpcEndpoints").formParam("Version", "2016-11-15")
+                .formParam("VpcEndpointId.1", id).post("/"));
+        return id;
+    }
+
+    private static ValidatableResponse ec2Tags(User user, String operation, String... ids) {
+        RequestSpecification request = user.query("ec2", operation).formParam("Version", "2016-11-15")
+                .formParam("Tag.1.Key", "team").formParam("Tag.1.Value", "data");
+        for (int i = 0; i < ids.length; i++) {
+            request.formParam("ResourceId." + (i + 1), ids[i]);
+        }
+        return request.post("/").then();
     }
 
     @Test

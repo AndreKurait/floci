@@ -3191,6 +3191,24 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
     }
 
+    /**
+     * The instance profile {@code nameOrArn} names in {@code accountId}, read as EC2 reads the profile a request
+     * names: by its name, or by its ARN, which must be the profile's own, its path and account included, so an ARN
+     * of another account or path names none; empty for one {@code iam} does not hold there. The one reading IAM's
+     * passed-role check, EMR's instance profile and an EC2 instance's credentials share, so a profile none of them
+     * finds is used by none.
+     */
+    public static Optional<InstanceProfile> instanceProfileNamed(IamService iam, String accountId, String nameOrArn) {
+        if (nameOrArn == null || nameOrArn.isBlank()) {
+            return Optional.empty();
+        }
+        if (!AwsArnUtils.isArn(nameOrArn)) {
+            return iam.findInstanceProfile(accountId, nameOrArn);
+        }
+        return iam.findInstanceProfile(accountId, nameOrArn.substring(nameOrArn.lastIndexOf('/') + 1))
+                .filter(profile -> nameOrArn.equals(profile.getArn()));
+    }
+
     public Optional<InstanceProfile> findInstanceProfile(String accountId, String profileName) {
         if (instanceProfiles instanceof AccountAwareStorageBackend<InstanceProfile> aware) {
             return aware.getForAccount(accountId, profileName);
@@ -5656,6 +5674,19 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public Optional<EksSessionIdentity> findEksSessionIdentity(String accessKeyId) {
         return currentSession(accessKeyId).map(session -> new EksSessionIdentity(
                 session.getOriginAccountId(), session.getRoleArn(), session.getEc2RoleId(), session.getEc2InstanceId()));
+    }
+
+    public record Ec2InstanceIdentity(String accountId, String instanceId) {}
+
+    /** Returns the instance bound to a live IMDS credential with the matching session token. */
+    public Optional<Ec2InstanceIdentity> findEc2InstanceIdentity(String accessKeyId, String sessionToken) {
+        if (sessionToken == null || sessionToken.isBlank()) {
+            return Optional.empty();
+        }
+        return currentSession(accessKeyId)
+                .filter(session -> session.getEc2InstanceId() != null && !session.getEc2InstanceId().isBlank())
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(session -> new Ec2InstanceIdentity(session.getOriginAccountId(), session.getEc2InstanceId()));
     }
 
     private Optional<SessionCredential> currentSession(String accessKeyId) {
