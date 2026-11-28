@@ -154,6 +154,9 @@ keys are never copied. Missing, invalid or empty extra certificates, or failure 
 write either configured trust output, prevent startup. Restart Floci after changing
 the file. This does not change the server certificate or override trust settings
 explicitly supplied by a workload.
+`FLOCI_TLS_EXTRA_CA_PATH` continues to configure Floci's own outbound clients;
+those certificates enter workload trust only when also supplied through
+`FLOCI_TLS_EXTRA_CA_CERTS`.
 
 ## User-Provided Certificates
 

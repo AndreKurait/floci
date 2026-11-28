@@ -517,11 +517,12 @@ public class EmbeddedDnsServer {
                                     qname, txId, questionOffset, questionEnd);
                         }
                         DnsAnswer records = plan.answer().orElseThrow();
-                        if (records.isPublicAuthorityAnswer() && !standardQuery) {
+                        if ((records.isPublicAuthorityAnswer() || plan.reservedAuthority()) && !standardQuery) {
                             records = DnsAnswer.refused();
                         }
-                        byte[] response = records.isPublicAuthorityAnswer()
-                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records, tcp)
+                        byte[] response = records.isPublicAuthorityAnswer() || plan.reservedAuthority()
+                                ? buildPublicResponse(data, txId, questionOffset, questionEnd, records, tcp,
+                                        plan.reservedAuthority())
                                 : !records.isEmpty()
                                 ? buildAResponse(data, txId, questionOffset, questionEnd, records, tcp)
                                 : buildEmptyResponse(data, txId, questionOffset, questionEnd,
@@ -713,13 +714,22 @@ public class EmbeddedDnsServer {
      * storage: an answer Floci owns, a set of resolvers a rule forwards the query to, or neither,
      * which leaves it to the upstream resolvers.
      */
-    record QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets, boolean routedUpstream) {
+    record QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets,
+                     boolean routedUpstream, boolean reservedAuthority) {
+
+        QueryPlan(Optional<DnsAnswer> answer, List<DnsForwardingRule.Target> ruleTargets, boolean routedUpstream) {
+            this(answer, ruleTargets, routedUpstream, false);
+        }
 
         static final QueryPlan UPSTREAM = new QueryPlan(Optional.empty(), List.of(), false);
         static final QueryPlan ROUTED_UPSTREAM = new QueryPlan(Optional.empty(), List.of(), true);
 
         static QueryPlan answering(DnsAnswer answer) {
             return new QueryPlan(Optional.of(answer), List.of(), false);
+        }
+
+        static QueryPlan answeringReservedAuthority(DnsAnswer answer) {
+            return new QueryPlan(Optional.of(answer), List.of(), false, true);
         }
 
         static QueryPlan forwardingTo(List<DnsForwardingRule.Target> targets) {
@@ -801,7 +811,7 @@ public class EmbeddedDnsServer {
         Optional<DnsAnswer> resource = stored.or(() -> resolveFromRecordSources(name, type, false, myIp, origin));
         if (authoritative) {
             // An EC2 public DNS name is backed by the address it carries, so it still answers inside a scope.
-            return QueryPlan.answering(authoritativeAnswer(resource.or(() -> ec2PublicAnswer(name, type))));
+            return QueryPlan.answeringReservedAuthority(authoritativeAnswer(resource.or(() -> ec2PublicAnswer(name, type))));
         }
         QueryPlan upstream = publicApiDnsResponse != null && origin != null ? QueryPlan.ROUTED_UPSTREAM
                 : QueryPlan.UPSTREAM;
@@ -1125,6 +1135,11 @@ public class EmbeddedDnsServer {
 
     private byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd,
                                   DnsAnswer answer, boolean tcp) {
+        return buildAResponse(query, txId, questionOffset, questionEnd, answer, tcp, false);
+    }
+
+    private byte[] buildAResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                  DnsAnswer answer, boolean tcp, boolean reservedAuthority) {
         List<DnsRecord> records = answer.records();
         int questionLength = questionEnd - questionOffset;
         List<byte[]> data = records.stream().map(DnsRecord::data).toList();
@@ -1144,7 +1159,7 @@ public class EmbeddedDnsServer {
 
         // header
         resp.putShort(txId);
-        int flags = answer.authority() == null ? 0x8180 : 0x8400 | (query[2] & 1) << 8;
+        int flags = answer.authority() == null && !reservedAuthority ? 0x8180 : 0x8400 | (query[2] & 1) << 8;
         resp.putShort((short) (flags | (truncated ? 0x0200 : 0)));
         resp.putShort((short) 1);           // qdcount
         resp.putShort((short) answerCount); // ancount
@@ -1173,10 +1188,18 @@ public class EmbeddedDnsServer {
 
     private byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd,
                                        DnsAnswer answer, boolean tcp) {
+        return buildPublicResponse(query, txId, questionOffset, questionEnd, answer, tcp, false);
+    }
+
+    private byte[] buildPublicResponse(byte[] query, short txId, int questionOffset, int questionEnd,
+                                       DnsAnswer answer, boolean tcp, boolean reservedAuthority) {
         if (!answer.isEmpty()) {
-            return buildAResponse(query, txId, questionOffset, questionEnd, answer, tcp);
+            return buildAResponse(query, txId, questionOffset, questionEnd, answer, tcp, reservedAuthority);
         }
         int flags = 0x8000 | (query[2] & 0x79) << 8 | answer.responseCode();
+        if (reservedAuthority && answer.responseCode() != 5) {
+            flags |= 0x0400;
+        }
         DnsAnswer.Authority authority = answer.authority();
         if (authority == null) {
             return buildAnswerlessResponse(query, txId, questionOffset, questionEnd, (short) flags);
