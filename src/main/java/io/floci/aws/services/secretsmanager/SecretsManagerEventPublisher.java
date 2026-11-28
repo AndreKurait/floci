@@ -19,6 +19,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 /** Emits successful secret API writes, without copying credential-bearing request bodies. */
 @ApplicationScoped
@@ -31,6 +32,7 @@ public class SecretsManagerEventPublisher implements Resettable {
     private final AccountResolver accounts;
     private final ObjectMapper mapper;
     private final Executor deliveries;
+    private final LongSupplier nanoTime;
     private final Object deliveryLock = new Object();
     private long generation;
     private int activeDeliveries;
@@ -48,11 +50,18 @@ public class SecretsManagerEventPublisher implements Resettable {
 
     SecretsManagerEventPublisher(CloudTrailService cloudTrail, EventBridgeService eventBridge,
                                 AccountResolver accounts, ObjectMapper mapper, Executor deliveries) {
+        this(cloudTrail, eventBridge, accounts, mapper, deliveries, System::nanoTime);
+    }
+
+    SecretsManagerEventPublisher(CloudTrailService cloudTrail, EventBridgeService eventBridge,
+                                AccountResolver accounts, ObjectMapper mapper, Executor deliveries,
+                                LongSupplier nanoTime) {
         this.cloudTrail = cloudTrail;
         this.eventBridge = eventBridge;
         this.accounts = accounts;
         this.mapper = mapper;
         this.deliveries = deliveries;
+        this.nanoTime = nanoTime;
     }
 
     @PreDestroy
@@ -72,9 +81,9 @@ public class SecretsManagerEventPublisher implements Resettable {
         synchronized (deliveryLock) {
             paused = true;
             discardPending();
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(RESET_DRAIN_TIMEOUT_SECONDS);
+            long deadline = nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(RESET_DRAIN_TIMEOUT_SECONDS);
             while (activeDeliveries > 0) {
-                long remaining = deadline - System.nanoTime();
+                long remaining = deadline - nanoTime.getAsLong();
                 if (remaining <= 0) {
                     throw new IllegalStateException("Secrets Manager event deliveries did not drain before reset");
                 }
