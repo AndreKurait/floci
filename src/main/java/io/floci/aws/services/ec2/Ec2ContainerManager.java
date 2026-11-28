@@ -1405,7 +1405,14 @@ public class Ec2ContainerManager {
     }
 
     boolean isContainerRunning(String containerId) {
-        return containerId != null && !containerId.isBlank() && lifecycleManager.isContainerRunning(containerId);
+        if (containerId == null || containerId.isBlank()) {
+            return false;
+        }
+        ContainerLiveness liveness = lifecycleManager.probeContainer(containerId);
+        if (liveness == ContainerLiveness.UNKNOWN) {
+            throw new IllegalStateException("Cannot determine EC2 container liveness: " + containerId);
+        }
+        return liveness == ContainerLiveness.RUNNING;
     }
 
     /**
@@ -1957,8 +1964,7 @@ public class Ec2ContainerManager {
     }
 
     public boolean isContainerRunning(Instance instance) {
-        String containerId = instance.getDockerContainerId();
-        return containerId != null && lifecycleManager.isContainerRunning(containerId);
+        return isContainerRunning(instance.getDockerContainerId());
     }
 
     /** Signals that an instance's file system could not be captured as a Docker image. */
