@@ -85,11 +85,44 @@ public class S3TablesController {
     }
 
     @PUT
+    @Path("/buckets/{tableBucketARN}/storage-class")
+    public Response putTableBucketStorageClass(@Context HttpHeaders headers,
+                                               @Encoded @PathParam("tableBucketARN") String tableBucketArn,
+                                               Map<String, Object> request) {
+        service.putTableBucketStorageClass(decode(tableBucketArn),
+                request == null ? null : request.get("storageClassConfiguration"), region(headers));
+        return Response.ok().build();
+    }
+
+    @PUT
     @Path("/buckets/{tableBucketARN}/policy")
     public Response putTableBucketPolicy(@Context HttpHeaders headers, @Encoded @PathParam("tableBucketARN") String tableBucketArn,
                                          Map<String, Object> request) {
         service.putTableBucketPolicy(decode(tableBucketArn), string(request, "resourcePolicy"), region(headers));
         return Response.ok().build();
+    }
+
+    @PUT
+    @Path("/buckets/{tableBucketARN}/metrics")
+    public Response putTableBucketMetricsConfiguration(@Context HttpHeaders headers,
+            @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
+        service.putTableBucketMetricsConfiguration(decode(tableBucketArn), region(headers));
+        return Response.noContent().build();
+    }
+
+    @GET
+    @Path("/buckets/{tableBucketARN}/metrics")
+    public Response getTableBucketMetricsConfiguration(@Context HttpHeaders headers,
+            @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
+        return Response.ok(service.getTableBucketMetricsConfiguration(decode(tableBucketArn), region(headers))).build();
+    }
+
+    @DELETE
+    @Path("/buckets/{tableBucketARN}/metrics")
+    public Response deleteTableBucketMetricsConfiguration(@Context HttpHeaders headers,
+            @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
+        service.deleteTableBucketMetricsConfiguration(decode(tableBucketArn), region(headers));
+        return Response.noContent().build();
     }
 
     @GET
@@ -180,6 +213,15 @@ public class S3TablesController {
                 ? service.getTableByArn(tableArn, region(headers))
                 : service.getTable(tableBucketArn, namespace, name, region(headers));
         return Response.ok(tableRepresentation(table)).build();
+    }
+
+    @GET
+    @Path("/tables/{tableBucketARN}/{namespace}/{name}/storage-class")
+    public Response getTableStorageClass(@Context HttpHeaders headers,
+                                         @Encoded @PathParam("tableBucketARN") String tableBucketArn,
+                                         @PathParam("namespace") String namespace, @PathParam("name") String name) {
+        return Response.ok(Map.of("storageClassConfiguration",
+                service.getTableStorageClass(decode(tableBucketArn), namespace, name, region(headers)))).build();
     }
 
     @GET
