@@ -213,6 +213,9 @@ class S3ServiceTest {
         s3Service.createBucket("awslambda-eu-west-1-tasks", "eu-west-1");
         Bucket internal = s3Service.createServiceOwnedBucket("awslambda-us-east-1-tasks", "us-east-1");
         assertTrue(internal.isServiceOwned());
+        assertTrue(s3Service.isServiceOwnedBucket(internal.getName()));
+        assertFalse(s3Service.isServiceOwnedBucket("awslambda-eu-west-1-tasks"));
+        assertFalse(s3Service.isServiceOwnedBucket("missing-service-owned-bucket"));
         assertEquals(List.of("awslambda-eu-west-1-tasks"),
                 s3Service.listBuckets().stream().map(Bucket::getName).toList());
 
