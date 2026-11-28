@@ -60,6 +60,15 @@ its version does not discard its pool identity. Unqualified invocation retains
 the normal on-demand path, and existing authorization checks still precede
 execution.
 
+## Version and alias IAM conditions
+
+`DescribeStateMachine` and `StartExecution` authorize the base state-machine ARN.
+Use `states:StateMachineQualifier` to restrict these calls to a version or alias,
+as in the [AWS authorization examples](https://docs.aws.amazon.com/step-functions/latest/dg/auth-version-alias.html).
+The condition contains the requested version number or alias name; an alias does
+not become its selected version number. An unqualified call has no qualifier key.
+Other qualifier-aware management operations do not yet populate this condition.
+
 ## Task-token IAM resources
 
 With IAM enforcement enabled, `SendTaskSuccess`, `SendTaskFailure`, and
