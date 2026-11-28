@@ -16,6 +16,7 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -91,7 +92,8 @@ class CloudFormationLambdaWebIntegrationTest {
         String newRevisionId = updated.get("RevId");
         assertNotEquals(revisionId, newRevisionId);
         assertEquals(functionArn + "/endpoint/prod", updated.get("EpRef"), "the endpoint keeps its identity");
-        await().untilAsserted(() -> given().contentType("application/json").body("{}")
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given().contentType("application/json").body("{}")
                 .when().post("/2025-03-07/web-functions/" + functionName + "/list-revisions")
                 .then().statusCode(200)
                 .body("revisions", hasSize(1))
@@ -102,18 +104,21 @@ class CloudFormationLambdaWebIntegrationTest {
 
         // A failure after the next replacement rolls the endpoint back to this revision and deletes the replacement.
         cloudFormation(stackName, "UpdateStack", template(functionName, 60, BAD_REVISION));
-        await().untilAsserted(() -> describeStacks(stackName, "UPDATE_ROLLBACK_COMPLETE"));
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> describeStacks(stackName, "UPDATE_ROLLBACK_COMPLETE"));
         given().when().get("/2025-03-07/web-functions/" + functionName + "/endpoints/prod")
                 .then().statusCode(200)
                 .body("revisionWeights[0].revisionId", equalTo(newRevisionId));
-        await().untilAsserted(() -> given().contentType("application/json").body("{}")
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given().contentType("application/json").body("{}")
                 .when().post("/2025-03-07/web-functions/" + functionName + "/list-revisions")
                 .then().statusCode(200)
                 .body("revisions", hasSize(1))
                 .body("revisions[0].revisionId", equalTo(newRevisionId)));
 
         cloudFormation(stackName, "DeleteStack", null);
-        await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
                 .then().statusCode(404));
     }
 
@@ -130,7 +135,8 @@ class CloudFormationLambdaWebIntegrationTest {
         String notZip = template(functionName, 30).replace("\"app.zip\"", "\"notzip.zip\"");
 
         cloudFormation(stackName, "CreateStack", notZip);
-        await().untilAsserted(() -> describeStacks(stackName, "ROLLBACK_COMPLETE"));
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> describeStacks(stackName, "ROLLBACK_COMPLETE"));
         stackEvents(stackName).body(containsString(
                 "<ResourceStatusReason>Failed to read zip file: zip: not a valid zip file</ResourceStatusReason>"));
         given().when().get("/2025-03-07/web-functions/" + functionName).then().statusCode(404);
@@ -141,7 +147,8 @@ class CloudFormationLambdaWebIntegrationTest {
         cloudFormation(updatedStack, "CreateStack", template(functionName, 30));
         String revisionId = outputs(describeStacks(updatedStack, "CREATE_COMPLETE")).get("RevId");
         cloudFormation(updatedStack, "UpdateStack", notZip);
-        await().untilAsserted(() -> describeStacks(updatedStack, "UPDATE_ROLLBACK_COMPLETE"));
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> describeStacks(updatedStack, "UPDATE_ROLLBACK_COMPLETE"));
         given().contentType("application/json").body("{}")
                 .when().post("/2025-03-07/web-functions/" + functionName + "/list-revisions")
                 .then().statusCode(200)
@@ -149,7 +156,8 @@ class CloudFormationLambdaWebIntegrationTest {
                 .body("revisions[0].revisionId", equalTo(revisionId));
 
         cloudFormation(updatedStack, "DeleteStack", null);
-        await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
                 .then().statusCode(404));
     }
 
@@ -170,7 +178,8 @@ class CloudFormationLambdaWebIntegrationTest {
                 """.formatted(PROBE_TOKEN);
 
         cloudFormation(stackName, "CreateStack", template(functionName, 30, probe));
-        await().untilAsserted(() -> describeStacks(stackName, "CREATE_COMPLETE"));
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> describeStacks(stackName, "CREATE_COMPLETE"));
         String revisionId = outputs(describeStacks(stackName, "CREATE_COMPLETE")).get("RevId");
         JsonNode value = handler.request("Create").path("ResourceProperties").path("Value");
         assertEquals(List.of("us-east-1"), value.properties().stream().map(Map.Entry::getKey).toList());
@@ -185,7 +194,8 @@ class CloudFormationLambdaWebIntegrationTest {
         assertEquals("The endpoint is active in the region.", home.path("StateReason").asText());
 
         cloudFormation(stackName, "DeleteStack", null);
-        await().untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> given().when().get("/2025-03-07/web-functions/" + functionName)
                 .then().statusCode(404));
     }
 
@@ -201,7 +211,8 @@ class CloudFormationLambdaWebIntegrationTest {
 
         cloudFormation(stackName, "CreateStack", template(functionName, 30).replace(state,
                 state + ", \"EpRegional\": {\"Value\": {\"Fn::GetAtt\": [\"Ep\", \"RegionalEndpoints\"]}}"));
-        await().untilAsserted(() -> describeStacks(stackName, "ROLLBACK_COMPLETE"));
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> describeStacks(stackName, "ROLLBACK_COMPLETE"));
         stackEvents(stackName).body(containsString("Template format error: Every Value member must be a string."));
         given().when().get("/2025-03-07/web-functions/" + functionName).then().statusCode(404);
         cloudFormation(stackName, "DeleteStack", null);
