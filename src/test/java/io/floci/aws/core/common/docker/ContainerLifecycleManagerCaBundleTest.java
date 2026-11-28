@@ -493,7 +493,7 @@ class ContainerLifecycleManagerCaBundleTest {
     private static ContainerSpec javaSpecWithEnv(List<String> env) {
         return new ContainerSpec("busybox:stable", null, env, null, null, null, Map.of(), List.of(), List.of(), null,
                 List.of(), List.of(), List.of(), List.of(), Map.of(), null, false, null, List.of(), null, null,
-                List.of(), List.of(), null, null, false, List.of(), Map.of(), false, LinuxOptions.NONE, true);
+                List.of(), List.of(), null, null, false, List.of(), Map.of(), Map.of(), false, LinuxOptions.NONE, true);
     }
 
     private CreateContainerCmd stubCreateContainer() {
