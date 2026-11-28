@@ -1,5 +1,6 @@
-"""The two-operation AppConfig admission scope survives generation and validation."""
+"""The reviewed AppConfig admission scope survives generation and validation."""
 import copy
+import json
 
 import pytest
 
@@ -7,13 +8,16 @@ import regen_iam_tag_on_create as r
 from test_regen_iam_tag_on_create import TAG_SHAPES, model, reference, structure
 
 
-NAMES = ["CreateApplication", "CreateDeploymentStrategy"]
+NAMES = [
+    "CreateApplication", "CreateConfigurationProfile", "CreateDeploymentStrategy", "CreateEnvironment",
+    "CreateExperimentDefinition", "CreateExtension", "CreateExtensionAssociation", "StartDeployment",
+    "StartExperimentRun",
+]
 
 
 @pytest.fixture
 def partial_document(monkeypatch, tmp_path):
-    operations = NAMES + ["CreateEnvironment", "CreateConfigurationProfile", "CreateExtension",
-                          "CreateExtensionAssociation", "StartDeployment", "FutureCreate"]
+    operations = NAMES + ["FutureCreate"]
     public = reference("appconfig", {name: ["appconfig:TagResource"] for name in operations},
                        keys={name: ["aws:RequestTag/${TagKey}", "aws:TagKeys"] for name in operations})
     sdk = model({name: "Input" for name in operations},
@@ -25,12 +29,12 @@ def partial_document(monkeypatch, tmp_path):
     return r.build([public], "public-contract-fixture", tmp_path, "test"), public
 
 
-def test_only_the_two_appconfig_operations_are_generated(partial_document):
+def test_only_the_reviewed_appconfig_operations_are_generated(partial_document):
     document, public = partial_document
     assert r.PARTIAL_NAMESPACES["appconfig"] == NAMES
     assert document["partialNamespaces"] == {"appconfig": NAMES}
     assert set(document["operations"]) == {"appconfig:" + name for name in NAMES}
-    assert document["notCovered"]["appconfig"].endswith("other creation tags remain uncovered")
+    assert "appconfig" not in document["notCovered"]
     assert r.validate(document) == []
     for entry in document["operations"].values():
         assert entry == {"tagging": ["appconfig:TagResource"], "requestTags": True,
@@ -39,10 +43,10 @@ def test_only_the_two_appconfig_operations_are_generated(partial_document):
     untrue, added = r.verify_against(document, upstream)
     assert untrue == []
     assert added == []
-    assert '"partialNamespaces": {"appconfig": ["CreateApplication", "CreateDeploymentStrategy"]}' in r.render(document)
+    assert json.loads(r.render(document))["partialNamespaces"] == {"appconfig": NAMES}
 
 
-@pytest.mark.parametrize("names", [[], ["CreateApplication"], NAMES + ["CreateEnvironment"],
+@pytest.mark.parametrize("names", [[], ["CreateApplication"], NAMES + ["FutureCreate"],
                                    NAMES + ["CreateApplication"], ["CreateApplication", "Bad:Name"]])
 def test_partial_inventory_cannot_omit_or_expand_the_exact_operation_set(partial_document, names):
     document = copy.deepcopy(partial_document[0])
@@ -52,7 +56,7 @@ def test_partial_inventory_cannot_omit_or_expand_the_exact_operation_set(partial
 
 def test_an_extra_namespace_operation_is_rejected_even_with_valid_tag_members(partial_document):
     document = copy.deepcopy(partial_document[0])
-    document["operations"]["appconfig:CreateEnvironment"] = copy.deepcopy(
+    document["operations"]["appconfig:FutureCreate"] = copy.deepcopy(
         document["operations"]["appconfig:CreateApplication"])
     document["operations"] = dict(sorted(document["operations"].items()))
     assert any("does not exactly match" in failure for failure in r.validate(document))

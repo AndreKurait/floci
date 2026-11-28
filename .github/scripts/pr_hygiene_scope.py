@@ -16,6 +16,23 @@ OLD_PACKAGE = b"io/github/hectorvent/floci"
 NEW_PACKAGE = b"io/floci/aws"
 SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+HISTORY_POLICY = Path(__file__).with_name("pr_hygiene_history.json")
+
+
+def history_policy(repository, eligible):
+    """Reviewed immutable import roots, never roots supplied by a PR event."""
+    if not HISTORY_POLICY.exists():
+        return [], None
+    contents = HISTORY_POLICY.read_bytes()
+    policy = json.loads(contents)
+    if policy.get("version") != 1 or not isinstance(policy.get("repositories"), dict):
+        raise ValueError("Malformed historical import policy")
+    roots = policy["repositories"].get(repository, [])
+    if not isinstance(roots, list) or len(set(roots)) != len(roots):
+        raise ValueError("Malformed historical import roots")
+    for root in roots:
+        valid_sha(root)
+    return roots if eligible else [], hashlib.sha256(contents).hexdigest()
 
 
 def run(*args, allowed=(0,)):
@@ -63,8 +80,10 @@ def event_anchors():
     if same_repository and (type(head["repo"]["id"]) is not int or head["repo"]["id"] != repository_id):
         raise ValueError("Head repository name and ID disagree")
     sync = same_repository and base["ref"] == "dev" and head["ref"] == "dev_target"
+    roots, policy_digest = history_policy(repository, same_repository and base["ref"] == "main")
     return {"version": 1, "repository": repository, "base": base["sha"], "head": head["sha"],
-            "eventDigest": hashlib.sha256(event_bytes).hexdigest(), "sync": sync}
+            "eventDigest": hashlib.sha256(event_bytes).hexdigest(), "sync": sync,
+            "historyCandidates": roots, "historyPolicyDigest": policy_digest}
 
 
 def require_object(sha):
@@ -79,6 +98,16 @@ def require_accepted_ancestry(scope):
         require_object(scope["acceptedMain"])
         for ancestor in (scope["base"], scope["acceptedMain"]):
             git("merge-base", "--is-ancestor", ancestor, scope["head"])
+    accepted = []
+    for root in scope["historyCandidates"]:
+        require_object(root)
+        result = subprocess.run(["git", "merge-base", "--is-ancestor", root, scope["head"]])
+        if result.returncode == 0:
+            accepted.append(root)
+        elif result.returncode != 1:
+            raise ValueError("Unable to verify historical import ancestry")
+    if scope["acceptedHistory"] != accepted:
+        raise ValueError("Historical import scope differs from reviewed ancestry")
 
 
 def write_scope(path):
@@ -86,6 +115,17 @@ def write_scope(path):
     path.unlink(missing_ok=True)
     scope = event_anchors()
     scope["acceptedMain"] = None
+    scope["acceptedHistory"] = []
+    for root in scope["historyCandidates"]:
+        present = subprocess.run(["git", "cat-file", "-e", root + "^{commit}"], capture_output=True)
+        if present.returncode:
+            git("fetch", "--no-tags", "--no-write-fetch-head",
+                f"https://github.com/{scope['repository']}.git", root)
+        result = subprocess.run(["git", "merge-base", "--is-ancestor", root, scope["head"]])
+        if result.returncode == 0:
+            scope["acceptedHistory"].append(root)
+        elif result.returncode != 1:
+            raise ValueError("Unable to verify historical import ancestry")
     if scope["sync"]:
         endpoint = f"repos/{scope['repository']}/git/ref/heads/main"
         reference = json.loads(run("gh", "api", "--hostname", "github.com", endpoint))
@@ -118,6 +158,7 @@ def read_scope(path):
 
 def ordinary_commits(scope):
     exclusions = ["^" + scope["base"]]
+    exclusions.extend("^" + root for root in scope["acceptedHistory"])
     if scope["sync"]:
         exclusions.append("^" + scope["acceptedMain"])
     return git("rev-list", "--no-merges", scope["head"], *exclusions).decode("ascii").splitlines()
@@ -172,7 +213,7 @@ def report(message):
 
 
 def check_emdashes(scope):
-    if not scope["sync"]:
+    if not scope["sync"] and not scope["acceptedHistory"]:
         added = set(git("diff", "-z", "--diff-filter=A", "--name-only",
                         scope["base"], scope["head"]).split(b"\0"))
         failed = False
@@ -184,7 +225,22 @@ def check_emdashes(scope):
         return failed
 
     failed = False
+    base = emdash_lines(scope["base"])
+    inherited = {}
+    for root in scope["acceptedHistory"] + ([scope["acceptedMain"]] if scope["sync"] else []):
+        for path, lines in emdash_lines(root).items():
+            inherited[path] = inherited.get(path, Counter()) | lines
     for sha in ordinary_commits(scope):
+        if scope["acceptedHistory"]:
+            # Signed history carriers can reapply accepted lines. Check their
+            # complete trees so new text and extra occurrences still fail.
+            for path, lines in emdash_lines(sha).items():
+                accepted = base.get(path, Counter()) | inherited.get(path, Counter())
+                for line, count in (lines - accepted).items():
+                    report("New em-dash text in commit " + sha + " at " + repr(os.fsdecode(path))
+                           + f" ({count} occurrence(s)): " + line.decode("utf-8", "replace"))
+                    failed = True
+            continue
         in_hunk = False
         patch = git("show", "--format=", "--unified=0", "--no-renames",
                     "--no-ext-diff", "--no-textconv", sha)
@@ -196,11 +252,9 @@ def check_emdashes(scope):
             elif in_hunk and line.startswith(b"+") and EM_DASH in line:
                 report("New em-dash text in commit " + sha + ": " + line[1:].decode("utf-8", "replace"))
                 failed = True
-    base = emdash_lines(scope["base"])
-    main = emdash_lines(scope["acceptedMain"])
     head = emdash_lines(scope["head"])
     for path, lines in head.items():
-        accepted = base.get(path, Counter()) | main.get(path, Counter())
+        accepted = base.get(path, Counter()) | inherited.get(path, Counter())
         for line, count in (lines - accepted).items():
             report("New em-dash provenance in " + repr(os.fsdecode(path))
                    + f" ({count} occurrence(s)): " + line.decode("utf-8", "replace"))

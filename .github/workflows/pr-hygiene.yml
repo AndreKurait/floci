@@ -37,6 +37,8 @@ jobs:
     name: PR hygiene
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      REPO: ${{ github.repository }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -220,7 +222,9 @@ jobs:
             return 0
           }
 
-          for sha in $(git log --no-merges --format=%H "$BASE_SHA".."$HEAD_SHA"); do
+          COMMITS_FILE=$(mktemp)
+          python3 "$GITHUB_WORKSPACE/.github/scripts/pr_hygiene_scope.py" commits --scope-file "$RUNNER_TEMP/pr-hygiene-scope.json" > "$COMMITS_FILE"
+          for sha in $(cat "$COMMITS_FILE"); do
             subject=$(git show -s --format=%s "$sha")
             offending=""
 
@@ -338,7 +342,10 @@ jobs:
             FAILED=1
           fi
 
-          while IFS= read -r msg; do
+          COMMITS_FILE=$(mktemp)
+          python3 "$GITHUB_WORKSPACE/.github/scripts/pr_hygiene_scope.py" commits --scope-file "$RUNNER_TEMP/pr-hygiene-scope.json" > "$COMMITS_FILE"
+          while IFS= read -r sha; do
+            msg=$(git show -s --format=%s "$sha")
             if echo "$msg" | grep -qE "$PATTERN"; then
               echo "ok: $msg"
             else
@@ -346,7 +353,7 @@ jobs:
               usage "$msg"
               FAILED=1
             fi
-          done < <(git log --no-merges --format="%s" "$BASE_SHA".."$HEAD_SHA")
+          done < "$COMMITS_FILE"
 
           exit $FAILED
 

@@ -160,9 +160,86 @@ os.execv(REAL_GIT, [REAL_GIT, *args])
 
     def resolve(self):
         self.write_api()
-        return subprocess.run([sys.executable, str(SCRIPT), "resolve", "--scope-file",
+        script = Path(self.env["GITHUB_WORKSPACE"]) / ".github/scripts/pr_hygiene_scope.py"
+        return subprocess.run([sys.executable, str(script), "resolve", "--scope-file",
                                str(self.root / "pr-hygiene-scope.json")], cwd=self.root, env=self.env,
                               capture_output=True, text=True, timeout=30)
+
+    def historical_import(self, roots=None, foreign=False):
+        workspace = self.root / "policy-workspace"
+        scripts = workspace / ".github/scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(SCRIPT, scripts / SCRIPT.name)
+        self.policy = scripts / "pr_hygiene_history.json"
+        self.policy.write_text(json.dumps({"version": 1, "repositories": {
+            "example/floci": roots if roots is not None else [self.main]}}))
+        self.env["GITHUB_WORKSPACE"] = str(workspace)
+        self.write_event(base_ref="main", head_ref="preserved-history",
+                         head_repository="attacker/floci" if foreign else "example/floci")
+
+    def test_reviewed_history_import_checks_only_new_contributions(self):
+        self.historical_import()
+        result = self.signatures()
+        self.assert_success(result)
+        self.assertEqual(1, result.stdout.count("ok: "))
+        self.assertIn(self.head, result.stdout)
+
+    def test_reviewed_history_does_not_admit_a_new_unsigned_commit(self):
+        self.historical_import()
+        self.assert_failure(self.signatures(verified=False))
+
+    def test_foreign_fork_cannot_use_reviewed_history_exclusions(self):
+        self.historical_import(foreign=True)
+        self.assert_failure(self.signatures())
+
+    def test_unrelated_history_root_does_not_exclude_contributions(self):
+        unrelated = self.commit("chore: unrelated history", self.base)
+        self.historical_import([unrelated])
+        self.assert_failure(self.signatures())
+
+    def test_event_cannot_expand_reviewed_history(self):
+        self.historical_import()
+        self.event["acceptedHistory"] = [self.head]
+        self.save_event()
+        self.assert_failure(self.signatures(verified=False))
+
+    def test_history_policy_change_invalidates_resolved_scope(self):
+        self.historical_import()
+        self.assert_success(self.resolve())
+        self.policy.write_text(json.dumps({"version": 1, "repositories": {
+            "example/floci": [self.main, self.head]}}))
+        self.assert_failure(self.bash(emdash_script()))
+
+    def test_history_scope_cannot_be_expanded_in_stored_file(self):
+        self.historical_import()
+        self.assert_success(self.resolve())
+        path = self.root / "pr-hygiene-scope.json"
+        scope = json.loads(path.read_text())
+        scope["acceptedHistory"].append(self.head)
+        path.write_text(json.dumps(scope))
+        self.assert_failure(self.bash(emdash_script()))
+
+    def test_reviewed_history_keeps_new_text_checks(self):
+        self.head = self.commit("fix: new text", self.head, files={"old.txt": "new" + EM_DASH})
+        self.historical_import()
+        self.assert_failure(self.emdashes())
+
+    def test_reviewed_history_preserves_inherited_text(self):
+        self.historical_import()
+        self.assert_success(self.emdashes())
+
+    def test_history_carrier_can_restore_an_accepted_line(self):
+        removed = self.commit("fix: prepare history carrier", self.head, files={"import.txt": None})
+        self.head = self.commit("fix: restore accepted text", removed,
+                                files={"import.txt": "import" + EM_DASH + "\n"})
+        self.historical_import()
+        self.assert_success(self.emdashes())
+
+    def test_history_carrier_cannot_duplicate_an_accepted_line(self):
+        self.head = self.commit("fix: duplicate text", self.head,
+                                files={"import.txt": ("import" + EM_DASH + "\n") * 2})
+        self.historical_import()
+        self.assert_failure(self.emdashes())
 
     def emdashes(self):
         result = self.resolve()
