@@ -238,7 +238,7 @@ def test_template_primary_interface_tags(ec2_client, supplied_interface, request
 
 
 @pytest.mark.parametrize("retain_primary", [False, True])
-def test_instance_group_update_preserves_secondary_interface_groups(ec2_client, retain_primary):
+def test_primary_interface_group_update_preserves_secondary_interface_groups(ec2_client, retain_primary):
     ec2 = ec2_client
     name = "interface-group-isolation-" + uuid.uuid4().hex
     with ExitStack() as cleanup:
@@ -271,7 +271,15 @@ def test_instance_group_update_preserves_secondary_interface_groups(ec2_client, 
         ec2.get_waiter("instance_running").wait(
             InstanceIds=[instance_id], WaiterConfig={"Delay": 1, "MaxAttempts": 30})
         ec2.attach_network_interface(NetworkInterfaceId=secondary_id, InstanceId=instance_id, DeviceIndex=1)
-        ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[groups[2]])
+        before = ec2.describe_network_interfaces(NetworkInterfaceIds=interfaces)["NetworkInterfaces"]
+        with pytest.raises(ClientError) as error:
+            ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[groups[2]])
+        assert error.value.response["Error"]["Code"] == "InvalidInstanceID"
+        assert error.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        unchanged = ec2.describe_network_interfaces(NetworkInterfaceIds=interfaces)["NetworkInterfaces"]
+        assert {eni["NetworkInterfaceId"]: eni["Groups"] for eni in unchanged} == {
+            eni["NetworkInterfaceId"]: eni["Groups"] for eni in before}
+        ec2.modify_network_interface_attribute(NetworkInterfaceId=primary_id, Groups=[groups[2]])
         expected = {primary_id: [groups[2]], secondary_id: [groups[1]]}
         described = ec2.describe_network_interfaces(NetworkInterfaceIds=interfaces)["NetworkInterfaces"]
         assert {eni["NetworkInterfaceId"]: [g["GroupId"] for g in eni["Groups"]]
