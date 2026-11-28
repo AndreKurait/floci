@@ -43,8 +43,8 @@ class SsmJsonHandlerSecretReferenceTest {
         getParameters.putArray("Names").add(NAME);
 
         assertEquals("An error occurred while calling one AWS dependency service.", assertThrows(AwsException.class,
-            () -> handler.handle("GetParameter", getParameter, REGION, "auth")).getMessage());
+            () -> handler.handle("GetParameter", getParameter, REGION, "auth", null)).getMessage());
         assertEquals("An error occurred while calling one AWS dependency service.", assertThrows(AwsException.class,
-            () -> handler.handle("GetParameters", getParameters, REGION, "auth")).getMessage());
+            () -> handler.handle("GetParameters", getParameters, REGION, "auth", null)).getMessage());
     }
 }
