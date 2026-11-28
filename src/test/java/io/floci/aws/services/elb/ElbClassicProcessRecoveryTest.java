@@ -30,8 +30,10 @@ import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.elb.model.ClassicLoadBalancer;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -50,6 +52,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(ParallelLocks.PORTS)
 class ElbClassicProcessRecoveryTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";

@@ -10,6 +10,8 @@ import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.FlociDockerHttpClient;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.testing.DockerAvailability;
+import io.floci.aws.testing.ParallelLocks;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -27,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Exercises the production scripts on IPv4 Docker bridges using only an explicitly selected cached helper image. */
+@ResourceLock(ParallelLocks.PORTS)
 class Ec2AttachedInterfaceIpv6DockerIntegrationTest {
 
     @ParameterizedTest

@@ -4,6 +4,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.dns.DnsAnswer;
+import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.floci.aws.core.common.dns.DnsRecord;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -758,34 +759,37 @@ class Route53ServiceTest {
     @Test
     void clear_resetsPrivateZoneNameCounts() {
         Route53Service service = newService();
+        ClientVpc origin = new ClientVpc(ACCOUNT, "us-east-1", "vpc-123");
         String zoneId = service.createHostedZone("corp.internal.", "ref-clear", null,
                 new VpcAssociation("vpc-123", "us-east-1")).zone().getId();
 
         service.changeResourceRecordSets(zoneId,
                 List.of(change("CREATE", aRecord("app.corp.internal.", 300, "10.0.0.1"))), null);
 
-        List<ResourceRecordSet> beforeClear = service.findPrivateRecordsForName("app.corp.internal.", null);
+        List<ResourceRecordSet> beforeClear = service.findPrivateRecordsForName("app.corp.internal.", origin);
         assertThat(beforeClear, hasSize(1));
 
         service.clear();
 
-        List<ResourceRecordSet> afterClear = service.findPrivateRecordsForName("app.corp.internal.", null);
+        List<ResourceRecordSet> afterClear = service.findPrivateRecordsForName("app.corp.internal.", origin);
         assertThat(afterClear, empty());
     }
 
     @Test
     void isCoveredByPrivateZone_matchesPrivateZoneDomainsOnly() {
         Route53Service service = newService();
+        ClientVpc origin = new ClientVpc(ACCOUNT, "us-east-1", "vpc-123");
         service.createHostedZone("corp.internal.", "ref-private", null,
                 new VpcAssociation("vpc-123", "us-east-1"));
         service.createHostedZone("public.com.", "ref-public", null, null);
 
-        assertTrue(service.isCoveredByPrivateZone("corp.internal", null));
-        assertTrue(service.isCoveredByPrivateZone("app.corp.internal.", null));
-        assertTrue(service.isCoveredByPrivateZone("sub.service.corp.internal", null));
-        assertFalse(service.isCoveredByPrivateZone("public.com", null));
-        assertFalse(service.isCoveredByPrivateZone("othercorp.internal", null));
-        assertFalse(service.isCoveredByPrivateZone("example.org", null));
+        assertTrue(service.isCoveredByPrivateZone("corp.internal", origin));
+        assertTrue(service.isCoveredByPrivateZone("app.corp.internal.", origin));
+        assertTrue(service.isCoveredByPrivateZone("sub.service.corp.internal", origin));
+        assertFalse(service.isCoveredByPrivateZone("corp.internal", null));
+        assertFalse(service.isCoveredByPrivateZone("public.com", origin));
+        assertFalse(service.isCoveredByPrivateZone("othercorp.internal", origin));
+        assertFalse(service.isCoveredByPrivateZone("example.org", origin));
     }
 
     private static HealthCheckConfig httpsCheck(String path) {

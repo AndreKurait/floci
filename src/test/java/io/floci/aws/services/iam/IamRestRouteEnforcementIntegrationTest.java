@@ -876,18 +876,29 @@ class IamRestRouteEnforcementIntegrationTest {
      */
     @Test
     void appConfigDataCallsAreCheckedByTheirModeledRoutes() {
+        String application = adminOf("appconfig").body("{\"Name\":\"route-data-" + suffix() + "\"}")
+                .post("/applications").then().statusCode(201).extract().path("Id");
+        cleanup.register(() -> adminOf("appconfig").delete("/applications/" + application));
+        String environment = adminOf("appconfig").body("{\"Name\":\"route-data-env\"}")
+                .post("/applications/" + application + "/environments").then().statusCode(201).extract().path("Id");
+        String profile = adminOf("appconfig")
+                .body("{\"Name\":\"route-data-profile\",\"LocationUri\":\"hosted\",\"Type\":\"AWS.Freeform\"}")
+                .post("/applications/" + application + "/configurationprofiles").then().statusCode(201)
+                .extract().path("Id");
+        String session = "{\"ApplicationIdentifier\":\"" + application + "\",\"EnvironmentIdentifier\":\""
+                + environment + "\",\"ConfigurationProfileIdentifier\":\"" + profile + "\"}";
+        String token = adminOf("appconfig").body(session).post("/configurationsessions")
+                .then().statusCode(201).extract().path("InitialConfigurationToken");
         String user = user("route-appconfigdata");
-        refused(as(user, "appconfig").queryParam("configuration_token", "token").get("/configuration").then(),
+        refused(as(user, "appconfig").queryParam("configuration_token", token).get("/configuration").then(),
                 "appconfig:GetLatestConfiguration");
-        refused(as(user, "appconfig").queryParam("configuration_token", "token").get("/_appconfigdata/configuration")
+        refused(as(user, "appconfig").queryParam("configuration_token", token).get("/_appconfigdata/configuration")
                 .then(), "appconfig:GetLatestConfiguration");
-        refused(as(user, "appconfig").body("{\"ApplicationIdentifier\":\"a\",\"EnvironmentIdentifier\":\"e\","
-                + "\"ConfigurationProfileIdentifier\":\"p\"}").post("/configurationsessions").then(),
+        refused(as(user, "appconfig").body(session).post("/configurationsessions").then(),
                 "appconfig:StartConfigurationSession");
-        refused(as(user, "appconfigdata").body("{\"ApplicationIdentifier\":\"a\",\"EnvironmentIdentifier\":\"e\","
-                + "\"ConfigurationProfileIdentifier\":\"p\"}").post("/configurationsessions").then(),
+        refused(as(user, "appconfigdata").body(session).post("/configurationsessions").then(),
                 "appconfig:StartConfigurationSession");
-        refused(as(user, "appconfigdata").queryParam("configuration_token", "token").get("/configuration").then(),
+        refused(as(user, "appconfigdata").queryParam("configuration_token", token).get("/configuration").then(),
                 "appconfig:GetLatestConfiguration");
     }
 

@@ -2,6 +2,7 @@ package io.floci.aws.services.ecs;
 
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.floci.aws.services.ecs.container.EcsContainerManager;
 import io.floci.aws.services.ecs.container.EcsTaskHandle;
 import io.floci.aws.services.ecs.exec.EcsExecSessionRegistry;
@@ -21,6 +22,7 @@ import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -51,6 +53,20 @@ class EcsServiceEcrPullIdentityTest {
                 service.listTasks("cluster", null, "RUNNING", null, REGION), REGION);
         assertEquals(1, tasks.size());
         assertEquals("RUNNING", tasks.getFirst().getLastStatus());
+    }
+
+    @Test
+    void enforcedNativeEcrLaunchRetainsBothInstanceCredentialsAndHostVpc() {
+        EcsService service = service(true, NATIVE_IMAGE);
+        ClientVpc origin = new ClientVpc(ACCOUNT, REGION, "vpc-owned");
+        when(manager.vpcForInstance(ACCOUNT, REGION, "i-owned")).thenReturn(Optional.of(origin));
+        when(manager.startTask(any(), any(), any(), eq(REGION), eq("i-owned"), eq(origin)))
+                .thenAnswer(invocation -> started(invocation.getArgument(0)));
+
+        createAndReconcile(service);
+
+        verify(manager).startTask(any(), any(), any(), eq(REGION), eq("i-owned"), eq(origin));
+        assertEquals(1, service.listTasks("cluster", null, "RUNNING", null, REGION).size());
     }
 
     @Test

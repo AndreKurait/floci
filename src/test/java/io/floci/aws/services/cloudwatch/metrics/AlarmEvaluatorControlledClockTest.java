@@ -121,7 +121,7 @@ class AlarmEvaluatorControlledClockTest {
     @Test
     void aFailedOwnedEnumerationDoesNotDisableTheCapturedScheduledCallback() {
         CloudWatchMetricsService failing = mock(CloudWatchMetricsService.class);
-        when(failing.allOwnedAlarms()).thenThrow(new IllegalStateException("controlled storage failure"))
+        when(failing.metricAlarmsInEveryAccount()).thenThrow(new IllegalStateException("controlled storage failure"))
                 .thenReturn(List.of());
         AlarmEvaluator subject = new AlarmEvaluator(failing, handlers(), clock, scheduler);
         ArgumentCaptor<Runnable> tick = ArgumentCaptor.forClass(Runnable.class);
@@ -131,7 +131,7 @@ class AlarmEvaluatorControlledClockTest {
         tick.getValue().run();
         tick.getValue().run();
 
-        verify(failing, times(2)).allOwnedAlarms();
+        verify(failing, times(2)).metricAlarmsInEveryAccount();
     }
 
     private void alarm(int period, int count, String missing) {

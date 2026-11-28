@@ -307,6 +307,23 @@ final class PassedRoles {
      * passes none or the request names none.
      */
     static List<PassedRole> of(String operation, ContainerRequestContext ctx, Lookups lookups) {
+        if (operation.startsWith("apigateway:") && ctx.getUriInfo() != null
+                && ctx.getUriInfo().getRequestUri() != null) {
+            String path = IamActionRegistry.routedPath(ctx);
+            String method = switch (operation) {
+                case "apigateway:CreateApi" -> "/v2/apis".equals(path) ? "POST" : null;
+                case "apigateway:ImportApi", "apigateway:ReimportApi" ->
+                        "/v2/apis".equals(path) || V2_API.matcher(path).matches() ? "PUT" : null;
+                case "apigateway:ImportRestApi" -> "/restapis".equals(path) ? "POST" : null;
+                case "apigateway:PutRestApi" -> REST_API.matcher(path).matches() ? "PUT" : null;
+                default -> null;
+            };
+            if (method != null) {
+                // The owning importer knows which assignments it consumes; the model also contains
+                // credentials in ignored extensions and quick-create requests with no AWS target.
+                return apiGatewayRoles("apigateway:" + method, ctx, lookups);
+            }
+        }
         List<PassedRole> byHand = byHand(operation, ctx, lookups);
         return byHand != null ? byHand : fromTable(operation, PassedRoleMembers.of(operation), ctx, lookups);
     }

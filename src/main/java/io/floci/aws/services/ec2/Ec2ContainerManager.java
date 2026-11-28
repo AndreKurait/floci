@@ -3250,6 +3250,7 @@ public class Ec2ContainerManager {
         Runnable initCleanup = systemdV1.captureRemoval(instance);
         TerminationCleanup cleanup = new TerminationCleanup(instance, accountId, region, capturedHelperId, afterTeardown, task -> {
             boolean containerGone = containerId == null || task.workloadGone;
+            boolean removedWorkload = false;
             boolean helperCleanupPending = containerId != null && !task.helperResolved
                     || task.helperId != null && !task.helperGone;
             try {
@@ -3271,14 +3272,15 @@ public class Ec2ContainerManager {
                     helperCleanupPending = task.helperId != null && !task.helperGone;
                     containerGone = removeContainer(containerId);
                     task.workloadGone = containerGone;
-                    // iptables/veth teardown lags behind successful removal; prevents port-reuse conflicts.
-                    if (containerGone) {
-                        metadataServer.suspendDns(instance);
-                        pause(500);
-                    }
+                    removedWorkload = containerGone;
                 }
                 if (!containerGone) {
                     return;
+                }
+                metadataServer.suspendDns(instance);
+                // iptables/veth teardown lags behind successful removal; prevents port-reuse conflicts.
+                if (removedWorkload) {
+                    pause(500);
                 }
                 containerGone = false;
                 helperCleanupPending = true;

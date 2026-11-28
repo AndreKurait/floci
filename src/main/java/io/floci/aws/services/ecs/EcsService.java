@@ -1870,8 +1870,16 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             origin = containerManager.vpcForInstance(
                     taskAccountId(task.getTaskArn()), region, host.getEc2InstanceId()).orElse(null);
         }
-        return containerManager.startTask(task, definition, overrides, region,
-                needsInstanceCredentials ? host.getEc2InstanceId() : null, origin);
+        if (needsInstanceCredentials && origin != null) {
+            return containerManager.startTask(task, definition, overrides, region, host.getEc2InstanceId(), origin);
+        }
+        if (needsInstanceCredentials) {
+            return containerManager.startTask(task, definition, overrides, region, host.getEc2InstanceId());
+        }
+        if (origin != null) {
+            return containerManager.startTask(task, definition, overrides, region, origin);
+        }
+        return containerManager.startTask(task, definition, overrides, region);
     }
 
     private void launchTask(EcsCluster cluster, EcsTask task, TaskDefinition taskDef,

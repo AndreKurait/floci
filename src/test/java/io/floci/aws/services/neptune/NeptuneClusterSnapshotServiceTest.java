@@ -45,6 +45,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -58,7 +59,7 @@ class NeptuneClusterSnapshotServiceTest {
             "{\"snapshot\":1}".getBytes(StandardCharsets.UTF_8));
     private final NeptuneContainerManager containers = mock(NeptuneContainerManager.class);
     private final NeptuneProxyManager proxies = mock(NeptuneProxyManager.class);
-    private final EmulatorConfig config = mock(EmulatorConfig.class);
+    private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
     private final EmulatorConfig.NeptuneServiceConfig neptune = mock(EmulatorConfig.NeptuneServiceConfig.class);
     private final RegionResolver resolver = mock(RegionResolver.class);
     private final StorageFactory factory = mock(StorageFactory.class);
@@ -72,6 +73,7 @@ class NeptuneClusterSnapshotServiceTest {
     @BeforeEach
     void setUp() {
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        when(config.storage().mode()).thenReturn("memory");
         when(config.services()).thenReturn(services);
         when(services.neptune()).thenReturn(neptune);
         when(config.hostname()).thenReturn(Optional.of("localhost"));

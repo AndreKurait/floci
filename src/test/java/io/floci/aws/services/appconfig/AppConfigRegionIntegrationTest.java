@@ -3,7 +3,9 @@ package io.floci.aws.services.appconfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.common.StoredResourceArns;
 import io.quarkus.test.junit.QuarkusTest;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -13,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -30,6 +33,17 @@ class AppConfigRegionIntegrationTest {
 
     @Inject
     AppConfigResourceArns arns;
+
+    @Inject
+    Instance<StoredResourceArns> storedResourceFinders;
+
+    @Test
+    void eachNamespaceHasOneStoredResourceFinder() {
+        Map<String, Long> counts = storedResourceFinders.stream()
+                .collect(Collectors.groupingBy(StoredResourceArns::namespace, Collectors.counting()));
+        assertEquals(1L, counts.get("appconfig"));
+        counts.forEach((namespace, count) -> assertEquals(1L, count, namespace));
+    }
 
     @Test
     void identicalNamesResolveOnlyWithinTheirAccountAndRegion() {

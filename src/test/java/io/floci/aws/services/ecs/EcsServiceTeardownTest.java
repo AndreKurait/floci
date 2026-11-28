@@ -194,7 +194,7 @@ class EcsServiceTeardownTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void stoppedTaskRetriesNetworkReleaseAfterNamespaceCleanup(boolean exitsNaturally) {
+    void stoppedTaskRetriesNetworkReleaseAfterNamespaceCleanup(boolean exitsNaturally) throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -241,6 +241,7 @@ class EcsServiceTeardownTest {
             service.reconcile();
         } else {
             service.stopTask(null, taskArn, null, REGION);
+            service.awaitPendingStops();
         }
         assertEquals("STOPPED", task.getLastStatus());
         assertEquals("ATTACHED", task.getAttachmentStatus());

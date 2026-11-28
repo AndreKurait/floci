@@ -970,6 +970,19 @@ class PassedRolesTest {
     }
 
     @Test
+    void modeledQuickCreateUsesTheSameConsumedCredentialsAsItsRestRoute() {
+        for (String target : List.of("", "https://example.com")) {
+            String body = "{\"protocolType\":\"HTTP\",\"target\":\"" + target
+                    + "\",\"credentialsArn\":\"" + ROLES + "unused\"}";
+            assertEquals(List.of(), PassedRoles.of("apigateway:CreateApi", rest("/v2/apis", body), LOOKUPS));
+        }
+        String body = "{\"protocolType\":\"HTTP\",\"target\":\"arn:incomplete\",\"credentialsArn\":\""
+                + ROLES + "used\"}";
+        assertEquals(List.of(passed("used", "apigateway.amazonaws.com")),
+                PassedRoles.of("apigateway:CreateApi", rest("/v2/apis", body), LOOKUPS));
+    }
+
+    @Test
     void httpImportEnvelopeAndRawYamlReachTheOwningLookupWithoutConsumingTheBody() throws Exception {
         String document = "openapi: 3.0.1\ninfo: {title: test, version: '1'}\npaths: {}";
         PassedRoles.Lookups lookup = mock(PassedRoles.Lookups.class);
@@ -981,6 +994,8 @@ class PassedRolesTest {
                 ContainerRequestContext request = rest(path, body);
                 assertEquals(List.of(passed("teams/import", "apigateway.amazonaws.com")),
                         PassedRoles.of("apigateway:PUT", request, lookup));
+                assertEquals(List.of(passed("teams/import", "apigateway.amazonaws.com")),
+                        PassedRoles.of("apigateway:ImportApi", request, lookup));
                 assertEquals(body, new String(IamConditionContextResolver.bufferEntity(request), StandardCharsets.UTF_8));
             }
         }

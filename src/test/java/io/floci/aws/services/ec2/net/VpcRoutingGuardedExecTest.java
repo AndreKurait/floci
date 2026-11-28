@@ -1,7 +1,9 @@
 package io.floci.aws.services.ec2.net;
 
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -10,6 +12,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@ResourceLock(ParallelLocks.PORTS)
 class VpcRoutingGuardedExecTest {
     @TempDir
     Path directory;

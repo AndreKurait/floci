@@ -4,7 +4,6 @@
 # without a reason.
 account	Account member ARNs use stored organization identity; AccountRegionOrganizationIamIntegrationTest and AccountRegionUnknownPartitionIamIntegrationTest cover exact member and request-partition grants without a returned ARN.
 acmpca	covered by AcmPcaIntegrationTest root and leaf lifecycle in commercial, China and GovCloud partitions; CA deletion retains restoration state by API contract
-appconfig	the only ARNs it builds are the application an id or a name finds and the configuration a session's token is on, which an IAM check names, in the request Region's partition, and they never reach the wire, so a case has nothing to assert
 appintegrations	no non-commercial partition publishes the service, so a case would be skipped in every partition
 athena	internal workgroup authorization ARN covered by AthenaBatchQueryIamIntegrationTest in each offered non-commercial partition; query history has no delete API
 bcmpricingcalculator	the only ARN it builds is the workload estimate's own, in the request's partition, which an IAM tag lookup compares against the ARN a request names, and it never reaches the wire, so a case has nothing to assert

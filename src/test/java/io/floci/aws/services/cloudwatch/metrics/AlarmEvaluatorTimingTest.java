@@ -80,9 +80,9 @@ class AlarmEvaluatorTimingTest {
     @Test
     void aTickThatFailsDoesNotStopTheNextOne() {
         CloudWatchMetricsService failing = mock(CloudWatchMetricsService.class);
-        when(failing.allOwnedAlarms())
+        when(failing.metricAlarmsInEveryAccount())
                 .thenThrow(new IllegalStateException("storage hiccup"))
-                .thenAnswer(invocation -> service.allOwnedAlarms());
+                .thenAnswer(invocation -> service.metricAlarmsInEveryAccount());
         ScheduledExecutorService ownScheduler = time.newScheduler();
         AlarmEvaluator subject = new AlarmEvaluator(failing, handlers(), time.clock(), ownScheduler);
         subject.start();
@@ -91,7 +91,7 @@ class AlarmEvaluatorTimingTest {
             assertEquals(1, time.pendingTasks(), "the periodic tick is still scheduled after it failed");
 
             time.advance(Duration.ofSeconds(10));
-            verify(failing, times(2)).allOwnedAlarms();
+            verify(failing, times(2)).metricAlarmsInEveryAccount();
         } finally {
             subject.stop();
         }
@@ -267,9 +267,9 @@ class AlarmEvaluatorTimingTest {
     @Test
     void aTickThatEndsInAnErrorDoesNotStopTheNextOne() {
         CloudWatchMetricsService failing = mock(CloudWatchMetricsService.class);
-        when(failing.allOwnedAlarms())
+        when(failing.metricAlarmsInEveryAccount())
                 .thenThrow(new StackOverflowError("storage hiccup"))
-                .thenAnswer(invocation -> service.allOwnedAlarms());
+                .thenAnswer(invocation -> service.metricAlarmsInEveryAccount());
         ScheduledExecutorService ownScheduler = time.newScheduler();
         AlarmEvaluator subject = new AlarmEvaluator(failing, handlers(), time.clock(), ownScheduler);
         subject.start();
@@ -278,7 +278,7 @@ class AlarmEvaluatorTimingTest {
             assertEquals(1, time.pendingTasks(), "the periodic tick is still scheduled after it failed");
 
             time.advance(Duration.ofSeconds(10));
-            verify(failing, times(2)).allOwnedAlarms();
+            verify(failing, times(2)).metricAlarmsInEveryAccount();
         } finally {
             subject.stop();
         }

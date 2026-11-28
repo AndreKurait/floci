@@ -20,6 +20,18 @@ class AppConfigResourceArnsTest {
 
     @ParameterizedTest
     @CsvSource({"us-east-1,aws", "cn-north-1,aws-cn", "us-gov-west-1,aws-us-gov"})
+    void theSameFinderResolvesStoredNamesAndTags(String region, String partition) {
+        Fixture fixture = fixture(region);
+        fixture.service().tagApplication(fixture.application(), Map.of("team", "data"));
+        String prefix = "arn:" + partition + ":appconfig:" + region + ":" + ACCOUNT + ":application/";
+        assertEquals(prefix + fixture.application(),
+                fixture.arns().resolveStoredArn(prefix + "orders").orElseThrow());
+        assertEquals(Map.of("team", "data"), fixture.arns().storedTags(prefix + fixture.application()));
+        assertTrue(fixture.arns().storedTags(prefix + "absent").isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"us-east-1,aws", "cn-north-1,aws-cn", "us-gov-west-1,aws-us-gov"})
     void namesAndIdsAuthorizeTheSameResources(String region, String partition) {
         Fixture fixture = fixture(region);
         String prefix = "arn:" + partition + ":appconfig:" + region + ":" + ACCOUNT + ":";

@@ -33,8 +33,10 @@ import io.floci.aws.services.elbv2.model.AvailabilityZone;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
 import io.floci.aws.testing.DockerAvailability;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
@@ -55,6 +57,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(ParallelLocks.PORTS)
 class ElbV2ManagedNamespacePacketTest {
     @TempDir
     Path storageDirectory;

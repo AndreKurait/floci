@@ -136,10 +136,16 @@ class Ec2DnsLifetimeTest {
                     fixture.metadata.registerContainer(ADDRESS, replacement.getInstanceId(), replacement);
                 }
                 finishRemoval.countDown();
-                assertTrue(cleaning.await(5, TimeUnit.SECONDS));
-                assertEquals(reused || "unknown".equals(outcome),
-                        fixture.metadata.vpcForClient(ADDRESS).isPresent(),
-                        "confirmed removal revokes DNS before remaining cleanup");
+                if ("unknown".equals(outcome)) {
+                    assertTrue(persisted.await(5, TimeUnit.SECONDS));
+                    verify(fixture.ports, never()).release(22001);
+                    assertTrue(fixture.metadata.vpcForClient(ADDRESS).isPresent(),
+                            "unconfirmed removal retains DNS and the workload's resources");
+                } else {
+                    assertTrue(cleaning.await(5, TimeUnit.SECONDS));
+                    assertEquals(reused, fixture.metadata.vpcForClient(ADDRESS).isPresent(),
+                            "confirmed removal revokes DNS before remaining cleanup");
+                }
             } finally {
                 finishRemoval.countDown();
                 finishCleanup.countDown();
@@ -250,6 +256,30 @@ class Ec2DnsLifetimeTest {
             assertTrue(done.await(5, TimeUnit.SECONDS));
             assertTrue(fixture.metadata.vpcForClient(ADDRESS).isEmpty(),
                     "an old running observation must not reactivate a subsequently stopped workload");
+        }
+    }
+
+    @Test
+    void shutdownDuringRecoveryLivenessProbeKeepsDnsSuspended() throws Exception {
+        try (Fixture fixture = new Fixture(); ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            fixture.manager.stopForShutdown(fixture.instance);
+            CountDownLatch probing = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            when(fixture.lifecycle.isContainerRunning(CONTAINER)).thenAnswer(invocation -> {
+                probing.countDown();
+                release.await();
+                return true;
+            });
+            Future<?> recovery = executor.submit(() -> fixture.manager.restoreMetadataRegistration(fixture.instance));
+            try {
+                assertTrue(probing.await(5, TimeUnit.SECONDS));
+                fixture.manager.stopForShutdown(fixture.instance);
+            } finally {
+                release.countDown();
+            }
+            recovery.get(5, TimeUnit.SECONDS);
+            assertTrue(fixture.metadata.vpcForClient(ADDRESS).isEmpty(),
+                    "recovery must not reactivate DNS after shutdown during its liveness probe");
         }
     }
 

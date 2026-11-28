@@ -117,6 +117,7 @@ class Ec2ImageResourceArnTest {
         ContainerRequestContext context = mock(ContainerRequestContext.class);
         UriInfo uri = mock(UriInfo.class);
         Map<String, Object> properties = new HashMap<>();
+        when(context.getMethod()).thenReturn("POST");
         when(context.getUriInfo()).thenReturn(uri);
         when(uri.getPath()).thenReturn("/");
         when(uri.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());

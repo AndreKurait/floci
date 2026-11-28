@@ -125,7 +125,8 @@ class Ec2NativeRecoveryHealthTest {
         assertFalse(manager.restoreMetadataRegistration(instance));
         assertFalse(manager.isContainerRunning(instance));
         assertTrue(tasks.isEmpty());
-        verifyNoInteractions(metadata);
+        verify(metadata).dnsSuspension(instance);
+        verifyNoMoreInteractions(metadata);
     }
 
     @Test
@@ -134,7 +135,8 @@ class Ec2NativeRecoveryHealthTest {
         assertFalse(manager.restoreMetadataRegistration(instance));
         assertFalse(manager.isContainerRunning(instance));
         assertTrue(tasks.isEmpty());
-        verifyNoInteractions(metadata);
+        verify(metadata).dnsSuspension(instance);
+        verifyNoMoreInteractions(metadata);
     }
 
     @Test
@@ -143,7 +145,8 @@ class Ec2NativeRecoveryHealthTest {
         assertFalse(manager.restoreMetadataRegistration(instance));
         assertFalse(manager.isContainerRunning(instance));
         assertTrue(tasks.isEmpty());
-        verifyNoInteractions(metadata);
+        verify(metadata).dnsSuspension(instance);
+        verifyNoMoreInteractions(metadata);
     }
 
     @Test

@@ -5,8 +5,10 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -28,6 +30,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
  * The IPv6 scripts take addresses as positional arguments, never interpolated into the script text.
  * Guests locate their interface by IPv4 address; the router uses its endpoint MAC to survive an IPv4 flush.
  */
+@ResourceLock(ParallelLocks.PORTS)
 class Ec2GuestIpv6CommandTest {
 
     @Test

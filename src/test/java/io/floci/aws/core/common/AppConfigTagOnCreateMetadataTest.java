@@ -12,6 +12,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -32,20 +33,20 @@ import static org.mockito.Mockito.when;
 
 class AppConfigTagOnCreateMetadataTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final Set<String> OPERATIONS = Set.of(
-            "appconfig:CreateApplication", "appconfig:CreateDeploymentStrategy");
+    private static final List<String> NAMES = List.of("CreateApplication", "CreateConfigurationProfile",
+            "CreateDeploymentStrategy", "CreateEnvironment", "CreateExperimentDefinition", "CreateExtension",
+            "CreateExtensionAssociation", "StartDeployment", "StartExperimentRun");
+    private static final Set<String> OPERATIONS = NAMES.stream()
+            .map(name -> "appconfig:" + name).collect(Collectors.toSet());
 
     @Test
-    void onlyTheTwoDeclaredOperationsAreReadAndTheRemainingNamespaceStaysUncovered() throws Exception {
+    void allReviewedCreationOperationsAreReadWithoutCoveringUnreviewedActions() throws Exception {
         ObjectNode document = document();
         assertEquals(OPERATIONS, TagOnCreateMembers.table().entries().keySet().stream()
                 .filter(operation -> operation.startsWith("appconfig:")).collect(Collectors.toSet()));
-        assertEquals(List.of("CreateApplication", "CreateDeploymentStrategy"),
-                MAPPER.convertValue(document.path("partialNamespaces").path("appconfig"), List.class));
-        assertTrue(document.path("notCovered").path("appconfig").asText().contains("other creation tags remain uncovered"));
-        for (String other : List.of("CreateConfigurationProfile", "CreateEnvironment", "CreateExtension",
-                "CreateExtensionAssociation", "CreateExperimentDefinition", "StartDeployment", "StartExperimentRun",
-                "TagResource", "createApplication")) {
+        assertEquals(NAMES, MAPPER.convertValue(document.path("partialNamespaces").path("appconfig"), List.class));
+        assertTrue(document.path("notCovered").path("appconfig").isMissingNode());
+        for (String other : List.of("TagResource", "createApplication", "CreateUnreviewedResource")) {
             assertNull(TagOnCreateMembers.of("appconfig:" + other), other);
         }
         assertNull(TagOnCreateMembers.of("CreateApplication"));
@@ -53,19 +54,20 @@ class AppConfigTagOnCreateMetadataTest {
 
     @Test
     void partialInventoryRejectsMissingExtraAndDuplicateOperationNames() throws Exception {
-        for (List<String> names : List.of(List.of("CreateApplication"),
-                List.of("CreateApplication", "CreateDeploymentStrategy", "CreateEnvironment"),
-                List.of("CreateApplication", "CreateApplication", "CreateDeploymentStrategy"))) {
+        List<String> extra = new ArrayList<>(NAMES);
+        extra.add("CreateUnreviewedResource");
+        List<String> duplicate = new ArrayList<>(NAMES);
+        duplicate.add(NAMES.getFirst());
+        for (List<String> names : List.of(NAMES.subList(1, NAMES.size()), extra, duplicate)) {
             ObjectNode invalid = document();
             ((ObjectNode) invalid.path("partialNamespaces")).set("appconfig", MAPPER.valueToTree(names));
             assertThrows(IllegalStateException.class, () -> parse(invalid));
         }
         ObjectNode invalid = document();
-        ((ObjectNode) invalid.path("operations")).set("appconfig:CreateEnvironment",
+        ((ObjectNode) invalid.path("operations")).set("appconfig:CreateUnreviewedResource",
                 invalid.path("operations").path("appconfig:CreateApplication").deepCopy());
         assertThrows(IllegalStateException.class, () -> parse(invalid));
-        ObjectNode valid = document();
-        parse(valid);
+        parse(document());
     }
 
     @ParameterizedTest

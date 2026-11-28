@@ -326,7 +326,7 @@ class Ec2SystemdGuestDockerIntegrationTest {
     private Ec2ContainerManager guestShutdownManager() {
         return new Ec2ContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class), dockerHostResolver, docker,
-                portAllocator, config, mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class),
+                portAllocator, config, metadataServer, mock(Ec2PortForwardManager.class),
                 regionResolver, mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
                 reachableEndpoint);
     }

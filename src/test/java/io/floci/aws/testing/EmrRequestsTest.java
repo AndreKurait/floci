@@ -94,13 +94,15 @@ class EmrRequestsTest {
 
     @Test
     void terminalStepEscapesTheReadinessWaitOnItsFirstPoll() {
+        Response failedStep = step("FAILED");
+        assertEquals("FAILED", failedStep.jsonPath().getString("Step.Status.State"));
         AtomicInteger describes = new AtomicInteger();
         AtomicInteger driverChecks = new AtomicInteger();
 
         AssertionFailedError failure = assertThrows(AssertionFailedError.class,
                 () -> await().pollDelay(Duration.ZERO).atMost(Duration.ofSeconds(1)).until(() -> {
                     describes.incrementAndGet();
-                    EmrRequests.requireUnfinishedStep(step("FAILED"));
+                    EmrRequests.requireUnfinishedStep(failedStep);
                     driverChecks.incrementAndGet();
                     return true;
                 }));
