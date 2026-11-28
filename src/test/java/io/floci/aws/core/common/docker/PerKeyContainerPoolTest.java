@@ -1,5 +1,8 @@
 package io.floci.aws.core.common.docker;
 
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.RemoveContainerCmd;
+import com.github.dockerjava.api.command.StopContainerCmd;
 import com.sun.net.httpserver.HttpServer;
 import io.floci.aws.core.common.docker.PerKeyContainerPool.StartedContainer;
 import io.floci.aws.testing.ParallelLocks;
@@ -7,6 +10,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -21,6 +26,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -28,12 +35,15 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
 
 /**
  * Covers the per-key container lifecycle (caching, restart-on-unhealthy, teardown, and the
@@ -97,7 +107,7 @@ class PerKeyContainerPoolTest {
 
         pool.stopAll();
         verify(lifecycleManager).stopAndRemoveStrict("retired-second", null);
-        verify(lifecycleManager).stopAndRemove("current", null);
+        verify(lifecycleManager).stopAndRemoveStrict("current", null);
         assertTrue(pool.isTracked("key-1"));
         pool.stopAllStrictExcept(Set.of());
         verify(lifecycleManager, times(2)).stopAndRemoveStrict("retired-first", null);
@@ -169,6 +179,93 @@ class PerKeyContainerPoolTest {
     }
 
     @Test
+    void concurrentCallerCannotUseAContainerBeforeItsInitialHealthWaitCompletes() throws Exception {
+        String url = "http://127.0.0.1:12345";
+        CountDownLatch waitingForHealth = new CountDownLatch(1);
+        CountDownLatch finishHealth = new CountDownLatch(1);
+        CountDownLatch secondCallerStarted = new CountDownLatch(1);
+        PerKeyContainerPool controlled = new PerKeyContainerPool(lifecycleManager, "/ping",
+                (baseUrl, path) -> true, (baseUrl, path) -> {
+                    waitingForHealth.countDown();
+                    try {
+                        assertTrue(finishHealth.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Interrupted health wait", e);
+                    }
+                });
+        ExecutorService callers = Executors.newFixedThreadPool(2);
+        try {
+            Future<String> first = callers.submit(() -> controlled.ensureReady("repo",
+                    () -> new StartedContainer("starting-container", url)));
+            assertTrue(waitingForHealth.await(5, TimeUnit.SECONDS));
+            Future<String> second = callers.submit(() -> {
+                secondCallerStarted.countDown();
+                return controlled.ensureReady("repo", () -> {
+                    throw new AssertionError("Concurrent request must reuse the initial container");
+                });
+            });
+            assertTrue(secondCallerStarted.await(5, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> second.get(100, TimeUnit.MILLISECONDS));
+            finishHealth.countDown();
+            assertEquals(url, first.get(5, TimeUnit.SECONDS));
+            assertEquals(url, second.get(5, TimeUnit.SECONDS));
+        } finally {
+            finishHealth.countDown();
+            callers.shutdown();
+            assertTrue(callers.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void failedProbeWithAnotherAdmittedUseWaitsWithoutDestroyingItsContainer() {
+        String url = "http://127.0.0.1:12345";
+        AtomicInteger waits = new AtomicInteger();
+        PerKeyContainerPool controlled = new PerKeyContainerPool(lifecycleManager, "/ping",
+                (baseUrl, path) -> false, (baseUrl, path) -> waits.incrementAndGet());
+        controlled.ensureReady("repo", () -> new StartedContainer("busy-container", url));
+        assertEquals(url, controlled.ensureReady("repo", () -> {
+            throw new AssertionError("Must not replace an in-use container");
+        }, false));
+        assertEquals(2, waits.get());
+        verifyNoInteractions(lifecycleManager);
+    }
+
+    @Test
+    void sustainedUnhealthyBusyContainerFailsReadinessWithoutStoppingOtherRequests() {
+        String url = "http://127.0.0.1:12345";
+        AtomicBoolean unhealthy = new AtomicBoolean();
+        PerKeyContainerPool controlled = new PerKeyContainerPool(lifecycleManager, "/ping",
+                (baseUrl, path) -> !unhealthy.get(), (baseUrl, path) -> {
+                    if (unhealthy.get()) {
+                        throw new IllegalStateException("Health wait timed out");
+                    }
+                });
+        controlled.ensureReady("repo", () -> new StartedContainer("busy-container", url));
+        unhealthy.set(true);
+        assertThrows(IllegalStateException.class, () -> controlled.ensureReady("repo", () -> {
+            throw new AssertionError("Must not replace an in-use container");
+        }, false));
+        verifyNoInteractions(lifecycleManager);
+    }
+
+    @Test
+    void strictResetRetriesDetachedFailuresAndPreservesProtectedKeys() throws IOException {
+        String url = startFakePing(200);
+        pool.ensureReady("retry", () -> new StartedContainer("failed", url));
+        pool.ensureReady("protected", () -> new StartedContainer("protected", url));
+        doThrow(new IllegalStateException("busy")).doNothing()
+                .when(lifecycleManager).stopAndRemoveStrict("failed", null);
+        assertThrows(IllegalStateException.class, () -> pool.stopContainer("retry"));
+
+        pool.stopAllStrictExcept(Set.of("protected"));
+
+        verify(lifecycleManager, times(2)).stopAndRemoveStrict("failed", null);
+        verify(lifecycleManager, never()).stopAndRemoveStrict("protected", null);
+        assertTrue(pool.isTracked("protected"));
+    }
+
+    @Test
     void ensureReadyStartsAContainerOnFirstUse() throws IOException {
         String url = startFakePing(200);
         AtomicInteger starterCalls = new AtomicInteger();
@@ -209,7 +306,7 @@ class PerKeyContainerPoolTest {
         String result = pool.ensureReady("key-1", () -> new StartedContainer("fresh-container", freshUrl));
 
         assertEquals(freshUrl, result);
-        verify(lifecycleManager).stopAndRemove("stale-container", null);
+        verify(lifecycleManager).stopAndRemoveStrict("stale-container", null);
     }
 
     @Test
@@ -219,7 +316,7 @@ class PerKeyContainerPoolTest {
 
         pool.stopContainer("key-1");
 
-        verify(lifecycleManager).stopAndRemove("container-1", null);
+        verify(lifecycleManager).stopAndRemoveStrict("container-1", null);
         // A second ensureReady must start a new container: the old one is genuinely forgotten,
         // not just marked unhealthy.
         AtomicInteger starterCalls = new AtomicInteger();
@@ -271,7 +368,7 @@ class PerKeyContainerPoolTest {
 
         // The container was tracked (by ensureReady, before stopContainer could run) and then
         // removed (by stopContainer, once it got the lock): the race does not orphan it.
-        verify(lifecycleManager).stopAndRemove("container-1", null);
+        verify(lifecycleManager).stopAndRemoveStrict("container-1", null);
     }
 
     @Test
@@ -305,7 +402,7 @@ class PerKeyContainerPoolTest {
             assertTrue(pool2.awaitTermination(30, TimeUnit.SECONDS));
         }
 
-        verify(lifecycleManager).stopAndRemove("container-1", null);
+        verify(lifecycleManager).stopAndRemoveStrict("container-1", null);
     }
 
     @Test
@@ -317,9 +414,137 @@ class PerKeyContainerPoolTest {
 
         pool.stopAll();
 
-        verify(lifecycleManager).stopAndRemove("container-a", null);
-        verify(lifecycleManager).stopAndRemove("container-b", null);
+        verify(lifecycleManager).stopAndRemoveStrict("container-a", null);
+        verify(lifecycleManager).stopAndRemoveStrict("container-b", null);
         verifyNoMoreInteractions(lifecycleManager);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void resetDoesNotForgetAReplacementStartedWhileOldCleanupIsBlocked(boolean cleanupFails) throws Exception {
+        String oldUrl = startFakePing(200);
+        pool.ensureReady("shared-key", () -> new StartedContainer("old-container", oldUrl));
+        fakeContainers.getFirst().stop(0);
+        String newUrl = startFakePing(200);
+        CountDownLatch cleaningOld = new CountDownLatch(1);
+        CountDownLatch releaseCleanup = new CountDownLatch(1);
+        AtomicInteger oldStops = new AtomicInteger();
+        doAnswer(invocation -> {
+            if (oldStops.incrementAndGet() == 1) {
+                cleaningOld.countDown();
+                assertTrue(releaseCleanup.await(10, TimeUnit.SECONDS));
+                if (cleanupFails) {
+                    throw new IllegalStateException("old cleanup failed");
+                }
+            }
+            return null;
+        }).when(lifecycleManager).stopAndRemoveStrict("old-container", null);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> reset = worker.submit(pool::stopAll);
+            assertTrue(cleaningOld.await(5, TimeUnit.SECONDS));
+            assertEquals(newUrl, pool.ensureReady("shared-key",
+                    () -> new StartedContainer("new-container", newUrl)));
+            releaseCleanup.countDown();
+            reset.get(5, TimeUnit.SECONDS);
+
+            assertTrue(pool.isTracked("shared-key"), "Reset must retain the new generation's container");
+            verify(lifecycleManager, never()).stopAndRemoveStrict("new-container", null);
+            pool.stopAll();
+            verify(lifecycleManager).stopAndRemoveStrict("new-container", null);
+        } finally {
+            releaseCleanup.countDown();
+            worker.shutdownNow();
+            assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedRemovalIsRetriedWithoutRemovingTheReplacement(boolean individualStop) throws IOException {
+        DockerClient docker = mock(DockerClient.class);
+        ContainerLifecycleManager manager = new ContainerLifecycleManager(docker, docker, null, null, null);
+        PerKeyContainerPool retryPool = new PerKeyContainerPool(manager, "/ping");
+        StopContainerCmd stop = mock(StopContainerCmd.class);
+        when(docker.stopContainerCmd("old-container")).thenReturn(stop);
+        when(stop.withTimeout(5)).thenReturn(stop);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class);
+        when(docker.removeContainerCmd("old-container")).thenReturn(remove);
+        when(remove.withForce(true)).thenReturn(remove);
+        doThrow(new IllegalStateException("daemon refused removal")).doNothing().when(remove).exec();
+        String url = startFakePing(200);
+        retryPool.ensureReady("key", () -> new StartedContainer("old-container", url));
+
+        try {
+            if (individualStop) {
+                retryPool.stopContainer("key");
+            } else {
+                retryPool.stopAll();
+            }
+        } catch (IllegalStateException expected) {
+            // Individual strict removal may report failure, but must retain retry ownership.
+        }
+        retryPool.ensureReady("key", () -> new StartedContainer("replacement", url));
+        StopContainerCmd replacementStop = mock(StopContainerCmd.class);
+        when(docker.stopContainerCmd("replacement")).thenReturn(replacementStop);
+        when(replacementStop.withTimeout(5)).thenReturn(replacementStop);
+        RemoveContainerCmd replacementRemove = mock(RemoveContainerCmd.class);
+        when(docker.removeContainerCmd("replacement")).thenReturn(replacementRemove);
+        when(replacementRemove.withForce(true)).thenReturn(replacementRemove);
+
+        verify(docker, never()).stopContainerCmd("replacement");
+        retryPool.stopAll();
+        verify(remove, times(2)).exec();
+        verify(replacementRemove).exec();
+        retryPool.stopAll();
+        verify(remove, times(2)).exec();
+        verify(replacementRemove).exec();
+    }
+
+    @Test
+    void individualRemovalRetriesTheDetachedContainerOnTheNextCall() throws IOException {
+        String url = startFakePing(200);
+        pool.ensureReady("key", () -> new StartedContainer("container", url));
+        doThrow(new IllegalStateException("daemon refused removal")).doNothing()
+                .when(lifecycleManager).stopAndRemoveStrict("container", null);
+
+        assertThrows(IllegalStateException.class, () -> pool.stopContainer("key"));
+        pool.stopContainer("key");
+        pool.stopContainer("key");
+
+        verify(lifecycleManager, times(2)).stopAndRemoveStrict("container", null);
+    }
+
+    @Test
+    void resetDuringStartRetainsFailedRemovalForTheNextReset() {
+        doThrow(new IllegalStateException("daemon refused removal")).doNothing()
+                .when(lifecycleManager).stopAndRemoveStrict("late-container", null);
+
+        assertThrows(IllegalStateException.class, () -> pool.ensureReady("key", () -> {
+            pool.stopAll();
+            return new StartedContainer("late-container", "http://127.0.0.1:1");
+        }));
+        pool.stopAll();
+        pool.stopAll();
+
+        verify(lifecycleManager, times(2)).stopAndRemoveStrict("late-container", null);
+    }
+
+    @Test
+    void unhealthyContainerRemovalFailureRetainsOwnershipBeforeStartingAReplacement() throws IOException {
+        String url = startFakePing(200);
+        pool.ensureReady("key", () -> new StartedContainer("unhealthy-container", url));
+        fakeContainers.getFirst().stop(0);
+        doThrow(new IllegalStateException("daemon refused removal")).doNothing()
+                .when(lifecycleManager).stopAndRemoveStrict("unhealthy-container", null);
+        PerKeyContainerPool.Starter replacement = mock(PerKeyContainerPool.Starter.class);
+
+        assertThrows(IllegalStateException.class, () -> pool.ensureReady("key", replacement));
+        verifyNoInteractions(replacement);
+        pool.stopAll();
+        pool.stopAll();
+
+        verify(lifecycleManager, times(2)).stopAndRemoveStrict("unhealthy-container", null);
     }
 
     @Test

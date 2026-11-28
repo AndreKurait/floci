@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -110,19 +111,17 @@ class SageMakerGpuIntegrationTest {
         return reason;
     }
 
-    private Response awaitTerminal(String job) throws Exception {
-        long deadline = System.currentTimeMillis() + Duration.ofSeconds(60).toMillis();
-        while (System.currentTimeMillis() < deadline) {
-            Response describe = post("SageMaker.DescribeTrainingJob",
-                    "{\"TrainingJobName\":\"%s\"}".formatted(job));
-            describe.then().statusCode(200);
-            String status = describe.path("TrainingJobStatus");
-            if ("Failed".equals(status) || "Completed".equals(status) || "Stopped".equals(status)) {
-                return describe;
-            }
-            Thread.sleep(200);
-        }
-        throw new AssertionError("Timed out waiting for training job " + job + " to reach a terminal state");
+    private Response awaitTerminal(String job) {
+        return await().alias("training job " + job + " reaches a terminal state")
+                .atMost(Duration.ofSeconds(60)).until(() -> {
+                    Response describe = post("SageMaker.DescribeTrainingJob",
+                            "{\"TrainingJobName\":\"%s\"}".formatted(job));
+                    describe.then().statusCode(200);
+                    return describe;
+                }, describe -> {
+                    String status = describe.path("TrainingJobStatus");
+                    return "Failed".equals(status) || "Completed".equals(status) || "Stopped".equals(status);
+                });
     }
 
     private Response post(String target, String body) {

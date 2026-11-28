@@ -36,7 +36,7 @@ import static org.mockito.Mockito.when;
 
 /**
  * The standalone security-group rule provisioner in isolation: property mapping, the
- * revoke-before-authorize that keeps UpdateStack from duplicating rules, and the delete that keeps a
+ * authorize-before-revoke replacement, and the delete that keeps a
  * rule from outliving its stack on a group that survives it (issue #1992).
  */
 class Ec2SecurityGroupRuleCfnProvisionerTest {
@@ -49,12 +49,16 @@ class Ec2SecurityGroupRuleCfnProvisionerTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
+        return ctx(null);
+    }
+
+    private ProvisionContext ctx(String priorPhysicalId) {
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
         when(engine.resolve(any())).thenAnswer(inv -> {
             JsonNode node = inv.getArgument(0);
             return node == null ? null : node.asText();
         });
-        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
+        return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack", priorPhysicalId);
     }
 
     private StackResource resource(String type, String logicalId) {
@@ -237,7 +241,7 @@ class Ec2SecurityGroupRuleCfnProvisionerTest {
                 .put("ToPort", 443)
                 .put("CidrIp", "10.0.0.0/16");
 
-        provisioner.provision(r, props, ctx());
+        provisioner.provision(r, props, ctx("sgr-old"));
 
         InOrder order = inOrder(ec2);
         order.verify(ec2).authorizeSecurityGroupIngress(eq("us-east-1"), eq("sg-123"), anyList());
@@ -255,7 +259,7 @@ class Ec2SecurityGroupRuleCfnProvisionerTest {
         r.setPhysicalId("sgr-old");
         ObjectNode props = mapper.createObjectNode().put("GroupId", "sg-123").put("CidrIp", "10.0.0.0/16");
 
-        assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx("sgr-old")));
 
         verify(ec2, never()).deleteSecurityGroupRule(anyString(), anyString());
         assertEquals("sgr-old", r.getPhysicalId());

@@ -14,6 +14,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -587,6 +588,10 @@ class SnsCfnProvisionerTest {
         r.setAttributes(new HashMap<>(Map.of("TopicName", priorName)));
         r.setPhysicalId(TOPIC_ARN);
         JsonNode prior = priorJson == null ? null : props(priorJson);
+        when(sns.readTopicForDrift(TOPIC_ARN, REGION, "000000000000"))
+                .thenReturn(new SnsService.DriftTopic(TOPIC_ARN, priorName, Instant.EPOCH,
+                        Map.of("DisplayName", prior == null ? "" : prior.path("DisplayName").asText("")),
+                        Map.of(), false));
         provisioner.provision(r, resolved,
                 new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", TOPIC_ARN, null, prior));
     }

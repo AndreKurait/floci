@@ -104,6 +104,29 @@ class Ec2NetworkInterfaceIpv6AddressCountIntegrationTest {
     }
 
     @Test
+    void theInterfaceNamesItsFirstIpv6AddressAsItsIpv6Address() throws Exception {
+        // NetworkInterface's ipv6Address: "The IPv6 globally unique address associated with the network interface."
+        String[] subnet = dualStackSubnet("10.117.0.0/16", "10.117.1.0/24", false);
+        Response created = create(subnet[0], "Ipv6AddressCount", "2");
+        assertEquals(200, created.statusCode(), created.asString());
+        String first = addresses(created, ADDRESSES).get(0);
+        assertEquals(first, created.path("CreateNetworkInterfaceResponse.networkInterface.ipv6Address"),
+                created.asString());
+
+        String eniId = created.path("CreateNetworkInterfaceResponse.networkInterface.networkInterfaceId");
+        Response described = given()
+            .formParam("Action", "DescribeNetworkInterfaces").formParam("NetworkInterfaceId.1", eniId)
+            .header("Authorization", AUTH_HEADER)
+        .when().post("/").then().statusCode(200).extract().response();
+        assertEquals(first, described.path("DescribeNetworkInterfacesResponse.networkInterfaceSet.item.ipv6Address"),
+                described.asString());
+
+        Response ipv4Only = create(subnet[0]);
+        assertEquals(200, ipv4Only.statusCode(), ipv4Only.asString());
+        assertFalse(ipv4Only.asString().contains("<ipv6Address>"), ipv4Only.asString());
+    }
+
+    @Test
     void theIpv6AddressFilterFindsTheInterfaceByOneOfItsAddresses() throws Exception {
         String[] subnet = dualStackSubnet("10.111.0.0/16", "10.111.1.0/24", false);
         Response created = create(subnet[0], "Ipv6AddressCount", "2");

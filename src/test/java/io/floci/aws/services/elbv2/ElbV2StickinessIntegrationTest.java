@@ -34,11 +34,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestProfile(RdsMockProfile.class)
 class ElbV2StickinessIntegrationTest {
 
+    private static final String REGION = "us-east-1";
+
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20261019/us-east-1/elasticloadbalancing/aws4_request";
 
     @Inject
     Vertx vertx;
+
+    @Inject
+    ElbV2HealthChecker healthChecker;
+
+    @Inject
+    ElbV2Service service;
 
     private HttpServer first;
     private HttpServer second;
@@ -55,12 +63,13 @@ class ElbV2StickinessIntegrationTest {
         loadBalancerArn = createLoadBalancer("sticky-lb");
         targetGroupArn = query("CreateTargetGroup", "Name", "sticky-tg", "Protocol", "HTTP",
                 "Port", first.actualPort(), "TargetType", "ip", "HealthCheckPath", "/health",
-                "HealthCheckIntervalSeconds", 1, "HealthyThresholdCount", 1, "UnhealthyThresholdCount", 1)
+                "HealthCheckIntervalSeconds", 5, "HealthyThresholdCount", 1, "UnhealthyThresholdCount", 1)
                 .xmlPath().getString("CreateTargetGroupResponse.CreateTargetGroupResult.TargetGroups.member.TargetGroupArn");
         registerTarget(targetGroupArn, "127.0.0.1", first.actualPort());
         registerTarget(targetGroupArn, "127.0.0.1", second.actualPort());
         createListener(loadBalancerArn, targetGroupArn, listenerPort);
         await().atMost(Duration.ofSeconds(3)).ignoreExceptions()
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .untilAsserted(() -> assertEquals(200, request(null).statusCode()));
     }
 
@@ -127,12 +136,16 @@ class ElbV2StickinessIntegrationTest {
         enableStickiness(true);
         Response initial = request(null);
         unhealthy.set(initial.asString());
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            List<String> states = query("DescribeTargetHealth", "TargetGroupArn", targetGroupArn).xmlPath()
-                    .getList("DescribeTargetHealthResponse.DescribeTargetHealthResult"
-                            + ".TargetHealthDescriptions.member.TargetHealth.State");
-            assertTrue(states.contains("unhealthy"));
-        });
+        // Probes outside the five-second cadence instead of waiting it out; the probes stay real.
+        await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    healthChecker.probeAll(targetGroupArn, service.getTargetGroup(REGION, targetGroupArn));
+                    List<String> states = query("DescribeTargetHealth", "TargetGroupArn", targetGroupArn).xmlPath()
+                            .getList("DescribeTargetHealthResponse.DescribeTargetHealthResult"
+                                    + ".TargetHealthDescriptions.member.TargetHealth.State");
+                    assertTrue(states.contains("unhealthy"));
+                });
         Response replacement = request("AWSALB=" + initial.getCookie("AWSALB"));
         assertNotEquals(initial.asString(), replacement.asString());
         assertNotNull(replacement.getCookie("AWSALB"));

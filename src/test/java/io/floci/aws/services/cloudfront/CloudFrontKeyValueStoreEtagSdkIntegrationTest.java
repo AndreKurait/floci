@@ -33,12 +33,14 @@ class CloudFrontKeyValueStoreEtagSdkIntegrationTest {
                         client.updateKeyValueStore(r -> r.name(name).ifMatch(created.eTag()).comment("after"));
                 String current = updated.eTag();
                 assertNotEquals(created.eTag(), current);
-                if (delete) {
-                    assertError("PreconditionFailed", 412,
-                            () -> client.deleteKeyValueStore(r -> r.name(name).ifMatch(created.eTag())));
-                } else {
-                    assertError("PreconditionFailed", 412,
-                            () -> client.updateKeyValueStore(r -> r.name(name).ifMatch(created.eTag()).comment("lost")));
+                for (String stale : List.of(created.eTag(), "E0000000000000")) {
+                    if (delete) {
+                        assertError("PreconditionFailed", 412,
+                                () -> client.deleteKeyValueStore(r -> r.name(name).ifMatch(stale)));
+                    } else {
+                        assertError("PreconditionFailed", 412,
+                                () -> client.updateKeyValueStore(r -> r.name(name).ifMatch(stale).comment("lost")));
+                    }
                 }
                 DescribeKeyValueStoreResponse unchanged = client.describeKeyValueStore(r -> r.name(name));
                 assertEquals("after", unchanged.keyValueStore().comment());

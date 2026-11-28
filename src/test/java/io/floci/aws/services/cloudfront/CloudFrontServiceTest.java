@@ -545,7 +545,7 @@ class CloudFrontServiceTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void findByHostIgnoresADistributionOfAnotherAccount() {
+    void findByHostFindsAnotherAccountWithoutExposingItsManagementRead() {
         CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
         Distribution dist = service.createDistribution(distribution(true, List.of()), Map.of());
         AccountAwareStorageBackend<Distribution> distributions =
@@ -553,7 +553,8 @@ class CloudFrontServiceTest {
         distributions.deleteForAccount("000000000000", dist.getId());
         distributions.putForAccount("111122223333", dist.getId(), dist);
 
-        assertNull(service.findByHost(dist.getDomainName()));
+        assertEquals(dist.getId(), service.findByHost(dist.getDomainName()).getId());
+        assertThrows(AwsException.class, () -> service.getDistribution(dist.getId()));
     }
 
     @Test

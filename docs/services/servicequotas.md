@@ -23,6 +23,15 @@ It defaults to 5. The AWS
 default read actions always return 5. EC2 can use this applied value for opt-in
 Standard On-Demand launch/start admission for each account and region; see [EC2 admission](ec2.md#standard-on-demand-admission).
 
+CloudWatch's (`monitoring`) `L-8BC498D4` ("Rate of PutMetricData requests", 500 per second, as
+the CloudWatch service quotas page lists it) carries its `UsageMetric`. That is the `AWS/Usage`
+`CallCount` metric with dimensions `Service` `CloudWatch`, `Type` `API` and `Resource`
+`PutMetricData`, and statistic recommendation `Sum`. Lambda's `L-B99A9384` carries the
+`AWS/Lambda` `ConcurrentExecutions` metric without dimensions. CloudWatch's `SERVICE_QUOTA()`
+metric math function resolves a quota by this usage metric. A `Class` dimension of `None`, which
+CloudWatch API usage metrics carry, is ignored in that match. See
+[CloudWatch metric math](cloudwatch.md).
+
 All other applied quotas and AWS default quotas return the same catalog data.
 `RequestServiceQuotaIncrease` is accepted and validated, records the request, and lets you read
 it back with `GetRequestedServiceQuotaChange` or list it with

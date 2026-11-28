@@ -12,7 +12,10 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -164,16 +167,12 @@ class StepFunctionsAwsSdkTaskIntegrationTest {
                 }
                 """.replace("CHILD_ARN", quickChildArn));
 
-        Response first = waitForTerminalState(startExecution(smArn, "{}"));
-        assertEquals("SUCCEEDED", first.jsonPath().getString("status"));
-
-        // The name is taken while the child's execution runs, and a start with that name and
-        // the same input then returns that execution again, so the second start would
-        // succeed. The name is a conflict once the child's execution is closed, so the test
-        // waits for that.
-        String childArn = mapper.readTree(first.jsonPath().getString("output"))
-                .path("ExecutionArn").asText();
-        waitForTerminalState(childArn);
+        JsonNode first = mapper.readTree(succeedingOutputOf(smArn, "{}"));
+        // The task does not wait for the child it starts, and a name is taken for good only once the
+        // execution holding it has closed: a start with the same name and input while it still runs
+        // is answered with that execution instead of a conflict.
+        assertEquals("SUCCEEDED", waitForTerminalState(first.path("ExecutionArn").asText())
+                .jsonPath().getString("status"));
 
         Response describe = waitForTerminalState(startExecution(smArn, "{}"));
         assertEquals("FAILED", describe.jsonPath().getString("status"));
@@ -1009,26 +1008,26 @@ class StepFunctionsAwsSdkTaskIntegrationTest {
     }
 
     private String receiveTaskToken() throws Exception {
-        for (int i = 0; i < 50; i++) {
-            Response resp = given()
-                    .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
-                    .contentType(SQS_CONTENT_TYPE)
-                    .body("{\"QueueUrl\":\"%s\",\"MaxNumberOfMessages\":1,\"WaitTimeSeconds\":1}"
-                            .formatted(callbackQueueUrl))
-                    .when().post("/");
-            resp.then().statusCode(200);
-            JsonNode messages = mapper.readTree(resp.body().asString()).path("Messages");
-            if (messages.size() == 1) {
-                JsonNode message = messages.get(0);
-                deleteMessage(message.path("ReceiptHandle").asText());
-                String token = mapper.readTree(message.path("Body").asText()).path("token").asText();
-                assertFalse(token.isBlank(), "the waiting task published a blank token");
-                return token;
-            }
-            Thread.sleep(100);
-        }
-        fail("The waiting execution never published its task token");
-        return null;
+        // Room for 50 empty receives: each one long-polls for 1 s, plus a 100 ms pause.
+        JsonNode message = await("the waiting execution to publish its task token")
+                .atMost(Duration.ofSeconds(55))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    Response resp = given()
+                            .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
+                            .contentType(SQS_CONTENT_TYPE)
+                            .body("{\"QueueUrl\":\"%s\",\"MaxNumberOfMessages\":1,\"WaitTimeSeconds\":1}"
+                                    .formatted(callbackQueueUrl))
+                            .when().post("/");
+                    resp.then().statusCode(200);
+                    return mapper.readTree(resp.body().asString()).path("Messages");
+                }, messages -> messages.size() == 1)
+                .get(0);
+        deleteMessage(message.path("ReceiptHandle").asText());
+        String token = mapper.readTree(message.path("Body").asText()).path("token").asText();
+        assertFalse(token.isBlank(), "the waiting task published a blank token");
+        return token;
     }
 
     private static void deleteMessage(String receiptHandle) {
@@ -1120,20 +1119,12 @@ class StepFunctionsAwsSdkTaskIntegrationTest {
     }
 
     private static Response waitForTerminalState(String execArn) {
-        for (int i = 0; i < 150; i++) {
-            Response resp = describeExecution(execArn);
-            if (!"RUNNING".equals(resp.jsonPath().getString("status"))) {
-                return resp;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                fail("Interrupted while waiting for execution " + execArn);
-            }
-        }
-        fail("Execution did not complete within timeout: " + execArn);
-        return null;
+        return await("execution " + execArn + " to leave RUNNING")
+                .atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> describeExecution(execArn),
+                        response -> !"RUNNING".equals(response.jsonPath().getString("status")));
     }
 
     private static String quote(String raw) {

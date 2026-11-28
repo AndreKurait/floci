@@ -63,6 +63,22 @@ machine: decision tasks, activity tasks, timers, signals, child workflows, and t
 
 All 39 modeled operations are implemented.
 
+## IAM resources
+
+With IAM enforcement enabled, requests naming a domain are checked against
+`arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}`. This includes
+starting and signaling workflows, polling, and inspecting their history. Domain
+tagging uses the request's `resourceArn`. Domain-scoped allows and explicit denies
+apply; `ListDomains` and `RegisterDomain` require `Resource: "*"`.
+
+The generated table restores the Region omitted by AWS's machine-readable Service
+Reference, following the ARN format in the
+[SWF policy guide](https://docs.aws.amazon.com/amazonswf/latest/developerguide/swf-dev-iam.policies.html).
+
+Requests carrying only a task token still use `Resource: "*"`; resolving the
+domain behind those tokens is not implemented by the request-resource table.
+SWF-specific condition keys are not yet evaluated.
+
 ## Decisions
 
 `RespondDecisionTaskCompleted` applies decisions in order:
@@ -88,6 +104,13 @@ A decision that cannot be applied appends its `*Failed` event with the AWS cause
 fresh decision task. A closing decision must be last in the batch: a batch with anything
 after it is rejected with `ValidationException` ("Close must be last decision in list") and
 no decision is applied.
+A closing decision is deferred with `UNHANDLED_DECISION` when another decision is
+needed, including a new signal, activity outcome, fired timer, or an earlier failed
+decision in the same batch. Claiming an activity adds `ActivityTaskStarted` without
+requesting another decision and does not prevent closure. Known pending activities,
+timers and children do not prevent closure either; normal activity cleanup and the
+configured child policy still apply. See the
+[SWF decision failure contract](https://docs.aws.amazon.com/amazonswf/latest/apireference/API_Decision.html).
 
 An empty decision response leaves the execution open and waits for a new event.
 It does not schedule another task merely because no activity, timer, or child is
@@ -156,6 +179,7 @@ floci:
       enabled: true
       timeout-sweep-enabled: true
       timeout-sweep-interval-seconds: 1
+      timeout-sweep-interval-millis: 0
 ```
 
 | Setting | Env var | Default | Description |
@@ -163,6 +187,12 @@ floci:
 | `enabled` | `FLOCI_SERVICES_SWF_ENABLED` | `true` | Enable the service |
 | `timeout-sweep-enabled` | `FLOCI_SERVICES_SWF_TIMEOUT_SWEEP_ENABLED` | `true` | Run the background timeout sweep |
 | `timeout-sweep-interval-seconds` | `FLOCI_SERVICES_SWF_TIMEOUT_SWEEP_INTERVAL_SECONDS` | `1` | Sweep interval |
+| `timeout-sweep-interval-millis` | `FLOCI_SERVICES_SWF_TIMEOUT_SWEEP_INTERVAL_MILLIS` | `0` | A positive value overrides the seconds interval; non-positive values keep it |
+
+For example, a `100` millisecond sweep observes expired timers and timeouts more
+frequently. It does not shorten activity, decision, workflow or timer deadlines.
+This setting does not change how workflow workers poll for tasks or how long a
+request may wait.
 
 ## Example
 
@@ -253,9 +283,12 @@ Faults use the AWS codes and messages, so SDK error handling works unchanged:
 
 ## Limitations
 
-- **Long polling.** `PollForDecisionTask` and `PollForActivityTask` return immediately
-  instead of holding the connection for up to 60 seconds. Workers that loop on an empty
-  poll behave the same; workers that rely on the call blocking will spin.
+- **Long polling.** `PollForDecisionTask` and `PollForActivityTask` hold an empty
+  poll for up to 60 seconds and wake when a matching task becomes available. Decision
+  history continuation requests return the next page without starting another poll.
+  Notifications are scoped by account, region, domain, task list and task type.
+  Activity heartbeats do not wake idle decision pollers, and idle notification
+  registrations are removed when their last waiter leaves.
 - **Task tokens are in-memory.** Tokens do not survive a restart even under persistent
   storage modes, matching the fact that SWF tokens are not durable handles.
 - **Retention.** `workflowExecutionRetentionPeriodInDays` is stored and returned but

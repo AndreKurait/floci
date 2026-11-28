@@ -1,12 +1,15 @@
 package io.floci.aws.services.dynamodb.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.services.dynamodb.DynamoDbCapacityUsage;
 
 
 public class ConditionalCheckFailedException extends AwsException {
 
     private final JsonNode item;
+    private DynamoDbCapacityUsage capacityUsage;
 
     public ConditionalCheckFailedException(JsonNode Item) {
         super("ConditionalCheckFailedException", "The conditional request failed", 400);
@@ -15,5 +18,15 @@ public class ConditionalCheckFailedException extends AwsException {
 
     public JsonNode getItem() {
         return item;
+    }
+
+    @JsonIgnore
+    public DynamoDbCapacityUsage capacityUsage() {
+        return capacityUsage;
+    }
+
+    @JsonIgnore
+    public void recordCapacityUsage(DynamoDbCapacityUsage usage) {
+        this.capacityUsage = usage;
     }
 }

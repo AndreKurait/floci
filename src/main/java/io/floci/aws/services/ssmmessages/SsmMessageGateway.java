@@ -37,6 +37,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /** The in-memory control connections and paired Session Manager data channels. */
 @ApplicationScoped
@@ -70,6 +71,7 @@ public class SsmMessageGateway implements Resettable {
     // Opening and closing sockets, grants and queues all use the same monitor. No socket I/O waits on it.
     private final Set<Connection> connections = new HashSet<>();
     private final Map<Node, Connection> controls = new HashMap<>();
+    private final Map<Node, ExternalControl> externalControls = new HashMap<>();
     private final Map<Node, Grant> controlGrants = new HashMap<>();
     private final Map<String, Session> sessions = new HashMap<>();
     private long generation;
@@ -92,7 +94,50 @@ public class SsmMessageGateway implements Resettable {
 
     public synchronized boolean isConnected(Node node) {
         Connection connection = controls.get(node);
-        return !resetting && connection != null && !connection.socket.isClosed();
+        return !resetting && !stopping && (externalControls.containsKey(node)
+                || connection != null && !connection.socket.isClosed());
+    }
+
+    /** Shares an authenticated agent connection with Run Command without opening another control socket. */
+    public synchronized void registerExternalControl(Node node, UUID owner,
+                                                       Function<Buffer, Future<Void>> sender) {
+        if (resetting || stopping) {
+            throw targetNotConnected();
+        }
+        externalControls.put(node, new ExternalControl(owner, sender));
+        Connection previous = controls.remove(node);
+        if (previous != null) {
+            previous.socket.close();
+        }
+    }
+
+    /** A retired connection cannot unregister the replacement that now owns this node. */
+    public synchronized void unregisterExternalControl(Node node, UUID owner) {
+        ExternalControl connection = externalControls.get(node);
+        if (connection != null && connection.owner().equals(owner)) {
+            externalControls.remove(node, connection);
+        }
+    }
+
+    /** Handles only a completion belonging to a session on this backend and this authenticated connection. */
+    public synchronized boolean receiveExternalControl(Node node, UUID owner, Buffer frame) {
+        ExternalControl connection = externalControls.get(node);
+        if (resetting || stopping || connection == null || !connection.owner().equals(owner)) {
+            return false;
+        }
+        if (!TASK_COMPLETE_MESSAGE.equals(AgentMessage.gatewayMessageType(frame))) {
+            return false;
+        }
+        AgentMessage message = AgentMessage.decode(frame.getBytes());
+        Session session = sessions.get(readJson(message).path("TaskId").asText());
+        if (session == null) {
+            return false;
+        }
+        if (!session.target.node().equals(node)) {
+            throw new IllegalArgumentException("Task completion is for a different instance");
+        }
+        completeTask(node, message);
+        return true;
     }
 
     /**
@@ -176,6 +221,7 @@ public class SsmMessageGateway implements Resettable {
                 return false;
             }
             controlGrants.remove(node);
+            externalControls.remove(node);
             Connection previous = controls.put(node, connection);
             if (previous != null) {
                 previous.socket.close();
@@ -535,6 +581,14 @@ public class SsmMessageGateway implements Resettable {
     }
 
     private Future<Void> sendControl(Node node, Buffer frame) {
+        ExternalControl external = externalControls.get(node);
+        if (!resetting && !stopping && external != null) {
+            try {
+                return external.sender().apply(frame);
+            } catch (RuntimeException failure) {
+                return Future.failedFuture(failure);
+            }
+        }
         Connection connection = controls.get(node);
         if (resetting || connection == null || connection.socket.isClosed() || connection.socket.writeQueueFull()) {
             return Future.failedFuture(targetNotConnected());
@@ -623,6 +677,7 @@ public class SsmMessageGateway implements Resettable {
         List<Connection> disconnect = List.copyOf(connections);
         connections.clear();
         controls.clear();
+        externalControls.clear();
         controlGrants.clear();
         sessions.clear();
         for (Connection connection : disconnect) {
@@ -637,6 +692,8 @@ public class SsmMessageGateway implements Resettable {
         vertx.cancelTimer(sweepTimer);
         clear();
     }
+
+    private record ExternalControl(UUID owner, Function<Buffer, Future<Void>> sender) { }
 
     private record Grant(String value, Instant expires, String binding) { }
 

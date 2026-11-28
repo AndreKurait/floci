@@ -91,56 +91,67 @@ class CloudFormationAppConfigIntegrationTest {
     @Test
     void aStackCreatesTheFourTypesAndItsDeleteRemovesThemWithTheirVersionsAndDeployments() throws Exception {
         String stack = unique("cfn-appconfig-create");
+        String monitorArn = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:" + stack;
         Map<String, Object> resources = first();
+        resources.put("Monitor", Map.of("Type", "AWS::CloudWatch::Alarm", "Properties", props(
+                "AlarmName", stack, "ActionsEnabled", false, "Namespace", "AppConfigFixture",
+                "MetricName", "Errors", "Statistic", "Sum", "Period", 60,
+                "EvaluationPeriods", 1, "ComparisonOperator", "GreaterThanThreshold", "Threshold", 1)));
+        properties(resources, "Env").put("Monitors", List.of(
+                Map.of("AlarmArn", Map.of("Fn::GetAtt", List.of("Monitor", "Arn")))));
         resources.put("Untyped", Map.of("Type", "AWS::AppConfig::ConfigurationProfile", "Properties",
                 Map.of("ApplicationId", ref("App"), "Name", "untyped", "LocationUri", "hosted")));
-        deploy("CreateStack", stack, template(resources, false));
-        assertStatus(stack, "CREATE_COMPLETE");
+        try {
+            deploy("CreateStack", stack, template(resources, false));
+            assertStatus(stack, "CREATE_COMPLETE");
 
-        Map<String, String> outputs = outputs(stack);
-        Map<String, String> physicalIds = physicalIds(stack);
-        for (String resource : RESOURCES) {
-            assertEquals(outputs.get(resource + "Ref"), outputs.get(resource + "Id"), resource);
-            assertEquals(physicalIds.get(resource), outputs.get(resource + "Ref"), resource);
+            Map<String, String> outputs = outputs(stack);
+            Map<String, String> physicalIds = physicalIds(stack);
+            for (String resource : RESOURCES) {
+                assertEquals(outputs.get(resource + "Ref"), outputs.get(resource + "Id"), resource);
+                assertEquals(physicalIds.get(resource), outputs.get(resource + "Ref"), resource);
+            }
+            String app = outputs.get("AppRef");
+            String env = outputs.get("EnvRef");
+            String profile = outputs.get("ProfileRef");
+            String strategy = outputs.get("StrategyRef");
+            String envPath = "/applications/" + app + "/environments/" + env;
+            String profilePath = "/applications/" + app + "/configurationprofiles/" + profile;
+
+            appconfig().get("/applications/" + app).then().statusCode(200)
+                    .body("Name", equalTo("orders"), "Description", equalTo("Order service"));
+            assertEquals(Map.of("team", "payments", "tier", "gold"), applicationTags(app));
+            appconfig().get(envPath).then().statusCode(200)
+                    .body("Name", equalTo("beta"), "Monitors[0].AlarmArn", equalTo(monitorArn))
+                    .body("Monitors[0]", not(hasKey("AlarmRoleArn")));
+            appconfig().get(profilePath).then().statusCode(200)
+                    .body("Name", equalTo("settings"), "LocationUri", equalTo("hosted"), "Type", equalTo("AWS.Freeform"));
+            appconfig().get("/applications/" + app + "/configurationprofiles/" + physicalIds.get("Untyped"))
+                    .then().statusCode(200).body("Type", equalTo("AWS.Freeform"));
+            appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(200)
+                    .body("Name", equalTo("gradual"), "DeploymentDurationInMinutes", equalTo(0),
+                            "FinalBakeTimeInMinutes", equalTo(0), "GrowthFactor", equalTo(100f),
+                            "GrowthType", equalTo("LINEAR"), "ReplicateTo", equalTo("NONE"));
+
+            // The stack's resources work together: a hosted version deploys with the stack's strategy.
+            appconfig().body("{\"enabled\":true}").post(profilePath + "/hostedconfigurationversions")
+                    .then().statusCode(201).header("Version-Number", equalTo("1"));
+            int deployment = appconfig().body(Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "1",
+                            "DeploymentStrategyId", strategy))
+                    .post(envPath + "/deployments").then().statusCode(201)
+                    .body("ConfigurationName", equalTo("settings"), "ConfigurationLocationUri", equalTo("hosted"))
+                    .extract().path("DeploymentNumber");
+
+            deleteStack(stack);
+            appconfig().get(envPath + "/deployments/" + deployment).then().statusCode(404);
+            appconfig().get(envPath).then().statusCode(404);
+            appconfig().get(profilePath + "/hostedconfigurationversions/1").then().statusCode(404);
+            appconfig().get(profilePath).then().statusCode(404);
+            appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(404);
+            appconfig().get("/applications/" + app).then().statusCode(404);
+        } finally {
+            deleteStack(stack);
         }
-        String app = outputs.get("AppRef");
-        String env = outputs.get("EnvRef");
-        String profile = outputs.get("ProfileRef");
-        String strategy = outputs.get("StrategyRef");
-        String envPath = "/applications/" + app + "/environments/" + env;
-        String profilePath = "/applications/" + app + "/configurationprofiles/" + profile;
-
-        appconfig().get("/applications/" + app).then().statusCode(200)
-                .body("Name", equalTo("orders"), "Description", equalTo("Order service"));
-        assertEquals(Map.of("team", "payments", "tier", "gold"), applicationTags(app));
-        appconfig().get(envPath).then().statusCode(200)
-                .body("Name", equalTo("beta"), "Monitors[0].AlarmArn", equalTo(ALARM))
-                .body("Monitors[0]", not(hasKey("AlarmRoleArn")));
-        appconfig().get(profilePath).then().statusCode(200)
-                .body("Name", equalTo("settings"), "LocationUri", equalTo("hosted"), "Type", equalTo("AWS.Freeform"));
-        appconfig().get("/applications/" + app + "/configurationprofiles/" + physicalIds.get("Untyped"))
-                .then().statusCode(200).body("Type", equalTo("AWS.Freeform"));
-        appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(200)
-                .body("Name", equalTo("gradual"), "DeploymentDurationInMinutes", equalTo(0),
-                        "FinalBakeTimeInMinutes", equalTo(0), "GrowthFactor", equalTo(100f),
-                        "GrowthType", equalTo("LINEAR"), "ReplicateTo", equalTo("NONE"));
-
-        // The stack's resources work together: a hosted version deploys with the stack's strategy.
-        appconfig().body("{\"enabled\":true}").post(profilePath + "/hostedconfigurationversions")
-                .then().statusCode(201).header("Version-Number", equalTo("1"));
-        int deployment = appconfig().body(Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "1",
-                        "DeploymentStrategyId", strategy))
-                .post(envPath + "/deployments").then().statusCode(201)
-                .body("ConfigurationName", equalTo("settings"), "ConfigurationLocationUri", equalTo("hosted"))
-                .extract().path("DeploymentNumber");
-
-        deleteStack(stack);
-        appconfig().get(envPath + "/deployments/" + deployment).then().statusCode(404);
-        appconfig().get(envPath).then().statusCode(404);
-        appconfig().get(profilePath + "/hostedconfigurationversions/1").then().statusCode(404);
-        appconfig().get(profilePath).then().statusCode(404);
-        appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(404);
-        appconfig().get("/applications/" + app).then().statusCode(404);
     }
 
     @Test
@@ -231,6 +242,74 @@ class CloudFormationAppConfigIntegrationTest {
                 replacements(stack, "moved", template(moved, false)));
 
         deleteStack(stack);
+    }
+
+    @Test
+    void sdkTagOnlyUpdatesKeepAllFourIdsAndRollbackRestoresTheirTags() throws Exception {
+        String stack = unique("cfn-appconfig-tags");
+        Map<String, Object> resources = first();
+        properties(resources, "Env").remove("Monitors");
+        for (String name : RESOURCES) {
+            properties(resources, name).put("Tags", tags("team", "first", "remove", "yes"));
+        }
+        try (CloudFormationClient client = AwsTestClients.create(
+                CloudFormationClient.builder(), "test", Region.US_EAST_1)) {
+            try {
+                String originalTemplate = template(resources, false);
+                client.createStack(request -> request.stackName(stack).templateBody(originalTemplate));
+                assertStatus(stack, "CREATE_COMPLETE");
+                Map<String, String> before = outputs(stack);
+                assertResourceTags(before, Map.of("team", "first", "remove", "yes"));
+                for (String name : RESOURCES) {
+                    properties(resources, name).put("Tags", tags("team", "second", "empty", ""));
+                }
+                String updatedTemplate = template(resources, false);
+                client.updateStack(request -> request.stackName(stack).templateBody(updatedTemplate));
+                assertStatus(stack, "UPDATE_COMPLETE");
+                assertEquals(before, outputs(stack));
+                assertResourceTags(before, Map.of("team", "second", "empty", ""));
+
+                for (String name : RESOURCES) {
+                    properties(resources, name).put("Tags", tags("team", "rolled-back"));
+                }
+                String failingTemplate = template(resources, true);
+                client.updateStack(request -> request.stackName(stack).templateBody(failingTemplate));
+                assertStatus(stack, "UPDATE_ROLLBACK_COMPLETE");
+                assertEquals(before, outputs(stack));
+                assertResourceTags(before, Map.of("team", "second", "empty", ""));
+
+                for (String name : RESOURCES) {
+                    properties(resources, name).remove("Tags");
+                }
+                String withoutTags = template(resources, false);
+                client.updateStack(request -> request.stackName(stack).templateBody(withoutTags));
+                assertStatus(stack, "UPDATE_COMPLETE");
+                assertEquals(before, outputs(stack));
+                assertResourceTags(before, Map.of());
+                client.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+                for (String arn : resourceTagArns(before)) {
+                    appconfig().get("/tags/{arn}", arn).then().statusCode(404);
+                }
+            } finally {
+                deleteStack(stack);
+            }
+        }
+    }
+
+    private static void assertResourceTags(Map<String, String> outputs, Map<String, String> expected) {
+        for (String arn : resourceTagArns(outputs)) {
+            assertEquals(expected, appconfig().get("/tags/{arn}", arn).then().statusCode(200)
+                    .extract().jsonPath().getMap("Tags", String.class, String.class), arn);
+        }
+    }
+
+    private static List<String> resourceTagArns(Map<String, String> outputs) {
+        String prefix = "arn:aws:appconfig:us-east-1:000000000000:";
+        String app = "application/" + outputs.get("AppRef");
+        return List.of(prefix + app, prefix + app + "/environment/" + outputs.get("EnvRef"),
+                prefix + app + "/configurationprofile/" + outputs.get("ProfileRef"),
+                prefix + "deploymentstrategy/" + outputs.get("StrategyRef"));
     }
 
     /** The first version of the four resources. */

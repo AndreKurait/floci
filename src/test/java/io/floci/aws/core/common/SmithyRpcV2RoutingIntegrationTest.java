@@ -111,6 +111,60 @@ class SmithyRpcV2RoutingIntegrationTest {
         assertThat(CBOR_MAPPER.readTree(response).path("Metrics"), notNullValue());
     }
 
+    /**
+     * The Resource Groups Tagging API's model lists smithy-rpc-v2-cbor first among its protocols
+     * (botocore resourcegroupstaggingapi 2017-01-26: "protocols": ["smithy-rpc-v2-cbor", "json"]), so a
+     * current SDK that picks the first protocol it supports sends each operation to
+     * /service/ResourceGroupsTaggingAPI_20170126/operation/{operation}. Each answers in CBOR as over JSON 1.1.
+     */
+    @Test
+    void resourceGroupsTaggingRoutesViaTargetPrefixServiceName() throws Exception {
+        String arn = "arn:aws:ec2:us-east-1:000000000000:instance/i-0rpcv2cbor0tag";
+        JsonNode tagged = taggingCbor("TagResources", """
+            {"ResourceARNList": ["%s"], "Tags": {"RpcV2CborKey": "rpc-v2-cbor-value"}}
+            """.formatted(arn));
+        assertThat(tagged.path("FailedResourcesMap").size(), equalTo(0));
+
+        JsonNode resources = taggingCbor("GetResources", """
+            {"TagFilters": [{"Key": "RpcV2CborKey", "Values": ["rpc-v2-cbor-value"]}]}
+            """);
+        assertThat(resources.path("ResourceTagMappingList").size(), equalTo(1));
+        assertThat(resources.path("ResourceTagMappingList").path(0).path("ResourceARN").asText(), equalTo(arn));
+        assertThat(resources.path("ResourceTagMappingList").path(0).path("Tags").path(0).path("Key").asText(),
+                equalTo("RpcV2CborKey"));
+
+        JsonNode keys = taggingCbor("GetTagKeys", "{}");
+        assertThat(keys.path("TagKeys").toString().contains("\"RpcV2CborKey\""), equalTo(true));
+        JsonNode values = taggingCbor("GetTagValues", """
+            {"Key": "RpcV2CborKey"}
+            """);
+        assertThat(values.path("TagValues").toString(), equalTo("[\"rpc-v2-cbor-value\"]"));
+
+        JsonNode untagged = taggingCbor("UntagResources", """
+            {"ResourceARNList": ["%s"], "TagKeys": ["RpcV2CborKey"]}
+            """.formatted(arn));
+        assertThat(untagged.path("FailedResourcesMap").size(), equalTo(0));
+        assertThat(taggingCbor("GetResources", """
+            {"TagFilters": [{"Key": "RpcV2CborKey"}]}
+            """).path("ResourceTagMappingList").size(), equalTo(0));
+    }
+
+    private JsonNode taggingCbor(String operation, String json) throws Exception {
+        byte[] response = given()
+            .contentType("application/cbor")
+            .accept("application/cbor")
+            .header("smithy-protocol", "rpc-v2-cbor")
+            .body(CBOR_MAPPER.writeValueAsBytes(JSON_MAPPER.readTree(json)))
+        .when()
+            .post("/service/ResourceGroupsTaggingAPI_20170126/operation/" + operation)
+        .then()
+            .statusCode(200)
+            .header("smithy-protocol", equalTo("rpc-v2-cbor"))
+            .contentType("application/cbor")
+            .extract().asByteArray();
+        return CBOR_MAPPER.readTree(response);
+    }
+
     @Test
     void unknownServiceNameReturns404() throws Exception {
         given()

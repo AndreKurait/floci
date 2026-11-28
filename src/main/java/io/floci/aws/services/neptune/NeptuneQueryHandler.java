@@ -11,6 +11,7 @@ import io.floci.aws.core.common.RdsFamilyQuerySupport;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.services.neptune.model.NeptuneCluster;
 import io.floci.aws.services.neptune.model.NeptuneClusterSettings;
+import io.floci.aws.services.neptune.model.NeptuneClusterSnapshot;
 import io.floci.aws.services.neptune.model.NeptuneInstance;
 import io.floci.aws.services.neptune.model.NeptuneInstanceSettings;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -51,6 +52,10 @@ public class NeptuneQueryHandler {
                 case "DescribeDBClusters" -> handleDescribeDbClusters(params);
                 case "DeleteDBCluster"    -> handleDeleteDbCluster(params);
                 case "ModifyDBCluster"    -> handleModifyDbCluster(params);
+                case "CreateDBClusterSnapshot" -> handleCreateDbClusterSnapshot(params);
+                case "DescribeDBClusterSnapshots" -> handleDescribeDbClusterSnapshots(params);
+                case "DeleteDBClusterSnapshot" -> handleDeleteDbClusterSnapshot(params);
+                case "RestoreDBClusterFromSnapshot" -> handleRestoreDbClusterFromSnapshot(params);
                 case "AddRoleToDBCluster" -> handleAddRoleToDbCluster(params);
                 case "RemoveRoleFromDBCluster" -> handleRemoveRoleFromDbCluster(params);
                 case "DescribeGlobalClusters" -> handleDescribeGlobalClusters(params);
@@ -191,6 +196,105 @@ public class NeptuneQueryHandler {
 
     private Response handleDescribeGlobalClusters(MultivaluedMap<String, String> params) {
         return RdsFamilyQuerySupport.handleDescribeGlobalClusters(LOG, params);
+    }
+
+    private Response handleCreateDbClusterSnapshot(MultivaluedMap<String, String> params) {
+        requireParameter(params, "DBClusterSnapshotIdentifier");
+        requireParameter(params, "DBClusterIdentifier");
+        NeptuneClusterSnapshot snapshot = service.createDbClusterSnapshot(
+                params.getFirst("DBClusterSnapshotIdentifier"), params.getFirst("DBClusterIdentifier"), parseTags(params));
+        return Response.ok(AwsQueryResponse.envelope("CreateDBClusterSnapshot", AwsNamespaces.RDS,
+                snapshotXml(snapshot))).build();
+    }
+
+    private Response handleDescribeDbClusterSnapshots(MultivaluedMap<String, String> params) {
+        String snapshotId = params.getFirst("DBClusterSnapshotIdentifier");
+        String clusterId = params.getFirst("DBClusterIdentifier");
+        if (snapshotId != null && clusterId != null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Specify either DBClusterSnapshotIdentifier or DBClusterIdentifier.", 400);
+        }
+        if (clusterId == null) {
+            clusterId = extractFilterValue(params, "db-cluster-id");
+        }
+        if (snapshotId == null) {
+            snapshotId = extractFilterValue(params, "db-cluster-snapshot-id");
+        }
+        boolean manual = includesManualSnapshots(params.getFirst("SnapshotType"));
+        List<NeptuneClusterSnapshot> snapshots = service.listDbClusterSnapshots(snapshotId, clusterId);
+        XmlBuilder xml = new XmlBuilder().start("DBClusterSnapshots");
+        if (manual) {
+            snapshots.forEach(snapshot -> xml.raw(snapshotXml(snapshot)));
+        }
+        xml.end("DBClusterSnapshots");
+        return Response.ok(AwsQueryResponse.envelope("DescribeDBClusterSnapshots", AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    /** Snapshot rows for the RDS-family inventory; archives never appear in public XML. */
+    public List<String> clusterSnapshotRowsXml(String clusterId, String snapshotType) {
+        return includesManualSnapshots(snapshotType)
+                ? service.listDbClusterSnapshots(null, clusterId).stream().map(this::snapshotXml).toList() : List.of();
+    }
+
+    private static boolean includesManualSnapshots(String snapshotType) {
+        if (snapshotType == null || snapshotType.isBlank() || "manual".equals(snapshotType)) {
+            return true;
+        }
+        if (!Set.of("automated", "shared", "public").contains(snapshotType)) {
+            throw new AwsException("InvalidParameterValue", "Invalid SnapshotType.", 400);
+        }
+        return false;
+    }
+
+    private Response handleDeleteDbClusterSnapshot(MultivaluedMap<String, String> params) {
+        requireParameter(params, "DBClusterSnapshotIdentifier");
+        NeptuneClusterSnapshot snapshot = service.deleteDbClusterSnapshot(params.getFirst("DBClusterSnapshotIdentifier"));
+        return Response.ok(AwsQueryResponse.envelope("DeleteDBClusterSnapshot", AwsNamespaces.RDS,
+                snapshotXml(snapshot))).build();
+    }
+
+    private Response handleRestoreDbClusterFromSnapshot(MultivaluedMap<String, String> params) {
+        requireParameter(params, "DBClusterIdentifier");
+        requireParameter(params, "SnapshotIdentifier");
+        requireParameter(params, "Engine");
+        if (!"neptune".equalsIgnoreCase(params.getFirst("Engine"))) {
+            throw new AwsException("InvalidParameterValue", "Engine must be neptune.", 400);
+        }
+        NeptuneCluster restored = service.restoreDbClusterFromSnapshot(params.getFirst("DBClusterIdentifier"),
+                params.getFirst("SnapshotIdentifier"), params.getFirst("EngineVersion"),
+                optionalBoolean(params.getFirst("EnableIAMDatabaseAuthentication")),
+                clusterSettings(params, true), parseTags(params));
+        return Response.ok(AwsQueryResponse.envelope("RestoreDBClusterFromSnapshot", AwsNamespaces.RDS,
+                clusterXml(restored))).build();
+    }
+
+    private static void requireParameter(MultivaluedMap<String, String> params, String name) {
+        String value = params.getFirst(name);
+        if (value == null || value.isBlank()) {
+            throw new AwsException("InvalidParameterValue", name + " is required.", 400);
+        }
+    }
+
+    private String snapshotXml(NeptuneClusterSnapshot snapshot) {
+        NeptuneClusterSettings settings = snapshot.settings();
+        XmlBuilder xml = new XmlBuilder().start("DBClusterSnapshot")
+                .elem("DBClusterSnapshotIdentifier", snapshot.dbClusterSnapshotIdentifier())
+                .elem("DBClusterSnapshotArn", snapshot.dbClusterSnapshotArn())
+                .elem("DBClusterIdentifier", snapshot.dbClusterIdentifier())
+                .elem("Status", "available").elem("SnapshotType", "manual").elem("PercentProgress", 100)
+                .elem("Engine", "neptune").elem("EngineVersion", snapshot.engineVersion())
+                .elem("Port", settings.port()).elem("StorageEncrypted", Boolean.TRUE.equals(settings.storageEncrypted()))
+                .elem("KmsKeyId", settings.kmsKeyId())
+                .elem("SnapshotCreateTime", DateTimeFormatter.ISO_INSTANT.format(snapshot.snapshotCreateTime()));
+        if (snapshot.clusterCreateTime() != null) {
+            xml.elem("ClusterCreateTime", DateTimeFormatter.ISO_INSTANT.format(snapshot.clusterCreateTime()));
+        }
+        xml.start("AvailabilityZones");
+        settings.availabilityZones().forEach(zone -> xml.elem("AvailabilityZone", zone));
+        xml.end("AvailabilityZones").start("TagList");
+        snapshot.tags().forEach((key, value) ->
+                xml.start("Tag").elem("Key", key).elem("Value", value).end("Tag"));
+        return xml.end("TagList").end("DBClusterSnapshot").build();
     }
 
     // ── Instances ─────────────────────────────────────────────────────────────

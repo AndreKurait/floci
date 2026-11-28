@@ -89,6 +89,26 @@ class AccessDeniedMessagesTest {
                         null, ACTION, CONNECTOR, Map.of()));
     }
 
+    @Test
+    void managedSessionPoliciesContributeToDenialReason() {
+        String allowAll = policy(allow("*"));
+        String allowNothing = policy(allowCreate());
+        CallerContext caller = CallerContext.of(List.of(allowAll))
+                .withManagedSessionPolicies(List.of(allowNothing));
+        assertEquals("because no session policy allows the lambda:PassNetworkConnector action",
+                AccessDeniedMessages.firstRefusal(evaluator, caller, null, ACTION, CONNECTOR, Map.of()));
+        CallerContext denied = new CallerContext(List.of(allowAll), allowAll, null)
+                .withManagedSessionPolicies(List.of(policy(deny("*"))));
+        assertEquals("with an explicit deny in a session policy",
+                AccessDeniedMessages.firstRefusal(evaluator, denied, null, ACTION, CONNECTOR, Map.of()));
+        CallerContext allowed = caller.withManagedSessionPolicies(List.of(allowNothing, allowAll));
+        assertNull(AccessDeniedMessages.firstRefusal(evaluator, allowed, null, ACTION, CONNECTOR, Map.of()));
+        CallerContext identityDenied = CallerContext.of(List.of(allowNothing))
+                .withManagedSessionPolicies(List.of(policy(deny("*"))));
+        assertEquals(NO_IDENTITY_ALLOW,
+                AccessDeniedMessages.firstRefusal(evaluator, identityDenied, null, ACTION, CONNECTOR, Map.of()));
+    }
+
     private String refusal(String identity, String resource) {
         return AccessDeniedMessages.firstRefusal(evaluator, CallerContext.of(List.of(identity)), null, ACTION, resource,
                 Map.of());

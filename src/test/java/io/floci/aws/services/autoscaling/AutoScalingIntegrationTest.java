@@ -1,11 +1,14 @@
 package io.floci.aws.services.autoscaling;
 
+import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
 
 import static io.floci.aws.services.autoscaling.AutoScalingXmlAssertions.assertModeledNamespace;
 import static io.restassured.RestAssured.given;
@@ -16,6 +19,7 @@ import static org.hamcrest.Matchers.*;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class AutoScalingIntegrationTest {
 
+    private static final String XML_NAMESPACE = "http://autoscaling.amazonaws.com/doc/2011-01-01/";
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260501/us-east-1/autoscaling/aws4_request";
     private static final String EC2_AUTH =
@@ -1224,6 +1228,16 @@ class AutoScalingIntegrationTest {
                 .extract().asString();
 
         assertModeledNamespace(xml);
+    }
+
+    private static void assertModeledNamespace(String xml) throws Exception {
+        Element root = XmlParser.parseDocument(xml).getDocumentElement();
+        assertThat(root.getNamespaceURI(), equalTo(XML_NAMESPACE));
+        NodeList descendants = root.getElementsByTagName("*");
+        for (int i = 0; i < descendants.getLength(); i++) {
+            assertThat(descendants.item(i).getNodeName(),
+                    descendants.item(i).getNamespaceURI(), equalTo(XML_NAMESPACE));
+        }
     }
 
     private static String createLaunchTemplate(String name) {

@@ -141,7 +141,7 @@ class EmrTrinoNightlyIntegrationTest {
 
         String step = trinoStep("SHOW CATALOGS; " + tables(schema));
 
-        assertEquals("COMPLETED", state(step), () -> logs(step));
+        assertCompleted(step);
         String logs = logs(step);
         // Its one catalog, as EMR's Trino has the catalogs the cluster configures, and its sums.
         assertTrue(logs.contains("\"hive\"\n\"system\"") || logs.contains("\"system\"\n\"hive\""), logs);
@@ -171,7 +171,7 @@ class EmrTrinoNightlyIntegrationTest {
 
         String step = trinoStep(tables(schema));
 
-        assertEquals("COMPLETED", state(step), () -> logs(step));
+        assertCompleted(step);
         assertTrue(logs(step).contains("\"apple\",\"10\"\n\"pear\",\"5\""), () -> logs(step));
         assertEquals(List.of("sales", "totals"), glue.getTables(request -> request.databaseName(schema)).tableList()
                 .stream().map(Table::name).sorted().toList());
@@ -209,7 +209,7 @@ class EmrTrinoNightlyIntegrationTest {
                 + s3Uri("iceberg/") + "'); CREATE TABLE iceberg." + schema + ".nation AS SELECT nationkey, name FROM "
                 + "tpch.tiny.nation; SELECT count(*) FROM iceberg." + schema + ".nation");
 
-        assertEquals("COMPLETED", state(step), () -> logs(step));
+        assertCompleted(step);
         String logs = logs(step);
         assertTrue(logs.contains("\"hive\"\n\"iceberg\"\n\"system\"\n\"tpch\""), logs);
         assertTrue(logs.contains("\"25\""), logs);
@@ -301,8 +301,10 @@ class EmrTrinoNightlyIntegrationTest {
         return EmrRequests.addStep(clusterId, "trino", "command-runner.jar", "trino-cli", "--execute", statements);
     }
 
-    private String state(String stepId) {
-        return awaitStep(clusterId, stepId).jsonPath().getString("Step.Status.State");
+    private void assertCompleted(String stepId) {
+        Response ended = awaitStep(clusterId, stepId);
+        assertEquals("COMPLETED", ended.jsonPath().getString("Step.Status.State"),
+                () -> EmrRequests.stepFailureMessage(ended, () -> logs(stepId)));
     }
 
     // What a step wrote to its standard output, then its standard error.

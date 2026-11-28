@@ -10,6 +10,7 @@ import java.util.List;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class NetworkInterface {
 
+    private String serviceAllocationToken;
     private String networkInterfaceId;
     private String subnetId;
     private String vpcId;
@@ -25,7 +26,8 @@ public class NetworkInterface {
     /**
      * Whether AWS itself manages this interface, rather than the account it is billed to.
      * False for anything a customer created; true for the service-owned interfaces AWS
-     * creates on the customer's behalf, of which an interface VPC endpoint's is one.
+     * creates on the customer's behalf, of which an interface VPC endpoint's is one, and for
+     * an interface a session of a service-linked role creates.
      */
     private boolean requesterManaged;
     /**
@@ -45,6 +47,9 @@ public class NetworkInterface {
     private List<NetworkInterfacePermission> permissions = new ArrayList<>();
 
     public NetworkInterface() {}
+
+    public String getServiceAllocationToken() { return serviceAllocationToken; }
+    public void setServiceAllocationToken(String token) { serviceAllocationToken = token; }
 
     public String getNetworkInterfaceId() { return networkInterfaceId; }
     public void setNetworkInterfaceId(String networkInterfaceId) { this.networkInterfaceId = networkInterfaceId; }
@@ -99,7 +104,9 @@ public class NetworkInterface {
 
     public List<NetworkInterfacePrivateIpAddress> getPrivateIpAddresses() { return privateIpAddresses; }
     public List<String> getIpv6Addresses() { return ipv6Addresses; }
-    public void setIpv6Addresses(List<String> ipv6Addresses) { this.ipv6Addresses = ipv6Addresses; }
+    public void setIpv6Addresses(List<String> ipv6Addresses) {
+        this.ipv6Addresses = ipv6Addresses != null ? ipv6Addresses : new ArrayList<>();
+    }
 
     public List<String> getIpv4Prefixes() { return ipv4Prefixes; }
     public void setIpv4Prefixes(List<String> ipv4Prefixes) { this.ipv4Prefixes = ipv4Prefixes; }

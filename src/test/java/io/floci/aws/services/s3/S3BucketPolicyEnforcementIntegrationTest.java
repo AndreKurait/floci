@@ -17,11 +17,14 @@ import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.UUID;
 
 import static io.floci.aws.testing.CloudTrailRequests.invokeCloudTrail;
@@ -1011,8 +1014,26 @@ class S3BucketPolicyEnforcementIntegrationTest {
                 .body(containsString("<Code>AccessDenied</Code>"));
     }
 
-    private static final String BUCKET_KEY = "arn:aws:kms:us-east-1:111122223333:key/11111111-1111-1111-1111-111111111111";
-    private static final String OTHER_KEY = "arn:aws:kms:us-east-1:111122223333:key/22222222-2222-2222-2222-222222222222";
+    private String bucketKey;
+    private String otherKey;
+
+    @BeforeEach
+    void createNativeEncryptionKeys() {
+        bucketKey = createNativeEncryptionKey();
+        otherKey = createNativeEncryptionKey();
+    }
+
+    private String createNativeEncryptionKey() {
+        String key = given().header("Authorization", auth(ACCOUNT_A, "kms"))
+                .contentType("application/x-amz-json-1.1").header("X-Amz-Target", "TrentService.CreateKey")
+                .body("{}".getBytes(StandardCharsets.UTF_8)).post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        cleanup.register(() -> given().header("Authorization", auth(ACCOUNT_A, "kms"))
+                .contentType("application/x-amz-json-1.1").header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                .body(("{\"KeyId\":\"" + key + "\",\"PendingWindowInDays\":7}").getBytes(StandardCharsets.UTF_8))
+                .post("/").then().statusCode(200));
+        return key;
+    }
+
 
     /** The refusals and the admission are what S3 answered under these two statements, measured 2026-10-30. */
     @Test
@@ -1021,15 +1042,15 @@ class S3BucketPolicyEnforcementIntegrationTest {
 
         assertEncryptedPut(fixture, "none.txt", null, null, 403);
         assertEncryptedPut(fixture, "aes.txt", "AES256", null, 403);
-        assertEncryptedPut(fixture, "bucket-key.txt", "aws:kms", BUCKET_KEY, 200);
-        assertEncryptedPut(fixture, "other-key.txt", "aws:kms", OTHER_KEY, 403);
+        assertEncryptedPut(fixture, "bucket-key.txt", "aws:kms", bucketKey, 200);
+        assertEncryptedPut(fixture, "other-key.txt", "aws:kms", otherKey, 403);
         assertEncryptedPut(fixture, "no-key.txt", "aws:kms", null, 403);
     }
 
     @Test
     void aCopyIsJudgedByItsOwnEncryptionHeaders() {
         EncryptionFixture fixture = kmsOnlyBucket();
-        assertEncryptedPut(fixture, "source.txt", "aws:kms", BUCKET_KEY, 200);
+        assertEncryptedPut(fixture, "source.txt", "aws:kms", bucketKey, 200);
         String source = "/" + fixture.bucket() + "/source.txt";
 
         given().filter(fixture.user().signer()).header("x-amz-copy-source", source)
@@ -1037,7 +1058,7 @@ class S3BucketPolicyEnforcementIntegrationTest {
                 .then().statusCode(403).body(containsString("<Code>AccessDenied</Code>"));
         given().filter(fixture.user().signer()).header("x-amz-copy-source", source)
                 .header(SSE, "aws:kms")
-                .header(SSE_KEY, BUCKET_KEY)
+                .header(SSE_KEY, bucketKey)
                 .put("/" + fixture.bucket() + "/encrypted-copy.txt")
                 .then().statusCode(200);
     }
@@ -1053,10 +1074,10 @@ class S3BucketPolicyEnforcementIntegrationTest {
 
     @Test
     void anAllowOnTheKmsKeyIdKeyAdmitsOnlyTheMatchingPut() {
-        EncryptionFixture fixture = allowOnlyBucket("s3:x-amz-server-side-encryption-aws-kms-key-id", BUCKET_KEY);
+        EncryptionFixture fixture = allowOnlyBucket("s3:x-amz-server-side-encryption-aws-kms-key-id", bucketKey);
 
-        assertEncryptedPut(fixture, "bucket-key.txt", "aws:kms", BUCKET_KEY, 200);
-        assertEncryptedPut(fixture, "other-key.txt", "aws:kms", OTHER_KEY, 403);
+        assertEncryptedPut(fixture, "bucket-key.txt", "aws:kms", bucketKey, 200);
+        assertEncryptedPut(fixture, "other-key.txt", "aws:kms", otherKey, 403);
         assertEncryptedPut(fixture, "no-key.txt", "aws:kms", null, 403);
     }
 
@@ -1070,7 +1091,7 @@ class S3BucketPolicyEnforcementIntegrationTest {
         EncryptionFixture fixture = kmsOnlyBucket();
         S3RequestSigner user = fixture.user().signer();
 
-        String uploadId = given().filter(user).header(SSE, "aws:kms").header(SSE_KEY, BUCKET_KEY)
+        String uploadId = given().filter(user).header(SSE, "aws:kms").header(SSE_KEY, bucketKey)
                 .post("/" + fixture.bucket() + "/large.bin?uploads")
                 .then().statusCode(200)
                 .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
@@ -1085,7 +1106,7 @@ class S3BucketPolicyEnforcementIntegrationTest {
         given().filter(user).head("/" + fixture.bucket() + "/large.bin")
                 .then().statusCode(200)
                 .header(SSE, equalTo("aws:kms"))
-                .header(SSE_KEY, equalTo(BUCKET_KEY));
+                .header(SSE_KEY, equalTo(bucketKey));
     }
 
     @Test
@@ -1173,7 +1194,7 @@ class S3BucketPolicyEnforcementIntegrationTest {
                 {"Version":"2012-10-17","Statement":[
                   {"Effect":"Allow","Action":"s3:*","Resource":"*",
                    "Condition":{"StringEquals":{"s3:x-amz-server-side-encryption":"aws:kms"}}}]}""").signer();
-        String uploadId = given().filter(kmsOnly).header(SSE, "aws:kms").header(SSE_KEY, BUCKET_KEY)
+        String uploadId = given().filter(kmsOnly).header(SSE, "aws:kms").header(SSE_KEY, bucketKey)
                 .post("/" + fixture.bucket() + "/held.bin?uploads")
                 .then().statusCode(200)
                 .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
@@ -1238,7 +1259,7 @@ class S3BucketPolicyEnforcementIntegrationTest {
     }
 
     /** Denies a put that does not name {@code aws:kms}, or names a key other than the bucket's. */
-    private static void putKmsOnlyPolicy(EncryptionFixture fixture) {
+    private void putKmsOnlyPolicy(EncryptionFixture fixture) {
         putBucketPolicyAs(fixture.bucket(), """
                 {"Version":"2012-10-17","Statement":[
                   {"Sid":"DenyUnencryptedPuts","Effect":"Deny","Principal":"*","Action":"s3:PutObject",
@@ -1247,7 +1268,7 @@ class S3BucketPolicyEnforcementIntegrationTest {
                   {"Sid":"DenyWrongKmsKey","Effect":"Deny","Principal":"*","Action":"s3:PutObject",
                    "Resource":"arn:aws:s3:::%1$s/*",
                    "Condition":{"StringNotEqualsIfExists":{"s3:x-amz-server-side-encryption-aws-kms-key-id":"%2$s"}}}]}
-                """.formatted(fixture.bucket(), BUCKET_KEY), fixture.owner());
+                """.formatted(fixture.bucket(), bucketKey), fixture.owner());
     }
 
     /** A bucket whose policy alone allows a user with no identity policy, on {@code key} being {@code value}. */
@@ -1271,6 +1292,9 @@ class S3BucketPolicyEnforcementIntegrationTest {
     private Credentials encryptionUser(String userName, String policy) {
         cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(ACCOUNT_A, "iam"), userName));
         Credentials user = createUser(userName, ACCOUNT_A);
+        putUserPolicy(userName, "FixtureKmsAccess", """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"kms:*","Resource":"*"}]}
+                """, ACCOUNT_A);
         if (policy != null) {
             putUserPolicy(userName, "AllowEncryptedPuts", policy, ACCOUNT_A);
         }
@@ -1288,7 +1312,7 @@ class S3BucketPolicyEnforcementIntegrationTest {
                     <ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule>
                       <ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>
                         <KMSMasterKeyID>%s</KMSMasterKeyID></ApplyServerSideEncryptionByDefault>
-                    </Rule></ServerSideEncryptionConfiguration>""".formatted(BUCKET_KEY))
+                    </Rule></ServerSideEncryptionConfiguration>""".formatted(bucketKey))
                     .put("/" + bucket + "?encryption").then().statusCode(200);
         }
         return new EncryptionFixture(bucket, owner.signer(), user);

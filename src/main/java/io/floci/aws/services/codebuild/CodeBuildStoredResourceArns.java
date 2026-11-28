@@ -45,11 +45,17 @@ public class CodeBuildStoredResourceArns implements StoredResourceArns {
             return List.of();
         }
         return codeBuild.batchGetBuilds(region, regionResolver.getAccountId(), List.of(value)).stream()
-                .map(Build::getProjectName)
-                .flatMap(name -> codeBuild.batchGetProjects(region, List.of(name)).stream())
-                .map(Project::getArn)
+                .map(build -> projectArn(build, region))
                 .distinct()
                 .toList();
+    }
+
+    private String projectArn(Build build, String region) {
+        List<Project> projects = codeBuild.batchGetProjects(region, List.of(build.getProjectName()));
+        // Deleting a project retains its builds. Their project permission must still name the original project.
+        return projects.isEmpty()
+                ? regionResolver.buildArn("codebuild", region, "project/" + build.getProjectName())
+                : projects.getFirst().getArn();
     }
 
     @Override

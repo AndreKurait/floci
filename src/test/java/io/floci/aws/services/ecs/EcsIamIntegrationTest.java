@@ -176,6 +176,10 @@ class EcsIamIntegrationTest {
         String name = "iam-" + UUID.randomUUID().toString().substring(0, 8);
         call(ACCOUNT, "CreateCluster", Map.of("clusterName", name)).statusCode(200);
         cleanup.register(() -> call(ACCOUNT, "DeleteCluster", Map.of("cluster", name)));
+        String instance = call(ACCOUNT, "RegisterContainerInstance", Map.of("cluster", name)).statusCode(200)
+                .extract().path("containerInstance.containerInstanceArn");
+        cleanup.register(() -> call(ACCOUNT, "DeregisterContainerInstance",
+                Map.of("cluster", name, "containerInstance", instance, "force", true)));
         return name;
     }
 

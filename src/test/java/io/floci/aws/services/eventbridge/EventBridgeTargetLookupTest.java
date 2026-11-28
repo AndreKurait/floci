@@ -16,12 +16,15 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 class EventBridgeTargetLookupTest {
@@ -76,7 +79,7 @@ class EventBridgeTargetLookupTest {
 
         assertEquals(List.of("owned"), fixture.lookup(ACCOUNT)
                 .listRuleNamesByTarget(TARGET, null, 100, null, REGION).items());
-        verify(fixture.rawRules).get(ACCOUNT + "/rule:" + REGION + ":default/owned");
+        verify(fixture.rawRules, times(2)).get(ACCOUNT + "/rule:" + REGION + ":default/owned");
         verify(fixture.rawRules, never()).get(OTHER + "/rule:" + REGION + ":default/foreign");
     }
 
@@ -172,6 +175,29 @@ class EventBridgeTargetLookupTest {
         assertNotNull(first.nextToken());
         assertTrue(first.nextToken().length() <= 2048);
         assertEquals(List.of("omega"), fixture.lookup(ACCOUNT).listRuleNamesByTarget(filter, null, 1, first.nextToken(), REGION).items());
+    }
+
+    @Test
+    void replacedRuleDuringTargetReadIsExcluded() {
+        Fixture fixture = new Fixture();
+        String key = "rule:" + REGION + ":default/owned";
+        fixture.rule(ACCOUNT, REGION, "default", "owned", false);
+        AtomicBoolean replaced = new AtomicBoolean();
+        InMemoryStorage<String, List<Target>> changingTargets = new InMemoryStorage<>() {
+            @Override
+            public Optional<List<Target>> get(String requestedKey) {
+                if (requestedKey.equals(ACCOUNT + "/" + key) && replaced.compareAndSet(false, true)) {
+                    fixture.rule(ACCOUNT, REGION, "default", "owned", false);
+                }
+                return super.get(requestedKey);
+            }
+        };
+        changingTargets.put(ACCOUNT + "/" + key, List.of(new Target("one", TARGET, null, null)));
+        EventBridgeService lookup = EventBridgeTargetLookupFixtures.service(fixture.buses, fixture.rules,
+                new AccountAwareStorageBackend<>(changingTargets, null, ACCOUNT), new RegionResolver(REGION, ACCOUNT));
+        assertEquals(List.of(), lookup.listRuleNamesByTarget(TARGET, null, null, null, REGION).items());
+        assertTrue(replaced.get());
+        assertEquals(List.of("owned"), lookup.listRuleNamesByTarget(TARGET, null, null, null, REGION).items());
     }
 
     private static void assertInvalid(Runnable call) {

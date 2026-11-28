@@ -1,0 +1,167 @@
+package io.floci.aws.services.ssm;
+
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.CallerCallAuthorizer;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
+import io.floci.aws.services.iam.IamService;
+import io.floci.aws.testutil.AwsRequestSigner;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+class SsmChannelAuthenticationTest {
+    private static final URI URI_VALUE = URI.create(
+            "https://ssmmessages.us-east-1.amazonaws.com/v1/control-channel/i-0123456789abcdef0");
+    private static final byte[] BODY = """
+            {"MessageSchemaVersion":"1.0","RequestId":"00000000-0000-0000-0000-000000000001"}
+            """.strip().getBytes(StandardCharsets.UTF_8);
+    private final Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    private SsmChannelAuthentication authentication;
+    private IamService iam;
+    private CallerCallAuthorizer authorizer;
+
+    @BeforeEach
+    void signedAgentRequest() throws Exception {
+        RegionResolver regions = mock(RegionResolver.class);
+        when(regions.getDefaultAccountId()).thenReturn("000000000000");
+        when(regions.buildGlobalArn("iam", "000000000000", "root")).thenReturn("arn:aws:iam::000000000000:root");
+        authorizer = mock(CallerCallAuthorizer.class);
+        when(authorizer.authorizeUnscopedRequest(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyBoolean())).thenReturn(Decision.ALLOW);
+        iam = mock(IamService.class);
+        authentication = new SsmChannelAuthentication(iam, regions, authorizer,
+                Clock.systemUTC(), mock(Ec2Service.class));
+        headers.put("Content-Type", "application/json");
+        headers.put("Content-Length", Integer.toString(BODY.length));
+        headers.putAll(AwsRequestSigner.signedAs("test", "test", "ssmmessages")
+                .headersFor("POST", URI_VALUE, Map.of("content-type", "application/json",
+                        "content-length", Integer.toString(BODY.length)), BODY));
+    }
+
+    @Test
+    void http2AuthoritySuppliesTheSignedHostWithoutAHostHeader() {
+        assertFalse(headers.containsKey("Host"));
+        assertEquals("us-east-1", authenticate(URI_VALUE, BODY).region());
+    }
+
+    @Test
+    void http1HostIsStillVerified() {
+        headers.put("Host", URI_VALUE.getAuthority());
+        assertEquals("000000000000", authenticate(URI_VALUE, BODY).account());
+        headers.put("Host", "other.example");
+        assertThrows(AwsException.class, () -> authenticate(URI_VALUE, BODY));
+    }
+
+    @Test
+    void changedAuthorityOrBodyDoesNotVerify() {
+        assertThrows(AwsException.class, () -> authenticate(
+                URI.create(URI_VALUE.toString().replace("ssmmessages.", "tampered.")), BODY));
+        assertThrows(AwsException.class, () -> authenticate(URI_VALUE, "{}".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void presignedGatewayRequestsUseTheBodyHashAndBindTheQuery() throws Exception {
+        URI signed = AwsRequestSigner.signedAs("test", "test", "ssmmessages")
+                .presignedUri("GET", URI_VALUE, Map.of("role", "subscribe", "stream", "input"), new byte[0]);
+        assertEquals("us-east-1", authenticatePresigned(signed, new byte[0]).region());
+        assertThrows(AwsException.class, () -> authenticatePresigned(
+                URI.create(signed.toString().replace("stream=input", "stream=other")), new byte[0]));
+        assertThrows(AwsException.class, () -> authenticatePresigned(signed, BODY));
+    }
+
+    @Test
+    void signatureVerificationDoesNotGrantUnscopedAuthorization() {
+        when(authorizer.authorizeUnscopedRequest(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyBoolean())).thenReturn(Decision.DENY);
+
+        SsmChannelAuthentication.Caller caller = authentication.verify(
+                "POST", URI_VALUE, headers::get, name -> null, BODY, "192.0.2.1", true);
+
+        assertEquals("000000000000", caller.account());
+        verifyNoInteractions(authorizer);
+        AwsException denied = assertThrows(AwsException.class, () -> authenticate(URI_VALUE, BODY));
+        assertEquals("AccessDeniedException", denied.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"us-east-1,aws", "us-gov-east-1,aws-us-gov", "cn-north-1,aws-cn"})
+    void resourceAuthorizationUsesTheExactSessionAndCallerPartition(String region, String partition) {
+        String account = "111122223333";
+        String callerArn = "arn:" + partition + ":iam::" + account + ":user/session-owner";
+        String sessionArn = "arn:" + partition + ":ssm:" + region + ":" + account + ":session/owned-session";
+        SsmChannelAuthentication.Caller caller = new SsmChannelAuthentication.Caller(
+                account, region, "session-key", callerArn, "192.0.2.1", true);
+        when(iam.resolveAccountId("session-key")).thenReturn(Optional.of(account));
+        when(authorizer.authorizeRequest("session-key", account, callerArn,
+                "ssmmessages:OpenDataChannel", sessionArn, partition, "192.0.2.1", true))
+                .thenReturn(Decision.ALLOW);
+
+        authentication.authorizeResource(caller, "OpenDataChannel", sessionArn);
+
+        verify(authorizer).authorizeRequest("session-key", account, callerArn,
+                "ssmmessages:OpenDataChannel", sessionArn, partition, "192.0.2.1", true);
+        verifyNoMoreInteractions(authorizer);
+    }
+
+    @Test
+    void resourceAuthorizationRejectsARevokedCredentialBeforePolicyEvaluation() {
+        SsmChannelAuthentication.Caller caller = new SsmChannelAuthentication.Caller(
+                "111122223333", "us-east-1", "revoked-key",
+                "arn:aws:iam::111122223333:user/session-owner", "192.0.2.1", true);
+        when(iam.resolveAccountId("revoked-key")).thenReturn(Optional.empty());
+
+        AwsException denied = assertThrows(AwsException.class, () -> authentication.authorizeResource(
+                caller, "OpenDataChannel", "arn:aws:ssm:us-east-1:111122223333:session/owned-session"));
+
+        assertEquals("AccessDeniedException", denied.getErrorCode());
+        verifyNoInteractions(authorizer);
+    }
+
+    @Test
+    void resourceAuthorizationRequiresAnAllowDecision() {
+        SsmChannelAuthentication.Caller caller = new SsmChannelAuthentication.Caller(
+                "000000000000", "us-east-1", "test",
+                "arn:aws:iam::000000000000:root", "192.0.2.1", true);
+        when(authorizer.authorizeRequest(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyString(), anyBoolean())).thenReturn(Decision.DENY);
+
+        AwsException denied = assertThrows(AwsException.class, () -> authentication.authorizeResource(
+                caller, "OpenDataChannel", "arn:aws:ssm:us-east-1:000000000000:session/other-session"));
+
+        assertEquals("AccessDeniedException", denied.getErrorCode());
+        verify(authorizer).authorizeRequest("test", "000000000000", caller.arn(),
+                "ssmmessages:OpenDataChannel", "arn:aws:ssm:us-east-1:000000000000:session/other-session",
+                "aws", "192.0.2.1", true);
+    }
+
+    private SsmChannelAuthentication.Caller authenticatePresigned(URI uri, byte[] body) {
+        Map<String, String> query = new TreeMap<>();
+        for (String part : uri.getRawQuery().split("&")) {
+            String[] pair = part.split("=", 2);
+            query.put(URLDecoder.decode(pair[0], StandardCharsets.UTF_8),
+                    URLDecoder.decode(pair[1], StandardCharsets.UTF_8));
+        }
+        return authentication.authenticate("GET", uri, name -> null, query::get, body,
+                "OpenControlChannel", "192.0.2.1", true);
+    }
+
+    private SsmChannelAuthentication.Caller authenticate(URI uri, byte[] body) {
+        return authentication.authenticate("POST", uri, headers::get, name -> null, body,
+                "CreateControlChannel", "192.0.2.1", true);
+    }
+}

@@ -76,7 +76,7 @@ public class NestedTaskCredentials {
                         machine.getStateMachineArn());
                 if (refusal.isPresent()) {
                     // The Lambda task's own check refuses an assumption this way, so the error stays the same.
-                    throw isLambda(resource, integration)
+                    throw isLambda(resource, integration) || SdkComputeTaskInvoker.supports(integration)
                             ? new AslExecutor.FailStateException("States.Permissions", refusal.get())
                             : assumptionDenied(machine, roleArn);
                 }

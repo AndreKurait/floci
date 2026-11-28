@@ -11,6 +11,7 @@ import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.floci.aws.services.cloudwatch.dashboards.model.Dashboard;
+import io.floci.aws.services.cloudwatch.insights.CloudWatchInsightRulesHandler;
 import io.floci.aws.services.cloudwatch.metrics.model.Alarm;
 import io.floci.aws.services.cloudwatch.metrics.model.AlarmHistoryItem;
 import io.floci.aws.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
@@ -63,7 +64,7 @@ public class CloudWatchMetricsJsonHandler {
             "DeleteAlarms", Set.of("AlarmNames"));
 
     private static final Set<String> CONSOLE_METRIC_DATUM_MEMBERS = Set.of(
-            "MetricName", "Dimensions", "Timestamp", "Unit", "Value", "StatisticValues");
+            "MetricName", "Dimensions", "Timestamp", "Unit", "Value", "StatisticValues", "Values", "Counts");
     private static final Set<String> CONSOLE_STATISTIC_MEMBERS = Set.of(
             "SampleCount", "Sum", "Minimum", "Maximum");
     private static final Set<String> CONSOLE_DIMENSION_MEMBERS = Set.of("Name", "Value");
@@ -72,20 +73,33 @@ public class CloudWatchMetricsJsonHandler {
     private final CloudWatchDashboardsService dashboardsService;
     private final CloudWatchMetricStreamsService metricStreamsService;
     private final ObjectMapper objectMapper;
+    private final CloudWatchInsightRulesHandler insightRules;
+
+    public CloudWatchMetricsJsonHandler(CloudWatchMetricsService metricsService,
+                                        CloudWatchDashboardsService dashboardsService,
+                                        CloudWatchMetricStreamsService metricStreamsService,
+                                        ObjectMapper objectMapper) {
+        this(metricsService, dashboardsService, metricStreamsService, objectMapper, null);
+    }
 
     @Inject
     public CloudWatchMetricsJsonHandler(CloudWatchMetricsService metricsService,
                                         CloudWatchDashboardsService dashboardsService,
                                         CloudWatchMetricStreamsService metricStreamsService,
-                                        ObjectMapper objectMapper) {
+                                        ObjectMapper objectMapper,
+                                        CloudWatchInsightRulesHandler insightRules) {
         this.metricsService = metricsService;
         this.dashboardsService = dashboardsService;
         this.metricStreamsService = metricStreamsService;
         this.objectMapper = objectMapper;
+        this.insightRules = insightRules;
     }
 
     public Response handle(String action, JsonNode request, String region) {
         String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        if (insightRules != null && insightRules.handles(normalizedAction, request.path("ResourceARN").asText(null))) {
+            return insightRules.json(normalizedAction, request, region);
+        }
         return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(request, region);
             case "ListMetrics" -> handleListMetrics(request, region);
@@ -124,19 +138,19 @@ public class CloudWatchMetricsJsonHandler {
      * their own, which this handler would silently misread or ignore, such as {@code GetMetricData}
      * with {@code Defaults} and {@code Metrics}, or {@code PutMetricAlarm} metric items with
      * {@code Alias} and {@code MetricName}. So only the operations and top-level members in
-     * {@code CONSOLE_TARGET_OPERATIONS} are served: any other operation, and any other member set
+     * {@code CloudWatchLegacyProtocol} are served: any other operation, and any other member set
      * to a value other than {@code null} or {@code false}, is refused rather than answered as if it
      * were unset, and a top-level {@code null} member is dropped. {@code PutMetricData} also checks
-     * the complete batch for supported scalar or statistic-set shapes before storing any metrics;
-     * {@code Values} and {@code Counts} remain outside this compatibility subset.
-     * Other operations pass nested members on unchecked, nulls included. A {@code DescribeAlarms} answer that would list
+     * each datum against {@code CONSOLE_METRIC_DATUM_MEMBERS} before storing any metrics;
+     * {@code Values} and {@code Counts} use the shared weighted-sample parser and validation. Other
+     * nested members are passed on unchecked, nulls included. A {@code DescribeAlarms} answer that would list
      * an alarm defined with {@code Metrics} is refused too, since the console's API gives those
      * items its own shape, with {@code Alias} instead of {@code Id} and {@code MetricStat}. The
      * name matches {@code DynamoDbJsonHandler.handleLegacy}, the entry point of the other JSON-only
      * target.
      */
     public Response handleLegacy(String action, JsonNode request, String region) {
-        Set<String> servedMembers = CONSOLE_TARGET_OPERATIONS.get(action);
+        Set<String> servedMembers = CloudWatchLegacyProtocol.members(action);
         if (servedMembers == null) {
             return unsupportedWithConsoleTarget("Operation " + action);
         }
@@ -182,7 +196,8 @@ public class CloudWatchMetricsJsonHandler {
         }
         boolean scalar = datum.hasNonNull("Value");
         boolean statistics = datum.hasNonNull("StatisticValues");
-        if (scalar == statistics || scalar && !isConsoleNumber(datum.path("Value"))) {
+        boolean weighted = datum.hasNonNull("Values");
+        if (!weighted && (scalar == statistics || scalar && !isConsoleNumber(datum.path("Value")))) {
             return false;
         }
         if (statistics) {
@@ -306,12 +321,15 @@ public class CloudWatchMetricsJsonHandler {
         if (statsNode.isArray()) {
             statsNode.forEach(s -> statistics.add(s.asText()));
         }
+        List<String> extended = new ArrayList<>();
+        request.path("ExtendedStatistics").forEach(stat -> extended.add(stat.asText()));
+        List<String> selected = MetricPercentiles.selection(statistics, extended);
 
         String unit = request.hasNonNull("Unit") ? request.path("Unit").asText() : null;
 
         List<CloudWatchMetricsService.Datapoint> datapoints =
                 metricsService.getMetricStatistics(namespace, metricName, dimensions,
-                        startTime, endTime, period, statistics, unit, region);
+                        startTime, endTime, period, selected, unit, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("Label", metricName);
@@ -324,6 +342,9 @@ public class CloudWatchMetricsJsonHandler {
             if (statistics.contains("Minimum")) dpNode.put("Minimum", dp.minimum());
             if (statistics.contains("Maximum")) dpNode.put("Maximum", dp.maximum());
             if (statistics.contains("SampleCount")) dpNode.put("SampleCount", dp.sampleCount());
+            if (!dp.extendedStatistics().isEmpty()) {
+                dpNode.set("ExtendedStatistics", objectMapper.valueToTree(dp.extendedStatistics()));
+            }
             dpNode.put("Unit", dp.unit());
         }
         return Response.ok(response).build();
@@ -336,6 +357,7 @@ public class CloudWatchMetricsJsonHandler {
         alarm.setNamespace(request.path("Namespace").asText(null));
         alarm.setStatistic(request.path("Statistic").asText(null));
         alarm.setExtendedStatistic(request.path("ExtendedStatistic").asText(null));
+        alarm.setEvaluateLowSampleCountPercentile(request.path("EvaluateLowSampleCountPercentile").asText(null));
         JsonNode metrics = request.path("Metrics");
         if (metrics.isArray()) {
             for (JsonNode query : metrics) {
@@ -473,6 +495,9 @@ public class CloudWatchMetricsJsonHandler {
             node.put("Threshold", a.getThreshold());
             if (a.getComparisonOperator() != null) node.put("ComparisonOperator", a.getComparisonOperator());
             if (a.getTreatMissingData() != null) node.put("TreatMissingData", a.getTreatMissingData());
+            if (a.getEvaluateLowSampleCountPercentile() != null) {
+                node.put("EvaluateLowSampleCountPercentile", a.getEvaluateLowSampleCountPercentile());
+            }
 
         }
         ArrayNode composites = response.putArray("CompositeAlarms");
@@ -682,7 +707,9 @@ public class CloudWatchMetricsJsonHandler {
                 }
 
                 queries.add(new CloudWatchMetricsService.MetricDataQuery(
-                        id, metricStat, expression, label, returnData));
+                        id, metricStat, expression, label, returnData,
+                        qNode.hasNonNull("Period") ? qNode.path("Period").asInt() : null,
+                        qNode.hasNonNull("AccountId") ? qNode.path("AccountId").asText() : null));
             }
         }
 

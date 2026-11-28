@@ -12,8 +12,8 @@
 # cleanly and then shows as drift on every later plan, which only an empty re-plan
 # catches.
 #
-# This config has its own provider.tf rather than reusing the module's, because it
-# must NOT set skip_requesting_account_id. See the comment there: skipping account
+# This config's provider.tf keeps account resolution enabled, as does the main
+# compatibility module. See the comment there: skipping account
 # resolution makes every same-account group reference read back as cross-account, and
 # the re-plan assertion below fails for a reason that has nothing to do with #2266.
 

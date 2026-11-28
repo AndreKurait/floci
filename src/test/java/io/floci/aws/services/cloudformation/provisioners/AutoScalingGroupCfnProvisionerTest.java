@@ -321,7 +321,7 @@ class AutoScalingGroupCfnProvisionerTest {
 
         ArgumentCaptor<AsgOptionalFields> captor = ArgumentCaptor.forClass(AsgOptionalFields.class);
         verify(autoScaling).updateAutoScalingGroup(eq(REGION), eq("my-asg"), any(), any(), any(), any(),
-                any(), eq(2), eq(6), anyInt(), anyInt(), anyList(), anyList(), any(), anyInt(), anyList(),
+                any(), eq(2), eq(6), isNull(), anyInt(), anyList(), anyList(), any(), anyInt(), anyList(),
                 captor.capture());
         assertEquals("units", captor.getValue().desiredCapacityType());
         verify(autoScaling, never()).createAutoScalingGroup(anyString(), anyString(), any(), any(), any(),
@@ -411,6 +411,7 @@ class AutoScalingGroupCfnProvisionerTest {
         }
         ObjectNode after = before.deepCopy().put("InstanceType", "t3.small");
         StackResource resource = resource(LAUNCH_CONFIGURATION, "Lc", oldName);
+        resource.getAttributes().put(CfnRollback.USES_ATTR_PREFIX + "LaunchConfigurationProperties", before.toString());
         LaunchConfiguration old = new LaunchConfiguration();
         old.setLaunchConfigurationName(oldName);
         when(autoScaling.describeLaunchConfigurations(REGION, List.of(oldName))).thenReturn(List.of(old));
@@ -433,7 +434,8 @@ class AutoScalingGroupCfnProvisionerTest {
         ObjectNode props = instanceProperties();
         StackResource resource = provisionExistingInstance(props, props.deepCopy(), null, false);
         assertEquals("my-lc", resource.getPhysicalId());
-        assertTrue(resource.getAttributes().isEmpty());
+        assertEquals(props.toString(), resource.getAttributes().get(
+                CfnRollback.USES_ATTR_PREFIX + "LaunchConfigurationProperties"));
     }
 
     @Test
@@ -693,5 +695,66 @@ class AutoScalingGroupCfnProvisionerTest {
 
         provisioner.clearUpdate(r);
         assertNull(r.getAttributes().get(CfnRollback.ASG_UPDATE_SNAPSHOT_ATTR));
+    }
+
+
+@Test
+    void legacyInstanceConfigurationReusesUnchangedLiteralTemplateAndStoresInputs() {
+        ObjectNode props = legacyInstanceProperties();
+        StackResource resource = provisionLegacyInstance(props, props.deepCopy(), false);
+        assertEquals("my-lc", resource.getPhysicalId());
+        assertEquals(props.toString(), resource.getAttributes().get(
+                CfnRollback.USES_ATTR_PREFIX + "LaunchConfigurationProperties"));
+    }
+
+@Test
+    void legacyInstanceConfigurationRejectsChangedInstanceBeforeMutation() {
+        ObjectNode previous = legacyInstanceProperties();
+        provisionLegacyInstance(previous.deepCopy().put("InstanceId", "i-changed"), previous, true);
+    }
+
+@Test
+    void legacyInstanceConfigurationRejectsOtherChangedInputsBeforeMutation() {
+        ObjectNode previous = legacyInstanceProperties();
+        provisionLegacyInstance(previous.deepCopy().put("InstanceType", "t3.small"), previous, true);
+    }
+
+@Test
+    void legacyInstanceConfigurationCannotInferMissingPriorInputs() {
+        provisionLegacyInstance(legacyInstanceProperties(), null, true);
+    }
+
+@Test
+    void legacyInstanceConfigurationDoesNotResolveOldReferenceWithCurrentParameters() {
+        ObjectNode previous = legacyInstanceProperties();
+        previous.putObject("InstanceId").put("Ref", "SourceInstance");
+        provisionLegacyInstance(legacyInstanceProperties(), previous, true);
+    }
+
+private ObjectNode legacyInstanceProperties() {
+        return mapper.createObjectNode().put("LaunchConfigurationName", "my-lc")
+                .put("InstanceId", "i-original").put("InstanceType", "t3.micro");
+    }
+
+private StackResource provisionLegacyInstance(ObjectNode current, JsonNode previous, boolean rejected) {
+        LaunchConfiguration lc = new LaunchConfiguration();
+        lc.setLaunchConfigurationName("my-lc");
+        when(autoScaling.describeLaunchConfigurations(REGION, List.of("my-lc"))).thenReturn(List.of(lc));
+        StackResource resource = resource(LAUNCH_CONFIGURATION, "Lc", "my-lc");
+        ProvisionContext original = ctx("my-lc");
+        ProvisionContext context = new ProvisionContext(original.engine(), REGION, "000000000000",
+                "my-stack", "my-lc", event -> {}, previous);
+        if (rejected) {
+            AwsException failure = assertThrows(AwsException.class,
+                    () -> provisioner.provision(resource, current, context));
+            assertTrue(failure.getMessage().contains("Rename my-lc"));
+            assertTrue(resource.getAttributes().isEmpty());
+        } else {
+            provisioner.provision(resource, current, context);
+        }
+        verify(autoScaling, never()).createLaunchConfiguration(anyString(), anyString(), any(), any(),
+                any(), any(), anyList(), any(), any(), any(), any(), anyList(), any());
+        verify(autoScaling, never()).deleteLaunchConfiguration(anyString(), anyString());
+        return resource;
     }
 }

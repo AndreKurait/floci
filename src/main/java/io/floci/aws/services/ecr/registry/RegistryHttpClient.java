@@ -36,6 +36,29 @@ public class RegistryHttpClient {
                 .build();
     }
 
+    /** Returns true if the registry responds to {@code GET /v2/}. */
+    public boolean ping() {
+        return ping(Duration.ofSeconds(5));
+    }
+
+    boolean ping(Duration timeout) {
+        try {
+            HttpResponse<Void> resp = http.send(
+                    HttpRequest.newBuilder(URI.create(baseUrl + "/v2/"))
+                            .timeout(timeout)
+                            .GET()
+                            .build(),
+                    HttpResponse.BodyHandlers.discarding());
+            return resp.statusCode() < 500;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (IOException e) {
+            LOG.debugv("Registry readiness probe failed: {0}", e.getMessage());
+            return false;
+        }
+    }
+
     /**
      * Lists all repository names known to the backing registry, following the
      * {@code Link} header pagination that {@code GET /v2/_catalog} uses

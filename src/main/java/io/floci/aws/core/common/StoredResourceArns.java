@@ -94,6 +94,15 @@ public interface StoredResourceArns {
     Optional<String> find(String type, List<String> names, String region);
 
     /**
+     * A named resource whose owner depends on the operation's own resolution rules, such as a built-in
+     * command document. Empty when ordinary name lookup applies. This does not select the resource types
+     * an operation authorizes, which remain the generated table's responsibility.
+     */
+    default Optional<String> resolveNamedForOperation(String operation, String type, String name, String region) {
+        return Optional.empty();
+    }
+
+    /**
      * The resource resolved by an ARN in its own account and Region, without substituting the caller's
      * coordinates (a layer version), or as the service's handler reads the ARN where it reads it first as the
      * caller's (a secret a full or partial ARN names, in the ARN's Region, before one another account holds under
@@ -102,6 +111,15 @@ public interface StoredResourceArns {
      */
     default Optional<String> resolveStoredArn(String arn) {
         return Optional.empty();
+    }
+
+    /**
+     * Resolves names filling an ARN's variables, including compound identities such as an AppConfig profile
+     * under its application. Single-variable resources retain the existing name lookup.
+     */
+    default Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+        return variables.size() == 1
+                ? find(type, List.of(variables.values().iterator().next()), region) : Optional.empty();
     }
 
     /**

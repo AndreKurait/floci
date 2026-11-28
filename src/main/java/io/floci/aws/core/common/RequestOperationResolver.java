@@ -149,7 +149,7 @@ public class RequestOperationResolver {
     }
 
     private String routeAction(String scope, ContainerRequestContext ctx, ResourceInfo resourceInfo) {
-        String matched = actionRegistry.resolveMatchedRoute(scope, resourceInfo);
+        String matched = actionRegistry.resolveMatchedRoute(scope, resourceInfo, ctx);
         return matched != null ? matched : actionRegistry.resolveRoute(scope, ctx);
     }
 

@@ -66,7 +66,7 @@ class S3ScratchSpaceTest {
                 return null;
             });
             try {
-                await().atMost(Duration.ofSeconds(5)).until(() -> secondThread.get() != null
+                await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).until(() -> secondThread.get() != null
                         && secondThread.get().getState() == Thread.State.BLOCKED);
                 verify(s3, times(1)).createInternalBucket(anyString(), anyString());
             } finally {

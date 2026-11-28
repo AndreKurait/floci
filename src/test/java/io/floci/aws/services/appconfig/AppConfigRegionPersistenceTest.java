@@ -37,7 +37,8 @@ class AppConfigRegionPersistenceTest {
         Map<String, Selection> selections = new LinkedHashMap<>();
         StorageFactory first = StorageFactories.open(directory, mode, "000000000000");
         try {
-            AppConfigService service = new AppConfigService(first, regions);
+            AppConfigService service = new AppConfigService(first, regions, mock(AppConfigAlarmMonitor.class),
+                    mock(AppConfigS3Source.class));
             AppConfigDataService data = new AppConfigDataService(first, service, new ObjectMapper(), regions);
             for (String region : List.of("us-east-1", "us-west-2", "cn-north-1")) {
                 current.set(region);
@@ -63,7 +64,8 @@ class AppConfigRegionPersistenceTest {
 
         StorageFactory restarted = StorageFactories.open(directory, mode, "000000000000");
         try {
-            AppConfigService service = new AppConfigService(restarted, regions);
+            AppConfigService service = new AppConfigService(restarted, regions, mock(AppConfigAlarmMonitor.class),
+                    mock(AppConfigS3Source.class));
             AppConfigDataService data = new AppConfigDataService(restarted, service, new ObjectMapper(), regions);
             selections.forEach((region, selection) -> {
                 current.set(region);

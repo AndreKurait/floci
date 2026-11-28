@@ -11,9 +11,11 @@ import org.hamcrest.Matcher;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.*;
 
+import java.time.Duration;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -255,23 +257,25 @@ class ApiGatewayAwsIntegrationTest {
     }
 
     @Test @Order(11)
-    void awsIntegration_sfnExecution_canDescribe() throws Exception {
-        // Wait briefly for async execution to complete
-        Thread.sleep(500);
+    void awsIntegration_sfnExecution_canDescribe() {
+        // The execution started by the previous test runs asynchronously; poll until it completes.
+        // (We look it up through ListExecutions on the state machine it was started on.)
+        await().atMost(Duration.ofSeconds(15))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    String listResponse = given()
+                            .header("X-Amz-Target", "AWSStepFunctions.ListExecutions")
+                            .contentType(SFN_CONTENT_TYPE)
+                            .body("{\"stateMachineArn\": \"" + stateMachineArn + "\"}")
+                            .when().post("/")
+                            .then().statusCode(200)
+                            .extract().asString();
 
-        // Verify the execution completed successfully via DescribeExecution
-        // (We use the executionArn from the previous test's StartExecution response)
-        String listResponse = given()
-                .header("X-Amz-Target", "AWSStepFunctions.ListExecutions")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("{\"stateMachineArn\": \"" + stateMachineArn + "\"}")
-                .when().post("/")
-                .then().statusCode(200)
-                .extract().asString();
-
-        JsonNode executions = mapper.readTree(listResponse).path("executions");
-        assertTrue(executions.isArray() && executions.size() > 0, "Should have at least one execution");
-        assertEquals("SUCCEEDED", executions.get(0).path("status").asText());
+                    JsonNode executions = mapper.readTree(listResponse).path("executions");
+                    assertTrue(executions.isArray() && executions.size() > 0, "Should have at least one execution");
+                    assertEquals("SUCCEEDED", executions.get(0).path("status").asText());
+                });
     }
 
     // ──────────────── Test: APIGW → DynamoDB directly ────────────────

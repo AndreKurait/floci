@@ -8,6 +8,7 @@ import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Reply;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import org.junit.jupiter.api.Test;
@@ -59,7 +60,11 @@ class DynamoDbCfnProvisionerTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private final NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, null, dynamoDb, null, null, mapper);
     private final DynamoDbCfnProvisioner provisioner = new DynamoDbCfnProvisioner(
-            new DynamoDbFacade(backend, backend, new RegionResolver("us-east-1", "000000000000")));
+            new DynamoDbFacade(backend, backend, new RegionResolver("us-east-1", "000000000000")), call -> {
+                assertEquals("DeleteTable", call.action());
+                backend.deleteTable(call.scope(), call.body().path("TableName").asText());
+                return new Reply(200, null, Map.of());
+            });
 
     private ProvisionContext ctx() {
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);

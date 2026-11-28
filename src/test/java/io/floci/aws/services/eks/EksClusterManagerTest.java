@@ -128,6 +128,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -1242,16 +1243,9 @@ class EksClusterManagerTest {
 
             assertEquals("cid-old", cluster.getContainerId());
             assertEquals(6440, cluster.getHostPort());
-            InOrder order = Mockito.inOrder(lifecycleManager, dockerClient);
-            order.verify(lifecycleManager).removeIfExists("floci-eks-demo");
-            order.verify(lifecycleManager).startCreated(any(), any());
-            order.verify(lifecycleManager, Mockito.times(2)).removeIfExistsStrict("floci-eks-demo", true);
-            order.verify(dockerClient).renameContainerCmd("cid-old");
-            verify(lifecycleManager).removeIfExists("floci-eks-demo");
-            assertEquals(firstCleanupFails ? 1 : 0, startup.getSuppressed().length);
-            if (firstCleanupFails) {
-                assertEquals(cleanup, startup.getSuppressed()[0]);
-            }
+            verify(lifecycleManager, Mockito.times(firstCleanupFails ? 2 : 3))
+                    .removeIfExistsStrict("floci-eks-demo", true);
+            verify(lifecycleManager, Mockito.times(firstCleanupFails ? 0 : 1)).create(any());
             verify(dockerClient).stopContainerCmd("cid-old");
             verify(portAllocator, never()).allocate(6440, 6499);
         }
@@ -1519,7 +1513,10 @@ class EksClusterManagerTest {
 
             assertEquals("cid-new", cluster.getContainerId());
             verify(lifecycleManager, Mockito.times(1)).adopt("cid-old", List.of(6443), Optional.empty());
-            verify(lifecycleManager, never()).removeIfExistsStrict("floci-eks-demo", true);
+            InOrder order = Mockito.inOrder(lifecycleManager);
+            order.verify(lifecycleManager).removeIfExistsStrict("floci-eks-demo", true);
+            order.verify(lifecycleManager).startCreated(eq("cid-new"), any());
+            order.verify(lifecycleManager, never()).removeIfExistsStrict("floci-eks-demo", true);
         }
 
         @Test
@@ -1563,7 +1560,7 @@ class EksClusterManagerTest {
 
             assertEquals("cid-new", cluster.getContainerId());
             // startCluster removes the broken survivor before reusing its name.
-            verify(lifecycleManager).removeIfExists("floci-eks-demo");
+            verify(lifecycleManager).removeIfExistsStrict("floci-eks-demo", true);
         }
 
         @Test
@@ -1831,7 +1828,7 @@ class EksClusterManagerTest {
             assertEquals("floci-aws-eks-999999999999.demo", cluster.getDockerName());
             assertEquals("cid-new", cluster.getContainerId());
             verify(lifecycleManager, never()).adopt(anyString(), any(), any());
-            verify(lifecycleManager, never()).removeIfExists("floci-eks-demo");
+            verify(lifecycleManager, never()).removeIfExistsStrict("floci-eks-demo", true);
         }
 
         @Test
@@ -1851,7 +1848,7 @@ class EksClusterManagerTest {
 
             assertEquals("floci-aws-eks-999999999999.demo", cluster.getDockerName());
             verify(lifecycleManager, never()).adopt(anyString(), any(), any());
-            verify(lifecycleManager, never()).removeIfExists("floci-eks-demo");
+            verify(lifecycleManager, never()).removeIfExistsStrict("floci-eks-demo", true);
         }
 
         @Test
@@ -1885,7 +1882,7 @@ class EksClusterManagerTest {
             manager.startCluster(cluster);
 
             assertEquals("floci-aws-eks-999999999999.demo", cluster.getDockerName());
-            verify(lifecycleManager).removeIfExists("floci-aws-eks-999999999999.demo");
+            verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-999999999999.demo", true);
         }
     }
 
@@ -4359,8 +4356,36 @@ class EksClusterManagerTest {
             cluster.setVersion("1.30");
 
             assertThrows(RuntimeException.class, () -> manager.startCluster(cluster));
-            verify(lifecycleManager).removeIfExists("floci-aws-eks-fail-cluster");
-            verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-fail-cluster", true);
+            verify(lifecycleManager, Mockito.times(2)).removeIfExistsStrict("floci-aws-eks-fail-cluster", true);
+        }
+
+        @Test
+        void startFailurePreservesItsCleanupFailure() {
+            RuntimeException startup = new RuntimeException("Container failed to boot");
+            RuntimeException cleanup = new RuntimeException("Docker refused removal");
+            when(lifecycleManager.startCreated(any(), any())).thenThrow(startup);
+            Mockito.doNothing().doThrow(cleanup).when(lifecycleManager)
+                    .removeIfExistsStrict("floci-aws-eks-fail-cluster", true);
+
+            Cluster cluster = new Cluster();
+            cluster.setName("fail-cluster");
+            cluster.setVersion("1.30");
+
+            assertSame(startup, assertThrows(RuntimeException.class, () -> manager.startCluster(cluster)));
+            assertEquals(List.of(cleanup), Arrays.asList(startup.getSuppressed()));
+        }
+
+        @Test
+        void staleContainerRemovalFailurePreventsReplacement() {
+            RuntimeException cleanup = new RuntimeException("Docker refused removal");
+            Mockito.doThrow(cleanup).when(lifecycleManager)
+                    .removeIfExistsStrict("floci-aws-eks-fail-cluster", true);
+            Cluster cluster = new Cluster();
+            cluster.setName("fail-cluster");
+            cluster.setVersion("1.30");
+
+            assertSame(cleanup, assertThrows(RuntimeException.class, () -> manager.startCluster(cluster)));
+            verify(lifecycleManager, never()).create(any());
         }
     }
 
@@ -6051,7 +6076,12 @@ class EksClusterManagerTest {
             assertNull(cluster.getNodePrivateIp());
             assertEquals("cid-bridge", cluster.getContainerId());
             verify(ec2Service).releaseVpcPrivateIp("000000000000", "us-east-1", "subnet-1", "10.0.1.25");
-            verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-first-launch-fallback", true);
+            InOrder cleanup = Mockito.inOrder(lifecycleManager);
+            cleanup.verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-first-launch-fallback", true);
+            cleanup.verify(lifecycleManager).create(any());
+            cleanup.verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-first-launch-fallback", true);
+            cleanup.verify(lifecycleManager).create(any());
+            cleanup.verify(lifecycleManager).startCreated(eq("cid-bridge"), any());
             verify(lifecycleManager, Mockito.times(2)).create(any());
             verify(lifecycleManager).startCreated(eq("cid-bridge"), any());
             verify(lifecycleManager, never()).startCreated(eq("cid-vpc"), any());
@@ -6106,7 +6136,10 @@ class EksClusterManagerTest {
 
             assertEquals("10.0.1.25", cluster.getNodePrivateIp());
             verify(ec2Service, never()).releaseVpcPrivateIp(anyString(), anyString(), anyString(), anyString());
-            verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-restore-attach-fail", true);
+            InOrder cleanup = Mockito.inOrder(lifecycleManager);
+            cleanup.verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-restore-attach-fail", true);
+            cleanup.verify(lifecycleManager).create(any());
+            cleanup.verify(lifecycleManager).removeIfExistsStrict("floci-aws-eks-restore-attach-fail", true);
             verify(lifecycleManager, Mockito.times(1)).create(any());
             verify(lifecycleManager, never()).startCreated(anyString(), any());
         }

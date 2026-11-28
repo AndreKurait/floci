@@ -1230,6 +1230,24 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
 
     // ──────────────────────────── Tags ────────────────────────────
 
+
+
+    /** The organization this account manages, which is the one holding no member row for it. */
+
+
+    /**
+     * The path an account's principals carry, which stops at the account's parent rather than at
+     * the account: the published condition for the key compares a path ending in an OU. An
+     * account the organization holds no row for is at its root, which is where the management
+     * account sits.
+     *
+     * <p>A chain that cannot be walked, an account naming a parent the organization no longer
+     * holds, is no path rather than a failed call: the caller asked for an authorization decision,
+     * and a key with no value is answered by every condition written on it. {@link
+     * #effectiveScpLevels} answers an organization it cannot resolve the same way.
+     */
+
+
     public Map<String, String> listTagsForResource(String callerAccountId, String resourceId) {
         Organization organization = requireOrganizationForCaller(callerAccountId);
         return new LinkedHashMap<>(resolveTagOwner(organization, resourceId).tags());

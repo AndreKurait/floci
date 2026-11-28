@@ -79,6 +79,8 @@ public final class CfnRollback {
      * retained across a failed move back.
      */
     public static final String LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR = "__FlociLoadBalancerSubnetsUpdateSnapshot";
+    public static final String LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR = "__FlociLoadBalancerAttributesUpdateSnapshot";
+    public static final String TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR = "__FlociTargetGroupAttributesUpdateSnapshot";
 
     /**
      * Holds what an update that kept an ELBv2 target group changed in its registrations: the targets
@@ -383,6 +385,9 @@ public final class CfnRollback {
      */
     public static final String METRIC_FILTER_UPDATE_SNAPSHOT_ATTR = "__FlociMetricFilterUpdateSnapshot";
 
+    /** Prior authority tags and owner-scoped address, retained until rollback or stack commit succeeds. */
+    public static final String ACM_PCA_TAGS_SNAPSHOT_ATTR = "__FlociAcmPcaTagsSnapshot";
+
     /**
      * Holds the pipe a rename displaced: the name it still lives under, the region that addresses
      * it, how many times deleting it has been attempted, and when the replacement was created.
@@ -425,6 +430,12 @@ public final class CfnRollback {
      * so a failed stack update can restore them.
      */
     public static final String SQS_UPDATE_SNAPSHOT_ATTR = "__FlociSqsUpdateSnapshot";
+
+    /** Prior CodeDeploy configuration and tags, retained until an in-place update commits or restores. */
+    public static final String CODEDEPLOY_UPDATE_SNAPSHOT_ATTR = "__FlociCodeDeployUpdateSnapshot";
+
+    /** Application identities for live and displaced CodeDeploy group names awaiting cleanup. */
+    public static final String CODEDEPLOY_GROUP_APPLICATIONS_ATTR = "__FlociCodeDeployGroupApplications";
 
     /**
      * Holds the value, settings and managed tags an SSM parameter carried before an in-place
@@ -492,6 +503,9 @@ public final class CfnRollback {
      * failed stack update can put them back.
      */
     public static final String EFS_ACCESS_POINT_UPDATE_SNAPSHOT_ATTR = "__FlociEfsAccessPointUpdateSnapshot";
+
+    /** The complete standalone API Gateway V2 authorizer before an in-place update. */
+    public static final String API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR = "__FlociApiAuthorizerUpdateSnapshot";
 
     private CfnRollback() {
     }

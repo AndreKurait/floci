@@ -3,8 +3,10 @@ package io.floci.aws.services.cloudformation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.services.acm.AcmService;
+import io.floci.aws.services.acmpca.AcmPcaService;
 import io.floci.aws.services.apigateway.ApiGatewayService;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.appconfig.AppConfigService;
@@ -17,6 +19,7 @@ import io.floci.aws.services.bedrock.BedrockService;
 import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreControlService;
 import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryService;
 import io.floci.aws.services.cloudformation.provisioners.AcmCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.AcmPcaCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayAccountCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayApiKeyCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayDomainCfnProvisioner;
@@ -26,6 +29,8 @@ import io.floci.aws.services.cloudformation.provisioners.ApiGatewayUsagePlanCfnP
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayV2CfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayV2DomainCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AppConfigCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.AppConfigDeploymentCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.AppConfigHostedVersionCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AppSyncCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApplicationAutoScalingCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AutoScalingGroupCfnProvisioner;
@@ -46,6 +51,7 @@ import io.floci.aws.services.cloudformation.provisioners.CloudTrailCfnProvisione
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchCompositeAlarmCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.CloudWatchInsightRuleCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CodeDeployCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CognitoCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CognitoIdentityProviderCfnProvisioner;
@@ -57,6 +63,7 @@ import io.floci.aws.services.cloudformation.provisioners.ConfigCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CustomResourceCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.DsqlCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.DynamoDbCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.Ec2DhcpCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2FlowLogCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2InstanceCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2KeyPairCfnProvisioner;
@@ -67,6 +74,7 @@ import io.floci.aws.services.cloudformation.provisioners.Ec2SecurityGroupCfnProv
 import io.floci.aws.services.cloudformation.provisioners.Ec2SecurityGroupRuleCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2VpcCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2VpcEndpointCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.Ec2VpcEndpointServiceCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.Ec2VpcGatewayAttachmentCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.EcrCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.EcsCapacityCfnProvisioner;
@@ -75,6 +83,7 @@ import io.floci.aws.services.cloudformation.provisioners.EfsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.EksCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ElastiCacheCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ElastiCacheServerlessCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.ElbClassicCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ElbV2CfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.EmrCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.EmrContainersCfnProvisioner;
@@ -97,6 +106,7 @@ import io.floci.aws.services.cloudformation.provisioners.IotDomainConfigurationC
 import io.floci.aws.services.cloudformation.provisioners.KinesisCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.KmsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.LambdaAddressingCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.LambdaAliasDeployment;
 import io.floci.aws.services.cloudformation.provisioners.LambdaCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.LambdaCodeSigningConfigCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.LambdaEventInvokeConfigCfnProvisioner;
@@ -107,6 +117,7 @@ import io.floci.aws.services.cloudformation.provisioners.LambdaWebCfnProvisioner
 import io.floci.aws.services.cloudformation.provisioners.LogsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.LogsLogStreamCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.LogsMetricFilterCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.LogsSubscriptionFilterCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.OrganizationsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.PipesCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.RdsCfnProvisioner;
@@ -126,17 +137,27 @@ import io.floci.aws.services.cloudformation.provisioners.SesReceiptRuleCfnProvis
 import io.floci.aws.services.cloudformation.provisioners.SignerCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.SnsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.SqsCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.SsmAssociationCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.SsmCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.SsmDocumentCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.SsmPatchBaselineCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.SsmResourceDataSyncCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.StepFunctionsActivityCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.StepFunctionsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.TransferCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.VerifiedPermissionsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.WafV2CfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.WaitConditionCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.WaitConditionHandleCfnProvisioner;
 import io.floci.aws.services.cloudfront.CloudFrontService;
 import io.floci.aws.services.cloudmap.CloudMapService;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.cloudwatch.dashboards.CloudWatchDashboardsService;
+import io.floci.aws.services.cloudwatch.insights.CloudWatchInsightRulesService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsMetricFilterService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
+import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsSubscriptionAdmissionService;
+import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsSubscriptionFilterService;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.codedeploy.CodeDeployService;
 import io.floci.aws.services.cognito.CognitoService;
@@ -145,7 +166,9 @@ import io.floci.aws.services.docdb.DocDbService;
 import io.floci.aws.services.dsql.DsqlService;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Reply;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
+import io.floci.aws.services.ec2.Ec2PrivateLinkService;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.FlowLogService;
 import io.floci.aws.services.ecr.EcrService;
@@ -157,6 +180,7 @@ import io.floci.aws.services.eks.EksService;
 import io.floci.aws.services.elasticache.ElastiCacheMemcachedService;
 import io.floci.aws.services.elasticache.ElastiCacheServerlessService;
 import io.floci.aws.services.elasticache.ElastiCacheService;
+import io.floci.aws.services.elb.ElbClassicService;
 import io.floci.aws.services.elbv2.ElbV2Service;
 import io.floci.aws.services.emr.EmrHandler;
 import io.floci.aws.services.emr.EmrService;
@@ -177,6 +201,7 @@ import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaCodeSigningConfigService;
 import io.floci.aws.services.lambda.LambdaLayerService;
 import io.floci.aws.services.lambda.LambdaService;
+import io.floci.aws.services.lambda.ProvisionedConcurrencyPool;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.organizations.OrganizationsService;
@@ -185,6 +210,7 @@ import io.floci.aws.services.rds.RdsService;
 import io.floci.aws.services.redshift.RedshiftService;
 import io.floci.aws.services.redshiftserverless.RedshiftServerlessService;
 import io.floci.aws.services.route53.Route53Service;
+import io.floci.aws.services.s3.PreSignedUrlGenerator;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.s3vectors.S3VectorsService;
 import io.floci.aws.services.scheduler.SchedulerService;
@@ -196,6 +222,8 @@ import io.floci.aws.services.ses.SesService;
 import io.floci.aws.services.signer.SignerService;
 import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sqs.SqsService;
+import io.floci.aws.services.ssm.SsmPatchBaselineService;
+import io.floci.aws.services.ssm.SsmResourceDataSyncService;
 import io.floci.aws.services.ssm.SsmService;
 import io.floci.aws.services.stepfunctions.StepFunctionsService;
 import io.floci.aws.services.transfer.TransferService;
@@ -208,6 +236,9 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Builds {@link CfnResourceDispatcher} for tests without a wall of positional nulls.
@@ -243,6 +274,7 @@ final class CfnProvisionerFixture {
 
         private SignerService signerService;
         private S3Service s3Service;
+        private PreSignedUrlGenerator presigner;
         private S3VectorsService s3VectorsService;
         private SnsService snsService;
         private SesService sesService;
@@ -254,8 +286,11 @@ final class CfnProvisionerFixture {
         private LambdaCodeSigningConfigService lambdaCodeSigningConfigService;
         private AppSyncService appSyncService;
         private AppConfigService appConfigService;
+
         private IamService iamService;
         private SsmService ssmService;
+        private SsmPatchBaselineService ssmPatchBaselines;
+        private SsmResourceDataSyncService ssmResourceDataSyncs;
         private KmsService kmsService;
         private VerifiedPermissionsService verifiedPermissionsService;
         private SecretsManagerService secretsManagerService;
@@ -272,6 +307,7 @@ final class CfnProvisionerFixture {
         private ContainerReachableEndpoint reachableEndpoint;
         private EcsService ecsService;
         private EfsService efsService;
+        private ElbClassicService elbClassicService;
         private ElbV2Service elbV2Service;
         private StepFunctionsService stepFunctionsService;
         private BatchService batchService;
@@ -283,6 +319,7 @@ final class CfnProvisionerFixture {
         private CloudWatchMetricsService cloudWatchMetricsService;
         private AutoScalingService autoScalingService;
         private AcmService acmService;
+        private AcmPcaService acmPcaService;
         private FirehoseService firehoseService;
         private DocDbService docDbService;
         private CloudFrontService cloudFrontService;
@@ -300,7 +337,9 @@ final class CfnProvisionerFixture {
         // Services that back a provisioner without being a constructor argument of the
         // dispatcher. They exist only so inferredProvisioners() can wire their provisioner.
         private FlowLogService flowLogService;
+        private Ec2PrivateLinkService privateLinkService;
         private CloudWatchDashboardsService cloudWatchDashboardsService;
+        private CloudWatchInsightRulesService cloudWatchInsightRulesService;
         private CloudWatchLogsMetricFilterService logsMetricFilterService;
         private IotAuthorizerService iotAuthorizerService;
         private IotDomainConfigurationService iotDomainConfigurationService;
@@ -364,10 +403,18 @@ final class CfnProvisionerFixture {
             ensureDynamicReferences();
             List<CfnResourceProvisioner> discovered = new ArrayList<>();
             discovered.add(new CdkMetadataCfnProvisioner());
+            if (appConfigService != null) {
+                discovered.add(new AppConfigCfnProvisioner(appConfigService));
+                ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
+                when(serviceConfig.isEnabled("appconfig")).thenReturn(true);
+                discovered.add(new AppConfigDeploymentCfnProvisioner(appConfigService, serviceConfig));
+                discovered.add(new AppConfigHostedVersionCfnProvisioner(appConfigService, serviceConfig));
+            }
             if (signerService != null) {
                 discovered.add(new SignerCfnProvisioner(signerService));
             }
             if (stepFunctionsService != null) {
+                discovered.add(new StepFunctionsActivityCfnProvisioner(stepFunctionsService));
                 discovered.add(new StepFunctionsCfnProvisioner(stepFunctionsService, s3Service, objectMapper));
             }
             if (lambdaService != null) {
@@ -382,6 +429,12 @@ final class CfnProvisionerFixture {
             }
             if (s3Service != null) {
                 discovered.add(new S3CfnProvisioner(s3Service));
+            }
+            if (s3Service != null && presigner != null && reachableEndpoint != null) {
+                discovered.add(new WaitConditionHandleCfnProvisioner(s3Service, presigner, reachableEndpoint));
+            }
+            if (s3Service != null && reachableEndpoint != null) {
+                discovered.add(new WaitConditionCfnProvisioner(s3Service, objectMapper, reachableEndpoint));
             }
             if (snsService != null) {
                 discovered.add(new SnsCfnProvisioner(snsService));
@@ -398,10 +451,24 @@ final class CfnProvisionerFixture {
             if (dynamoDbService != null) {
                 NativeDynamoDbBackend backend = new NativeDynamoDbBackend(null, null, null, dynamoDbService, null, null, objectMapper);
                 discovered.add(new DynamoDbCfnProvisioner(new DynamoDbFacade(backend, backend,
-                        new RegionResolver("us-east-1", "000000000000"))));
+                        new RegionResolver("us-east-1", "000000000000")), call -> {
+                            if (!"DeleteTable".equals(call.action())) {
+                                throw new AssertionError("Unexpected DynamoDB wire operation: " + call.action());
+                            }
+                            backend.deleteTable(call.scope(), call.body().path("TableName").asText());
+                            return new Reply(200, null, Map.of());
+                        }));
             }
             if (ssmService != null) {
                 discovered.add(new SsmCfnProvisioner(ssmService));
+                discovered.add(new SsmDocumentCfnProvisioner(ssmService));
+                discovered.add(new SsmAssociationCfnProvisioner(ssmService));
+            }
+            if (ssmPatchBaselines != null) {
+                discovered.add(new SsmPatchBaselineCfnProvisioner(ssmPatchBaselines));
+            }
+            if (ssmResourceDataSyncs != null) {
+                discovered.add(new SsmResourceDataSyncCfnProvisioner(ssmResourceDataSyncs));
             }
             if (kmsService != null) {
                 discovered.add(new KmsCfnProvisioner(kmsService));
@@ -432,6 +499,9 @@ final class CfnProvisionerFixture {
             if (logsService != null) {
                 discovered.add(new LogsCfnProvisioner(logsService));
                 discovered.add(new LogsLogStreamCfnProvisioner(logsService));
+                discovered.add(new LogsSubscriptionFilterCfnProvisioner(
+                        new CloudWatchLogsSubscriptionFilterService(logsService,
+                                mock(CloudWatchLogsSubscriptionAdmissionService.class))));
             }
             if (logsMetricFilterService != null) {
                 discovered.add(new LogsMetricFilterCfnProvisioner(logsMetricFilterService));
@@ -446,6 +516,9 @@ final class CfnProvisionerFixture {
             if (cloudWatchDashboardsService != null) {
                 discovered.add(new CloudWatchDashboardCfnProvisioner(cloudWatchDashboardsService));
             }
+            if (cloudWatchInsightRulesService != null) {
+                discovered.add(new CloudWatchInsightRuleCfnProvisioner(cloudWatchInsightRulesService));
+            }
             if (iamService != null) {
                 discovered.add(new IamRoleCfnProvisioner(iamService));
                 discovered.add(new IamUserCfnProvisioner(iamService));
@@ -459,6 +532,9 @@ final class CfnProvisionerFixture {
             }
             if (elbV2Service != null) {
                 discovered.add(new ElbV2CfnProvisioner(elbV2Service));
+            }
+            if (elbClassicService != null) {
+                discovered.add(new ElbClassicCfnProvisioner(elbClassicService));
             }
             if (ecsService != null) {
                 discovered.add(new EcsCapacityCfnProvisioner(ecsService));
@@ -491,16 +567,17 @@ final class CfnProvisionerFixture {
             if (acmService != null) {
                 discovered.add(new AcmCfnProvisioner(acmService));
             }
+            if (acmPcaService != null) {
+                discovered.add(new AcmPcaCfnProvisioner(acmPcaService, config));
+            }
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
-            }
-            if (appConfigService != null) {
-                discovered.add(new AppConfigCfnProvisioner(appConfigService));
             }
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
                 discovered.add(new LambdaEventInvokeConfigCfnProvisioner(lambdaService));
-                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService));
+                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService,
+                        mock(ProvisionedConcurrencyPool.class), mock(LambdaAliasDeployment.class)));
                 discovered.add(new LambdaEventSourceMappingCfnProvisioner(lambdaService));
                 if (lambdaCodeSigningConfigService != null) {
                     discovered.add(new LambdaCodeSigningConfigCfnProvisioner(lambdaCodeSigningConfigService,
@@ -509,6 +586,9 @@ final class CfnProvisionerFixture {
             }
             if (flowLogService != null) {
                 discovered.add(new Ec2FlowLogCfnProvisioner(flowLogService, ec2Service));
+            }
+            if (privateLinkService != null) {
+                discovered.add(new Ec2VpcEndpointServiceCfnProvisioner(privateLinkService, ec2Service));
             }
             if (iotAuthorizerService != null) {
                 discovered.add(new IotAuthorizerCfnProvisioner(iotAuthorizerService));
@@ -558,8 +638,12 @@ final class CfnProvisionerFixture {
             if (wafV2Service != null) {
                 discovered.add(new WafV2CfnProvisioner(wafV2Service));
             }
+            if (ec2Service != null && ssmService != null) {
+                discovered.add(new Ec2KeyPairCfnProvisioner(ec2Service, ssmService));
+            }
             if (ec2Service != null) {
                 discovered.add(new Ec2VpcCfnProvisioner(ec2Service));
+                discovered.add(new Ec2DhcpCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcEndpointCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcGatewayAttachmentCfnProvisioner(ec2Service));
                 discovered.add(new Ec2NetworkAclCfnProvisioner(ec2Service));
@@ -568,9 +652,6 @@ final class CfnProvisionerFixture {
                 discovered.add(new Ec2InstanceCfnProvisioner(ec2Service));
                 discovered.add(new Ec2LaunchTemplateCfnProvisioner(ec2Service));
                 discovered.add(new Ec2NetworkCfnProvisioner(ec2Service));
-            }
-            if (ec2Service != null && ssmService != null) {
-                discovered.add(new Ec2KeyPairCfnProvisioner(ec2Service, ssmService));
             }
             if (route53Service != null) {
                 discovered.add(new Route53CfnProvisioner(route53Service));
@@ -647,6 +728,11 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder presignedUrls(PreSignedUrlGenerator v) {
+            this.presigner = v;
+            return this;
+        }
+
         public Builder sns(SnsService v) {
             this.snsService = v;
             return this;
@@ -697,6 +783,8 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+    
+
         public Builder iam(IamService v) {
             this.iamService = v;
             return this;
@@ -704,6 +792,16 @@ final class CfnProvisionerFixture {
 
         public Builder ssm(SsmService v) {
             this.ssmService = v;
+            return this;
+        }
+
+        public Builder ssmPatchBaselines(SsmPatchBaselineService value) {
+            this.ssmPatchBaselines = value;
+            return this;
+        }
+
+        public Builder ssmResourceDataSyncs(SsmResourceDataSyncService value) {
+            this.ssmResourceDataSyncs = value;
             return this;
         }
 
@@ -789,6 +887,11 @@ final class CfnProvisionerFixture {
 
         public Builder elbV2(ElbV2Service v) {
             this.elbV2Service = v;
+            return this;
+        }
+
+        public Builder elbClassic(ElbClassicService v) {
+            this.elbClassicService = v;
             return this;
         }
 
@@ -897,6 +1000,11 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder acmPca(AcmPcaService v) {
+            this.acmPcaService = v;
+            return this;
+        }
+
         public Builder firehose(FirehoseService v) {
             this.firehoseService = v;
             return this;
@@ -917,8 +1025,18 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder privateLink(Ec2PrivateLinkService v) {
+            this.privateLinkService = v;
+            return this;
+        }
+
         public Builder cloudWatchDashboards(CloudWatchDashboardsService v) {
             this.cloudWatchDashboardsService = v;
+            return this;
+        }
+
+        public Builder cloudWatchInsightRules(CloudWatchInsightRulesService v) {
+            this.cloudWatchInsightRulesService = v;
             return this;
         }
 

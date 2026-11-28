@@ -8,7 +8,8 @@ format (io/github/.../FooTest, no extension). Classes sharing a @TestProfile are
 assigned to the SAME shard atomically, except known slow classes: per-shard Quarkus augmentation cost is
 (distinct profiles in shard) x ~5.4s, so splitting a profile group pays its
 augmentation once per shard it touches. Profile-less classes fill the remainder.
-A class counts as one, but for the few in SLOW_CLASSES, whose run time would
+Recorded CI timings weight classes while keeping their profile groups together.
+Explicit SLOW_CLASSES overrides are separate groups when their run time would
 otherwise be invisible to a partition that balances class counts. These are
 separate groups even when they share a profile: saving one augmentation must
 not force minutes of Docker work onto the same shard.
@@ -17,6 +18,8 @@ Deterministic: sorted inputs, greedy least-loaded bin-packing, no RNG/timestamps
 Exit 2 on bad arguments or an unreadable input file.
 """
 import json
+import math
+from pathlib import Path
 import os
 import re
 import sys
@@ -30,10 +33,26 @@ AUGMENTATION_WEIGHT = 10  # one augmentation ~ 5.4s ~ 10 average test classes
 SLOW_CLASSES = json.loads(os.environ.get('PARTITION_SLOW_CLASSES', '{}'))
 SECONDS_PER_CLASS = 1.2  # the suite's mean: 4212s over 3451 classes on 2026-11-09
 
-def weight(cls):
-    """How many average test classes a class is worth."""
-    seconds = SLOW_CLASSES.get(cls.rsplit('/', 1)[-1])
-    return 1 if seconds is None else round(seconds / SECONDS_PER_CLASS)
+def durations():
+    path = Path(__file__).with_name('test-durations.json')
+    with path.open(encoding='utf-8') as source:
+        seconds = json.load(source)['seconds']
+    if not isinstance(seconds, dict) or any(
+        not isinstance(name, str) or isinstance(value, bool)
+        or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+        for name, value in seconds.items()
+    ):
+        raise ValueError('test durations must map class paths to positive finite seconds')
+    return seconds
+
+
+def weight(cls, seconds):
+    """Recorded timings retain profile groups; explicit slow overrides may split them."""
+    override = SLOW_CLASSES.get(cls.rsplit('/', 1)[-1])
+    if override is not None:
+        return round(override / SECONDS_PER_CLASS)
+    recorded = seconds.get(cls)
+    return 1 if recorded is None else recorded / SECONDS_PER_CLASS
 
 def warn_of_stale_slow_classes(classes):
     """A renamed class would quietly lose its weight, so name it where the run's annotations show it."""
@@ -69,7 +88,8 @@ def main():
     try:
         classes = [l.strip() for l in open(sys.argv[1]) if l.strip()]
         total, index = int(sys.argv[2]), int(sys.argv[3])
-    except (OSError, ValueError) as e:
+        seconds = durations()
+    except (OSError, ValueError, KeyError) as e:
         sys.exit(f'partition.sh: {e}')
     if not (1 <= index <= total):
         sys.exit(f'partition.sh: shard index {index} outside 1..{total}')
@@ -83,7 +103,7 @@ def main():
         if key is None:
             plain.append(c)
         else:
-            if weight(c) > 1:
+            if c.rsplit('/', 1)[-1] in SLOW_CLASSES and weight(c, seconds) > 1:
                 key = (key, c)
             else:
                 key = (key, '')
@@ -92,14 +112,14 @@ def main():
     load = [0] * total
     shard_of = {}
     # Heaviest first; ties broken by name for determinism.
-    for key, members in sorted(groups.items(), key=lambda kv: (-sum(map(weight, kv[1])), kv[0])):
+    for key, members in sorted(groups.items(), key=lambda kv: (-sum(weight(c, seconds) for c in kv[1]), kv[0])):
         target = min(range(total), key=lambda s: (load[s], s))
-        load[target] += AUGMENTATION_WEIGHT + sum(map(weight, members))
+        load[target] += AUGMENTATION_WEIGHT + sum(weight(c, seconds) for c in members)
         for c in members:
             shard_of[c] = target
-    for c in sorted(plain, key=lambda c: (-weight(c), c)):
+    for c in sorted(plain, key=lambda c: (-weight(c, seconds), c)):
         target = min(range(total), key=lambda s: (load[s], s))
-        load[target] += weight(c)
+        load[target] += weight(c, seconds)
         shard_of[c] = target
 
     out = sorted(c for c, s in shard_of.items() if s == index - 1)

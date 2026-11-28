@@ -1,6 +1,7 @@
 package io.floci.aws.core.common;
 
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.iam.DerivedSigningKeyController;
 import jakarta.annotation.Priority;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
@@ -111,6 +112,11 @@ public class AwsProtocolClaimFilter implements ContainerRequestFilter {
                                              ResolvedServiceCatalog catalog, EmulatorConfig config) {
         Optional<String> scope = SigV4CredentialScope.serviceName(signals.authorization());
         if (scope.isEmpty() || catalog.byCredentialScope(scope.get()).isPresent()) {
+            return false;
+        }
+        // The derived signing key endpoint's caller signs for the uncatalogued name "floci"; that
+        // exact path and name is let through, and the endpoint verifies the signature itself.
+        if (DerivedSigningKeyController.isCallerScope(signals.path(), scope.get())) {
             return false;
         }
         // Gated like the other rejections in this filter. The guard is only as good as the

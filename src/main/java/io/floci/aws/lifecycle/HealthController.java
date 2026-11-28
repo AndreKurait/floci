@@ -47,6 +47,7 @@ public class HealthController {
         body.put("services", services);
         body.put("edition", "community");
         body.put("original_edition", "floci-always-free");
+        body.put("features", Map.of("lambda_container_readiness", 1, "ec2_native_peer_dependencies", 1));
         body.put("version", version);
         return body;
     }

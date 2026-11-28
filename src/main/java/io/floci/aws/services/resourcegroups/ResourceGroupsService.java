@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 
 @ApplicationScoped
@@ -40,7 +41,7 @@ public class ResourceGroupsService implements Resettable {
     private final Clock clock;
     private final Map<String, Page> pages = new LinkedHashMap<>();
 
-    private record Page(String groupArn, String generation, List<String> filter,
+    private record Page(String scope, String generation, List<String> filter,
                         List<String> remaining, long lastRead) {}
 
     @Inject
@@ -190,12 +191,12 @@ public class ResourceGroupsService implements Resettable {
             selected = group.members();
         } else {
             Page page = pages.get(token);
-            if (page == null || !page.groupArn().equals(group.arn())
+            if (page == null || !page.scope().equals(group.arn())
                     || !page.generation().equals(group.generation()) || !page.filter().equals(filter)) {
                 throw bad("NextToken does not match this group and filter, or has expired.");
             }
             pages.remove(token);
-            pages.put(token, new Page(page.groupArn(), page.generation(), page.filter(), page.remaining(), now));
+            pages.put(token, new Page(page.scope(), page.generation(), page.filter(), page.remaining(), now));
             selected = page.remaining().stream().filter(group.members()::contains).toList();
         }
         List<Map<String, String>> identifiers = selected.stream().limit(maximum)
@@ -210,6 +211,74 @@ public class ResourceGroupsService implements Resettable {
             String next = Base64.getEncoder().encodeToString(
                     UUID.randomUUID().toString().getBytes(StandardCharsets.US_ASCII));
             pages.put(next, new Page(group.arn(), group.generation(), filter,
+                    List.copyOf(selected.subList(maximum, selected.size())), now));
+            response.put("NextToken", next);
+        }
+        return response;
+    }
+
+    public synchronized Map<String, Object> listGroups(String region, String account, JsonNode request) {
+        ResourceGroupsRequestShapes.check("ListGroups", request);
+        int maximum = request.path("MaxResults").asInt(50);
+        Map<String, ResourceGroup> available = new TreeMap<>();
+        List<String> filters = new ArrayList<>();
+        for (JsonNode filter : request.path("Filters")) {
+            List<String> values = new ArrayList<>();
+            filter.path("Values").forEach(value -> values.add(value.asText()));
+            filters.add(filter.path("Name").asText() + "="
+                    + String.join(",", values.stream().distinct().sorted().toList()));
+        }
+        filters.sort(String::compareTo);
+        for (ResourceGroup group : groups.scanForAccount(account, key -> key.startsWith(region + "::"))) {
+            boolean matches = true;
+            for (String filter : filters) {
+                // Supported groups have a service configuration, not ResourceTypeFilters or owner metadata.
+                matches &= filter.startsWith("configuration-type=")
+                        && List.of(filter.substring(filter.indexOf('=') + 1).split(",")).contains(POOL_TYPE);
+            }
+            if (matches) {
+                available.put(group.name(), group);
+            }
+        }
+        long now = clock.millis();
+        pages.values().removeIf(page -> now - page.lastRead() >= PAGE_IDLE_MILLIS);
+        String scope = "ListGroups/" + account + "/" + region;
+        String token = text(request, "NextToken", false);
+        List<String> selected = new ArrayList<>(available.keySet());
+        if (token != null) {
+            Page page = pages.get(token);
+            if (page == null || !page.scope().equals(scope) || !page.filter().equals(filters)) {
+                throw bad("NextToken does not match this account, region and filter, or has expired.");
+            }
+            pages.remove(token);
+            pages.put(token, new Page(scope, "", filters, page.remaining(), now));
+            selected = page.remaining().stream().filter(available::containsKey).toList();
+        }
+        List<Map<String, String>> identifiers = new ArrayList<>();
+        List<Map<String, String>> legacyGroups = new ArrayList<>();
+        for (String name : selected.stream().limit(maximum).toList()) {
+            ResourceGroup group = available.get(name);
+            Map<String, String> metadata = new LinkedHashMap<>();
+            metadata.put("GroupArn", group.arn());
+            metadata.put("Name", group.name());
+            if (group.description() != null) {
+                metadata.put("Description", group.description());
+            }
+            legacyGroups.add(metadata);
+            Map<String, String> identifier = new LinkedHashMap<>(metadata);
+            identifier.put("GroupName", identifier.remove("Name"));
+            identifiers.add(identifier);
+        }
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("GroupIdentifiers", identifiers);
+        response.put("Groups", legacyGroups);
+        if (selected.size() > maximum) {
+            if (pages.size() >= MAX_PAGES) {
+                pages.remove(pages.keySet().iterator().next());
+            }
+            String next = Base64.getEncoder().encodeToString(
+                    UUID.randomUUID().toString().getBytes(StandardCharsets.US_ASCII));
+            pages.put(next, new Page(scope, "", List.copyOf(filters),
                     List.copyOf(selected.subList(maximum, selected.size())), now));
             response.put("NextToken", next);
         }

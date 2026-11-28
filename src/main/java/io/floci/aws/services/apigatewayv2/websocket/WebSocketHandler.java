@@ -3,15 +3,20 @@ package io.floci.aws.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Base64Url;
+import io.floci.aws.core.common.CallerCallAuthorizer;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.apigateway.ApiGatewayExecuteApiHostFilter;
+import io.floci.aws.services.apigateway.ExecuteApiSigV4Authorizer;
+import io.floci.aws.services.apigateway.ExecuteApiSigV4Authorizer.CallerIdentity;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.apigatewayv2.model.Api;
 import io.floci.aws.services.apigatewayv2.model.Integration;
 import io.floci.aws.services.apigatewayv2.model.Route;
 import io.floci.aws.services.apigatewayv2.model.Stage;
+import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.ServerWebSocket;
@@ -28,6 +33,8 @@ import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import org.jboss.logging.Logger;
 
+import java.net.URI;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -52,6 +59,7 @@ import java.util.concurrent.ThreadLocalRandom;
 public class WebSocketHandler {
 
     private static final Logger LOG = Logger.getLogger(WebSocketHandler.class);
+    private static final String VERIFIED_CALLER = WebSocketHandler.class.getName() + ".caller";
 
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final WebSocketConnectionManager connectionManager;
@@ -62,7 +70,11 @@ public class WebSocketHandler {
     private final RegionResolver regionResolver;
     private final String baseHostname;
     private final ObjectMapper objectMapper;
+    private final ExecuteApiSigV4Authorizer sigV4Authorizer;
+    private final CallerCallAuthorizer callerCallAuthorizer;
+    private final EmulatorConfig config;
     private final Vertx vertx;
+    private final Clock clock;
 
     @Inject
     public WebSocketHandler(ApiGatewayV2Service apiGatewayV2Service,
@@ -74,7 +86,9 @@ public class WebSocketHandler {
                             RegionResolver regionResolver,
                             EmulatorConfig config,
                             ObjectMapper objectMapper,
-                            Vertx vertx) {
+                            Vertx vertx, ExecuteApiSigV4Authorizer sigV4Authorizer,
+                            CallerCallAuthorizer callerCallAuthorizer,
+                            Clock clock) {
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.connectionManager = connectionManager;
         this.routeSelectionEvaluator = routeSelectionEvaluator;
@@ -85,6 +99,10 @@ public class WebSocketHandler {
         this.baseHostname = config.hostname().orElse("localhost");
         this.objectMapper = objectMapper;
         this.vertx = vertx;
+        this.sigV4Authorizer = sigV4Authorizer;
+        this.callerCallAuthorizer = callerCallAuthorizer;
+        this.config = config;
+        this.clock = clock;
     }
 
     /**
@@ -108,7 +126,7 @@ public class WebSocketHandler {
      * host and the stage from the single path segment. The region is taken from the host when it
      * carries one, else the default; a cross-region apiId lookup then resolves an API created
      * outside that region (issue #1871). Host parsing is shared with
-     * {@link io.floci.aws.services.apigateway.ApiGatewayExecuteApiHostFilter} so the
+     * {@link ApiGatewayExecuteApiHostFilter} so the
      * filter and this handler agree on the host grammar. Any request that is not a WebSocket
      * upgrade on an execute-api host is passed through untouched so JAX-RS (and that filter, which
      * routes {@code @connections}) handle it.
@@ -215,9 +233,20 @@ public class WebSocketHandler {
             return;
         }
 
+        ExecuteApiSigV4Authorizer.Result verified = sigV4Authorizer.authorize(ctx.request().method().name(),
+                URI.create(ctx.request().absoluteURI()),
+                name -> {
+                    List<String> values = ctx.request().headers().getAll(name);
+                    return values.isEmpty() ? null : String.join(",", values);
+                },
+                ctx.request()::getParam, new byte[0], ctx.request().path());
+        if (verified.authorized()) {
+            ctx.put(VERIFIED_CALLER, verified.identity());
+        }
+
         // Generate a unique connectionId (AWS format: base64-encoded random bytes, ~10-14 chars)
         String connectionId = generateConnectionId();
-        long connectedAt = System.currentTimeMillis();
+        long connectedAt = clock.millis();
 
         // Extract source IP and user agent from the upgrade request
         String sourceIp = ctx.request().remoteAddress() != null
@@ -231,6 +260,11 @@ public class WebSocketHandler {
 
         // Look up the $connect route
         Route connectRoute = apiGatewayV2Service.findRouteByKey(region, apiId, "$connect");
+
+        if (!permitsConnect(connectRoute, verified, region, apiId, stageName, sourceIp, secureTransport)) {
+            ctx.response().setStatusCode(403).end();
+            return;
+        }
 
         if (connectRoute != null && connectRoute.getTarget() != null) {
             // Check if the $connect route has a Lambda REQUEST authorizer configured
@@ -263,7 +297,7 @@ public class WebSocketHandler {
                             finalConnectionId, finalConnectedAt, finalSourceIp, finalUserAgent,
                             finalStageVariables, headers, queryParams, authResult.context());
                 }).onFailure(e -> {
-                    LOG.warnv("Lambda authorizer invocation failed for API {0}: {1}",
+                    LOG.warnv(e, "Lambda authorizer invocation failed for API {0}: {1}",
                             apiId, e.getMessage());
                     ctx.response().setStatusCode(500).end();
                 });
@@ -280,6 +314,22 @@ public class WebSocketHandler {
             completeUpgrade(ctx, connectionId, apiId, stageName, region,
                     connectedAt, sourceIp, userAgent);
         }
+    }
+
+    boolean permitsConnect(Route route, ExecuteApiSigV4Authorizer.Result verified,
+                           String region, String apiId, String stage, String sourceIp, boolean secureTransport) {
+        if (route == null || !"AWS_IAM".equalsIgnoreCase(route.getAuthorizationType())
+                || !config.services().iam().enforcementEnabled()) {
+            return true;
+        }
+        if (!verified.authorized() || verified.identity() == null) {
+            return false;
+        }
+        CallerIdentity caller = verified.identity();
+        String resource = AwsArnUtils.Arn.of("execute-api", region, regionResolver.getAccountId(),
+                apiId + "/" + stage + "/$connect").toString();
+        return callerCallAuthorizer.authorizeRequest(caller.accessKey(), caller.accountId(), caller.userArn(),
+                "execute-api:Invoke", resource, regionResolver.getPartition(), sourceIp, secureTransport) == Decision.ALLOW;
     }
 
     /**
@@ -314,8 +364,10 @@ public class WebSocketHandler {
         final Integration finalIntegration = integration;
         final Map<String, String> finalStageVariables = stageVariables;
         vertx.<WebSocketIntegrationInvoker.IntegrationResult>executeBlocking(() -> {
-            return integrationInvoker.invoke(region, finalIntegration, eventJson,
-                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
+            return integrationInvoker.invoke(region, apiId, stageName, "$connect",
+                    finalIntegration, eventJson,
+                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap(),
+                    ctx.<CallerIdentity>get(VERIFIED_CALLER));
         }).onSuccess(result -> {
             // Check for function error (Lambda invocation error)
             if (result.functionError() != null) {
@@ -336,7 +388,7 @@ public class WebSocketHandler {
                 ctx.response().setStatusCode(403).end();
             }
         }).onFailure(e -> {
-            LOG.warnv("$connect integration invocation failed for API {0}: {1}",
+            LOG.warnv(e, "$connect integration invocation failed for API {0}: {1}",
                     apiId, e.getMessage());
             ctx.response().setStatusCode(500).end();
         });
@@ -362,6 +414,7 @@ public class WebSocketHandler {
             ConnectionInfo connectionInfo = new ConnectionInfo(
                     connectionId, apiId, stageName, region,
                     connectedAt, connectedAt, sourceIp, userAgent);
+            connectionInfo.callerIdentity(ctx.get(VERIFIED_CALLER));
             connectionManager.register(connectionId, connectionInfo, ws);
 
             LOG.debugv("WebSocket connection {0} established for API {1}/{2}",
@@ -442,7 +495,7 @@ public class WebSocketHandler {
                 return;
             }
 
-            long now = System.currentTimeMillis();
+            long now = clock.millis();
 
             // Check max connection duration (2 hours)
             if (now - connectedAt > MAX_CONNECTION_DURATION_MS) {
@@ -574,7 +627,7 @@ public class WebSocketHandler {
 
         // Get connection info for connectedAt, sourceIp, userAgent
         ConnectionInfo connectionInfo = connectionManager.getConnectionInfo(connectionId);
-        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : System.currentTimeMillis();
+        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : clock.millis();
         String sourceIp = connectionInfo != null ? connectionInfo.getSourceIp() : "127.0.0.1";
         String userAgent = connectionInfo != null ? connectionInfo.getUserAgent() : "";
 
@@ -589,8 +642,10 @@ public class WebSocketHandler {
         final Route finalRoute = route;
         final String finalConnectionId = connectionId;
         vertx.executeBlocking(() -> {
-            return integrationInvoker.invoke(region, finalIntegration, eventJson,
-                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
+            return integrationInvoker.invoke(region, apiId, stageName, finalRoute.getRouteKey(),
+                    finalIntegration, eventJson,
+                    finalStageVariables, Collections.emptyMap(), Collections.emptyMap(),
+                    connectionInfo == null ? null : connectionInfo.callerIdentity());
         }).onSuccess(result -> {
             // Route response handling (Requirements 5.1–5.3)
             if (finalRoute.getRouteResponseSelectionExpression() != null && result.body() != null) {
@@ -611,7 +666,7 @@ public class WebSocketHandler {
                 }
             }
         }).onFailure(e -> {
-            LOG.warnv("Integration invocation failed for route {0} on connection {1}: {2}",
+            LOG.warnv(e, "Integration invocation failed for route {0} on connection {1}: {2}",
                     finalRoute.getRouteKey(), finalConnectionId, e.getMessage());
             String requestId = UUID.randomUUID().toString();
             String errorFrame = String.format(
@@ -644,7 +699,7 @@ public class WebSocketHandler {
 
         // Retrieve connection info BEFORE unregistering so we have connectedAt, sourceIp, userAgent
         ConnectionInfo connectionInfo = connectionManager.getConnectionInfo(connectionId);
-        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : System.currentTimeMillis();
+        long connectedAt = connectionInfo != null ? connectionInfo.getConnectedAt() : clock.millis();
         String sourceIp = connectionInfo != null ? connectionInfo.getSourceIp() : "127.0.0.1";
         String userAgent = connectionInfo != null ? connectionInfo.getUserAgent() : "";
 
@@ -687,13 +742,15 @@ public class WebSocketHandler {
             final Integration finalIntegration = integration;
             final Map<String, String> finalStageVariables = stageVariables;
             vertx.executeBlocking(() -> {
-                integrationInvoker.invoke(region, finalIntegration, eventJson,
-                        finalStageVariables, Collections.emptyMap(), Collections.emptyMap());
+                integrationInvoker.invoke(region, apiId, stageName, "$disconnect",
+                        finalIntegration, eventJson,
+                        finalStageVariables, Collections.emptyMap(), Collections.emptyMap(),
+                        connectionInfo == null ? null : connectionInfo.callerIdentity());
                 return null;
             }).onComplete(ar -> {
                 if (ar.failed()) {
                     // $disconnect errors must never prevent cleanup — log and continue
-                    LOG.warnv("Error invoking $disconnect route for connection {0}: {1}",
+                    LOG.warnv(ar.cause(), "Error invoking $disconnect route for connection {0}: {1}",
                             connectionId, ar.cause().getMessage());
                 }
             });

@@ -15,7 +15,16 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
 import static io.restassured.RestAssured.given;
-import static org.hamcrest.Matchers.*;
+import static org.hamcrest.Matchers.anEmptyMap;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.everyItem;
+import static org.hamcrest.Matchers.hasItems;
+import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -134,7 +143,7 @@ class AppConfigIntegrationTest {
                 .then()
                 .statusCode(200)
                 .header("Content-Type", startsWith("application/json"))
-                .header("Version-Label", equalTo("1"))
+                .header("Version-Label", nullValue())
                 .header("Next-Poll-Configuration-Token", notNullValue())
                 .header("Next-Poll-Configuration-Token", not(equalTo(configToken)))
                 .header("Next-Poll-Interval-In-Seconds", equalTo("15"))
@@ -166,13 +175,19 @@ class AppConfigIntegrationTest {
 
     @Test @Order(11)
     void repeatedPollWithSameVersionReturnsEmptyPayload() {
+        String storedContentType = given()
+                .when().get("/applications/" + appId + "/configurationprofiles/" + profileId
+                        + "/hostedconfigurationversions/1")
+                .then().statusCode(200)
+                .header("Content-Type", startsWith("application/json"))
+                .extract().header("Content-Type");
         unchangedConfigToken = given()
                 .queryParam("configuration_token", nextConfigToken)
                 .when().get("/configuration")
                 .then()
                 .statusCode(200)
-                .header("Content-Type", equalTo("application/octet-stream"))
-                .header("Version-Label", equalTo(""))
+                .header("Content-Type", equalTo(storedContentType))
+                .header("Version-Label", nullValue())
                 .header("Next-Poll-Configuration-Token", notNullValue())
                 .header("Next-Poll-Configuration-Token", not(equalTo(nextConfigToken)))
                 .header("Next-Poll-Interval-In-Seconds", equalTo("15"))
@@ -205,7 +220,7 @@ class AppConfigIntegrationTest {
                 .then()
                 .statusCode(200)
                 .header("Content-Type", startsWith("application/json"))
-                .header("Version-Label", equalTo("2"))
+                .header("Version-Label", nullValue())
                 .header("Next-Poll-Configuration-Token", notNullValue())
                 .header("Next-Poll-Configuration-Token", not(equalTo(unchangedConfigToken)))
                 .body("foo", equalTo("baz"));
@@ -234,7 +249,7 @@ class AppConfigIntegrationTest {
                 .when().get("/configuration")
                 .then()
                 .statusCode(200)
-                .header("Version-Label", equalTo("2"))
+                .header("Version-Label", nullValue())
                 .body("foo", equalTo("baz"))
                 .extract().header("Next-Poll-Configuration-Token");
 
@@ -243,7 +258,7 @@ class AppConfigIntegrationTest {
                 .when().get("/configuration")
                 .then()
                 .statusCode(200)
-                .header("Version-Label", equalTo("2"))
+                .header("Version-Label", nullValue())
                 .body("foo", equalTo("baz"));
 
         given()
@@ -251,7 +266,7 @@ class AppConfigIntegrationTest {
                 .when().get("/configuration")
                 .then()
                 .statusCode(200)
-                .header("Version-Label", equalTo(""))
+                .header("Version-Label", nullValue())
                 .body(equalTo(""));
     }
 
@@ -523,7 +538,7 @@ class AppConfigIntegrationTest {
                 .body("Tags.team", equalTo("platform"));
     }
 
-    // ──────────────────────────── Tags on untagged environment and deployment ARNs ────────────────────────────
+    // ──────────────────────────── Tags on newly created child resources ────────────────────────────
 
     @Test @Order(22)
     void listTagsForEnvironmentArnReturnsEmpty() {
@@ -545,12 +560,8 @@ class AppConfigIntegrationTest {
                 .body("Tags", anEmptyMap());
     }
 
-    // ──────────── Tags on top-level (non-application-nested) resource ARNs ────────────
-    // deploymentstrategy/extension/extensionassociation are real, taggable AppConfig resource
-    // types per the API. Unlike environment/deployment above, their ARNs don't nest under
-    // application/..., so they need their own top-level branch in AppConfigTagHandler#parseArn.
-    // Regression coverage for that ARN-shape acceptance. Floci stores tags for applications and
-    // environments only, so tagging these is accepted and not stored, and only 200-not-400 is asserted.
+    // ──────────── Tags on top-level resource ARNs ────────────
+    // These top-level resource ARNs have no application component.
 
     @Test @Order(24)
     void listTagsForDeploymentStrategyArnIsAcceptedNotRejected() {
@@ -825,7 +836,7 @@ class AppConfigIntegrationTest {
                 .when().get("/configuration")
                 .then().statusCode(200)
                 .header("Content-Type", startsWith("application/json"))
-                .header("Version-Label", equalTo("1"))
+                .header("Version-Label", nullValue())
                 .header("Next-Poll-Configuration-Token", notNullValue())
                 .body("flags", nullValue())
                 .body("values", nullValue())
@@ -1020,7 +1031,7 @@ class AppConfigIntegrationTest {
                 .then().statusCode(200)
                 .header("Content-Type", startsWith("application/ion"))
                 .header("Content-Type", containsString("type=AWS.AppConfig.FeatureFlags"))
-                .header("Version-Label", equalTo("1"))
+                .header("Version-Label", nullValue())
                 .extract().asByteArray();
         assertEquals(IonTestSupport.parse("promo::[uk::[(eq $storeId \"uk\"), "
                         + "'''{\"_variant\":\"uk\",\"enabled\":true,\"storeId\":\"uk\"}'''],"
@@ -1237,7 +1248,7 @@ class AppConfigIntegrationTest {
                 .queryParam("configuration_token", token)
                 .when().get("/configuration")
                 .then().statusCode(200)
-                .header("Version-Label", equalTo("1"));
+                .header("Version-Label", nullValue());
     }
 
     /** Deploys a feature flag profile whose one flag has variants; returns the StartConfigurationSession body. */

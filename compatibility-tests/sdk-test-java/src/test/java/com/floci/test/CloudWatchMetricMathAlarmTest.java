@@ -13,6 +13,7 @@ import software.amazon.awssdk.services.cloudwatch.model.MetricDataQuery;
 import software.amazon.awssdk.services.cloudwatch.model.MetricStat;
 import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
 import software.amazon.awssdk.services.cloudwatch.model.Statistic;
+import software.amazon.awssdk.services.sts.StsClient;
 
 import java.util.List;
 
@@ -101,10 +102,14 @@ class CloudWatchMetricMathAlarmTest {
     }
 
     private static List<MetricDataQuery> metrics() {
+        String account;
+        try (StsClient sts = TestFixtures.stsClient()) {
+            account = sts.getCallerIdentity().account();
+        }
         return List.of(
                 MetricDataQuery.builder().id("rate").expression("100 * errors / requests")
                         .returnData(true).period(300).label("Error <rate> & requests").build(),
-                MetricDataQuery.builder().id("errors").returnData(false).accountId("123456789012")
+                MetricDataQuery.builder().id("errors").returnData(false).accountId(account)
                         .metricStat(MetricStat.builder().period(300).stat("Sum").unit(StandardUnit.COUNT)
                                 .metric(Metric.builder().namespace("AWS/ApiGateway").metricName("5xx")
                                         .dimensions(Dimension.builder().name("ApiName").value("api<&>").build())

@@ -1,10 +1,14 @@
 package io.floci.aws.services.iam.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -13,20 +17,41 @@ import java.util.Map;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class SessionCredential {
 
+    /** In-process provenance only; restored credentials are never admitted by the management verifier. */
+    @JsonIgnore
+    private boolean assumeRoleIssued;
+    @JsonIgnore
+    private boolean managedSessionPolicyPresent;
+    @JsonIgnore
+    private LambdaExecutionBinding lambdaExecution;
+    @JsonIgnore
+    private SessionCredential lambdaParentSession;
+
+    public LambdaExecutionBinding getLambdaExecution() { return lambdaExecution; }
+    public void setLambdaExecution(LambdaExecutionBinding value) { lambdaExecution = value; }
+    public SessionCredential getLambdaParentSession() { return lambdaParentSession; }
+    public void setLambdaParentSession(SessionCredential value) { lambdaParentSession = value; }
+
     private String accessKeyId;
     private String secretAccessKey;
     private String sessionToken;
     private String roleArn;
     private String roleSessionName;
     private String assumedRoleId;
+    private String sourceIdentity;
     private Instant expiration;
     /**
      * When the credentials were issued, the request's {@code aws:TokenIssueTime}. Null for a
      * session stored before Floci recorded it.
      */
     private Instant issuedAt;
+    /** True only for credentials issued by GetSessionToken, never inferred from their key or token. */
+    private boolean sessionTokenCredential;
+    private Boolean multiFactorAuthPresent;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
+    private Map<String, List<String>> cognitoIdentityClaims = Map.of();
+    private List<String> managedSessionPolicyArns = List.of();
     /**
      * Account of the caller that minted this session, captured at mint time. Used to route
      * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller. A
@@ -37,6 +62,9 @@ public class SessionCredential {
     /** True when this session belongs to a Floci-launched Lambda container. */
     private boolean lambdaExecutionRole;
     private String ec2InstanceId;
+    /** Exact launching instance; only live IMDS issuance establishes this identity. */
+    @JsonIgnore
+    private String ec2InstanceArn;
     private String ec2RoleId;
     /**
      * Exact ARN of the workload this session was minted for and is served to at the container
@@ -99,6 +127,24 @@ public class SessionCredential {
      */
     private List<String> transitiveTagKeys = new ArrayList<>();
 
+    @JsonProperty(value = "transitiveSessionTags", access = JsonProperty.Access.WRITE_ONLY)
+    public void setTransitiveSessionTags(Map<String, String> tags) {
+        transitiveTagKeys = tags == null ? new ArrayList<>() : new ArrayList<>(tags.keySet());
+        if (tags != null) {
+            sessionTags.putAll(tags);
+        }
+    }
+
+    public Map<String, String> getTransitiveSessionTags() {
+        Map<String, String> tags = new LinkedHashMap<>();
+        sessionTags.forEach((key, value) -> {
+            if (transitiveTagKeys.stream().anyMatch(selected -> selected.equalsIgnoreCase(key))) {
+                tags.put(key, value);
+            }
+        });
+        return Collections.unmodifiableMap(tags);
+    }
+
     public SessionCredential() {}
 
     public SessionCredential(String accessKeyId, String roleArn, Instant expiration) {
@@ -145,6 +191,12 @@ public class SessionCredential {
         this.originAccountId = originAccountId;
     }
 
+    public boolean isAssumeRoleIssued() { return assumeRoleIssued; }
+    public void setAssumeRoleIssued(boolean value) { assumeRoleIssued = value; }
+
+    public boolean isManagedSessionPolicyPresent() { return managedSessionPolicyPresent; }
+    public void setManagedSessionPolicyPresent(boolean value) { managedSessionPolicyPresent = value; }
+
     public String getAccessKeyId() { return accessKeyId; }
     public void setAccessKeyId(String accessKeyId) { this.accessKeyId = accessKeyId; }
 
@@ -160,14 +212,42 @@ public class SessionCredential {
     public String getRoleSessionName() { return roleSessionName; }
     public void setRoleSessionName(String roleSessionName) { this.roleSessionName = roleSessionName; }
 
+    public String getSourceIdentity() { return sourceIdentity; }
+    public void setSourceIdentity(String value) { sourceIdentity = value; }
+
     public String getAssumedRoleId() { return assumedRoleId; }
     public void setAssumedRoleId(String assumedRoleId) { this.assumedRoleId = assumedRoleId; }
+
+    public Instant getIssuedAt() { return issuedAt; }
+    public void setIssuedAt(Instant issuedAt) { this.issuedAt = issuedAt; }
+
+    public boolean isSessionTokenCredential() { return sessionTokenCredential; }
+    public void setSessionTokenCredential(boolean value) { sessionTokenCredential = value; }
+
+    public Boolean getMultiFactorAuthPresent() {
+        return multiFactorAuthPresent;
+    }
+    public void setMultiFactorAuthPresent(Boolean multiFactorAuthPresent) {
+        this.multiFactorAuthPresent = multiFactorAuthPresent;
+        if (!Boolean.TRUE.equals(multiFactorAuthPresent)) {
+            mfaAuthenticatedAt = null;
+        }
+    }
+
+    public Instant getMultiFactorAuthenticatedAt() { return mfaAuthenticatedAt; }
+
+    @JsonProperty(value = "multiFactorAuthenticatedAt", access = JsonProperty.Access.WRITE_ONLY)
+    public void setMultiFactorAuthenticatedAt(Instant authenticatedAt) {
+        mfaAuthenticatedAt = authenticatedAt;
+    }
 
     public Instant getExpiration() { return expiration; }
     public void setExpiration(Instant expiration) { this.expiration = expiration; }
 
-    public Instant getIssuedAt() { return issuedAt; }
-    public void setIssuedAt(Instant issuedAt) { this.issuedAt = issuedAt; }
+    public List<String> getManagedSessionPolicyArns() { return managedSessionPolicyArns; }
+    public void setManagedSessionPolicyArns(List<String> arns) {
+        managedSessionPolicyArns = arns == null ? List.of() : List.copyOf(arns);
+    }
 
     public String getSessionPolicyDocument() { return sessionPolicyDocument; }
     public void setSessionPolicyDocument(String sessionPolicyDocument) { this.sessionPolicyDocument = sessionPolicyDocument; }
@@ -180,6 +260,8 @@ public class SessionCredential {
 
     public String getEc2InstanceId() { return ec2InstanceId; }
     public void setEc2InstanceId(String ec2InstanceId) { this.ec2InstanceId = ec2InstanceId; }
+    public String getEc2InstanceArn() { return ec2InstanceArn; }
+    public void setEc2InstanceArn(String ec2InstanceArn) { this.ec2InstanceArn = ec2InstanceArn; }
 
     public String getEcsTaskArn() { return ecsTaskArn; }
     public void setEcsTaskArn(String ecsTaskArn) { this.ecsTaskArn = ecsTaskArn; }
@@ -214,16 +296,18 @@ public class SessionCredential {
     }
     public void setDelegatedApproverArn(String arn) { this.delegatedApproverArn = arn; }
 
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public Instant getMfaAuthenticatedAt() {
-        return mfaAuthenticatedAt;
+        return Boolean.TRUE.equals(multiFactorAuthPresent) ? mfaAuthenticatedAt : null;
     }
 
     public void setMfaAuthenticatedAt(Instant mfaAuthenticatedAt) {
         this.mfaAuthenticatedAt = mfaAuthenticatedAt;
+        this.multiFactorAuthPresent = mfaAuthenticatedAt != null;
     }
 
     public Map<String, String> getSessionTags() {
-        return sessionTags;
+        return Collections.unmodifiableMap(sessionTags);
     }
 
     public void setSessionTags(Map<String, String> sessionTags) {
@@ -237,5 +321,17 @@ public class SessionCredential {
     public void setTransitiveTagKeys(List<String> transitiveTagKeys) {
         this.transitiveTagKeys = transitiveTagKeys == null
                 ? new ArrayList<>() : new ArrayList<>(transitiveTagKeys);
+    }
+
+    public Map<String, List<String>> getCognitoIdentityClaims() {
+        return cognitoIdentityClaims;
+    }
+
+    public void setCognitoIdentityClaims(Map<String, List<String>> claims) {
+        Map<String, List<String>> copy = new LinkedHashMap<>();
+        if (claims != null) {
+            claims.forEach((key, value) -> copy.put(key, List.copyOf(value)));
+        }
+        this.cognitoIdentityClaims = Map.copyOf(copy);
     }
 }

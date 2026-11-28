@@ -1,7 +1,9 @@
 package io.floci.aws.services.elbv2;
 
+import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.services.acm.CertificateGenerator;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
+import io.floci.aws.services.elbv2.model.TargetGroup;
 import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.RdsMockProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -65,6 +67,8 @@ import static org.junit.jupiter.api.Assertions.*;
 @TestProfile(RdsMockProfile.class)
 class ElbV2BackendTlsIntegrationTest {
 
+    private static final String ACCOUNT = "321321321323";
+
     private final String name = "alb-tls-" + UUID.randomUUID().toString().substring(0, 8);
     private final List<Executable> cleanup = new ArrayList<>();
     private final AtomicInteger healthStatus = new AtomicInteger(200);
@@ -92,9 +96,9 @@ class ElbV2BackendTlsIntegrationTest {
 
     @BeforeEach
     void createSdkNetwork() {
-        ec2 = AwsTestClients.create(Ec2Client.builder(), "test", Region.EU_WEST_1, endpoint);
+        ec2 = AwsTestClients.create(Ec2Client.builder(), ACCOUNT, Region.EU_WEST_1, endpoint);
         cleanup.add(ec2::close);
-        elb = AwsTestClients.create(ElasticLoadBalancingV2Client.builder(), "test", Region.EU_WEST_1, endpoint);
+        elb = AwsTestClients.create(ElasticLoadBalancingV2Client.builder(), ACCOUNT, Region.EU_WEST_1, endpoint);
         cleanup.add(elb::close);
         vpc = ec2.createVpc(r -> r.cidrBlock("10.83.0.0/16")).vpc().vpcId();
         cleanup.add(() -> ec2.deleteVpc(r -> r.vpcId(vpc)));
@@ -170,9 +174,11 @@ class ElbV2BackendTlsIntegrationTest {
         });
         try {
             createTarget("HTTP", health.actualPort(), tls ? "HTTPS" : "HTTP", health.actualPort(), "200");
-            await().atMost(Duration.ofSeconds(5)).until(() -> proxied.get() > 0
-                    || "healthy".equals(elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
-                            .targetHealthDescriptions().getFirst().targetHealth().stateAsString()));
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> proxied.get() > 0
+                            || "healthy".equals(elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
+                                    .targetHealthDescriptions().getFirst().targetHealth().stateAsString()));
             assertEquals(0, proxied.get(), "The JVM proxy must not receive target health probes");
             awaitHealth("healthy", null);
         } finally {
@@ -366,8 +372,10 @@ class ElbV2BackendTlsIntegrationTest {
             server.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         });
         cleanup.add(() -> {
-            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertTrue(closed.size() >= 2,
-                    "Both timed-out probe connections must be closed without fixture cleanup"));
+            await().atMost(Duration.ofSeconds(2))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> assertTrue(closed.size() >= 2,
+                            "Both timed-out probe connections must be closed without fixture cleanup"));
             assertTrue(closed.stream().allMatch(wait -> wait.compareTo(Duration.ofSeconds(4)) < 0),
                     "Peer connections exceeded the configured health deadline: " + closed);
         });
@@ -448,11 +456,13 @@ class ElbV2BackendTlsIntegrationTest {
         cleanup.add(() -> elb.deleteListener(r -> r.listenerArn(listener)));
         elb.registerTargets(r -> r.targetGroupArn(groupArn)
                 .targets(TargetDescription.builder().id("127.0.0.1").port(port).build()));
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress("127.0.0.1", listenerPort), 1000);
-            }
-        });
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = new Socket()) {
+                        socket.connect(new InetSocketAddress("127.0.0.1", listenerPort), 1000);
+                    }
+                });
     }
 
     private void awaitHealth(String state, String reason) {
@@ -464,15 +474,21 @@ class ElbV2BackendTlsIntegrationTest {
     }
 
     private void awaitHealth(String state, String reason, boolean triggerProbe) {
-        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
-            if (triggerProbe) {
-                healthChecker.probeAll(groupArn, elbService.getTargetGroup(Region.EU_WEST_1.id(), groupArn));
-            }
-            List<TargetHealthDescription> targets = elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
-                    .targetHealthDescriptions();
-            assertEquals(1, targets.size());
-            assertEquals(state, targets.getFirst().targetHealth().stateAsString());
-            assertEquals(reason, targets.getFirst().targetHealth().reasonAsString());
-        });
+        await().atMost(Duration.ofSeconds(20))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    if (triggerProbe) {
+                        RequestScopes.runAs(ACCOUNT, Region.EU_WEST_1.id(), () -> {
+                            TargetGroup group = elbService.getTargetGroup(Region.EU_WEST_1.id(), groupArn);
+                            assertNotNull(group);
+                            healthChecker.probeAll(groupArn, group);
+                        });
+                    }
+                    List<TargetHealthDescription> targets = elb.describeTargetHealth(r -> r.targetGroupArn(groupArn))
+                            .targetHealthDescriptions();
+                    assertEquals(1, targets.size());
+                    assertEquals(state, targets.getFirst().targetHealth().stateAsString());
+                    assertEquals(reason, targets.getFirst().targetHealth().reasonAsString());
+                });
     }
 }

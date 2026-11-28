@@ -25,6 +25,9 @@ public class SsmDocument {
     @JsonProperty("DocumentVersion")
     private long documentVersion;
 
+    @JsonProperty("DefaultVersion")
+    private Long defaultVersion;
+
     @JsonProperty("Status")
     private String status = "Active";
 
@@ -56,6 +59,7 @@ public class SsmDocument {
         this.content = content;
         this.documentType = documentType;
         this.documentVersion = 1;
+        this.defaultVersion = 1L;
         this.createdDate = Instant.now();
         if (content != null) {
             this.versions.put("1", content);
@@ -73,6 +77,10 @@ public class SsmDocument {
 
     public long getDocumentVersion() { return documentVersion; }
     public void setDocumentVersion(long documentVersion) { this.documentVersion = documentVersion; }
+
+    /** Older stored documents served their latest version as the default. */
+    public long getDefaultVersion() { return defaultVersion != null ? defaultVersion : documentVersion; }
+    public void setDefaultVersion(Long defaultVersion) { this.defaultVersion = defaultVersion; }
 
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
@@ -104,6 +112,14 @@ public class SsmDocument {
 
     public void setVersions(Map<String, String> versions) {
         this.versions = versions != null ? new LinkedHashMap<>(versions) : new LinkedHashMap<>();
+    }
+
+    public Map<String, String> getTags() {
+        return tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags);
+    }
+
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags);
     }
 
     /**
@@ -160,11 +176,7 @@ public class SsmDocument {
         return getVersions().get(version);
     }
 
-    public Map<String, String> getTags() {
-        return tags;
-    }
 
-    public void setTags(Map<String, String> tags) {
-        this.tags = tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags);
-    }
+
+
 }

@@ -97,11 +97,13 @@ public final class KeyedWorkQueue<K> implements AutoCloseable {
     }
 
     private void run(K key, Work work) {
+        boolean admitted = false;
         try {
             synchronized (this) {
                 if (closed) {
                     return;
                 }
+                admitted = true;
             }
             action.accept(key);
         } catch (RuntimeException failure) {
@@ -109,10 +111,17 @@ public final class KeyedWorkQueue<K> implements AutoCloseable {
                 failures++;
             }
             LOG.warnv(failure, "Background reconciliation failed for {0}; periodic repair can retry", key);
+        } catch (Error failure) {
+            synchronized (this) {
+                failures++;
+            }
+            throw failure;
         } finally {
             synchronized (this) {
                 active--;
-                completed++;
+                if (admitted) {
+                    completed++;
+                }
                 pending.remove(key);
                 if (!closed && work.dirty) {
                     // Reinsert at the tail so a hot key cannot starve other resources.

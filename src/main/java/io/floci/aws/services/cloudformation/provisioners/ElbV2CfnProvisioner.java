@@ -72,12 +72,23 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     private static final TypeReference<List<TargetDescription>> TARGET_LIST = new TypeReference<>() { };
     private static final TypeReference<List<String>> CERTIFICATE_LIST = new TypeReference<>() { };
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final List<String> UPDATE_SNAPSHOTS = List.of(
+            CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR,
+            CfnRollback.LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
+            CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
+            CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR,
+            CfnRollback.LISTENER_CERTIFICATES_UPDATE_SNAPSHOT_ATTR,
+            HEALTH_UPDATE_SNAPSHOT_ATTR);
 
     private final ElbV2Service elbV2Service;
+    private final ElbV2CfnLoadBalancerAttributes loadBalancerAttributes;
+    private final ElbV2CfnTargetGroupAttributes targetGroupAttributes;
 
     @Inject
     public ElbV2CfnProvisioner(ElbV2Service elbV2Service) {
         this.elbV2Service = elbV2Service;
+        this.loadBalancerAttributes = new ElbV2CfnLoadBalancerAttributes(elbV2Service);
+        this.targetGroupAttributes = new ElbV2CfnTargetGroupAttributes(elbV2Service);
     }
 
     @Override
@@ -87,10 +98,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
-        r.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
-        r.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
-        r.getAttributes().remove(HEALTH_UPDATE_SNAPSHOT_ATTR);
-        r.getAttributes().remove(CfnRollback.LISTENER_CERTIFICATES_UPDATE_SNAPSHOT_ATTR);
+        UPDATE_SNAPSHOTS.forEach(r.getAttributes()::remove);
         Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
         switch (r.getResourceType()) {
             case LOAD_BALANCER -> provisionLoadBalancer(r, props, ctx);
@@ -159,7 +167,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
         if ("UPDATE_COMPLETE".equals(resource.getStatus())) {
-            resource.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
+            UPDATE_SNAPSHOTS.forEach(resource.getAttributes()::remove);
         }
         clearTargetUpdateRecords(resource);
         return ReplacementCleanup.complete(resource,
@@ -168,7 +176,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void clearUpdate(StackResource resource) {
-        resource.getAttributes().remove(CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR);
+        UPDATE_SNAPSHOTS.forEach(resource.getAttributes()::remove);
         clearTargetUpdateRecords(resource);
         ReplacementCleanup.clear(resource);
     }
@@ -180,6 +188,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         DECLARED_TARGETS.clearPrior(resource);
     }
 
+    @Override
+    public boolean requiresUpdateRecovery(StackResource resource) {
+        return "UPDATE_FAILED".equals(resource.getStatus())
+                && UPDATE_SNAPSHOTS.stream().anyMatch(resource.getAttributes()::containsKey);
+    }
+
     /**
      * Keeps the snapshot of a target group or listener certificate update whose own undo did not
      * complete. The engine restores the previous resource and reports the rollback failure once; with
@@ -188,6 +202,14 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
      */
     @Override
     public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        for (String attribute : List.of(CfnRollback.LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
+                CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
+                CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR)) {
+            String snapshot = attempted.getAttributes().get(attribute);
+            if (snapshot != null) {
+                previous.getAttributes().put(attribute, snapshot);
+            }
+        }
         CfnRollback.carryFailedUndoSnapshot(previous, attempted,
                 CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR,
                 CfnRollback.LISTENER_CERTIFICATES_UPDATE_SNAPSHOT_ATTR, HEALTH_UPDATE_SNAPSHOT_ATTR);
@@ -215,6 +237,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             return true;
         }
         if (LOAD_BALANCER.equals(resource.getResourceType())) {
+            loadBalancerAttributes.restore(resource);
             return restorePriorSubnets(resource);
         }
         if (TARGET_GROUP.equals(resource.getResourceType())) {
@@ -230,18 +253,16 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     private void restorePriorTargetGroup(StackResource resource) {
         RuntimeException failure = null;
-        try {
-            restorePriorRegistrations(resource);
-        } catch (RuntimeException e) {
-            failure = e;
-        }
-        try {
-            restorePriorHealth(resource);
-        } catch (RuntimeException e) {
-            if (failure == null) {
-                failure = e;
-            } else if (failure != e) {
-                failure.addSuppressed(e);
+        for (Runnable restore : List.<Runnable>of(() -> targetGroupAttributes.restore(resource),
+                () -> restorePriorRegistrations(resource), () -> restorePriorHealth(resource))) {
+            try {
+                restore.run();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else if (failure != e) {
+                    failure.addSuppressed(e);
+                }
             }
         }
         if (failure != null) {
@@ -319,6 +340,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
      * creates the replacement and hands the displaced balancer to the replacement cleanup.
      */
     private void provisionLoadBalancer(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> declaredAttributes = ElbV2CfnLoadBalancerAttributes.declared(props, ctx);
         String name = nameOrPrior(ctx.resolveOptional(props, "Name"), r.getAttributes().get("LoadBalancerName"),
                 ctx, r.getLogicalId());
         String scheme = ctx.resolveOptional(props, "Scheme");
@@ -330,10 +352,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
         LoadBalancer lb;
         List<String> onSubnets;
+        boolean created;
         try {
             lb = elbV2Service.createLoadBalancer(ctx.region(), name, scheme, type, ipAddressType,
                     subnets, securityGroups, tags);
             onSubnets = subnetIds(lb);
+            created = !ctx.reusesPriorEntity(lb.getLoadBalancerArn());
         } catch (AwsException e) {
             if (!"DuplicateLoadBalancerName".equals(e.getErrorCode())) {
                 throw e;
@@ -342,6 +366,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             onSubnets = ctx.reusesPriorEntity(lb.getLoadBalancerArn())
                     ? moveToTemplateSubnets(r, lb, subnets, ctx)
                     : subnetIds(lb);
+            created = false;
         }
 
         r.setPhysicalId(lb.getLoadBalancerArn());
@@ -351,6 +376,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("LoadBalancerName", lb.getLoadBalancerName());
         r.getAttributes().put("LoadBalancerFullName", loadBalancerFullName(lb.getLoadBalancerArn()));
         recordUsedSubnets(r, onSubnets);
+        loadBalancerAttributes.apply(r, declaredAttributes, ctx, created, () -> restorePriorSubnets(r));
     }
 
     private static List<String> subnetIds(LoadBalancer lb) {
@@ -427,6 +453,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
      */
     private void provisionTargetGroup(StackResource r, JsonNode props, ProvisionContext ctx,
                                       Map<String, String> attributesBefore) {
+        Map<String, String> declaredAttributes = ElbV2CfnTargetGroupAttributes.declared(props, ctx);
         String name = nameOrPrior(ctx.resolveOptional(props, "Name"), r.getAttributes().get("TargetGroupName"),
                 ctx, r.getLogicalId());
         String protocol = ctx.resolveOptional(props, "Protocol");
@@ -451,11 +478,12 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         String declaredRecord = MAPPER.valueToTree(targets).toString();
 
         TargetGroup tg;
-        boolean created = true;
+        boolean created;
         try {
             tg = elbV2Service.createTargetGroup(ctx.region(), name, protocol, protocolVersion, port, vpcId, targetType,
                     hcProtocol, hcPort, hcEnabled, hcPath, hcInterval, hcTimeout,
                     healthyThreshold, unhealthyThreshold, matcher, ipAddressType, tags);
+            created = true;
         } catch (AwsException e) {
             if (!"DuplicateTargetGroupName".equals(e.getErrorCode())) {
                 throw e;
@@ -472,6 +500,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         // forwards to the group, as on AWS.
         r.getAttributes().put("LoadBalancerArns", String.join(",", tg.getLoadBalancerArns()));
         TargetGroup group = tg;
+        boolean createdGroup = created;
         CfnRollback.guarded(r, ctx, created,
                 () -> elbV2Service.deleteTargetGroup(ctx.region(), group.getTargetGroupArn()),
                 () -> restorePriorTargetGroup(r),
@@ -485,6 +514,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
                                 hcProtocol, hcPort, hcEnabled, hcPath, hcInterval, hcTimeout,
                                 healthyThreshold, unhealthyThreshold, matcher);
                     }
+                    targetGroupAttributes.apply(r, declaredAttributes, ctx, createdGroup);
                     reconcileTargets(r, group, targets, ctx);
                 });
         DECLARED_TARGETS.record(r, ctx, attributesBefore, declaredRecord);

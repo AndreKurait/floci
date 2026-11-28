@@ -45,6 +45,23 @@ class RequestResourceMembersTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
+    void lowercaseNamesLeaveExplicitArnsAndOtherVariablesUnchanged() throws Exception {
+        ObjectNode document = (ObjectNode) MAPPER.readTree("""
+                {"namespaces":{"example":["example"]},"arnFormats":{"example":{
+                  "item":"arn:${Partition}:example:${Region}:${Account}:item/${Name}/${Id}"}},
+                  "lowercaseVariables":{"example":{"item":["Name"]}},
+                  "operations":{"example:Read":{"resources":[]}}}
+                """);
+        ArnFormat format = parse(document.toString()).formats().get("example").get("item");
+        String arn = "arn:aws-cn:example:future-1:000000000001:item/NAME/ID";
+        assertEquals(arn, format.checked(arn));
+        assertEquals(arn.replace("/NAME/", "/name/"), format.named(arn));
+        document.set("lowercaseVariables", MAPPER.readTree("{\"example\":{\"item\":[\"Account\"]}}"));
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> parse(document.toString()));
+        assertTrue(failure.getMessage().contains("lowercaseVariables"));
+    }
+
+    @Test
     void modeledIntegerArnVariablesNormalizeOnlyTheirOwnValues() throws Exception {
         ObjectNode document = (ObjectNode) MAPPER.readTree("""
                 {
@@ -602,7 +619,8 @@ class RequestResourceMembersTest {
                     });
                     List<String> named = operation.getValue().stream()
                             .filter(other -> (other == resource || named(other) && !other.signer()
-                                    || signedFor(other, given) || sharesAMember(other, given)
+                                    || signedFor(other, given)
+                                    || sharesAMember(other, given, table.formats().get(namespace))
                                     || fillsFromTheArn(other, resource, type)
                                     || !other.find().isEmpty() && other.find().equals(resource.find())
                                     && other.when().equals(resource.when()) && other.unless().equals(resource.unless()))
@@ -827,7 +845,17 @@ class RequestResourceMembersTest {
      * values fail leaves it out (each member given is {@code x}, any other absent, which a value list holds as
      * {@code ""}).
      */
-    private static boolean sharesAMember(Resource resource, Map<Member, String> given) {
+    private static boolean sharesAMember(Resource resource, Map<Member, String> given, Map<String, ArnFormat> formats) {
+        // A complete ARN supplied as a name-or-ARN selector names that exact resource, not another with its
+        // remaining variables open. The ARN selector already contributes it to the expected set.
+        if (resource.fill().size() == 1) {
+            Member member = resource.fill().values().iterator().next();
+            String value = given.get(member);
+            if (value != null && !resource.arnOf().containsKey(member.path())
+                    && formats.get(resource.types().getFirst()).pattern().matcher(value).matches()) {
+                return false;
+            }
+        }
         // A resource its service finds by several members is found only from a request giving every one of them.
         if (!resource.find().isEmpty() && !given.keySet().containsAll(resource.find())) {
             return false;

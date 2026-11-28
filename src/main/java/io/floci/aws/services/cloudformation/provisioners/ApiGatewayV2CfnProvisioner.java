@@ -59,6 +59,8 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String BODY_INTEGRATION_IDS_ATTR = "__FlociApiGatewayV2BodyIntegrationIds";
     private static final String BODY_AUTHORIZER_IDS_ATTR = "__FlociApiGatewayV2BodyAuthorizerIds";
 
+    private static final String API_REPLACEMENT_BODY_IDS_ATTR = "__FlociApiGatewayV2ReplacementBodyIds";
+
     private final ApiGatewayV2Service apiGatewayV2Service;
     private final S3Service s3Service;
     private final ObjectMapper objectMapper;
@@ -72,12 +74,32 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     }
 
     @Override
+    public boolean requiresOwnershipRecovery(StackResource resource) {
+        return resource.getPhysicalId() != null && !"DELETE_COMPLETE".equals(resource.getStatus())
+                && Set.of(AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT).contains(resource.getResourceType())
+                && (resource.getAttributes().get("ApiId") == null
+                    || resource.getAttributes().get("ApiId").isBlank());
+    }
+
+    @Override
+    public void recoverOwnership(StackResource resource, JsonNode properties, ProvisionContext context) {
+        JsonNode resolved = context.engine().resolveNodeStrict(properties.path("ApiId"));
+        if (resolved == null || !resolved.isTextual() || resolved.asText().isBlank()
+                || resolved.asText().contains("{{resolve:")) {
+            throw new AwsException("ValidationError", "Cannot recover ApiId for " + resource.getLogicalId()
+                    + " from its previous stack template", 400);
+        }
+        resource.getAttributes().put("ApiId", resolved.asText());
+    }
+
+    @Override
     public Set<String> resourceTypes() {
         return Set.of(API, AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT, VPC_LINK);
     }
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
         switch (r.getResourceType()) {
             case API -> provisionApi(r, props, ctx);
             case AUTHORIZER -> provisionAuthorizer(r, props, ctx);
@@ -88,34 +110,108 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             case VPC_LINK -> provisionVpcLink(r, props, ctx);
             default -> throw new IllegalStateException("Unhandled type: " + r.getResourceType());
         }
+        if (isChild(r)) {
+            StackResource cleanup = childCleanupResource(r);
+            String priorApi = attributesBefore.getOrDefault("ApiId", r.getAttributes().get("ApiId"));
+            String prior = ctx.isUpdate() ? priorApi + "/" + ctx.priorPhysicalId() : null;
+            ProvisionContext cleanupContext = new ProvisionContext(ctx.engine(), ctx.region(), ctx.accountId(),
+                    ctx.stackName(), prior, ctx.progress(), ctx.priorProperties());
+            ReplacementCleanup.record(cleanup, cleanupContext, attributesBefore);
+        }
+    }
+
+    private static boolean isChild(StackResource resource) {
+        return switch (resource.getResourceType()) {
+            case AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT -> true;
+            default -> false;
+        };
+    }
+
+    private static boolean replacingChild(StackResource resource, String apiId, ProvisionContext ctx) {
+        String priorApi = resource.getAttributes().get("ApiId");
+        return ctx.isUpdate() && priorApi != null && !priorApi.equals(apiId);
+    }
+
+    // Cleanup identities include the owning API; Ref and resource events retain the AWS child id.
+    private static StackResource childCleanupResource(StackResource resource) {
+        if (!isChild(resource)) {
+            return resource;
+        }
+        StackResource cleanup = new StackResource();
+        cleanup.setResourceType(resource.getResourceType());
+        cleanup.setPhysicalId(resource.getAttributes().get("ApiId") + "/" + resource.getPhysicalId());
+        cleanup.setAttributes(resource.getAttributes());
+        cleanup.setUpdateReplacePolicy(resource.getUpdateReplacePolicy());
+        return cleanup;
+    }
+
+    private static String childPhysicalId(String identity) {
+        return identity == null ? null : identity.substring(identity.indexOf('/') + 1);
+    }
+
+    private void deleteReplacement(String type, String identity, String region) {
+        int separator = identity == null ? -1 : identity.indexOf('/');
+        if (VPC_LINK.equals(type) || API.equals(type)) {
+            delete(type, identity, region);
+            return;
+        }
+        if (separator <= 0 || separator == identity.length() - 1) {
+            throw new AwsException("ValidationError", "Cannot delete replacement without its owning API", 400);
+        }
+        StackResource child = new StackResource();
+        child.setResourceType(type);
+        child.setPhysicalId(childPhysicalId(identity));
+        child.getAttributes().put("ApiId", identity.substring(0, separator));
+        deleteChild(child, region);
     }
 
     @Override
     public void delete(StackResource resource, String region) {
         switch (resource.getResourceType()) {
-            case API -> deleteApi(region, resource.getPhysicalId());
-            case AUTHORIZER -> {
-                // Deleting an authorizer needs the api id (a create-time attribute) as well as the
-                // authorizer id (the physical id), which the id-only delete path cannot supply.
-                String apiId = resource.getAttributes().get("ApiId");
-                if (apiId != null && !apiId.isBlank()) {
-                    try {
-                        apiGatewayV2Service.deleteAuthorizer(region, apiId, resource.getPhysicalId());
-                    } catch (RuntimeException e) {
-                        LOG.debugv("Error deleting authorizer {0}: {1}",
-                                resource.getPhysicalId(), e.getMessage());
-                    }
+            case API -> {
+                for (String identity : ReplacementCleanup.owedPhysicalIds(resource)) {
+                    delete(API, identity, region);
                 }
+                delete(API, resource.getPhysicalId(), region);
+            }
+            case AUTHORIZER, ROUTE, INTEGRATION, STAGE, DEPLOYMENT -> {
+                for (String identity : ReplacementCleanup.owedPhysicalIds(resource)) {
+                    deleteReplacement(resource.getResourceType(), identity, region);
+                }
+                deleteChild(resource, region);
             }
             case VPC_LINK -> delete(VPC_LINK, resource.getPhysicalId(), region);
             default -> {
-                // Route, Integration, Stage and Deployment are removed when their Api is deleted.
+                // Unhandled types are rejected by provision().
             }
         }
     }
 
+    private void deleteChild(StackResource resource, String region) {
+        String apiId = resource.getAttributes().get("ApiId");
+        if (apiId == null || apiId.isBlank()) {
+            throw new AwsException("ValidationError", "Cannot delete " + resource.getResourceType()
+                    + " without its recorded ApiId", 400);
+        }
+        String id = resource.getPhysicalId();
+        CfnDeletes.safeDelete(resource.getResourceType(), id, () -> {
+            switch (resource.getResourceType()) {
+                case AUTHORIZER -> apiGatewayV2Service.deleteAuthorizer(region, apiId, id);
+                case ROUTE -> apiGatewayV2Service.deleteRoute(region, apiId, id);
+                case INTEGRATION -> apiGatewayV2Service.deleteIntegration(region, apiId, id);
+                case STAGE -> apiGatewayV2Service.deleteStage(region, apiId, id);
+                case DEPLOYMENT -> apiGatewayV2Service.deleteDeployment(region, apiId, id);
+                default -> throw new IllegalStateException("Unhandled child: " + resource.getResourceType());
+            }
+        }, "NotFoundException");
+    }
+
+
     @Override
     public void delete(String resourceType, String physicalId, String region) {
+        if (API.equals(resourceType) && physicalId != null && !physicalId.isBlank()) {
+            deleteApi(region, physicalId);
+        }
         if (VPC_LINK.equals(resourceType) && physicalId != null && !physicalId.isBlank()) {
             CfnDeletes.safeDelete("API Gateway V2 VPC link", physicalId,
                     () -> apiGatewayV2Service.deleteVpcLink(region, physicalId), "NotFoundException");
@@ -138,16 +234,28 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public String updateCleanupPhysicalId(StackResource resource) {
-        return ReplacementCleanup.cleanupPhysicalId(resource);
+        String identity = ReplacementCleanup.cleanupPhysicalId(childCleanupResource(resource));
+        return isChild(resource) ? childPhysicalId(identity) : identity;
     }
 
     @Override
     public UpdateCleanupResult completeUpdate(StackResource resource) {
-        return ReplacementCleanup.complete(resource, this::delete);
+        UpdateCleanupResult result = ReplacementCleanup.complete(childCleanupResource(resource), this::deleteReplacement);
+        if (isChild(resource)) {
+            result = new UpdateCleanupResult(result.applicable(), result.complete(),
+                    childPhysicalId(result.previousPhysicalId()), result.attempts(), result.failureReason());
+        }
+        if (!result.applicable()
+                && resource.getAttributes().containsKey(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR)) {
+            return new UpdateCleanupResult(true, true, null, 0, null);
+        }
+        return result;
     }
 
     @Override
     public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(API_REPLACEMENT_BODY_IDS_ATTR);
+        resource.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.VPC_LINK_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
         ReplacementCleanup.clear(resource);
@@ -155,11 +263,22 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public boolean rollbackUpdate(StackResource resource) {
-        if (ReplacementCleanup.rollback(resource, this::delete)) {
-            return true;
+        StackResource cleanup = childCleanupResource(resource);
+        try {
+            if (ReplacementCleanup.rollback(cleanup, this::deleteReplacement)) {
+                return true;
+            }
+        } finally {
+            restoreReplacementBodyIds(resource);
+            if (isChild(resource)) {
+                resource.setPhysicalId(childPhysicalId(cleanup.getPhysicalId()));
+            }
         }
         if (VPC_LINK.equals(resource.getResourceType())) {
             return rollbackVpcLinkUpdate(resource);
+        }
+        if (AUTHORIZER.equals(resource.getResourceType())) {
+            return rollbackAuthorizerUpdate(resource);
         }
         if (INTEGRATION.equals(resource.getResourceType())) {
             return rollbackIntegrationConnection(resource);
@@ -169,6 +288,14 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        if (AUTHORIZER.equals(previous.getResourceType())) {
+            String authorizerSnapshot = attempted.getAttributes().get(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
+            if (authorizerSnapshot != null) {
+                previous.getAttributes().put(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR, authorizerSnapshot);
+            }
+            return;
+        }
+
         // Only the Api carries body-generated sub-resource ids; keep any the failed attempt created
         // so the restored resource still owns them for the next cleanup or stack delete.
         if (!API.equals(previous.getResourceType())) {
@@ -209,6 +336,11 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         // Read before anything changes, so a document that cannot be read leaves the API as it was.
         JsonNode body = OpenApiDocuments.resolve(props, engine, s3Service, objectMapper);
 
+        if (ctx.isUpdate() && !req.get("protocolType").equals(
+                apiGatewayV2Service.getApi(region, ctx.priorPhysicalId()).getProtocolType())) {
+            replaceApi(r, body, ctx, req);
+            return;
+        }
         boolean created = !ctx.isUpdate();
         Api api;
         if (created) {
@@ -216,13 +348,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         } else {
             api = apiGatewayV2Service.updateApi(region, ctx.priorPhysicalId(), req);
         }
-        r.setPhysicalId(api.getApiId());
-        r.getAttributes().put("ApiId", api.getApiId());
-        r.getAttributes().put("ApiEndpoint", api.getApiEndpoint());
-        // The ARN prefix a Lambda permission's SourceArn is built from; AWS returns
-        // arn:<partition>:execute-api:<region>:<account>:<apiId> for this attribute.
-        r.getAttributes().put("ExecuteApiArn",
-                AwsArnUtils.Arn.of("execute-api", region, ctx.accountId(), api.getApiId()).toString());
+        setApiAttributes(r, api, ctx);
         // A Body that cannot be materialized fails the provision after the API exists. Its own
         // rollback has already removed what it generated, or kept the ids of what it could not, and
         // on a kept API put back the routes, integrations and authorizers it replaced; what
@@ -232,6 +358,69 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                 () -> deleteApi(region, api.getApiId()),
                 () -> { },
                 () -> reconcileBodyRoutes(r, region, api.getApiId(), body));
+    }
+
+    private void replaceApi(StackResource resource, JsonNode body, ProvisionContext ctx,
+                            Map<String, Object> request) {
+        Map<String, String> previous = new HashMap<>(resource.getAttributes());
+        Api replacement = apiGatewayV2Service.createApi(ctx.region(), request);
+        setApiAttributes(resource, replacement, ctx);
+        ReplacementCleanup.record(resource, ctx, previous);
+        ObjectNode bodyIds = objectMapper.createObjectNode();
+        bodyIds.put("apiId", ctx.priorPhysicalId());
+        for (String key : List.of(BODY_ROUTE_IDS_ATTR, BODY_INTEGRATION_IDS_ATTR, BODY_AUTHORIZER_IDS_ATTR)) {
+            if (previous.containsKey(key)) {
+                bodyIds.put(key, previous.get(key));
+            }
+            resource.getAttributes().remove(key);
+        }
+        resource.getAttributes().put(API_REPLACEMENT_BODY_IDS_ATTR, bodyIds.toString());
+        try {
+            reconcileBodyRoutes(resource, ctx.region(), replacement.getApiId(), body);
+        } catch (RuntimeException failure) {
+            try {
+                rollbackUpdate(resource);
+            } catch (RuntimeException cleanupFailure) {
+                if (cleanupFailure != failure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                resource.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR,
+                        "Could not delete replacement API " + replacement.getApiId());
+            }
+            throw failure;
+        }
+    }
+
+    private void restoreReplacementBodyIds(StackResource resource) {
+        String raw = resource.getAttributes().get(API_REPLACEMENT_BODY_IDS_ATTR);
+        if (raw == null) {
+            return;
+        }
+        try {
+            JsonNode previous = objectMapper.readTree(raw);
+            if (!previous.path("apiId").asText().equals(resource.getPhysicalId())) {
+                return;
+            }
+            for (String key : List.of(BODY_ROUTE_IDS_ATTR, BODY_INTEGRATION_IDS_ATTR, BODY_AUTHORIZER_IDS_ATTR)) {
+                resource.getAttributes().remove(key);
+                if (previous.has(key)) {
+                    resource.getAttributes().put(key, previous.path(key).asText());
+                }
+            }
+            resource.getAttributes().remove(API_REPLACEMENT_BODY_IDS_ATTR);
+        } catch (JsonProcessingException failure) {
+            throw new IllegalStateException("Could not read replacement API body ownership", failure);
+        }
+    }
+
+    private void setApiAttributes(StackResource r, Api api, ProvisionContext ctx) {
+        r.setPhysicalId(api.getApiId());
+        r.getAttributes().put("ApiId", api.getApiId());
+        r.getAttributes().put("ApiEndpoint", api.getApiEndpoint());
+        // The ARN prefix a Lambda permission's SourceArn is built from; AWS returns
+        // arn:<partition>:execute-api:<region>:<account>:<apiId> for this attribute.
+        r.getAttributes().put("ExecuteApiArn",
+                AwsArnUtils.Arn.of("execute-api", ctx.region(), ctx.accountId(), api.getApiId()).toString());
     }
 
     /**
@@ -831,6 +1020,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         req.put("authorizerType", ctx.resolveOptional(props, "AuthorizerType"));
         req.put("identitySource", resolveIdentitySource(props, "IdentitySource", engine));
         req.put("authorizerUri", ctx.resolveOptional(props, "AuthorizerUri"));
+        req.put("authorizerCredentialsArn", ctx.resolveOptional(props, "AuthorizerCredentialsArn"));
         req.put("authorizerPayloadFormatVersion", ctx.resolveOptional(props, "AuthorizerPayloadFormatVersion"));
 
         String ttl = ctx.resolveOptional(props, "AuthorizerResultTtlInSeconds");
@@ -855,32 +1045,72 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             req.put("jwtConfiguration", jwtConfig);
         }
 
+        r.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
         Authorizer authorizer;
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)) {
             authorizer = apiGatewayV2Service.createAuthorizer(region, apiId, req);
         } else {
-            authorizer = apiGatewayV2Service.updateAuthorizer(region, apiId, r.getPhysicalId(), req);
-            Set<String> dropped = ctx.droppedProperties(props);
-            if (dropped.contains("AuthorizerUri") || dropped.contains("AuthorizerPayloadFormatVersion")
-                    || dropped.contains("JwtConfiguration") || dropped.contains("AuthorizerResultTtlInSeconds")
-                    || dropped.contains("EnableSimpleResponses")) {
-                // UpdateAuthorizer keeps a field it is not given, so a dropped one is cleared here and
-                // the others keep what the update left, a value set outside the stack included.
-                authorizer = apiGatewayV2Service.replaceAuthorizerSettings(region, apiId, r.getPhysicalId(),
-                        dropped.contains("AuthorizerUri") ? null : authorizer.getAuthorizerUri(),
-                        dropped.contains("AuthorizerPayloadFormatVersion")
-                                ? null : authorizer.getAuthorizerPayloadFormatVersion(),
-                        dropped.contains("JwtConfiguration") ? null : authorizer.getJwtConfiguration(),
-                        dropped.contains("AuthorizerResultTtlInSeconds")
-                                ? null : authorizer.getAuthorizerResultTtlInSeconds(),
-                        dropped.contains("EnableSimpleResponses")
-                                ? null : authorizer.getEnableSimpleResponses());
+            Authorizer prior = apiGatewayV2Service.getAuthorizer(region, apiId, ctx.priorPhysicalId());
+            ObjectNode snapshot = objectMapper.createObjectNode();
+            snapshot.put("region", region);
+            snapshot.put("apiId", apiId);
+            snapshot.set("authorizer", objectMapper.valueToTree(prior));
+            r.getAttributes().put(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
+            try {
+                authorizer = apiGatewayV2Service.updateAuthorizer(region, apiId, ctx.priorPhysicalId(), req);
+                Set<String> dropped = ctx.droppedProperties(props);
+                if (dropped.contains("AuthorizerUri") || dropped.contains("AuthorizerPayloadFormatVersion")
+                        || dropped.contains("JwtConfiguration") || dropped.contains("AuthorizerResultTtlInSeconds")
+                        || dropped.contains("EnableSimpleResponses")) {
+                    // UpdateAuthorizer keeps a field it is not given, so a dropped one is cleared here and
+                    // the others keep what the update left, a value set outside the stack included.
+                    authorizer = apiGatewayV2Service.replaceAuthorizerSettings(region, apiId, r.getPhysicalId(),
+                            dropped.contains("AuthorizerUri") ? null : authorizer.getAuthorizerUri(),
+                            dropped.contains("AuthorizerPayloadFormatVersion")
+                                    ? null : authorizer.getAuthorizerPayloadFormatVersion(),
+                            dropped.contains("JwtConfiguration") ? null : authorizer.getJwtConfiguration(),
+                            dropped.contains("AuthorizerResultTtlInSeconds")
+                                    ? null : authorizer.getAuthorizerResultTtlInSeconds(),
+                            dropped.contains("EnableSimpleResponses")
+                                    ? null : authorizer.getEnableSimpleResponses());
+                }
+                if (req.get("authorizerCredentialsArn") == null) {
+                    apiGatewayV2Service.replaceAuthorizerCredentials(region, apiId, ctx.priorPhysicalId(), null);
+                }
+            } catch (RuntimeException failure) {
+                try {
+                    rollbackAuthorizerUpdate(r);
+                } catch (RuntimeException restoreFailure) {
+                    r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR,
+                            "Could not restore authorizer " + ctx.priorPhysicalId() + ": "
+                                    + restoreFailure.getMessage());
+                    if (restoreFailure != failure) {
+                        failure.addSuppressed(restoreFailure);
+                    }
+                }
+                throw failure;
             }
         }
         r.setPhysicalId(authorizer.getAuthorizerId());
         r.getAttributes().put("AuthorizerId", authorizer.getAuthorizerId());
         // ApiId is needed by delete() to scope deleteAuthorizer; the id-only delete path has none.
         r.getAttributes().put("ApiId", apiId);
+    }
+
+    private boolean rollbackAuthorizerUpdate(StackResource resource) {
+        String raw = resource.getAttributes().get(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
+        if (raw == null) {
+            return false;
+        }
+        try {
+            JsonNode snapshot = objectMapper.readTree(raw);
+            apiGatewayV2Service.restoreAuthorizer(snapshot.path("region").asText(), snapshot.path("apiId").asText(),
+                    objectMapper.treeToValue(snapshot.path("authorizer"), Authorizer.class));
+        } catch (JsonProcessingException failure) {
+            throw new IllegalStateException("Could not read authorizer update snapshot", failure);
+        }
+        resource.getAttributes().remove(CfnRollback.API_AUTHORIZER_UPDATE_SNAPSHOT_ATTR);
+        return true;
     }
 
     // ── Route ────────────────────────────────────────────────────────────────
@@ -898,7 +1128,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         req.put("target", ctx.resolveOptional(props, "Target"));
 
         Route route;
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)) {
             route = apiGatewayV2Service.createRoute(region, apiId, req);
         } else {
             route = apiGatewayV2Service.updateRoute(region, apiId, r.getPhysicalId(), req);
@@ -917,6 +1147,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         }
         r.setPhysicalId(route.getRouteId());
         r.getAttributes().put("RouteId", route.getRouteId());
+        r.getAttributes().put("ApiId", apiId);
     }
 
     // ── Integration ──────────────────────────────────────────────────────────
@@ -929,6 +1160,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         req.put("integrationType", ctx.resolveOptional(props, "IntegrationType"));
         req.put("integrationSubtype", integrationSubtype);
         req.put("integrationUri", ctx.resolveOptional(props, "IntegrationUri"));
+        req.put("credentialsArn", ctx.resolveOptional(props, "CredentialsArn"));
         req.put("payloadFormatVersion", ctx.resolveOrDefault(props, "PayloadFormatVersion",
                 ApiGatewayV2Service.defaultPayloadFormatVersion(integrationSubtype)));
         String connectionType = ctx.resolveOptional(props, "ConnectionType");
@@ -964,14 +1196,13 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().remove(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
 
         Integration integration;
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)) {
             integration = apiGatewayV2Service.createIntegration(region, apiId, req);
         } else {
             Integration prior = apiGatewayV2Service.getIntegration(region, apiId, r.getPhysicalId());
             r.getAttributes().put(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR,
                     integrationConnectionSnapshot(region, apiId, prior, req));
-            // The connection changes first, in one call. If the update after it fails, the connection
-            // is the only change to undo.
+            // Change the connection first; restore the tracked connection and credentials if a later call fails.
             try {
                 // A connection removed from the template is removed here too. INTERNET is the AWS default.
                 apiGatewayV2Service.replaceIntegrationConnection(region, apiId, r.getPhysicalId(),
@@ -986,6 +1217,9 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                     apiGatewayV2Service.replaceIntegrationSubtype(region, apiId, r.getPhysicalId(), null);
                 }
                 integration = apiGatewayV2Service.updateIntegration(region, apiId, r.getPhysicalId(), req);
+                if (req.get("credentialsArn") == null) {
+                    apiGatewayV2Service.replaceIntegrationCredentials(region, apiId, r.getPhysicalId(), null);
+                }
             } catch (RuntimeException failure) {
                 // The stack skips rollbackUpdate for a resource whose own update failed, so undo it here.
                 try {
@@ -1003,6 +1237,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         }
         r.setPhysicalId(integration.getIntegrationId());
         r.getAttributes().put("IntegrationId", integration.getIntegrationId());
+        r.getAttributes().put("ApiId", apiId);
     }
 
     /**
@@ -1027,6 +1262,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         snapshot.set("responseParameters", objectMapper.valueToTree(prior.getResponseParameters()));
         snapshot.set("requestTemplates", objectMapper.valueToTree(prior.getRequestTemplates()));
         snapshot.put("integrationSubtype", prior.getIntegrationSubtype());
+        snapshot.put("credentialsArn", prior.getCredentialsArn());
         snapshot.put("otherFieldChanged", otherFieldChanged);
         return snapshot.toString();
     }
@@ -1036,9 +1272,9 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Puts the connection and the settings back from the snapshot taken before the update. Answers
-     * true only when the update changed nothing else: this provisioner keeps no copy of the other
-     * fields, so the stack must still report that their rollback is not implemented.
+     * Puts the connection, settings and credentials back from the snapshot taken before the update.
+     * Answers true only when the update changed nothing else: this provisioner keeps no copy of the
+     * other fields, so the stack must still report that their rollback is not implemented.
      */
     private boolean rollbackIntegrationConnection(StackResource resource) {
         String raw = resource.getAttributes().get(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
@@ -1066,6 +1302,11 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             apiGatewayV2Service.replaceIntegrationSubtype(snapshot.path("region").asText(),
                     snapshot.path("apiId").asText(), resource.getPhysicalId(),
                     textOrNull(snapshot, "integrationSubtype"));
+        }
+        if (snapshot.has("credentialsArn")) {
+            apiGatewayV2Service.replaceIntegrationCredentials(snapshot.path("region").asText(),
+                    snapshot.path("apiId").asText(), resource.getPhysicalId(),
+                    textOrNull(snapshot, "credentialsArn"));
         }
         // Spent only once the restore succeeded, so a restore that throws can be tried again.
         resource.getAttributes().remove(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
@@ -1108,12 +1349,14 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             req.put("stageVariables", stageVariables);
         }
 
-        if (r.getPhysicalId() == null) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)
+                || stageName != null && !stageName.equals(ctx.priorPhysicalId())) {
             apiGatewayV2Service.createStage(region, apiId, req);
             r.setPhysicalId(stageName);
         } else {
             apiGatewayV2Service.updateStage(region, apiId, r.getPhysicalId(), req);
         }
+        r.getAttributes().put("ApiId", apiId);
     }
 
     // ── Deployment ───────────────────────────────────────────────────────────
@@ -1121,16 +1364,17 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     private void provisionDeployment(StackResource r, JsonNode props, ProvisionContext ctx) {
         // Deployments are immutable point-in-time snapshots; on redeploy keep the existing one
         // rather than minting a duplicate (idempotent re-deploy).
-        if (r.getPhysicalId() != null) {
+        String apiId = ctx.resolveOptional(props, "ApiId");
+        if (ctx.isUpdate() && !replacingChild(r, apiId, ctx)) {
             return;
         }
-        String apiId = ctx.resolveOptional(props, "ApiId");
         Map<String, Object> req = new HashMap<>();
         req.put("description", ctx.resolveOptional(props, "Description"));
 
         Deployment deployment = apiGatewayV2Service.createDeployment(ctx.region(), apiId, req);
         r.setPhysicalId(deployment.getDeploymentId());
         r.getAttributes().put("DeploymentId", deployment.getDeploymentId());
+        r.getAttributes().put("ApiId", apiId);
     }
 
     // ── VpcLink ──────────────────────────────────────────────────────────────

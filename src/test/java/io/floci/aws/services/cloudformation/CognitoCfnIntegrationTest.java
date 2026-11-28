@@ -9,6 +9,8 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.floci.aws.services.cognito.CognitoRestAssuredUtils.cognitoAction;
 import static io.floci.aws.services.cognito.CognitoRestAssuredUtils.cognitoJson;
 import static io.floci.aws.testing.RestAssuredJsonUtils.awsAction;
@@ -23,7 +25,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Provisions an {@code AWS::Cognito::UserPoolDomain} through a CloudFormation stack, laid out the
@@ -673,20 +674,14 @@ class CognitoCfnIntegrationTest {
     }
 
     private static void awaitStackStatus(String stack, String expectedStatus) throws InterruptedException {
-        String body = null;
-        for (int i = 0; i < 100; i++) {
-            body = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stack)
-            .when().post("/").then().extract().asString();
-            if (body.contains("<StackStatus>" + expectedStatus + "</StackStatus>")) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        fail("stack " + stack + " did not reach " + expectedStatus + " within the timeout: " + body);
+            .when().post("/").then().extract().asString(),
+                body -> body.contains("<StackStatus>" + expectedStatus + "</StackStatus>"),
+                body -> "stack " + stack + " did not reach " + expectedStatus + " within the timeout: " + body);
     }
 
     private static void cloudFormation(String stack, String action, String templateBody) {

@@ -59,7 +59,7 @@ class Route53PublicAliasAnswerTest {
     @ParameterizedTest
     @CsvSource({"false,false", "false,true", "true,false", "true,true"})
     void validTargetsRetainTheirTtlAndZoneAuthority(boolean explicitSimpleRecord, boolean evaluateTargetHealth) {
-        when(dns.resolveAliasTarget("target.example.test.", "ZOWNED", 1, "192.0.2.20"))
+        when(dns.resolvePublicAliasTarget(NAME, "target.example.test.", "ZOWNED", 1, "192.0.2.20", null))
                 .thenReturn(Optional.of(DnsAnswer.records(List.of("192.0.2.20"), 73)));
         ResourceRecordSet record = alias();
         record.getAliasTarget().setEvaluateTargetHealth(evaluateTargetHealth);
@@ -75,9 +75,9 @@ class Route53PublicAliasAnswerTest {
 
     @Test
     void missingTargetsAndWrongAddressFamiliesRemainRefused() {
-        when(dns.resolveAliasTarget("target.example.test.", "ZOWNED", 1, "192.0.2.20")).thenReturn(Optional.empty());
+        when(dns.resolvePublicAliasTarget(NAME, "target.example.test.", "ZOWNED", 1, "192.0.2.20", null)).thenReturn(Optional.empty());
         assertEquals(5, source(List.of(alias())).resolveAuthoritative(NAME, 1, "192.0.2.20").orElseThrow().responseCode());
-        when(dns.resolveAliasTarget("target.example.test.", "ZOWNED", 1, "192.0.2.20")).thenReturn(
+        when(dns.resolvePublicAliasTarget(NAME, "target.example.test.", "ZOWNED", 1, "192.0.2.20", null)).thenReturn(
                 Optional.of(DnsAnswer.typedRecords(List.of(new DnsRecord.Address(28, "2001:db8::1")), 60)));
         assertEquals(5, source(List.of(alias())).resolveAuthoritative(NAME, 1, "192.0.2.20").orElseThrow().responseCode());
         verifyNoInteractions(lookup);

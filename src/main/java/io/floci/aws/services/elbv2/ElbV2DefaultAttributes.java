@@ -23,6 +23,8 @@ final class ElbV2DefaultAttributes {
 
     /** Target group protocols that belong to an Application Load Balancer. */
     private static final Set<String> APPLICATION_PROTOCOLS = Set.of("HTTP", "HTTPS");
+    /** Network Load Balancer target-group protocols that carry {@code preserve_client_ip.enabled}. */
+    private static final Set<String> CLIENT_IP_PROTOCOLS = Set.of("TCP", "TLS", "UDP", "TCP_UDP");
 
     private ElbV2DefaultAttributes() {}
 
@@ -89,6 +91,14 @@ final class ElbV2DefaultAttributes {
         } else {
             defaults.put("stickiness.type", "source_ip");
             defaults.put("proxy_protocol_v2.enabled", "false");
+            String protocol = tg.getProtocol() == null ? "" : tg.getProtocol().toUpperCase();
+            if (CLIENT_IP_PROTOCOLS.contains(protocol)) {
+                // Network Load Balancer target groups: client IP preservation is off by default for IP
+                // targets over TCP or TLS and on otherwise (it cannot be turned off for UDP or TCP_UDP).
+                boolean ipOverTcp = "ip".equalsIgnoreCase(tg.getTargetType())
+                        && ("TCP".equals(protocol) || "TLS".equals(protocol));
+                defaults.put("preserve_client_ip.enabled", ipOverTcp ? "false" : "true");
+            }
         }
         return defaults;
     }

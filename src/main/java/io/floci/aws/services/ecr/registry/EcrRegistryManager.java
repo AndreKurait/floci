@@ -10,6 +10,7 @@ import com.github.dockerjava.api.model.ContainerPort;
 import com.github.dockerjava.api.model.Frame;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
@@ -23,7 +24,6 @@ import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.PortAllocator;
-import io.floci.aws.core.common.docker.SidecarHealthHelper;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -35,6 +35,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -65,6 +66,7 @@ public class EcrRegistryManager {
     private static final int CONTAINER_INTERNAL_PORT = 5000;
     private static final int REPOSITORY_DELETION_TIMEOUT_SECONDS = 10;
     private static final int REPOSITORY_DELETION_KILL_GRACE_SECONDS = 1;
+    private static final Duration REGISTRY_STARTUP_TIMEOUT = Duration.ofSeconds(10);
     private static final String NAMED_VOLUME = "ecr-registry-data";
     private static final String REPOSITORIES_PATH = "/var/lib/registry/docker/registry/v2/repositories/";
     private static final Pattern REVISION_LINK = Pattern.compile(".*/_manifests/revisions/sha256/([a-f0-9]{64})/link");
@@ -204,7 +206,7 @@ public class EcrRegistryManager {
         if (!m.matches()) {
             return image;
         }
-        if (config.services().ecr().preferLocalImages()) {
+        if (config.services().ecr().preferLocalImages() && !config.services().iam().enforcementEnabled()) {
             String resolved = containerBuilder.resolveImage(image);
             if (isPresentOnDaemon(resolved)) {
                 LOG.infov("Using locally present image {0} as-is (not rewriting to the emulated ECR registry)", resolved);
@@ -234,8 +236,7 @@ public class EcrRegistryManager {
     }
 
     /**
-     * The ECR repository an image URI names, in any of the forms {@link #imageRegion} reads, and the tag or digest it
-     * asks for, its tag {@code latest} where it names neither; empty for an image outside ECR.
+     * The repository, tag and digest named by an AWS-shaped or emulator ECR image reference.
      */
     public static Optional<EcrImage> ecrImage(String image) {
         Matcher m = image != null ? ECR_IMAGE_PARTS.matcher(image) : null;
@@ -263,10 +264,7 @@ public class EcrRegistryManager {
     /** An image in an ECR repository: its registry, Region and repository, and the tag or the digest asked for. */
     public record EcrImage(String registryId, String region, String repository, String tag, String digest) {}
 
-    /**
-     * The Region of the ECR repository an image URI names, AWS-shaped or one Floci's ECR hands out; empty for an
-     * image outside ECR.
-     */
+    /** The Region of an AWS-shaped or emulator ECR reference, empty for an image outside ECR. */
     public static Optional<String> imageRegion(String image) {
         Matcher m = image != null ? ECR_IMAGE_REGION.matcher(image) : null;
         if (m == null || !m.matches()) {
@@ -307,6 +305,9 @@ public class EcrRegistryManager {
 
     /** Returns the docker-pullable repository URI for the given account/region/name. */
     public String getRepositoryUri(String accountId, String region, String repoName) {
+        if (config.services().ecr().nativeUri()) {
+            return nativeRegistryHost(accountId, region) + "/" + repoName;
+        }
         return repositoryUri(accountId, region, repoName, tlsUriEnabled() ? "localhost.floci.io" : "localhost");
     }
 
@@ -317,6 +318,10 @@ public class EcrRegistryManager {
             return domain + ":" + port + "/" + accountId + "/" + region + "/" + repoName;
         }
         return accountId + ".dkr.ecr." + region + "." + domain + ":" + port + "/" + repoName;
+    }
+
+    private static String nativeRegistryHost(String accountId, String region) {
+        return accountId + ".dkr.ecr." + region + "." + AwsRegions.dnsSuffixFor(region);
     }
 
     private boolean tlsUriEnabled() {
@@ -344,16 +349,23 @@ public class EcrRegistryManager {
      * the two must name the same host.
      */
     public String getProxyEndpoint() {
+        return getProxyEndpoint(regionResolver.getAccountId(), regionResolver.getRegion());
+    }
+
+    public String getProxyEndpoint(String accountId, String region) {
+        if (config.services().ecr().nativeUri()) {
+            return "https://" + nativeRegistryHost(accountId, region);
+        }
         if (tlsUriEnabled()) {
             String host = "path".equalsIgnoreCase(config.services().ecr().uriStyle())
                     ? "localhost.floci.io"
-                    : regionResolver.getAccountId() + ".dkr.ecr."
-                            + regionResolver.getRegion() + ".localhost.floci.io";
+                    : accountId + ".dkr.ecr."
+                            + region + ".localhost.floci.io";
             return "https://" + host + ":" + advertisedPort();
         }
         String scheme = config.services().ecr().tlsEnabled() ? "https" : "http";
-        return scheme + "://" + regionResolver.getAccountId() + ".dkr.ecr."
-                + regionResolver.getRegion() + ".localhost:" + advertisedPort();
+        return scheme + "://" + accountId + ".dkr.ecr."
+                + region + ".localhost:" + advertisedPort();
     }
 
     /**
@@ -467,7 +479,7 @@ public class EcrRegistryManager {
 
     /**
      * Lazily starts (or reuses) the {@code registry:2} container. Idempotent and
-     * thread-safe. Throws if Docker is unreachable.
+     * thread-safe. Throws if Docker is unreachable or the registry does not become ready.
      */
     public void ensureStarted() {
         if (!config.services().ecr().enabled()) {
@@ -546,11 +558,9 @@ public class EcrRegistryManager {
                         rememberRegistryAddress(info);
                         return port;
                     });
+            attachLogStream(false);
             this.started = true;
             LOG.infov("Started ECR backing registry {0} on host port {1}", name, String.valueOf(hostPort));
-
-            // Attach log streaming (new feature)
-            attachLogStream(false);
         } catch (Exception e) {
             throw new RuntimeException("Failed to start ECR backing registry container: " + e.getMessage(), e);
         }
@@ -558,7 +568,7 @@ public class EcrRegistryManager {
     }
 
     private void completeStartup() {
-        SidecarHealthHelper.waitForHealth(httpClient().baseUrl(), "/v2/");
+        awaitRegistryReady();
         runReconcileOnce();
         this.ready = true;
     }
@@ -674,6 +684,31 @@ public class EcrRegistryManager {
             reconciled = true;
         } catch (Exception e) {
             LOG.warnv("ECR reconcile-on-startup failed: {0}", e.getMessage());
+        }
+    }
+
+    private void awaitRegistryReady() {
+        RegistryHttpClient registry = httpClient();
+        long deadline = System.nanoTime() + REGISTRY_STARTUP_TIMEOUT.toNanos();
+        while (true) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Interrupted while waiting for the ECR backing registry");
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                throw new IllegalStateException("ECR backing registry did not become ready within "
+                        + REGISTRY_STARTUP_TIMEOUT.toSeconds() + " seconds");
+            }
+            if (registry.ping(Duration.ofNanos(Math.min(remaining, TimeUnit.SECONDS.toNanos(1))))) {
+                return;
+            }
+            try {
+                TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.MILLISECONDS.toNanos(200),
+                        Math.max(0, deadline - System.nanoTime())));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while waiting for the ECR backing registry", e);
+            }
         }
     }
 
@@ -933,7 +968,7 @@ public class EcrRegistryManager {
     }
 
     private void stopRegistry() {
-        if (!started || containerId == null) {
+        if (containerId == null) {
             return;
         }
         lifecycleManager.stopAndRemove(containerId, logStream);
@@ -984,18 +1019,16 @@ public class EcrRegistryManager {
                 LOG.warnv("Adopted ECR registry container {0} has no published binding for port {1}; keeping configured port {2}",
                         containerId, String.valueOf(CONTAINER_INTERNAL_PORT), String.valueOf(hostPort));
             }
+            attachLogStream(true);
             this.started = true;
             LOG.infov("Adopted existing ECR registry container {0} on host port {1}",
                     containerId, String.valueOf(hostPort));
-
-            // Attach log streaming to adopted container
-            attachLogStream(true);
         } catch (Exception e) {
+            closeLogStream();
             LOG.warnv("Failed to adopt existing ECR registry container: {0}", e.getMessage());
-            this.containerId = null;
-            this.registryAddress = null;
             this.started = false;
             this.ready = false;
+            throw new RuntimeException("Failed to adopt existing ECR registry container: " + e.getMessage(), e);
         }
     }
 
@@ -1108,6 +1141,6 @@ public class EcrRegistryManager {
     }
 
     public boolean isStarted() {
-        return started;
+        return ready;
     }
 }

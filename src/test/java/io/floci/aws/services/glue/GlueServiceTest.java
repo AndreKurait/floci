@@ -587,6 +587,8 @@ class GlueServiceTest {
         assertTrue(partitionStore.scan(k -> true).isEmpty());
     }
 
+    
+
     @Test
     void createPartitionRefusesValuesThatAlreadyExist() {
         Table table = new Table();

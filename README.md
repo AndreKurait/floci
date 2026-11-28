@@ -298,7 +298,7 @@ Floci supports local emulation for application services, data services, eventing
 |---|---|
 | Core app services | S3, SQS, SNS, DynamoDB, Lambda, Lambda MicroVMs, Lambda Web Functions, IAM, STS, KMS, Payment Cryptography, Payment Cryptography data plane, Secrets Manager, SSM |
 | Events and workflows | EventBridge, EventBridge V2, EventBridge Pipes, EventBridge Scheduler, Step Functions, SWF, CloudWatch Logs, CloudWatch Metrics, CloudWatch OAM, CloudWatch RUM, X-Ray, Managed Prometheus (AMP) |
-| API and identity | API Gateway REST, API Gateway v2, AppSync, Cognito, Cognito Identity, ACM, Route53, Route 53 Resolver, Cloud Map, Global Accelerator |
+| API and identity | API Gateway REST, API Gateway v2, AppSync, Cognito, Cognito Identity, ACM, AWS Private CA, Route53, Route 53 Resolver, Cloud Map, Global Accelerator |
 | Containers and compute | ECS, EC2, EC2 Instance Connect, Lightsail, EKS, MWAA, ECR, EFS, CodeBuild, CodeDeploy, CodePipeline, CodeGuru Reviewer, CodeArtifact, AWS Batch, Auto Scaling, Application Auto Scaling, Elastic Beanstalk, ELB v2, ELB Classic |
 | Data, analytics, and AI | Athena, Glue, Lake Formation, EMR, EMR on EKS, EMR Serverless, Redshift, Redshift Data API, Redshift Serverless, Firehose, Managed Service for Apache Flink, OpenSearch, S3 Tables, S3 Vectors, Textract, Transcribe, Comprehend, Rekognition, Translate, Bedrock, Bedrock Runtime, Bedrock AgentCore, Bedrock AgentCore Control, Amazon SageMaker, QuickSight |
 | Databases and caching | Aurora DSQL, RDS, RDS Data API, Neptune, DocumentDB, DMS, MemoryDB, ElastiCache, Timestream for InfluxDB |
@@ -785,6 +785,20 @@ def test_s3_create_bucket():
 ```
 
 </details>
+
+## Java test heap
+
+The Surefire test JVM defaults to a 6 GiB maximum heap. For a large suite on a
+machine with sufficient memory, override it explicitly:
+
+```bash
+./mvnw -Dtest.jvm.heap=32g test
+```
+
+This controls the forked test JVM, not Maven's own JVM. Leave memory for Maven,
+native allocations, and any Docker services used by the tests.
+The property deliberately sits outside `floci.*`, which is reserved for validated
+application settings.
 
 ## Compatibility Testing
 
