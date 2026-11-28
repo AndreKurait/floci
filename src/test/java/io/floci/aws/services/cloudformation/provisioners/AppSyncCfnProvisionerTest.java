@@ -20,6 +20,7 @@ import io.floci.aws.services.cloudformation.CfnDropPolicyTable;
 import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
@@ -57,7 +58,9 @@ class AppSyncCfnProvisionerTest {
     private static final String API_ID = "abcd1234";
 
     private final AppSyncService appSync = mock(AppSyncService.class);
-    private final AppSyncCfnProvisioner provisioner = new AppSyncCfnProvisioner(appSync);
+    private final TestTime time = TestTime.create();
+    private final AppSyncCfnProvisioner provisioner =
+            new AppSyncCfnProvisioner(appSync, time::nanoTime, time::sleepAdvancing);
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
@@ -283,8 +286,58 @@ class AppSyncCfnProvisionerTest {
         // Every AppSync call for the API is refused with a 409 while the schema is PROCESSING, so a
         // provision that returned early would fail the data sources and resolvers behind it.
         verify(appSync, Mockito.times(3)).getSchemaCreationStatus(API_ID);
+        assertEquals(TestTime.DEFAULT_START.plusMillis(50), time.now(), "two 25 ms polls");
         assertEquals(API_ID + "GraphQLSchema", r.getPhysicalId());
         assertEquals(API_ID, r.getAttributes().get("ApiId"));
+    }
+
+    @Test
+    void schemaStillProcessingAfterTwoMinutesFailsTheResource() {
+        schemaSucceedsAt(null);
+        StackResource r = resource("AWS::AppSync::GraphQLSchema", "GraphQlSchema");
+        ObjectNode props = mapper.createObjectNode().put("ApiId", API_ID).put("Definition", "type Query { ping: String }");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+
+        assertEquals("Schema creation for API " + API_ID + " did not complete within 120s (status PROCESSING).",
+                e.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(120), time.now());
+        verify(appSync, Mockito.times(4801)).getSchemaCreationStatus(API_ID);
+        assertNull(r.getPhysicalId());
+    }
+
+    @Test
+    void schemaThatCompilesAtTheTwoMinuteDeadlineStillCompletes() {
+        schemaSucceedsAt(TestTime.DEFAULT_START.plusSeconds(120));
+        StackResource r = resource("AWS::AppSync::GraphQLSchema", "GraphQlSchema");
+        ObjectNode props = mapper.createObjectNode().put("ApiId", API_ID).put("Definition", "type Query { ping: String }");
+
+        provisioner.provision(r, props, ctx());
+
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(120), time.now());
+        assertEquals(API_ID + "GraphQLSchema", r.getPhysicalId());
+    }
+
+    @Test
+    void schemaThatCompilesJustAfterTheDeadlineIsNotWaitedFor() {
+        schemaSucceedsAt(TestTime.DEFAULT_START.plusSeconds(120).plusNanos(1));
+        StackResource r = resource("AWS::AppSync::GraphQLSchema", "GraphQlSchema");
+        ObjectNode props = mapper.createObjectNode().put("ApiId", API_ID).put("Definition", "type Query { ping: String }");
+
+        AwsException e = assertThrows(AwsException.class, () -> provisioner.provision(r, props, ctx()));
+
+        assertTrue(e.getMessage().contains("did not complete within 120s"), e.getMessage());
+        assertEquals(TestTime.DEFAULT_START.plusSeconds(120), time.now());
+    }
+
+    /** The schema reads as PROCESSING until the timeline reaches {@code instant}; never, when null. */
+    private void schemaSucceedsAt(Instant instant) {
+        when(appSync.getSchemaCreationStatus(API_ID)).thenAnswer(call -> {
+            SchemaCreationStatus status = new SchemaCreationStatus();
+            status.setStatus(instant == null || time.now().isBefore(instant)
+                    ? SchemaCreationStatusType.PROCESSING : SchemaCreationStatusType.SUCCESS);
+            return status;
+        });
     }
 
     @Test
@@ -1241,10 +1294,8 @@ class AppSyncCfnProvisionerTest {
 
     @Test
     void aRollbackThatTheServiceRefusesLeavesTheApiKeyAsTheUpdateLeftItAndKeepsTheSnapshot() throws Exception {
-        Instant start = Instant.parse("2026-01-01T00:00:00Z");
-        AppSyncServiceFixture.MutableClock clock = new AppSyncServiceFixture.MutableClock(start);
-        // CloudFormation provisions in its stack's Region, eu-west-1 here, and the service answers for it.
-        AppSyncService real = AppSyncServiceFixture.create(clock, "eu-west-1");
+        Instant start = time.now();
+        AppSyncService real = AppSyncServiceFixture.create(time.clock(), "eu-west-1");
         AppSyncCfnProvisioner onRealService = new AppSyncCfnProvisioner(real);
         GraphqlApi created = real.createGraphqlApi(Map.of("name", "keys", "authenticationType", "API_KEY"), "eu-west-1");
         long soonExpiry = start.getEpochSecond() + Duration.ofHours(25).getSeconds();
@@ -1258,7 +1309,7 @@ class AppSyncCfnProvisionerTest {
                 updateCtx(key.getId(), "{\"ApiId\":\"" + created.getApiId() + "\",\"Description\":\"before\","
                         + "\"Expires\":" + soonExpiry + "}"));
         // Three hours on, the prior expiry is under a day away, which the service no longer accepts.
-        clock.set(start.plus(Duration.ofHours(3)));
+        time.advance(Duration.ofHours(3));
 
         AwsException refused = assertThrows(AwsException.class, () -> onRealService.rollbackUpdate(r));
 
