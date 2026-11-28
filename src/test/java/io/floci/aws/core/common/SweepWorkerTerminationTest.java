@@ -1,18 +1,20 @@
 package io.floci.aws.core.common;
 
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -55,26 +57,28 @@ class SweepWorkerTerminationTest {
                 interrupted.countDown();
             }
         }, scheduler, Clock.systemUTC());
-        try (ExecutorService stopping = Executors.newSingleThreadExecutor()) {
-            try {
-                worker.start();
-                assertTrue(entered.await(5, TimeUnit.SECONDS));
-                Future<?> stopped = stopping.submit(worker::stop);
-                assertTrue(tailEntered.await(5, TimeUnit.SECONDS));
-                assertEquals(0, interrupted.getCount());
-                assertTrue(actual.get().isAlive());
-                assertThrows(TimeoutException.class, () -> stopped.get(1, TimeUnit.SECONDS),
-                        "Stop must not return while its observed worker thread is still alive");
-                releaseTail.countDown();
-                stopped.get(5, TimeUnit.SECONDS);
-                assertFalse(actual.get().isAlive());
-                assertNull(tailFailure.get());
-            } finally {
-                releaseTail.countDown();
-                worker.stop();
-                actual.get().join(5_000);
-                assertFalse(actual.get().isAlive(), "The controlled worker must be cleaned up");
-            }
+        FutureTask<Void> stopped = new FutureTask<>(worker::stop, null);
+        Thread caller = Thread.ofPlatform().name("sweep-stop-caller").unstarted(stopped);
+        try {
+            worker.start();
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            caller.start();
+            assertTrue(tailEntered.await(5, TimeUnit.SECONDS));
+            assertEquals(0, interrupted.getCount());
+            assertTrue(actual.get().isAlive());
+            assertEquals(Thread.State.TIMED_WAITING, ThreadStates.awaitState(caller,
+                    Set.of(Thread.State.TIMED_WAITING, Thread.State.TERMINATED), Duration.ofSeconds(5),
+                    "caller joining the worker thread"));
+            releaseTail.countDown();
+            stopped.get(5, TimeUnit.SECONDS);
+            assertFalse(actual.get().isAlive());
+            assertNull(tailFailure.get());
+        } finally {
+            releaseTail.countDown();
+            worker.stop();
+            actual.get().join(5_000);
+            assertFalse(actual.get().isAlive(), "The controlled worker must be cleaned up");
+            assertTrue(caller.join(Duration.ofSeconds(5)), "The stop caller must be cleaned up");
         }
     }
 
@@ -83,7 +87,7 @@ class SweepWorkerTerminationTest {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicReference<Thread> actual = new AtomicReference<>();
-        SweepWorker worker = new SweepWorker("uncooperative-sweep", true, 3600, true, now -> {
+        SweepWorker worker = new SweepWorker("uncooperative-sweep", 3600, true, now -> {
             actual.set(Thread.currentThread());
             entered.countDown();
             while (release.getCount() != 0) {
@@ -93,20 +97,19 @@ class SweepWorkerTerminationTest {
                     // Model a callback that cannot be stopped by an interrupt.
                 }
             }
-        });
-        try {
-            worker.start();
-            assertTrue(entered.await(5, TimeUnit.SECONDS));
-            long started = System.nanoTime();
-            worker.stop();
-            assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started) < 8,
-                    "Shutdown must not add a second wait budget or wait indefinitely");
-            assertTrue(actual.get().isAlive(), "The controlled callback is still held");
-        } finally {
-            release.countDown();
-            worker.stop();
-            actual.get().join(5_000);
-            assertFalse(actual.get().isAlive());
+        }, Thread.ofPlatform().daemon(true).factory(), Duration.ofMillis(25));
+        try (ExecutorService caller = Executors.newSingleThreadExecutor()) {
+            try {
+                worker.start();
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                caller.submit(worker::stop).get(2, TimeUnit.SECONDS);
+                assertTrue(actual.get().isAlive(), "The controlled callback is still held");
+            } finally {
+                release.countDown();
+                worker.stop();
+                actual.get().join(5_000);
+                assertFalse(actual.get().isAlive());
+            }
         }
     }
 
