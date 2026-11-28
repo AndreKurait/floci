@@ -469,6 +469,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         // Now start the container with code in place
         joinVpcNetwork(fn, containerId, lambdaAccountId, lambdaRegion);
+        if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
+            executionRoleCredentials.bindContainer(fn, roleCredentials.get().accessKeyId(), containerId);
+        }
         boolean exitByEvents = exitEvents.enabled();
         if (exitByEvents) {
             // Events report only what happens after the subscription, so register before the start.
@@ -483,6 +486,15 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             throw e;
         }
         runtimeApiServer.markContainerStarted();
+        if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
+            try {
+                executionRoleCredentials.bindStartedContainer(fn, roleCredentials.get().accessKeyId(), containerId,
+                        dockerClient.inspectContainerCmd(containerId).exec().getState().getStartedAt());
+            } catch (RuntimeException unavailable) {
+                // Normal execution remains available; identity verification fails closed without this seal.
+                LOG.debug("Could not seal Lambda execution start time", unavailable);
+            }
+        }
         if (!exitByEvents) {
             watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
         }
@@ -495,6 +507,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         logStreamer.ensureLogGroupAndStreamForAccount(
                 lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
 
+        LambdaContainerReadiness.await(dockerClient, containerId,
+                config.services().lambda().containerReadinessCommand(),
+                config.services().lambda().containerReadinessTimeoutSeconds());
         // Real AWS's runtime interface client discovers and launches every binary under
         // /opt/extensions/ as a sibling process to the main entrypoint before the runtime is
         // considered ready; Floci only runs the image's own ENTRYPOINT/CMD, so extensions

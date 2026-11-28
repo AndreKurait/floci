@@ -9,6 +9,7 @@ import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -65,6 +66,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -135,6 +137,7 @@ class ContainerLauncherTest {
     void setUp() {
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
+        EmulatorConfig.IamServiceConfig iam = mock(EmulatorConfig.IamServiceConfig.class);
         EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
         EmulatorConfig.StorageConfig storage = mock(EmulatorConfig.StorageConfig.class);
         EmulatorConfig.EfsSharingConfig efs = mock(EmulatorConfig.EfsSharingConfig.class);
@@ -142,6 +145,8 @@ class ContainerLauncherTest {
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambda);
         lenient().when(lambda.reconcileContainersOnStartup()).thenReturn(true);
+        lenient().when(services.iam()).thenReturn(iam);
+        lenient().when(iam.lambdaIdentityVerificationEnabled()).thenReturn(false);
         when(lambda.dockerNetwork()).thenReturn(Optional.empty());
         lenient().when(lambda.extraHosts()).thenReturn(Optional.empty());
         lenient().when(lambda.awsConfigPath()).thenReturn(Optional.empty());
@@ -316,6 +321,50 @@ class ContainerLauncherTest {
         verify(lifecycleManager, atLeastOnce()).create(any(ContainerSpec.class), platformCaptor.capture());
         List<String> platforms = platformCaptor.getAllValues();
         return platforms.get(platforms.size() - 1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedNamespaceReadinessStopsBothColdAndProvisionedContainersBeforePoolAdmission(boolean provisioned) {
+        when(config.services().lambda().containerReadinessCommand()).thenReturn(Optional.of("probe"));
+        when(config.services().lambda().containerReadinessTimeoutSeconds()).thenReturn(10);
+        LambdaFunction function = imageFunction();
+        when(config.services().iam().lambdaIdentityVerificationEnabled()).thenReturn(true);
+        when(executionRoleCredentials.forFunction(function)).thenReturn(
+                Optional.of(new SessionCreds("ASIAEXAMPLE", "example-secret", "example-token")));
+        InspectContainerCmd container = mock(InspectContainerCmd.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectContainerCmd("container-123")).thenReturn(container);
+        when(container.exec().getState().getStartedAt()).thenReturn("current-start");
+        ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
+        ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
+        when(dockerClient.execCreateCmd("container-123")).thenReturn(create);
+        when(create.exec()).thenReturn(created);
+        when(created.getId()).thenReturn("probe-exec");
+        ExecStartCmd start = mock(ExecStartCmd.class, RETURNS_SELF);
+        when(dockerClient.execStartCmd("probe-exec")).thenReturn(start);
+        when(start.exec(any())).thenAnswer(call -> {
+            verify(lifecycleManager).startCreated(eq("container-123"), any());
+            verify(executionRoleCredentials).bindStartedContainer(
+                    function, "ASIAEXAMPLE", "container-123", "current-start");
+            ResultCallback<Frame> callback = call.getArgument(0);
+            callback.onStart(mock(Closeable.class));
+            callback.onComplete();
+            return callback;
+        });
+        InspectExecCmd inspect = mock(InspectExecCmd.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectExecCmd("probe-exec")).thenReturn(inspect);
+        when(inspect.exec().getExitCodeLong()).thenReturn(127L);
+        assertThrows(IllegalStateException.class, () -> {
+            if (provisioned) {
+                launcher.launchProvisioned(function);
+            } else {
+                launcher.launch(function);
+            }
+        });
+        verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any());
+        verify(runtimeApiServer).stop();
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+        verify(dockerClient, never()).copyArchiveFromContainerCmd("container-123", "/opt/extensions");
     }
 
     /** Returns the read-only {@code /var/task} volume mount on the spec, or null if absent. */

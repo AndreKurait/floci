@@ -58,6 +58,13 @@ class EmulatorInfoControllerTest {
     }
 
     @Test
+    void health_reportsContainerReadinessProtocol() {
+        when(serviceRegistry.getServices()).thenReturn(Map.of());
+        Map<?, ?> health = (Map<?, ?>) controller.health().getEntity();
+        assertEquals(Map.of("lambda_container_readiness", 1), health.get("features"));
+    }
+
+    @Test
     @DisplayName("Should report the selected DynamoDB backend in info")
     void info_reportsTheSelectedDynamoDbBackend() {
         when(dynamoDbBackendSelector.selected()).thenReturn("local");

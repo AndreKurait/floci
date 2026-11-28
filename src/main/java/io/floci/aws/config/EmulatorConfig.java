@@ -1855,6 +1855,14 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean enforcementEnabled();
 
+        /** Enables bounded metadata lookup and proof verification for current AssumeRole sessions. */
+        @WithDefault("false")
+        boolean issuedSessionVerificationEnabled();
+
+        /** Enables issuer-owned current Lambda execution identity observations and proof verification. */
+        @WithDefault("false")
+        boolean lambdaIdentityVerificationEnabled();
+
         @WithDefault("false")
         boolean seedDeployerPrincipal();
 
@@ -3755,6 +3763,17 @@ public interface EmulatorConfig {
 
         /** Additional Docker create flags applied to every Lambda execution container. */
         Optional<String> dockerFlags();
+
+        /**
+         * Optional command executed inside each new Lambda container before it can receive invocations.
+         * Exit zero admits the container; nonzero retries within container-readiness-timeout-seconds.
+         * Arguments use Docker flag quoting rules; no shell is implicitly invoked.
+         */
+        Optional<String> containerReadinessCommand();
+
+        /** Overall budget for the optional container readiness command, in seconds. */
+        @WithDefault("60")
+        int containerReadinessTimeoutSeconds();
 
         /**
          * Base name prefix for the containers and code volumes Lambda spawns, replacing the

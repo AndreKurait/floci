@@ -18,6 +18,7 @@ import io.floci.aws.services.iam.model.IamPolicy;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
 import io.floci.aws.services.iam.model.InstanceProfile;
+import io.floci.aws.services.iam.model.LambdaExecutionBinding;
 import io.floci.aws.services.iam.model.LoginProfile;
 import io.floci.aws.services.iam.model.OpenIDConnectProvider;
 import io.floci.aws.services.iam.model.OrganizationRootFeatures;
@@ -2960,6 +2961,41 @@ class IamServiceTest {
     }
 
     @Test
+    void inspectedAssumeRoleSessionRetainsTokenIssueTime() {
+        Instant issuedAt = Instant.parse("2026-11-19T10:00:00Z");
+        IamService service = iamServiceOn(Clock.fixed(issuedAt, ZoneOffset.UTC));
+        service.registerAssumeRoleSession("ASIAISSUEDTIME", "secret", "token",
+                "arn:aws:iam::000000000000:role/worker", issuedAt.plusSeconds(3600),
+                null, "000000000000", "worker", "AROAEXAMPLE:worker", false);
+
+        assertEquals(issuedAt, service.issuedSessionCandidates("ASIAISSUEDTIME").getFirst().getIssuedAt());
+    }
+
+    @Test
+    void lambdaSessionBindingUsesUniqueExactKeysBeyondThePrincipalScanLimit() {
+        String account = "222233334444";
+        String role = "arn:aws:iam::222233334444:role/LambdaRole";
+        String key = "ASIALARGESESSIONREGISTRY";
+        AccountAwareStorageBackend<SessionCredential> sessions = AccountAwareStorageBackend.inMemory("000000000000");
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        for (int i = 0; i < 5000; i++) {
+            sessions.putForAccount(account, "unrelated-" + i,
+                    new SessionCredential("unrelated-" + i, "secret", "token", role, null, null, account));
+        }
+        service.registerLambdaExecutionRoleSession(account, key, "secret", role);
+        LambdaExecutionBinding binding = new LambdaExecutionBinding(account, "us-east-1", "fn",
+                "arn:aws:lambda:us-east-1:222233334444:function:fn", "$LATEST", role,
+                "code", "revision", null, null);
+        service.bindLambdaExecution(account, key, binding);
+        assertEquals(binding, service.lambdaIdentitySession(key).orElseThrow().getLambdaExecution());
+        assertTrue(service.issuedSessionCandidates("missing").isEmpty());
+        assertThrows(IllegalStateException.class, () -> service.issuedSessionCandidates(null));
+        service.registerLambdaExecutionRoleSession("333344445555", key, "other-secret", role);
+        assertEquals(2, service.issuedSessionCandidates(key).size());
+        assertTrue(service.lambdaIdentitySession(key).isEmpty());
+    }
+
+    @Test
     void anExecutionRoleSessionWithAnInlinePolicyIsScopedByItAsAnAssumedRolesIs() {
         String accountId = "222233334444";
         String accessKeyId = "ASIAEXECUTIONSCOPED";
@@ -4281,4 +4317,3 @@ class IamServiceTest {
         assertTrue(nullOpt.isEmpty());
     }
 }
-
