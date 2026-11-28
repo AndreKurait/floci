@@ -1530,3 +1530,5 @@ aws cloudformation create-stack \
 !!! note "Dependency ordering"
     Use `!Ref MyFunction` (not a plain string) for `FunctionName` so CloudFormation
     provisions the function before the event source mapping.
+
+`AWS::ElasticLoadBalancingV2::TargetGroup` applies the declared `TargetGroupAttributes` on create and update. Only declared keys change; omitted keys retain their values. Failed updates restore those attributes independently of target registrations and health settings, and retain a failed restoration for a rollback retry. Network target groups report the `preserve_client_ip.enabled` default for TCP, TLS, UDP and TCP_UDP: false for IP targets over TCP or TLS, true otherwise.

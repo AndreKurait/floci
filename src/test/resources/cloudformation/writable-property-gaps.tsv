@@ -354,7 +354,6 @@ AWS::ElasticLoadBalancingV2::LoadBalancer	Ipv4IpamPoolId	accepted and ignored
 AWS::ElasticLoadBalancingV2::LoadBalancer	LoadBalancerAttributes	accepted and ignored
 AWS::ElasticLoadBalancingV2::LoadBalancer	MinimumLoadBalancerCapacity	accepted and ignored
 AWS::ElasticLoadBalancingV2::TargetGroup	TargetControlPort	accepted and ignored
-AWS::ElasticLoadBalancingV2::TargetGroup	TargetGroupAttributes	accepted and ignored
 AWS::Events::Archive	KmsKeyIdentifier	documented as ignored (docs/services/cloudformation.md, EventBridge)
 AWS::Events::EventBus	DeadLetterConfig	rejected with a ValidationError, not supported by Floci
 AWS::Events::EventBus	KmsKeyIdentifier	rejected with a ValidationError, not supported by Floci

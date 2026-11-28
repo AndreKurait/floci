@@ -302,7 +302,9 @@ class ElbV2DefaultAttributesIntegrationTest {
             .body("DescribeTargetGroupAttributesResponse.DescribeTargetGroupAttributesResult.Attributes.member.find { it.Key == 'load_balancing.algorithm.type' }.Value",
                     equalTo("round_robin"))
             .body("DescribeTargetGroupAttributesResponse.DescribeTargetGroupAttributesResult.Attributes.member.Key",
-                    not(hasItem("proxy_protocol_v2.enabled")));
+                    not(hasItem("proxy_protocol_v2.enabled")))
+            .body("DescribeTargetGroupAttributesResponse.DescribeTargetGroupAttributesResult.Attributes.member.Key",
+                    not(hasItem("preserve_client_ip.enabled")));
     }
 
     @Test
@@ -332,7 +334,38 @@ class ElbV2DefaultAttributesIntegrationTest {
                     equalTo("source_ip"))
             .body("DescribeTargetGroupAttributesResponse.DescribeTargetGroupAttributesResult.Attributes.member.find { it.Key == 'proxy_protocol_v2.enabled' }.Value",
                     equalTo("false"))
+            // An instance target group preserves the client IP by default.
+            .body("DescribeTargetGroupAttributesResponse.DescribeTargetGroupAttributesResult.Attributes.member.find { it.Key == 'preserve_client_ip.enabled' }.Value",
+                    equalTo("true"))
             .body("DescribeTargetGroupAttributesResponse.DescribeTargetGroupAttributesResult.Attributes.member.Key",
                     not(hasItem("load_balancing.algorithm.type")));
+    }
+
+    @Test
+    void aTcpIpTargetGroupDoesNotPreserveTheClientIpByDefault() {
+        String vpcId = createVpc("10.95.0.0/16");
+
+        String tgArn = given()
+            .formParam("Action", "CreateTargetGroup")
+            .formParam("Version", "2015-12-01")
+            .formParam("Name", "attrs-tcp-ip-tg")
+            .formParam("Protocol", "TCP")
+            .formParam("Port", "443")
+            .formParam("TargetType", "ip")
+            .formParam("VpcId", vpcId)
+            .header("Authorization", AUTH)
+        .when().post("/")
+        .then().statusCode(200)
+            .extract().path("CreateTargetGroupResponse.CreateTargetGroupResult.TargetGroups.member.TargetGroupArn");
+
+        given()
+            .formParam("Action", "DescribeTargetGroupAttributes")
+            .formParam("TargetGroupArn", tgArn)
+            .header("Authorization", AUTH)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeTargetGroupAttributesResponse.DescribeTargetGroupAttributesResult.Attributes.member.find { it.Key == 'preserve_client_ip.enabled' }.Value",
+                    equalTo("false"));
     }
 }

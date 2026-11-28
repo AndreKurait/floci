@@ -88,6 +88,7 @@ public final class CfnRollback {
      * undo of a failed provision or by its {@code rollbackUpdate}, retained across a failed put back.
      */
     public static final String TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR = "__FlociTargetGroupTargetsUpdateSnapshot";
+    public static final String TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR = "__FlociTargetGroupAttributesUpdateSnapshot";
 
     /**
      * Holds what an update that kept an ELBv2 listener certificate resource changed on its listener:
