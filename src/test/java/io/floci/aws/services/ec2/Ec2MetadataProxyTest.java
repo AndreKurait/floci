@@ -16,6 +16,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -23,6 +24,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -34,6 +36,156 @@ class Ec2MetadataProxyTest {
 
     /** Where the relay {@link Ec2MetadataProxy#startEc2Command} starts keeps its PID. */
     private static final String EC2_RELAY_PID_FILE = "/tmp/floci-imds-proxy-42169.pid";
+
+    @ParameterizedTest
+    @CsvSource({
+            "10.0.0.3, true,",
+            "172.18.0.3, true,",
+            "240.199.44.3, true,",
+            "255.0.0.3, true,",
+            "0.1.2.3, false,",
+            "127.0.0.3, false,",
+            "169.254.1.3, false,",
+            "224.0.0.3, false,",
+            "239.0.0.3, false,",
+            "255.255.255.255, false,",
+            "10.0.0.3, false, local 10.0.0.3 dev eth0 src 10.0.0.2",
+            "10.0.0.3, false, broadcast 10.0.0.3 dev eth0 src 10.0.0.2",
+            "10.0.0.3, false, throw 10.0.0.3 dev eth0 src 10.0.0.2",
+            "10.0.0.3, false, 10.0.0.4 dev eth0 src 10.0.0.2",
+            "10.0.0.3, false, 10.0.0.3 dev lo src 10.0.0.2"
+    })
+    void metadataRoutingAllowsDockerUnicastAndRejectsSpecialTargets(String address, boolean accepted, String targetRoute,
+                                                                   @TempDir Path directory) throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        HelperShellFixture.writeTool(bin, "ip", """
+                case "$*" in
+                  "-4 -o addr show"|"-4 -o addr show dev eth0")
+                    printf '2: eth0 inet 10.0.0.2/24 scope global eth0\\n' ;;
+                  "-4 route get "*) printf '%s\\n' "$TEST_TARGET_ROUTE" ;;
+                  "-4 route show table main exact 169.254.169.254/32")
+                    if [ -f "$TEST_ROUTE" ]; then
+                      printf '169.254.169.254 dev eth0 scope link src 10.0.0.2\\n'
+                    fi ;;
+                  "-4 route add "*) touch "$TEST_ROUTE" ;;
+                  *) exit 95 ;;
+                esac
+                """);
+        HelperShellFixture.writeTool(bin, "iptables", """
+                case "$*" in
+                  *"-S OUTPUT")
+                    if [ -f "$TEST_NAT" ]; then
+                      printf '%s\\n' '-A OUTPUT -m comment --comment floci-imds -j DNAT'
+                    fi ;;
+                  *"-I OUTPUT 1 "*) touch "$TEST_NAT" ;;
+                  *"-C OUTPUT "*) test -f "$TEST_NAT" ;;
+                  *) exit 96 ;;
+                esac
+                """);
+        for (String[] command : List.of(Ec2MetadataProxy.ec2RoutingCommand(address, 9169, false),
+                namespaceFixture(Ec2MetadataProxy.ec2NamespaceStartCommand(address, 9169, false), directory))) {
+            Files.deleteIfExists(directory.resolve("route"));
+            Files.deleteIfExists(directory.resolve("nat"));
+            int result = HelperShellFixture.run(command, directory,
+                    Map.of("PATH", bin + ":/usr/bin:/bin", "TEST_ROUTE", directory.resolve("route").toString(),
+                            "TEST_NAT", directory.resolve("nat").toString(),
+                            "TEST_TARGET_ROUTE", targetRoute == null ? address + " dev eth0 src 10.0.0.2" : targetRoute));
+
+            assertEquals(accepted ? 0 : 1, result, HelperShellFixture.output(directory));
+            assertEquals(accepted, Files.exists(directory.resolve("route")));
+            assertEquals(accepted, Files.exists(directory.resolve("nat")));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"none", "floci-imds-proxy.pid", "floci-imds-proxy-42169.pid"})
+    void namespaceInstallerRequiresNatOnlyForFreshDirectRouting(String relayFile, @TempDir Path directory)
+            throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path calls = directory.resolve("packages");
+        for (String tool : List.of("ip", "socat", "curl")) {
+            HelperShellFixture.writeTool(bin, tool, "exit 0\n");
+        }
+        HelperShellFixture.writeTool(bin, "apk", "printf '%s\\n' \"$*\" >> \"$TEST_RECORD\"\n");
+        if (!"none".equals(relayFile)) {
+            Files.writeString(directory.resolve(relayFile), "999999999\n");
+        }
+        assertEquals(0, HelperShellFixture.run(namespaceFixture(Ec2MetadataProxy.ec2NamespaceInstallCommand(), directory),
+                directory, Map.of("PATH", bin.toString(), "TEST_RECORD", calls.toString())),
+                HelperShellFixture.output(directory));
+        assertEquals("none".equals(relayFile), Files.exists(calls));
+        if (Files.exists(calls)) {
+            assertTrue(Files.readString(calls).contains("iptables"));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"floci-imds-proxy.pid", "floci-imds-proxy-42169.pid"})
+    void existingNamespaceRetainsRelayMigrationAndNftFallback(String relayFile, @TempDir Path directory)
+            throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path record = directory.resolve("nft-commands");
+        writeEc2StartTools(bin);
+        Files.writeString(directory.resolve(relayFile), ProcessHandle.current().pid() + "\n");
+        HelperShellFixture.writeTool(bin, "iptables", "exit 1\n");
+        HelperShellFixture.writeTool(bin, "nft", "printf '%s\\n' \"$*\" >> \"$TEST_RECORD\"\n"
+                + "case \"$*\" in\n"
+                + "  '-f -') cat >> \"$TEST_RECORD\" ;;\n"
+                + "  'list table ip floci_imds') exit 1 ;;\n"
+                + "esac\n");
+        assertEquals(0, HelperShellFixture.run(namespaceFixture(
+                        Ec2MetadataProxy.ec2NamespaceStartCommand("127.0.0.1", 9169, true), directory),
+                directory, Map.of("PATH", bin + ":/usr/bin:/bin", "TEST_RECORD", record.toString())),
+                HelperShellFixture.output(directory));
+        assertTrue(Files.readString(record).contains("insert rule ip floci_imds output"));
+        assertNotEquals(ProcessHandle.current().pid() + "\n",
+                Files.readString(directory.resolve("floci-imds-proxy-42169.pid")));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true", "false"})
+    void disabledMetadataNamespaceWaitsForItsOwnedRelayWithoutHttpProbe(boolean nat, @TempDir Path directory)
+            throws Exception {
+        Path bin = Files.createDirectory(directory.resolve("bin"));
+        Path calls = directory.resolve("http-calls");
+        Files.writeString(directory.resolve("floci-imds-proxy.pid"), ProcessHandle.current().pid() + "\n");
+        HelperShellFixture.writeTool(bin, "ip", "printf '%s\\n' 'inet 169.254.169.254/32'\n");
+        // A shell stands in for socat, keeping the listener arguments in its real process command line.
+        HelperShellFixture.writeTool(bin, "socat", "while :; do /bin/sleep 1; done\n");
+        HelperShellFixture.writeTool(bin, "cat", "case \"${1-}\" in\n"
+                + "  /proc/*/comm) test -r \"${1%/comm}/cmdline\" && printf socat ;;\n"
+                + "  *) exec /bin/cat \"$@\" ;;\nesac\n");
+        HelperShellFixture.writeTool(bin, "iptables", nat ? "exit 0\n" : "exit 1\n");
+        HelperShellFixture.writeTool(bin, "nft", "exit 1\n");
+        HelperShellFixture.writeTool(bin, "curl", "echo called >> \"$TEST_RECORD\"\nexit 1\n");
+        try {
+            assertEquals(0, HelperShellFixture.run(namespaceFixture(
+                            Ec2MetadataProxy.ec2NamespaceStartCommand("127.0.0.1", 9169, false), directory),
+                    directory, Map.of("PATH", bin + ":/usr/bin:/bin", "TEST_RECORD", calls.toString())),
+                    HelperShellFixture.output(directory));
+            assertFalse(Files.exists(calls), "disabled metadata must not require an IMDS token response");
+            Path pidFile = directory.resolve(nat ? "floci-imds-proxy-42169.pid" : "floci-imds-proxy.pid");
+            long relayPid = Long.parseLong(Files.readString(pidFile).trim());
+            assertNotEquals(ProcessHandle.current().pid(), relayPid);
+            assertTrue(ProcessHandle.of(relayPid).orElseThrow().isAlive());
+        } finally {
+            for (String name : List.of("floci-imds-proxy.pid", "floci-imds-proxy-42169.pid")) {
+                Path pidFile = directory.resolve(name);
+                if (Files.exists(pidFile)) {
+                    long pid = Long.parseLong(Files.readString(pidFile).trim());
+                    ProcessHandle.of(pid).filter(process -> process.info().commandLine()
+                            .orElse("").contains(directory.toString())).ifPresent(process -> {
+                                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                                process.destroyForcibly();
+                            });
+                }
+            }
+        }
+    }
+
+    private static String[] namespaceFixture(String[] command, Path directory) {
+        return new String[]{command[0], command[1], command[2].replace("/tmp/floci-", directory + "/floci-")};
+    }
 
     @Test
     void everyProxyCommandLeavesTheRootCgroupBeforeItStartsAnything() {
@@ -411,8 +563,7 @@ class Ec2MetadataProxyTest {
             fixture.start();
             requireTokens(fixture.instance());
 
-            assertEquals(0, HelperShellFixture.run(probe(fixture.endpoint()), directory, Map.of()),
-                    HelperShellFixture.output(directory));
+            assertMetadataProbeReady(fixture.endpoint(), directory, Map.of());
         }
     }
 
@@ -425,9 +576,7 @@ class Ec2MetadataProxyTest {
             fixture.start();
             requireTokens(fixture.instance());
 
-            int result = HelperShellFixture.run(probe(fixture.endpoint()), directory, HelperShellFixture.proxyEnvironment(proxy));
-
-            assertEquals(0, result, HelperShellFixture.output(directory));
+            assertMetadataProbeReady(fixture.endpoint(), directory, proxyEnvironment(proxy));
             assertEquals(List.of(), proxied);
         } finally {
             proxy.stop(0);
@@ -578,6 +727,33 @@ class Ec2MetadataProxyTest {
     }
 
     /** An HTTP proxy that records every request it is sent and answers each with 502. */
+    private static HttpServer failingProxy(List<String> proxied) throws Exception {
+        HttpServer proxy = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        proxy.createContext("/", exchange -> {
+            proxied.add(exchange.getRequestMethod() + " " + exchange.getRequestURI());
+            exchange.sendResponseHeaders(502, -1);
+            exchange.close();
+        });
+        proxy.start();
+        return proxy;
+    }
+
+    /** The proxy settings an image could carry, with nothing exempted. */
+    private static Map<String, String> proxyEnvironment(HttpServer proxy) {
+        String proxyUrl = "http://127.0.0.1:" + proxy.getAddress().getPort();
+        return Map.of("http_proxy", proxyUrl, "HTTP_PROXY", proxyUrl, "all_proxy", proxyUrl,
+                "ALL_PROXY", proxyUrl, "no_proxy", "", "NO_PROXY", "");
+    }
+
+    private static void assertMetadataProbeReady(String endpoint, Path directory, Map<String, String> environment) {
+        // Startup retries the one-second probe; a newly started fixture can also
+        // miss its first attempt when the full CI shard is busy.
+        await().pollInSameThread().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(100))
+                .atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                    assertEquals(0, HelperShellFixture.run(probe(endpoint), directory, environment),
+                            HelperShellFixture.output(directory)));
+    }
+
     private static String[] probe(String endpoint) {
         return new String[]{"sh", "-c", Ec2MetadataProxy.imdsProbeCommand(endpoint)};
     }

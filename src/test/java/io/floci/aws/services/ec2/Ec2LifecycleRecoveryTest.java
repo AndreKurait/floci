@@ -1,6 +1,8 @@
 package io.floci.aws.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import io.floci.aws.config.EmulatorConfig;
@@ -311,6 +313,9 @@ class Ec2LifecycleRecoveryTest {
         final Ec2Service service;
 
         Node(Options options) {
+            InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+            when(inspect.exec()).thenReturn(new InspectContainerResponse());
+            when(docker.inspectContainerCmd(anyString())).thenReturn(inspect);
             RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
             if (options.removeBehaviour != null) {
                 options.removeBehaviour.accept(remove);
