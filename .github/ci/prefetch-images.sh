@@ -54,9 +54,22 @@ starts() {
 # The image a test constant pins, or empty (and a log line) when the constant cannot be read.
 # TestImages is found by name rather than by its package path, which a package rename changes.
 TEST_IMAGES="$(find src/test/java -path '*/testing/TestImages.java' -print -quit)"
+if starts SsmSessionManagerDockerNightlyIntegrationTest; then
+    pull debian:bookworm-slim
+    pull postgres:17
+fi
+if starts RdsIntegrationRetryPermissionDockerNightlyIntegrationTest; then
+    pull postgres:16-alpine
+fi
 if starts Ec2PublishedConnectionNightlyIntegrationTest; then
     ecr public.ecr.aws/docker/library/alpine:latest
     pull alpine/socat
+fi
+# Ec2GuestShutdownDockerNightlyIntegrationTest launches ami-alpine and attaches a volume through the
+# volume helper (floci.services.ec2.volume-helper-image).
+if starts Ec2GuestShutdownDockerNightlyIntegrationTest; then
+    ecr public.ecr.aws/docker/library/alpine:latest
+    pull alpine:3.21
 fi
 test_image() {
     image="$(grep -oE "$1 *= *\"[^\"]+\"" "${TEST_IMAGES:-/dev/null}" | grep -oE '"[^"]+"' | tr -d '"')"
@@ -121,6 +134,14 @@ starts ContainerCaBundleDockerIntegrationTest EcsCredentialsProxyDockerNightlyIn
     && [ -n "$PYTHON_ALPINE_IMAGE" ] && pull "$PYTHON_ALPINE_IMAGE"
 # Firewall fixtures also start lightweight network clients in this pinned Alpine image.
 starts SecurityGroupFirewallDockerNightlyIntegrationTest && pull alpine:3.21
+# DNS lifecycle guests use Python, including inherited protected/shared checks. Their network helpers build
+# from alpine:3.21 locally, so prefetch the base rather than pulling the locally built helper image.
+if starts EcsPrivateDnsGuestDockerNightlyIntegrationTest EcsSharedPrivateDnsGuestDockerNightlyIntegrationTest \
+          EcsProtectedPrivateDnsGuestDockerNightlyIntegrationTest Ec2PrivateDnsGuestDockerNightlyIntegrationTest \
+          Ec2ProtectedPrivateDnsGuestDockerNightlyIntegrationTest; then
+    [ -n "$PYTHON_ALPINE_IMAGE" ] && pull "$PYTHON_ALPINE_IMAGE"
+    pull alpine:3.21
+fi
 CORRETTO_8_IMAGE="$(test_image CORRETTO_8)"
 starts ContainerCaBundleDockerIntegrationTest && [ -n "$CORRETTO_8_IMAGE" ] && pull "$CORRETTO_8_IMAGE"
 # The Firelens test names the log router image itself rather than taking it from config.
@@ -193,6 +214,14 @@ if grep -q '/neptune/' "$SHARD_FILE"; then
     configured_image neptune default-neo4j-image
     configured_image neptune default-image
 fi
+# NeptuneGraphVolumeDockerNightlyIntegrationTest keeps a graph across containers on both engines' configured images,
+# and NeptuneClusterRestartDockerNightlyIntegrationTest restarts clusters on the Gremlin one.
+if starts NeptuneGraphVolumeDockerNightlyIntegrationTest NeptuneClusterRestartDockerNightlyIntegrationTest; then
+    configured_image neptune default-image
+    configured_image neptune default-neo4j-image
+fi
+# DocDbClusterRestartDockerNightlyIntegrationTest restarts clusters on the configured MongoDB image.
+starts DocDbClusterRestartDockerNightlyIntegrationTest && configured_image docdb default-image
 grep -q '/elasticache/' "$SHARD_FILE" && { pull valkey/valkey:8; pull memcached:1.6; }
 grep -q '/memorydb/'    "$SHARD_FILE" && pull valkey/valkey:8
 grep -q '/ecr/'         "$SHARD_FILE" && pull registry:2
@@ -219,7 +248,9 @@ grep -q 'RdsAwsDockerNightlyIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_I
 REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resources/application.yml | awk '{print $2}')"
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
 grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
-# The template-database restore fixture gets its PostgreSQL image from its test profile.
+# RdsEndpointsInVpcDockerNightlyIntegrationTest serves each instance through a relay on EC2's socat image.
+starts RdsEndpointsInVpcDockerNightlyIntegrationTest && configured_image ec2 socat-image
+# The template-database restore fixture selects its own PostgreSQL image.
 # Read that override so its first CreateDBInstance does not also have to pull PostGIS.
 POSTGIS_PROFILE="$(find src/test/java -path '*/testing/CloudFormationSettingsProfile.java' -print -quit)"
 POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4 }' "${POSTGIS_PROFILE:-/dev/null}")"

@@ -162,6 +162,16 @@ and deletion events produced by the operation.
 `ClientRequestToken` remains absent, including on legacy stored events. This
 support does not add token generation, request deduplication, or token expiry.
 
+## IAM role tags
+
+`AWS::IAM::Role` attaches the template's `Tags` to the role on creation and
+drives them to the template's set on update, which requires no interruption. A
+tag a template declares that IAM refuses, such as a key or value outside
+`TagRole`'s shape or more than 50 tags, fails the resource the way `CreateRole`
+fails the whole request. An update takes out only the keys the stack applied,
+so a tag added outside the stack stays, and a failed update puts the prior tags
+of the touched keys back.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->

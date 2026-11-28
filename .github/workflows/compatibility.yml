@@ -376,8 +376,8 @@ jobs:
         docker inspect -f '{{json .State.Health}}' floci
         docker logs --tail 50 floci
         exit 1
-    - name: Pre-pull Neptune image for Node SDK
-      if: matrix.test == 'sdk-test-node'
+    - name: Pre-pull Neptune image for Node SDK and AWS CLI
+      if: matrix.test == 'sdk-test-node' || matrix.test == 'sdk-test-awscli'
       run: |
         image="$(bash .github/ci/service-image.sh neptune default-image)"
         if [ -z "$image" ]; then
@@ -395,6 +395,7 @@ jobs:
         done
         echo "::error::Neptune image pre-pull failed after 3 attempts: $image"
         exit 1
+
     - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
     - name: Build test image
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
