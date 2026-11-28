@@ -166,7 +166,10 @@ class IotMqttMutualTlsIntegrationTest {
         try {
             assertNotAuthorized(() -> connectTls(IotDeviceIdentity.stranger(TLS_DIR), clientId));
 
-            Thread.sleep(200);
+            // A round trip on the holder's own connection, sent after the refusal came back: the
+            // broker answers it only for a session the refused connect left open.
+            holder.setTimeToWait(10_000);
+            holder.unsubscribe("after/the/refusal");
             assertTrue(holder.isConnected(), "the admitted session survives a refused connect with its client id");
             given()
                 .when().get("/connections/{clientId}", clientId)

@@ -1,0 +1,162 @@
+{
+  "_source": {
+    "generator": "tools/aws/regen_ssm_inventory_shapes.py",
+    "botocore": "botocore 1.43.118 (installed package)"
+  },
+  "operations": {
+    "PutInventory": "PutInventoryRequest",
+    "ListInventoryEntries": "ListInventoryEntriesRequest"
+  },
+  "shapes": {
+    "AttributeName": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "AttributeValue": {
+      "type": "string",
+      "min": 0,
+      "max": 4096
+    },
+    "InstanceId": {
+      "type": "string",
+      "pattern": "(^i-(\\w{8}|\\w{17})$)|(^mi-\\w{17}$)"
+    },
+    "InventoryFilter": {
+      "type": "structure",
+      "required": [
+        "Key",
+        "Values"
+      ],
+      "members": {
+        "Key": "InventoryFilterKey",
+        "Values": "InventoryFilterValueList",
+        "Type": "InventoryQueryOperatorType"
+      }
+    },
+    "InventoryFilterKey": {
+      "type": "string",
+      "min": 1,
+      "max": 200
+    },
+    "InventoryFilterList": {
+      "type": "list",
+      "min": 1,
+      "max": 5,
+      "member": "InventoryFilter"
+    },
+    "InventoryFilterValue": {
+      "type": "string"
+    },
+    "InventoryFilterValueList": {
+      "type": "list",
+      "min": 1,
+      "max": 40,
+      "member": "InventoryFilterValue"
+    },
+    "InventoryItem": {
+      "type": "structure",
+      "required": [
+        "TypeName",
+        "SchemaVersion",
+        "CaptureTime"
+      ],
+      "members": {
+        "TypeName": "InventoryItemTypeName",
+        "SchemaVersion": "InventoryItemSchemaVersion",
+        "CaptureTime": "InventoryItemCaptureTime",
+        "ContentHash": "InventoryItemContentHash",
+        "Content": "InventoryItemEntryList",
+        "Context": "InventoryItemContentContext"
+      }
+    },
+    "InventoryItemCaptureTime": {
+      "type": "string",
+      "pattern": "^(20)[0-9][0-9]-(0[1-9]|1[012])-([12][0-9]|3[01]|0[1-9])(T)(2[0-3]|[0-1][0-9])(:[0-5][0-9])(:[0-5][0-9])(Z)$"
+    },
+    "InventoryItemContentContext": {
+      "type": "map",
+      "min": 0,
+      "max": 50,
+      "key": "AttributeName",
+      "value": "AttributeValue"
+    },
+    "InventoryItemContentHash": {
+      "type": "string",
+      "max": 256
+    },
+    "InventoryItemEntry": {
+      "type": "map",
+      "min": 0,
+      "max": 50,
+      "key": "AttributeName",
+      "value": "AttributeValue"
+    },
+    "InventoryItemEntryList": {
+      "type": "list",
+      "min": 0,
+      "max": 10000,
+      "member": "InventoryItemEntry"
+    },
+    "InventoryItemList": {
+      "type": "list",
+      "min": 1,
+      "max": 30,
+      "member": "InventoryItem"
+    },
+    "InventoryItemSchemaVersion": {
+      "type": "string",
+      "pattern": "^([0-9]{1,6})(\\.[0-9]{1,6})$"
+    },
+    "InventoryItemTypeName": {
+      "type": "string",
+      "min": 1,
+      "max": 100,
+      "pattern": "^(AWS|Custom):.*$"
+    },
+    "InventoryQueryOperatorType": {
+      "type": "string",
+      "enum": [
+        "Equal",
+        "NotEqual",
+        "BeginWith",
+        "LessThan",
+        "GreaterThan",
+        "Exists"
+      ]
+    },
+    "ListInventoryEntriesRequest": {
+      "type": "structure",
+      "required": [
+        "InstanceId",
+        "TypeName"
+      ],
+      "members": {
+        "InstanceId": "InstanceId",
+        "TypeName": "InventoryItemTypeName",
+        "Filters": "InventoryFilterList",
+        "NextToken": "NextToken",
+        "MaxResults": "MaxResults"
+      }
+    },
+    "MaxResults": {
+      "type": "integer",
+      "min": 1,
+      "max": 50
+    },
+    "NextToken": {
+      "type": "string"
+    },
+    "PutInventoryRequest": {
+      "type": "structure",
+      "required": [
+        "InstanceId",
+        "Items"
+      ],
+      "members": {
+        "InstanceId": "InstanceId",
+        "Items": "InventoryItemList"
+      }
+    }
+  }
+}

@@ -2,6 +2,8 @@ package io.floci.aws.services.lambda.launcher;
 
 import io.floci.aws.services.lambda.model.LambdaFunction;
 
+import java.util.List;
+
 /**
  * Starts and stops Lambda execution environments. Implementations back each
  * environment with a concrete runtime: a Docker container ({@link ContainerLauncher}),
@@ -21,6 +23,9 @@ public interface LambdaRuntimeLauncher {
     }
 
     void stop(ContainerHandle handle);
+
+    default void retireFunctionCode(List<LambdaFunction> deletedFunctions) {
+    }
 
     boolean isAlive(ContainerHandle handle);
 }

@@ -8,6 +8,7 @@ import java.util.Map;
  *
  * @param issuer   the {@code iss} claim
  * @param subject  the {@code sub} claim. For IRSA, {@code system:serviceaccount:<ns>:<sa>}
+ * @param sourceIdentity the optional verified AWS source identity claim
  * @param audiences the {@code aud} claim, normalized to a list (JWT allows string or array)
  * @param principalTags the session tags the token passes, from either of the two claim formats
  *                      AWS publishes for them, and empty when it passes none
@@ -16,9 +17,18 @@ import java.util.Map;
  */
 public record WebIdentityToken(String issuer, String subject, List<String> audiences,
                                Map<String, String> principalTags,
-                               List<String> transitiveTagKeys) {
+                               List<String> transitiveTagKeys, String sourceIdentity) {
 
     public WebIdentityToken(String issuer, String subject, List<String> audiences) {
-        this(issuer, subject, audiences, Map.of(), List.of());
+        this(issuer, subject, audiences, Map.of(), List.of(), null);
+    }
+
+    public WebIdentityToken(String issuer, String subject, List<String> audiences, String sourceIdentity) {
+        this(issuer, subject, audiences, Map.of(), List.of(), sourceIdentity);
+    }
+
+    public WebIdentityToken(String issuer, String subject, List<String> audiences,
+                            Map<String, String> principalTags, List<String> transitiveTagKeys) {
+        this(issuer, subject, audiences, principalTags, transitiveTagKeys, null);
     }
 }

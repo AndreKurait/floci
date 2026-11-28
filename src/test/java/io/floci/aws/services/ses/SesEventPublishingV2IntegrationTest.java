@@ -1478,7 +1478,10 @@ class SesEventPublishingV2IntegrationTest {
 
     private List<JsonNode> receiveEbEvents(int expectedAtLeast) throws Exception {
         List<JsonNode> events = new ArrayList<>();
-        int maxAttempts = expectedAtLeast > 0 ? 10 : 2;
+        // SES -> EventBridge -> SQS runs inside the send request, so "no event arrives" is read
+        // off the queue once the send has returned, without waiting for one.
+        int maxAttempts = expectedAtLeast > 0 ? 10 : 1;
+        int waitSeconds = expectedAtLeast > 0 ? 1 : 0;
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
             if (expectedAtLeast > 0 && events.size() >= expectedAtLeast) {
                 break;
@@ -1488,7 +1491,7 @@ class SesEventPublishingV2IntegrationTest {
                     .header("Authorization", SQS_AUTH)
                     .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
                     .body("{\"QueueUrl\":\"" + ebQueueUrl
-                            + "\",\"MaxNumberOfMessages\":10,\"WaitTimeSeconds\":1}")
+                            + "\",\"MaxNumberOfMessages\":10,\"WaitTimeSeconds\":" + waitSeconds + "}")
             .when()
                     .post("/")
             .then()
@@ -1894,10 +1897,11 @@ class SesEventPublishingV2IntegrationTest {
 
     private List<JsonNode> receiveSesEvents(int expectedAtLeast) throws Exception {
         List<JsonNode> events = new ArrayList<>();
-        // When we're confirming "no event arrives", a couple of long-poll attempts is
-        // enough — SES → SNS → SQS propagates in seconds locally. Keep 10 attempts only
-        // when we're actually waiting for events to appear.
-        int maxAttempts = expectedAtLeast > 0 ? 10 : 2;
+        // SES -> SNS -> SQS runs inside the send request, so "no event arrives" is read off the
+        // queue once the send has returned, without waiting for one. Keep 10 long-poll attempts
+        // only when we're actually collecting events.
+        int maxAttempts = expectedAtLeast > 0 ? 10 : 1;
+        int waitSeconds = expectedAtLeast > 0 ? 1 : 0;
         for (int attempt = 0; attempt < maxAttempts; attempt++) {
             if (expectedAtLeast > 0 && events.size() >= expectedAtLeast) {
                 break;
@@ -1907,7 +1911,7 @@ class SesEventPublishingV2IntegrationTest {
                     .header("Authorization", SQS_AUTH)
                     .header("X-Amz-Target", "AmazonSQS.ReceiveMessage")
                     .body("{\"QueueUrl\":\"" + queueUrl
-                            + "\",\"MaxNumberOfMessages\":10,\"WaitTimeSeconds\":1}")
+                            + "\",\"MaxNumberOfMessages\":10,\"WaitTimeSeconds\":" + waitSeconds + "}")
             .when()
                     .post("/")
             .then()

@@ -64,7 +64,8 @@ class CloudFormationIamRoleDurationIntegrationTest {
             sessions.forEach(key -> iamService.unregisterSession(ACCOUNT, key));
             if (stackCreated) {
                 cfn.deleteStack(request -> request.stackName(name));
-                await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                await().atMost(Duration.ofSeconds(10)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() ->
                         assertThrows(NoSuchEntityException.class,
                                 () -> iam.getRole(request -> request.roleName(name))));
             }

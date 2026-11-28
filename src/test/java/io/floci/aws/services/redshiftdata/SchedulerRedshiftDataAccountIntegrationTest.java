@@ -111,7 +111,8 @@ class SchedulerRedshiftDataAccountIntegrationTest {
     // The SQL runs off the invoking thread. Waiting for its outcome shows it ran as the schedule's account
     // too, and keeps a late write from leaking into the next test.
     private void awaitFailed(String statementId) {
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals("FAILED",
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertEquals("FAILED",
                 RequestScopes.callAs(SCHEDULE_ACCOUNT, () -> redshiftDataService.describeStatement(
                         JsonNodeFactory.instance.objectNode().put("Id", statementId))).path("Status").asText()));
     }

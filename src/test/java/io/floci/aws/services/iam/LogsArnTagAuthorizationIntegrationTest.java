@@ -8,6 +8,7 @@ import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
 import io.floci.aws.services.cloudwatch.logs.model.LogDestination;
 import io.floci.aws.testing.IamEnforcementProfile;
 import io.floci.aws.testing.LogsAuthorizationFixtures;
+import io.floci.aws.testing.LogsDeliveryFixture;
 import io.floci.aws.testing.PartitionCleanup;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -15,6 +16,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.ValidatableResponse;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -47,6 +49,24 @@ class LogsArnTagAuthorizationIntegrationTest {
 
     @TestHTTPResource
     URI endpoint;
+
+    private LogsDeliveryFixture delivery;
+
+    private LogsDeliveryFixture delivery() {
+        if (delivery == null) {
+            delivery = new LogsDeliveryFixture(endpoint, ACCOUNT, REGION);
+        }
+        return delivery;
+    }
+
+    @AfterEach
+    void closeDeliveryFixture() {
+        if (delivery != null) {
+            delivery.close();
+            delivery = null;
+        }
+    }
+
 
     @Inject
     CloudWatchLogsService logsService;
@@ -331,8 +351,8 @@ class LogsArnTagAuthorizationIntegrationTest {
         registerDestinationCleanup(name);
         call(endpoint.getPort(), ACCOUNT, "PutDestination", Map.of(
                 "destinationName", name,
-                "targetArn", "arn:aws:kinesis:us-east-1:" + ACCOUNT + ":stream/logs",
-                "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/logs",
+                "targetArn", delivery().targetArn(),
+                "roleArn", delivery().roleArn(),
                 "tags", Map.of("team", team))).statusCode(200);
         return destinationArn(name);
     }
@@ -347,8 +367,8 @@ class LogsArnTagAuthorizationIntegrationTest {
     private ValidatableResponse putTaggedDestination(String caller, String name) {
         return call(endpoint.getPort(), caller, "PutDestination", Map.of(
                 "destinationName", name,
-                "targetArn", "arn:aws:kinesis:us-east-1:" + ACCOUNT + ":stream/logs",
-                "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/logs",
+                "targetArn", delivery().targetArn(),
+                "roleArn", delivery().roleArn(),
                 "tags", Map.of("team", "blue")));
     }
 

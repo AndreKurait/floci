@@ -168,7 +168,8 @@ class RedshiftEventsIntegrationTest {
                     redshift.modifyEventSubscription(request -> request.subscriptionName(name).enabled(false));
                     redshift.modifyClusterParameterGroup(request -> request.parameterGroupName(name)
                             .parameters(Parameter.builder().parameterName("statement_timeout").parameterValue("5001").build()));
-                    assertTrue(sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(1)).messages().isEmpty());
+                    // The event is published on the request thread: had it been delivered, it is in the queue now.
+                    assertTrue(sqs.receiveMessage(request -> request.queueUrl(queue).waitTimeSeconds(0)).messages().isEmpty());
                 } finally {
                     redshift.deleteClusterParameterGroup(request -> request.parameterGroupName(name));
                 }

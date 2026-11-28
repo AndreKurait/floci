@@ -1,10 +1,17 @@
 package io.floci.aws.services.ce;
 
+import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.model.Instance;
+import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -19,6 +26,9 @@ import static org.hamcrest.Matchers.*;
 @QuarkusTest
 class CostExplorerIntegrationTest {
 
+    @Inject
+    Ec2Service ec2;
+
     private static final String CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final String AUTH_HEADER =
             "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/ce/aws4_request";
@@ -28,6 +38,42 @@ class CostExplorerIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @Test
+    void runningM6gInstancesUseTheBundledOnDemandPriceForEveryCostMetric() {
+        Instance instance = ec2.runInstances("us-east-1", "ami-unknown-arm64", "m6g.large",
+                        1, 1, null, List.of(), null, null, List.of(), null, null)
+                .getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        try {
+            Map<String, Map<String, String>> metrics = given()
+                    .contentType(CONTENT_TYPE)
+                    .header("X-Amz-Target", "AWSInsightsIndexService.GetCostAndUsage")
+                    .header("Authorization", AUTH_HEADER)
+                    .body("""
+                            {
+                              "TimePeriod":{"Start":"2026-10-01","End":"2026-10-02"},
+                              "Granularity":"DAILY",
+                              "Metrics":["UnblendedCost","BlendedCost","AmortizedCost",
+                                         "NetUnblendedCost","NetAmortizedCost"],
+                              "Filter":{"Dimensions":{"Key":"RESOURCE_ID","Values":["%s"]}}
+                            }
+                            """.formatted(instance.getInstanceId()))
+            .when().post("/")
+            .then()
+                    .statusCode(200)
+                    .extract().path("ResultsByTime[0].Total");
+
+            assertThat(metrics.keySet(), containsInAnyOrder("UnblendedCost", "BlendedCost",
+                    "AmortizedCost", "NetUnblendedCost", "NetAmortizedCost"));
+            for (Map<String, String> metric : metrics.values()) {
+                assertThat(Double.parseDouble(metric.get("Amount")), closeTo(24 * 0.077, 1e-9));
+                assertThat(metric.get("Unit"), equalTo("USD"));
+            }
+        } finally {
+            ec2.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+        }
     }
 
     @Test

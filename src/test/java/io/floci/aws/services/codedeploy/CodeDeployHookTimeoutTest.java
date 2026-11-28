@@ -3,6 +3,7 @@ package io.floci.aws.services.codedeploy;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ecs.EcsService;
 import io.floci.aws.services.elbv2.ElbV2Service;
@@ -84,7 +85,8 @@ class CodeDeployHookTimeoutTest {
         CodeDeployService service = new CodeDeployService(
                 mock(LambdaService.class), mock(EcsService.class), mock(ElbV2Service.class),
                 ssm, mock(Ec2Service.class), new ObjectMapper(),
-                new RegionResolver(region, "000000000000"), null);
+                new RegionResolver(region, "000000000000"), null,
+                CodeDeployTestRoles.allowAll());
         service.createApplication(region, "app", "Server", null);
         service.createDeploymentGroup(region, "app", "group", null, "role", null, null);
         return service;

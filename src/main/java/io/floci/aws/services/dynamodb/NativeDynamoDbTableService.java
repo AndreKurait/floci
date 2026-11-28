@@ -61,7 +61,12 @@ public class NativeDynamoDbTableService {
     }
 
     record GsiThroughputUpdate(String indexName, Throughput provisionedThroughput,
-                               OnDemandThroughput onDemandThroughput, WarmThroughput warmThroughput) {}
+                               OnDemandThroughput onDemandThroughput, WarmThroughput warmThroughput) {
+        GsiThroughputUpdate(String indexName, Throughput provisionedThroughput,
+                               OnDemandThroughput onDemandThroughput) {
+            this(indexName, provisionedThroughput, onDemandThroughput, null);
+        }
+    }
 
     record TableSettings(String billingMode, Boolean deletionProtectionEnabled, String tableClass,
                          OnDemandThroughput onDemandThroughput,
@@ -73,7 +78,16 @@ public class NativeDynamoDbTableService {
                               List<GlobalSecondaryIndex> globalSecondaryIndexes,
                               List<LocalSecondaryIndex> localSecondaryIndexes,
                               List<DynamoDbService.VectorIndexCreate> vectorIndexes,
-                              Map<String, String> tags, TableSettings settings, WarmThroughput warmThroughput) {}
+                              Map<String, String> tags, TableSettings settings, WarmThroughput warmThroughput) {
+        CreateTableRequest(String tableName, List<KeySchemaElement> keySchema,
+                              List<AttributeDefinition> attributeDefinitions, Throughput provisionedThroughput,
+                              List<GlobalSecondaryIndex> globalSecondaryIndexes,
+                              List<LocalSecondaryIndex> localSecondaryIndexes,
+                              List<DynamoDbService.VectorIndexCreate> vectorIndexes,
+                              Map<String, String> tags, TableSettings settings) {
+            this(tableName, keySchema, attributeDefinitions, provisionedThroughput, globalSecondaryIndexes, localSecondaryIndexes, vectorIndexes, tags, settings, null);
+        }
+    }
 
     record UpdateTableRequest(String tableName, Throughput provisionedThroughput,
                               List<AttributeDefinition> attributeDefinitions,
@@ -81,7 +95,17 @@ public class NativeDynamoDbTableService {
                               List<GsiThroughputUpdate> gsiUpdates,
                               List<DynamoDbService.VectorIndexCreate> vectorCreates, List<String> vectorDeletes,
                               List<String> replicaAdds, List<String> replicaRemoves, List<String> replicaUpdates,
-                              TableSettings settings, WarmThroughput warmThroughput) {}
+                              TableSettings settings, WarmThroughput warmThroughput) {
+        UpdateTableRequest(String tableName, Throughput provisionedThroughput,
+                              List<AttributeDefinition> attributeDefinitions,
+                              List<GlobalSecondaryIndex> gsiCreates, List<String> gsiDeletes,
+                              List<GsiThroughputUpdate> gsiUpdates,
+                              List<DynamoDbService.VectorIndexCreate> vectorCreates, List<String> vectorDeletes,
+                              List<String> replicaAdds, List<String> replicaRemoves, List<String> replicaUpdates,
+                              TableSettings settings) {
+            this(tableName, provisionedThroughput, attributeDefinitions, gsiCreates, gsiDeletes, gsiUpdates, vectorCreates, vectorDeletes, replicaAdds, replicaRemoves, replicaUpdates, settings, null);
+        }
+    }
 
     /**
      * What one Enable or Disable call applied. The values are the ones the call itself wrote, not a
@@ -122,6 +146,13 @@ public class NativeDynamoDbTableService {
      *                      a table an ImportTable job is still loading
      */
     TableDefinition createTable(CreateTableRequest request, String initialStatus, String region) {
+        DynamoDbTableNames.requireShortName(request.tableName());
+        synchronized (dynamoDbService.tableControlLock(request.tableName(), region)) {
+            return createTableWithCapacityLock(request, initialStatus, region);
+        }
+    }
+
+    private TableDefinition createTableWithCapacityLock(CreateTableRequest request, String initialStatus, String region) {
         String tableName = request.tableName();
         TableSettings settings = request.settings();
         String billingMode = settings.billingMode();
@@ -189,6 +220,7 @@ public class NativeDynamoDbTableService {
         // backend serializes on write rather than holding the live object. Flush once so the
         // stream, billing, class, tag and SSE settings survive a restart: stream state
         // especially, since startup rebuilds streams from the persisted table.
+        table.retainWarmThroughput();
         dynamoDbService.persistTable(tableName, table, region);
         return table;
     }
@@ -461,8 +493,10 @@ public class NativeDynamoDbTableService {
      * stay with the caller, which runs them while it parses so their error precedence holds.
      */
     TableDefinition updateTable(UpdateTableRequest request, String region) {
-        synchronized (dynamoDbService.capacityLock()) {
-            return applyUpdate(request, region);
+        synchronized (dynamoDbService.tableControlLock(request.tableName(), region)) {
+            synchronized (dynamoDbService.capacityLock()) {
+                return applyUpdate(request, region);
+            }
         }
     }
 
@@ -499,6 +533,7 @@ public class NativeDynamoDbTableService {
                 request.vectorCreates(), request.vectorDeletes(),
                 settings.billingMode(), region);
 
+        table.retainWarmThroughput();
         for (GsiThroughputUpdate update : request.gsiUpdates()) {
             GlobalSecondaryIndex gsi = table.findGsi(update.indexName()).orElseThrow();
             Throughput gsiThroughput = update.provisionedThroughput();
@@ -569,6 +604,7 @@ public class NativeDynamoDbTableService {
         // the table from storage for its own persist. A persistent backend serializes on write
         // rather than holding the live object, so without this flush first, that re-fetch would
         // see neither the stream nor the SSE mutations above.
+        table.retainWarmThroughput();
         dynamoDbService.persistTable(tableName, table, region);
 
         if (replicaUpdates) {

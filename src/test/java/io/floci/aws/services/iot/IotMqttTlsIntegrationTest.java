@@ -29,7 +29,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
@@ -41,6 +40,7 @@ import static io.floci.aws.services.iot.IotMqttEnabledIntegrationTest.AWS_MAX_PA
 import static io.floci.aws.services.iot.IotMqttEnabledIntegrationTest.randomPayload;
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -483,15 +483,10 @@ class IotMqttTlsIntegrationTest {
             return next;
         }
 
-        void awaitDisconnected() throws InterruptedException {
-            Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
-            while (Instant.now().isBefore(deadline)) {
-                if (!client.isConnected()) {
-                    return;
-                }
-                Thread.sleep(25);
-            }
-            throw new AssertionError("the TLS session stayed open");
+        void awaitDisconnected() {
+            await("the TLS session to close").atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(25))
+                    .until(() -> !client.isConnected());
         }
 
         @Override

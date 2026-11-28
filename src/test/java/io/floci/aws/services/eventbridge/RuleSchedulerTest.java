@@ -2,6 +2,8 @@ package io.floci.aws.services.eventbridge;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.eventbridge.model.Rule;
 import io.floci.aws.services.eventbridge.model.RuleState;
 import io.floci.aws.services.eventbridge.model.Target;
@@ -16,6 +18,7 @@ import org.mockito.ArgumentCaptor;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -242,6 +245,29 @@ class RuleSchedulerTest {
     }
 
     @SuppressWarnings("unchecked")
+    @Test
+    void aScheduledEventCarriesTheTimeOfTheSchedulerClock() throws Exception {
+        Vertx vertx = mock(Vertx.class);
+        ArgumentCaptor<Handler<Long>> fire = timerHandlerCaptor();
+        when(vertx.setTimer(anyLong(), fire.capture())).thenReturn(1L, 2L);
+        AtomicReference<String> delivered = new AtomicReference<>();
+        EventBridgeInvoker invoker = new EventBridgeInvoker(null, null, null, new ObjectMapper(), testConfig()) {
+            @Override
+            public void invokeTarget(Target target, String eventJson, String region, String ruleArn) {
+                delivered.set(eventJson);
+            }
+        };
+        Rule rule = enabledRule();
+        RuleScheduler scheduler = newScheduler(vertx, invoker);
+        scheduler.startScheduler(RULE_ARN, EVERY_MINUTE_CRON, () -> toScheduleData(rule));
+
+        fire.getValue().handle(1L);
+
+        assertEquals(JUST_BEFORE_MINUTE_BOUNDARY.truncatedTo(ChronoUnit.SECONDS).toString(),
+                new ObjectMapper().readTree(delivered.get()).path("time").asText());
+    }
+
+    @SuppressWarnings("unchecked")
     private static ArgumentCaptor<Handler<Long>> timerHandlerCaptor() {
         return ArgumentCaptor.forClass(Handler.class);
     }
@@ -273,7 +299,9 @@ class RuleSchedulerTest {
     }
 
     private static RuleScheduler newScheduler(Vertx vertx, EventBridgeInvoker invoker, Clock clock) {
-        TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, "http://localhost:4566", Clock.systemUTC(), null);
+        TargetDispatcher dispatcher = new TargetDispatcher(invoker, null, mock(ServiceCallAuthorizer.class),
+                mock(ServiceRoleCallAuthorizer.class),
+                "http://localhost:4566", Clock.systemUTC(), null);
         return new RuleScheduler(vertx, testConfig(), new ObjectMapper(), dispatcher, clock);
     }
 

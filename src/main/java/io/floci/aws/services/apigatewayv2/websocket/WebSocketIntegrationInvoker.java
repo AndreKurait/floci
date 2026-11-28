@@ -4,11 +4,18 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.ContainerCaBundle;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.CallerCallAuthorizer;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.core.common.SsrfProtection;
 import io.floci.aws.services.apigateway.AwsServiceRouter;
+import io.floci.aws.services.apigateway.ExecuteApiSigV4Authorizer.CallerIdentity;
 import io.floci.aws.services.apigateway.VtlTemplateEngine;
 import io.floci.aws.services.apigatewayv2.model.Integration;
 import io.floci.aws.services.apigatewayv2.proxy.PinnedHttpClient;
+import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
@@ -60,36 +67,109 @@ public class WebSocketIntegrationInvoker {
     private final VtlTemplateEngine vtlEngine;
     private final HttpClient httpClient;
     private final AddressResolver addressResolver;
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
+    private final RegionResolver regionResolver;
+    private final CallerCallAuthorizer callerCallAuthorizer;
+
+    public WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                       AwsServiceRouter serviceRouter,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       EmulatorConfig config) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, null, null, null, null,
+                InetAddress::getAllByName, ContainerCaBundle.sslContext(config).orElse(null));
+    }
+
+    public WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                       AwsServiceRouter serviceRouter,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, null, null, null, null,
+                InetAddress::getAllByName, null);
+    }
+
+    WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                       AwsServiceRouter serviceRouter,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       AddressResolver addressResolver) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, null, null, null, null, addressResolver,
+                null);
+    }
+
+    private WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                       AwsServiceRouter serviceRouter,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       AddressResolver addressResolver,
+                                       SSLContext sslContext) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, null, null, null, null, addressResolver,
+                sslContext);
+    }
+
+    public WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                       AwsServiceRouter serviceRouter,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       RegionResolver regionResolver,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, serviceCallAuthorizer, regionResolver,
+                serviceRoleCallAuthorizer, callerCallAuthorizer, InetAddress::getAllByName, null);
+    }
+
+    WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                       AwsServiceRouter serviceRouter,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       RegionResolver regionResolver,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer,
+                                       AddressResolver addressResolver) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, serviceCallAuthorizer, regionResolver,
+                serviceRoleCallAuthorizer, callerCallAuthorizer, addressResolver, null);
+    }
 
     @Inject
-    public WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
-                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
-                                       EmulatorConfig config) {
-        this(lambdaService, serviceRouter, objectMapper, vtlEngine, InetAddress::getAllByName,
+    public WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                       AwsServiceRouter serviceRouter,
+                                       ObjectMapper objectMapper,
+                                       VtlTemplateEngine vtlEngine,
+                                       EmulatorConfig config,
+                                       ServiceCallAuthorizer serviceCallAuthorizer,
+                                       RegionResolver regionResolver,
+                                       ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                       CallerCallAuthorizer callerCallAuthorizer) {
+        this(lambdaService, serviceRouter, objectMapper, vtlEngine, serviceCallAuthorizer, regionResolver,
+                serviceRoleCallAuthorizer, callerCallAuthorizer, InetAddress::getAllByName,
                 ContainerCaBundle.sslContext(config).orElse(null));
     }
 
-    public WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
-                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine) {
-        this(lambdaService, serviceRouter, objectMapper, vtlEngine, InetAddress::getAllByName);
-    }
-
-    WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
-                                ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
-                                AddressResolver addressResolver) {
-        this(lambdaService, serviceRouter, objectMapper, vtlEngine, addressResolver, null);
-    }
-
-    private WebSocketIntegrationInvoker(LambdaService lambdaService, AwsServiceRouter serviceRouter,
-                                        ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
-                                        AddressResolver addressResolver, SSLContext sslContext) {
+    private WebSocketIntegrationInvoker(LambdaService lambdaService,
+                                        AwsServiceRouter serviceRouter,
+                                        ObjectMapper objectMapper,
+                                        VtlTemplateEngine vtlEngine,
+                                        ServiceCallAuthorizer serviceCallAuthorizer,
+                                        RegionResolver regionResolver,
+                                        ServiceRoleCallAuthorizer serviceRoleCallAuthorizer,
+                                        CallerCallAuthorizer callerCallAuthorizer,
+                                        AddressResolver addressResolver,
+                                        SSLContext sslContext) {
         this.lambdaService = lambdaService;
         this.serviceRouter = serviceRouter;
         this.objectMapper = objectMapper;
         this.vtlEngine = vtlEngine;
         this.httpClient = ContainerCaBundle.httpClientBuilder(sslContext).build();
         this.addressResolver = addressResolver;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.regionResolver = regionResolver;
+        this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
+        this.callerCallAuthorizer = callerCallAuthorizer;
     }
+
 
     @FunctionalInterface
     interface AddressResolver {
@@ -131,6 +211,9 @@ public class WebSocketIntegrationInvoker {
      * Invoke the integration for a route.
      *
      * @param region            the AWS region
+     * @param apiId             the source API identifier
+     * @param stageName         the source stage
+     * @param routeKey          the selected route key
      * @param integration       the Integration model
      * @param eventJson         the serialized proxy event JSON
      * @param stageVariables    stage variables for URI substitution
@@ -138,18 +221,62 @@ public class WebSocketIntegrationInvoker {
      * @param responseTemplates response templates (for MOCK integration)
      * @return the integration result
      */
-    public IntegrationResult invoke(String region, Integration integration, String eventJson,
+    public IntegrationResult invoke(String region, String apiId, String stageName, String routeKey,
+                                    Integration integration, String eventJson,
                                     Map<String, String> stageVariables,
                                     Map<String, String> requestTemplates,
                                     Map<String, String> responseTemplates) {
+        return invoke(region, apiId, stageName, routeKey, integration, eventJson, stageVariables,
+                requestTemplates, responseTemplates, null);
+    }
+
+    public IntegrationResult invoke(String region, String apiId, String stageName, String routeKey,
+                                    Integration integration, String eventJson,
+                                    Map<String, String> stageVariables,
+                                    Map<String, String> requestTemplates,
+                                    Map<String, String> responseTemplates, CallerIdentity caller) {
         String integrationType = integration.getIntegrationType();
         if (integrationType == null) {
             integrationType = "AWS_PROXY";
         }
 
+        String functionName = null;
+        if ("AWS_PROXY".equals(integrationType) || "AWS".equals(integrationType)) {
+            functionName = extractFunctionName(substituteStageVariables(integration.getIntegrationUri(),
+                    stageVariables));
+            if (functionName == null || functionName.isEmpty()) {
+                LOG.warnv("Could not extract function name from integration URI: {0}", integration.getIntegrationUri());
+                return new IntegrationResult(500, null, "Invalid integration URI");
+            }
+            String accountId = regionResolver.getAccountId();
+            String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                    region, accountId);
+            String credentials = integration.getCredentialsArn();
+            Decision decision = Decision.ALLOW;
+            if (credentials == null || credentials.isBlank()) {
+                String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
+                        apiId + "/" + stageName + "/" + routeKey).toString();
+                decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId);
+            } else if (credentials.equals(AwsArnUtils.Arn.global(
+                    regionResolver.getPartition(), "iam", "*", "user/*").toString())) {
+                decision = callerCallAuthorizer.authorize(caller == null ? null : caller.accessKey(),
+                        caller == null ? null : caller.accountId(), caller == null ? null : caller.userArn(),
+                        "lambda:InvokeFunction", functionArn, regionResolver.getPartition());
+            } else if (!"*".equals(credentials)) {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, accountId, regionResolver.getPartition());
+            }
+            if (decision == Decision.DENY) {
+                return new IntegrationResult(500, null, "Invalid permissions on Lambda function");
+            }
+            functionName = functionArn;
+        }
+
         return switch (integrationType) {
-            case "AWS_PROXY" -> invokeAwsProxy(region, integration, eventJson, stageVariables);
-            case "AWS" -> invokeAws(region, integration, eventJson, stageVariables, requestTemplates, responseTemplates);
+            case "AWS_PROXY" -> invokeAwsProxy(region, functionName, eventJson);
+            case "AWS" -> invokeAws(region, functionName, integration, eventJson,
+                    stageVariables, requestTemplates, responseTemplates);
             case "HTTP_PROXY" -> invokeHttpProxy(integration, eventJson, stageVariables);
             case "HTTP" -> invokeHttp(integration, eventJson, stageVariables, requestTemplates, responseTemplates);
             case "MOCK" -> invokeMock(integration, stageVariables, requestTemplates, responseTemplates);
@@ -163,17 +290,7 @@ public class WebSocketIntegrationInvoker {
     /**
      * Invoke a Lambda function via AWS_PROXY integration.
      */
-    private IntegrationResult invokeAwsProxy(String region, Integration integration,
-                                             String eventJson, Map<String, String> stageVariables) {
-        String uri = integration.getIntegrationUri();
-        uri = substituteStageVariables(uri, stageVariables);
-
-        String functionName = extractFunctionName(uri);
-        if (functionName == null || functionName.isEmpty()) {
-            LOG.warnv("Could not extract function name from integration URI: {0}", uri);
-            return new IntegrationResult(500, null, "Invalid integration URI");
-        }
-
+    private IntegrationResult invokeAwsProxy(String region, String functionName, String eventJson) {
         LOG.debugv("Invoking Lambda function {0} for AWS_PROXY integration", functionName);
 
         InvokeResult result = lambdaService.invokeTarget(region, functionName,
@@ -219,19 +336,10 @@ public class WebSocketIntegrationInvoker {
      * Applies requestTemplates before invocation and responseTemplates after.
      * Uses templates from the method parameters first, falling back to the integration model's templates.
      */
-    private IntegrationResult invokeAws(String region, Integration integration, String eventJson,
+    private IntegrationResult invokeAws(String region, String functionName, Integration integration, String eventJson,
                                         Map<String, String> stageVariables,
                                         Map<String, String> requestTemplates,
                                         Map<String, String> responseTemplates) {
-        String uri = integration.getIntegrationUri();
-        uri = substituteStageVariables(uri, stageVariables);
-
-        String functionName = extractFunctionName(uri);
-        if (functionName == null || functionName.isEmpty()) {
-            LOG.warnv("Could not extract function name from integration URI: {0}", uri);
-            return new IntegrationResult(500, null, "Invalid integration URI");
-        }
-
         // Use passed templates, falling back to integration model's templates
         Map<String, String> effectiveRequestTemplates = (requestTemplates != null && !requestTemplates.isEmpty())
                 ? requestTemplates

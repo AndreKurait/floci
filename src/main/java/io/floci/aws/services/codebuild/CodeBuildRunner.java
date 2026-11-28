@@ -240,6 +240,7 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
 
             if (stopFlag.get()) { finishStopped(build); return; }
 
+            String accountId = AwsArnUtils.parse(build.getArn()).accountId();
             String logGroup = "/aws/codebuild/" + project.getName();
             String logStream = logStreamer.generateLogStreamName(buildId.replace(":", "/"));
 
@@ -255,7 +256,7 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
             Map<String, Object> logsMap = new HashMap<>();
             logsMap.put("groupName", logGroup);
             logsMap.put("streamName", logStream);
-            logsMap.put("cloudWatchLogsArn", AwsArnUtils.Arn.of("logs", region, regionResolver.getAccountId(), "log-group:" + logGroup + ":log-stream:" + logStream).toString());
+            logsMap.put("cloudWatchLogsArn", AwsArnUtils.Arn.of("logs", region, accountId, "log-group:" + logGroup + ":log-stream:" + logStream).toString());
             build.setLogs(logsMap);
 
             List<String> envList = buildEnvList(region, build, project, buildspec, logStream, credentials.env());
@@ -285,7 +286,7 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
             runningContainers.put(executionId, containerId);
             joinVpcNetwork(region, build, containerId);
 
-            logHandle = logStreamer.attach(containerId, logGroup, logStream, region, "codebuild:" + buildId);
+            logHandle = logStreamer.attachForAccount(accountId, containerId, logGroup, logStream, region, "codebuild:" + buildId);
 
             String containerSrcDir = "/codebuild/output/src/src";
             int timeoutMinutes = build.getTimeoutInMinutes() != null ? build.getTimeoutInMinutes() : 60;
@@ -318,7 +319,8 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
             beginPhase(build, "INSTALL");
             build.setCurrentPhase("INSTALL");
             PhaseResult installResult = runPhase(containerId, containerSrcDir, envList,
-                    buildspec.installCommands(), timeoutMinutes, stopFlag);
+                    buildspec.installCommands(), timeoutMinutes, stopFlag,
+                        logStreamer.execLineLogCallbackForAccount(accountId, logGroup, logStream, region));
             if (installResult.stopped()) { finishStopped(build); return; }
             if (installResult.failed()) {
                 completePhaseWithError(build, "INSTALL", "FAILED", installResult.errorMessage());
@@ -333,7 +335,8 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
                 beginPhase(build, "PRE_BUILD");
                 build.setCurrentPhase("PRE_BUILD");
                 PhaseResult preBuildResult = runPhase(containerId, containerSrcDir, envList,
-                        buildspec.preBuildCommands(), timeoutMinutes, stopFlag);
+                        buildspec.preBuildCommands(), timeoutMinutes, stopFlag,
+                        logStreamer.execLineLogCallbackForAccount(accountId, logGroup, logStream, region));
                 if (preBuildResult.stopped()) { finishStopped(build); return; }
                 if (preBuildResult.failed()) {
                     completePhaseWithError(build, "PRE_BUILD", "FAILED", preBuildResult.errorMessage());
@@ -351,7 +354,8 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
                 beginPhase(build, "BUILD");
                 build.setCurrentPhase("BUILD");
                 PhaseResult buildResult = runPhase(containerId, containerSrcDir, envList,
-                        buildspec.buildCommands(), timeoutMinutes, stopFlag);
+                        buildspec.buildCommands(), timeoutMinutes, stopFlag,
+                        logStreamer.execLineLogCallbackForAccount(accountId, logGroup, logStream, region));
                 if (buildResult.stopped()) { finishStopped(build); return; }
                 if (buildResult.failed()) {
                     completePhaseWithError(build, "BUILD", "FAILED", buildResult.errorMessage());
@@ -368,7 +372,8 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
             beginPhase(build, "POST_BUILD");
             build.setCurrentPhase("POST_BUILD");
             PhaseResult postBuildResult = runPhase(containerId, containerSrcDir, envList,
-                    buildspec.postBuildCommands(), timeoutMinutes, stopFlag);
+                    buildspec.postBuildCommands(), timeoutMinutes, stopFlag,
+                        logStreamer.execLineLogCallbackForAccount(accountId, logGroup, logStream, region));
             if (postBuildResult.stopped()) { finishStopped(build); return; }
             if (postBuildResult.failed()) {
                 completePhaseWithError(build, "POST_BUILD", "FAILED", postBuildResult.errorMessage());
@@ -717,6 +722,12 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
 
     PhaseResult runPhase(String containerId, String workDir, List<String> env,
                                  List<String> commands, int timeoutMinutes, AtomicBoolean stopFlag) {
+        return runPhase(containerId, workDir, env, commands, timeoutMinutes, stopFlag, null);
+    }
+
+    PhaseResult runPhase(String containerId, String workDir, List<String> env,
+                         List<String> commands, int timeoutMinutes, AtomicBoolean stopFlag,
+                         ResultCallback.Adapter<Frame> logCallback) {
         if (commands.isEmpty()) {
             return PhaseResult.ofSuccess();
         }
@@ -741,39 +752,57 @@ public class CodeBuildRunner implements ContainerTeardown, VpcDependencyProvider
             CountDownLatch latch = new CountDownLatch(1);
             OutputTail outputCapture = new OutputTail();
 
-            phaseOutput = streamingDockerClient.execStartCmd(execId).exec(new ResultCallback.Adapter<Frame>() {
+            try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>() {
                 @Override
                 public void onNext(Frame frame) {
-                    if (frame.getPayload() != null) {
+                    if (frame != null && frame.getPayload() != null) {
                         outputCapture.write(frame.getPayload());
+                        if (logCallback != null) {
+                            logCallback.onNext(frame);
+                        }
                     }
                 }
                 @Override
-                public void onComplete() { latch.countDown(); }
-                @Override
-                public void onError(Throwable t) { latch.countDown(); }
-            });
-
-            boolean completed = latch.await(timeoutMinutes, TimeUnit.MINUTES);
-            if (!completed) {
-                // Its output would otherwise hold a streaming connection for as long as the command runs on.
-                closePhaseOutput(phaseOutput);
-                return PhaseResult.ofFailure("Phase timed out after " + timeoutMinutes + " minutes");
-            }
-            if (stopFlag.get()) {
-                return PhaseResult.ofStopped();
-            }
-
-            Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
-            if (exitCode != null && exitCode != 0) {
-                String output = outputCapture.asString().stripTrailing();
-                String msg = "Exit code " + exitCode;
-                if (!output.isBlank()) {
-                    msg += ": " + output.substring(Math.max(0, output.length() - FAILURE_OUTPUT_CHARS));
+                public void onComplete() {
+                    if (logCallback != null) {
+                        logCallback.onComplete();
+                    }
+                    latch.countDown();
                 }
-                return PhaseResult.ofFailure(msg);
+                @Override
+                public void onError(Throwable t) {
+                    if (logCallback != null) {
+                        logCallback.onError(t);
+                    }
+                    latch.countDown();
+                }
+            }) {
+                phaseOutput = streamingDockerClient.execStartCmd(execId).exec(callback);
+
+                boolean completed = latch.await(timeoutMinutes, TimeUnit.MINUTES);
+                if (!completed) {
+                    return PhaseResult.ofFailure("Phase timed out after " + timeoutMinutes + " minutes");
+                }
+                if (stopFlag.get()) {
+                    return PhaseResult.ofStopped();
+                }
+
+                Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
+                if (exitCode != null && exitCode != 0) {
+                    String output = outputCapture.asString().stripTrailing();
+                    String msg = "Exit code " + exitCode;
+                    if (!output.isBlank()) {
+                        msg += ": " + output.substring(Math.max(0, output.length() - FAILURE_OUTPUT_CHARS));
+                    }
+                    return PhaseResult.ofFailure(msg);
+                }
+                return PhaseResult.ofSuccess();
+            } finally {
+                closePhaseOutput(phaseOutput);
+                if (logCallback != null) {
+                    logCallback.onComplete();
+                }
             }
-            return PhaseResult.ofSuccess();
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

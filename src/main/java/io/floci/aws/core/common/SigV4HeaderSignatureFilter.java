@@ -6,12 +6,17 @@ import io.floci.aws.core.common.auth.SigV4AuthorizationHeader;
 import io.floci.aws.core.common.auth.SigV4Canonicalization;
 import io.floci.aws.core.common.auth.SigV4RequestValidator;
 import io.floci.aws.core.common.auth.SigV4aSignature;
+import io.floci.aws.services.account.AccountController;
+import io.floci.aws.services.account.AccountRegionActions;
 import io.floci.aws.services.apigateway.ApiGatewayAwsExecuteController;
 import io.floci.aws.services.apigateway.ApiGatewayExecuteController;
 import io.floci.aws.services.apigateway.ApiGatewayUserRequestController;
 import io.floci.aws.services.appsync.graphql.AppSyncExecutionController;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestController;
+import io.floci.aws.services.iam.DerivedSigningKeyController;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.RequestBodyReader;
+import io.floci.aws.services.iam.model.SessionCredential;
 import io.floci.aws.services.s3.S3ControlController;
 import io.floci.aws.services.s3.S3Controller;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
@@ -97,7 +102,11 @@ import static io.floci.aws.core.common.auth.SigV4RequestValidator.LEGACY_SECRET_
  * that does not verify, exceeds its query expiry or falls outside the header clock-skew window.
  * EC2 uses {@code RequestExpired} for expiry and clock skew, including expired temporary credentials.
  *
- * <p>Nothing here runs with the flag off: the filter returns before reading a single header.
+ * <p>With global verification off, IAM-enforced CodeDeploy agent requests still require
+ * verification because their authorization depends on the issuing instance.
+ * <p>With global verification off, the optional Lambda identity facility authenticates only
+ * native execution-role and one-hop session records. Other credentials retain their existing
+ * behavior; no unknown-key secret fallback is added. With both flags off no headers are read.
  */
 @Provider
 @Priority(Priorities.AUTHENTICATION)
@@ -111,10 +120,14 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     private static final DateTimeFormatter AMZ_DATE =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
-    /** Resources whose signatures another verifier owns; see the class comment. */
+    /**
+     * Resources whose signatures another verifier owns; see the class comment.
+     * {@link DerivedSigningKeyController} verifies its one configured caller itself.
+     */
     private static final Set<Class<?>> VERIFIED_ELSEWHERE = Set.of(S3Controller.class,
             ApiGatewayExecuteController.class, ApiGatewayAwsExecuteController.class,
-            ApiGatewayUserRequestController.class, AppSyncExecutionController.class);
+            ApiGatewayUserRequestController.class, AppSyncExecutionController.class,
+            DerivedSigningKeyController.class);
 
     /** REST-XML resources the catalog does not list: S3 Control answers in S3's XML. */
     private static final Set<Class<?>> UNCATALOGUED_REST_XML = Set.of(S3ControlController.class);
@@ -128,6 +141,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     // (the AwsProtocolClaimFilter pattern).
     private final MemoizedSupplier<EmulatorConfig> config;
     private final IamService iamService;
+    private final RequestContext verifiedRequest;
     private final ResolvedServiceCatalog catalog;
     private final CurrentVertxRequest currentVertxRequest;
 
@@ -137,11 +151,18 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     @Inject
     public SigV4HeaderSignatureFilter(jakarta.inject.Provider<EmulatorConfig> configProvider,
                                       IamService iamService, ResolvedServiceCatalog catalog,
-                                      CurrentVertxRequest currentVertxRequest) {
+                                      CurrentVertxRequest currentVertxRequest, RequestContext verifiedRequest) {
         this.config = new MemoizedSupplier<>(configProvider::get);
         this.iamService = iamService;
+        this.verifiedRequest = verifiedRequest;
         this.catalog = catalog;
         this.currentVertxRequest = currentVertxRequest;
+    }
+
+    SigV4HeaderSignatureFilter(jakarta.inject.Provider<EmulatorConfig> configProvider,
+                              IamService iamService, ResolvedServiceCatalog catalog,
+                              CurrentVertxRequest currentVertxRequest) {
+        this(configProvider, iamService, catalog, currentVertxRequest, null);
     }
 
     private EmulatorConfig config() {
@@ -150,10 +171,24 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
-        if (!config().auth().validateSignatures()) {
+        if (verifiedRequest != null) {
+            verifiedRequest.recordVerifiedSignature(null);
+            verifiedRequest.setVerifiedSession(null, null, null);
+        }
+        EmulatorConfig config = config();
+        boolean validateAll = config.auth().validateSignatures();
+        boolean lambdaIdentity = config.services().iam().lambdaIdentityVerificationEnabled();
+        boolean iamEnforcement = config.services().iam().enforcementEnabled();
+        Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
+        boolean ec2Registration = resource == AwsJson11Controller.class
+                && "AmazonSSM.RegisterManagedInstance".equals(ctx.getHeaderString("X-Amz-Target"));
+        if (!validateAll && !lambdaIdentity && !iamEnforcement && !ec2Registration) {
             return;
         }
-        Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
+        boolean defaultAgent = iamEnforcement && defaultCodeDeployAgent(ctx, resource);
+        if (!validateAll && !lambdaIdentity && !defaultAgent && !ec2Registration) {
+            return;
+        }
         if (resource != null && VERIFIED_ELSEWHERE.contains(resource)) {
             return;
         }
@@ -175,15 +210,51 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             }
             signed = SigV4AuthorizationHeader.parse(authorization);
             if (signed == null) {
+                if (defaultAgent || ec2Registration) {
+                    incompleteSignature(ctx, resource, "The agent requires a signed instance request.");
+                }
                 return;
             }
         }
 
         CredentialScope scope = CredentialScope.parse(signed.credential());
+        SessionCredential nativeSession = null;
+        if (scope != null) {
+            if (ec2Registration) {
+                nativeSession = iamService.ec2InstanceIdentitySession(scope.accessKeyId()).orElse(null);
+            } else if (defaultAgent) {
+                nativeSession = iamService.ec2InstanceProfileSession(scope.accessKeyId()).orElse(null);
+            } else if (lambdaIdentity) {
+                nativeSession = iamService.lambdaIdentitySession(scope.accessKeyId()).orElse(null);
+            }
+        }
+        if (!validateAll && !defaultAgent && !ec2Registration && nativeSession == null) {
+            return;
+        }
         if (scope == null || isBlank(signed.signedHeaders()) || isBlank(signed.signature())) {
             incompleteSignature(ctx, resource, "Authorization header requires 'Credential' (in the form "
                     + "<access key>/<date>/<region>/<service>/aws4_request), 'SignedHeaders' and "
                     + "'Signature' parameters.");
+            return;
+        }
+        if (defaultAgent && !"codedeploy-commands".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: "
+                    + "'codedeploy-commands'");
+            return;
+        }
+        if (ec2Registration && !"ssm".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'ssm'");
+            return;
+        }
+        if (resource != null && CloudFrontFunctionTestController.class.isAssignableFrom(resource)
+                && !"cloudfront".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'cloudfront'");
+            return;
+        }
+        if (resource == AccountController.class && resourceInfo.getResourceMethod() != null
+                && AccountRegionActions.forMethod(resourceInfo.getResourceMethod().getName()) != null
+                && !"account".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'account'");
             return;
         }
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {
@@ -272,6 +343,11 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         }
 
         byte[] body = signedBody(ctx);
+        String declaredHash = ctx.getHeaderString("x-amz-content-sha256");
+        if (ec2Registration && declaredHash != null && !Digests.sha256Hex(body).equals(declaredHash.trim())) {
+            signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
+            return;
+        }
         UnaryOperator<String> headers = name -> "content-length".equals(name)
                 && ctx.getProperty(SqsQueueUrlRouterFilter.APPENDED_BODY_BYTES_PROPERTY) != null
                 ? String.valueOf(body.length)
@@ -289,7 +365,16 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             LOG.debugv("Refusing {0} request: signature mismatch for accessKey={1}",
                     scope.service(), SigV4RequestValidator.sanitizeForLog(scope.accessKeyId()));
             signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
+        } else if (verifiedRequest != null) {
+            verifiedRequest.recordVerifiedSignature(scope.accessKeyId());
+            verifiedRequest.setVerifiedSession(nativeSession, secretKey.get(), token);
         }
+    }
+
+    private boolean defaultCodeDeployAgent(ContainerRequestContext ctx, Class<?> resource) {
+        String target = resource == AwsJson11Controller.class ? ctx.getHeaderString("X-Amz-Target") : null;
+        return target != null && catalog.matchTarget(target)
+                .map(match -> "codedeploy-commands".equals(match.descriptor().externalKey())).orElse(false);
     }
 
     /** Whether {@code signature} verifies for this request; package-private for the unit test. */

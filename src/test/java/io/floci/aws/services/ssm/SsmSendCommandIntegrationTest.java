@@ -1,8 +1,10 @@
 package io.floci.aws.services.ssm;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.json.JsonPath;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -29,6 +31,7 @@ import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.when;
 
 @QuarkusTest
+@TestProfile(SsmDirectCommandProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class SsmSendCommandIntegrationTest {
 
@@ -533,24 +536,10 @@ class SsmSendCommandIntegrationTest {
     }
 
     private static String buildReplyPayload(String stdout, String status, int returnCode) {
-        String json = """
-            {
-              "additionalInfo": {
-                "agent": { "name": "amazon-ssm-agent", "version": "3.2.2172.0" }
-              },
-              "documentTraceOutput": "",
-              "runtimeStatus": {
-                "runShellScript": {
-                  "status": "%s",
-                  "returnCode": %d,
-                  "standardOutput": "%s",
-                  "standardError": "",
-                  "startDateTime": "2026-01-01T00:00:00Z",
-                  "endDateTime": "2026-01-01T00:00:01Z"
-                }
-              }
-            }
-            """.formatted(status, returnCode, stdout.replace("\n", "\\n").replace("\"", "\\\""));
-        return json;
+        return new ObjectMapper().valueToTree(Map.of(
+                "documentStatus", status, "runtimeStatus", Map.of("aws:runShellScript", Map.of(
+                        "status", status, "code", returnCode, "standardOutput", stdout,
+                        "standardError", "", "startDateTime", "2026-01-01T00:00:00Z",
+                        "endDateTime", "2026-01-01T00:00:01Z")))).toString();
     }
 }

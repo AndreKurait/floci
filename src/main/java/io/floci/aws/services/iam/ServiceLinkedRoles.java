@@ -59,6 +59,21 @@ public final class ServiceLinkedRoles {
     private static final String RESOURCE_NAME = "iam/service-linked-roles.tsv";
     private static final Map<String, Entry> BY_PRINCIPAL = load();
 
+    /**
+     * The AWS managed permissions policy IAM attaches when it creates a service's role, by the
+     * canonical principal. The Amazon OpenSearch Service developer guide's page "Using
+     * service-linked roles to create VPC domains and direct query data sources" says: "The
+     * AWSServiceRoleForAmazonOpenSearchService service-linked role trusts the following services to
+     * assume the role: opensearchservice.amazonaws.com" and "The role permissions policy named
+     * AmazonOpenSearchServiceRolePolicy allows OpenSearch Service to complete the following actions".
+     * The document is in the bundled managed policy catalog, under {@code /aws-service-role/}.
+     *
+     * <p>Only services listed here get a policy. Any other role is created with its trust policy
+     * alone, as before, rather than with a policy guessed from the name.
+     */
+    private static final Map<String, String> MANAGED_POLICY_BY_PRINCIPAL = Map.of(
+            ServicePrincipals.of("opensearchservice"), "AmazonOpenSearchServiceRolePolicy");
+
     private ServiceLinkedRoles() {
     }
 
@@ -83,6 +98,22 @@ public final class ServiceLinkedRoles {
         }
         String derived = derivedRoleName(awsServiceName);
         return ROLE_NAME_PREFIX.equals(derived) ? Optional.empty() : Optional.of(derived);
+    }
+
+    /**
+     * The name of the AWS managed policy IAM attaches to the service's role, in any partition form
+     * of the principal; empty for a service {@link #MANAGED_POLICY_BY_PRINCIPAL} does not list.
+     */
+    public static Optional<String> managedPolicyName(String awsServiceName) {
+        if (awsServiceName == null) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(MANAGED_POLICY_BY_PRINCIPAL.get(ServicePrincipals.canonical(awsServiceName)));
+    }
+
+    /** Every principal with a managed policy, for tests that hold the mapping to the catalog. */
+    static Map<String, String> managedPolicies() {
+        return MANAGED_POLICY_BY_PRINCIPAL;
     }
 
     /** Suffix support for a principal, {@code UNKNOWN} when nothing records it. */

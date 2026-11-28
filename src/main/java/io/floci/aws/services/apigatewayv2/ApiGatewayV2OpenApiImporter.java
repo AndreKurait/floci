@@ -101,6 +101,38 @@ public class ApiGatewayV2OpenApiImporter implements PassedRoleLookup {
         this.service = service;
     }
 
+    @Override
+    public List<String> importedHttpApiRoles(String document, String region) {
+        ImportPlan importPlan;
+        try {
+            importPlan = plan(document, null, false);
+        } catch (AwsException expected) {
+            // The normal importer reports invalid definitions before assigning any credentials.
+            LOG.debugv(expected, "Invalid HTTP API import has no role assignments");
+            return List.of();
+        }
+        List<String> roles = new ArrayList<>();
+        for (AuthorizerSpec spec : importPlan.authorizerSpecs()) {
+            if ("CUSTOM".equals(spec.authorizationType()) && spec.request() != null
+                    && spec.request().get("authorizerCredentialsArn") instanceof String role) {
+                roles.add(role);
+            }
+        }
+        forEachImportedOperation(importPlan.openAPI(), (method, path, operation) -> {
+            Map<String, Object> definition = extensionAsMap(
+                    operation == null ? null : operation.getExtensions(), EXT_INTEGRATION);
+            if (definition != null) {
+                Map<String, Object> request = toIntegrationRequest(definition);
+                if (("AWS".equals(request.get("integrationType"))
+                        || "AWS_PROXY".equals(request.get("integrationType")))
+                        && request.get("credentialsArn") instanceof String role) {
+                    roles.add(role);
+                }
+            }
+        });
+        return roles;
+    }
+
     // ──────────────────────────── Entry points ────────────────────────────
 
     /** ImportApi — creates a brand new HTTP API from an OpenAPI 3 document. */

@@ -9,12 +9,13 @@ import io.floci.aws.services.glue.schemaregistry.model.RegistryId;
 import io.floci.aws.services.glue.schemaregistry.model.Schema;
 import io.floci.aws.services.glue.schemaregistry.model.SchemaId;
 import io.floci.aws.services.glue.schemaregistry.model.SchemaVersion;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
-import java.time.Instant;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -28,13 +29,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 class GlueSchemaRegistryServiceTest {
 
@@ -190,16 +191,22 @@ class GlueSchemaRegistryServiceTest {
     }
 
     @Test
-    void updateRegistryChangesDescriptionAndUpdatedTime() throws InterruptedException {
+    void updateRegistryChangesDescriptionAndUpdatedTime() {
+        TestTime time = TestTime.create();
+        service = new GlueSchemaRegistryService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, ACCOUNT_ID),
+                time.clock());
         service.createRegistry("r1", "old", null, REGION);
-        Instant beforeTime = service.getRegistry(new RegistryId("r1", null), REGION).getUpdatedTime();
-        Thread.sleep(10);
+        Registry created = service.getRegistry(new RegistryId("r1", null), REGION);
+        assertEquals(TestTime.DEFAULT_START, created.getCreatedTime());
+        assertEquals(TestTime.DEFAULT_START, created.getUpdatedTime());
+        time.advance(Duration.ofMillis(10));
 
         Registry updated = service.updateRegistry(new RegistryId("r1", null), "new", REGION);
 
         assertEquals("new", updated.getDescription());
-        assertTrue(updated.getUpdatedTime().isAfter(beforeTime),
-                "updatedTime should advance: before=" + beforeTime + " after=" + updated.getUpdatedTime());
+        assertEquals(TestTime.DEFAULT_START.plusMillis(10), updated.getUpdatedTime());
+        assertEquals(TestTime.DEFAULT_START, updated.getCreatedTime(), "an update leaves the created time alone");
     }
 
     @Test
@@ -671,18 +678,17 @@ class GlueSchemaRegistryServiceTest {
         }
     }
 
-    private void assertBlockedOnService(Thread worker, Future<?> task) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (System.nanoTime() < deadline && !task.isDone()) {
-            ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(worker.threadId());
-            if (info != null && info.getThreadState() == Thread.State.BLOCKED
-                    && info.getLockInfo() != null
-                    && info.getLockInfo().getIdentityHashCode() == System.identityHashCode(service)) {
-                return;
-            }
-            Thread.sleep(10);
-        }
-        fail("Expected worker to block on the schema service monitor");
+    private void assertBlockedOnService(Thread worker, Future<?> task) {
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                .until(() -> task.isDone() || isBlockedOnService(worker));
+        assertFalse(task.isDone(), "Expected worker to block on the schema service monitor");
+    }
+
+    private boolean isBlockedOnService(Thread worker) {
+        ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(worker.threadId());
+        return info != null && info.getThreadState() == Thread.State.BLOCKED
+                && info.getLockInfo() != null
+                && info.getLockInfo().getIdentityHashCode() == System.identityHashCode(service);
     }
 
     private record LegacyAvroVersions(SchemaId schemaId, SchemaVersion first, SchemaVersion second) {}

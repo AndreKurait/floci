@@ -5,6 +5,7 @@ import io.floci.aws.services.iam.AssumeRolePolicyEvaluator.TrustDecision;
 import io.floci.aws.services.iam.model.IamRole;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -32,6 +33,84 @@ class AssumeRolePolicyEvaluatorTest {
             {"Version":"2012-10-17","Statement":[
               {"Effect":"Allow","Principal":%s,"Action":"sts:AssumeRole"}]}
             """.formatted(principal);
+    }
+
+    @Test
+    void boundRolePrincipalMatchesItsIdAndRejectsARecreatedRole() {
+        String roleArn = "arn:aws:iam::111111111111:role/team/app";
+        String sessionArn = "arn:aws:sts::111111111111:assumed-role/app/session";
+        IamService.CallerArns original = new IamService.CallerArns(sessionArn, roleArn,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROAORIGINAL:session", null);
+        IamService.CallerArns recreated = new IamService.CallerArns(sessionArn, roleArn,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROARECREATED:session", null);
+        String document = trust("{\"AWS\":\"AROAORIGINAL\"}");
+        assertEquals(TrustDecision.ALLOW, evaluator.decide(document, original, CALLER_ACCOUNT, Map.of()));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, recreated, CALLER_ACCOUNT,
+                Map.of("aws:userid", List.of("AROAORIGINAL:session"))));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, caller(sessionArn, roleArn),
+                CALLER_ACCOUNT, Map.of("aws:userid", List.of("AROAORIGINAL:session"))));
+        assertEquals(TrustDecision.ALLOW, evaluator.decide(trust("{\"AWS\":\"" + roleArn + "\"}"),
+                recreated, CALLER_ACCOUNT, Map.of()), "Historical ARN rows retain their existing matcher");
+    }
+
+    @Test
+    void boundUserPrincipalFollowsTheIdAcrossRenameAndStillChecksConditions() {
+        String renamedArn = "arn:aws:iam::111111111111:user/new/alicia";
+        IamService.CallerArns renamed = new IamService.CallerArns(renamedArn, renamedArn,
+                IamService.CallerArns.TYPE_USER, "AIDAORIGINAL", "alicia");
+        String document = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                 "Principal":{"AWS":"AIDAORIGINAL"},
+                 "Condition":{"ArnEquals":{"aws:PrincipalArn":"%s"}}}]}
+                """.formatted(renamedArn);
+        assertEquals(TrustDecision.ALLOW, evaluator.decide(document, renamed, CALLER_ACCOUNT, Map.of()));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document.replace(renamedArn, CALLER_ARN),
+                renamed, CALLER_ACCOUNT, Map.of()));
+        IamService.CallerArns wrongType = new IamService.CallerArns(renamedArn, renamedArn,
+                IamService.CallerArns.TYPE_FEDERATED_USER, "AIDAORIGINAL", null);
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, wrongType, CALLER_ACCOUNT, Map.of()));
+    }
+
+    @Test
+    void denyByImmutableIdWinsOverWildcardAllow() {
+        IamService.CallerArns user = new IamService.CallerArns(CALLER_ARN, CALLER_ARN,
+                IamService.CallerArns.TYPE_USER, "AIDAORIGINAL", "alice");
+        String document = """
+                {"Version":"2012-10-17","Statement":[
+                 {"Effect":"Allow","Action":"sts:AssumeRole","Principal":"*"},
+                 {"Effect":"Deny","Action":"sts:AssumeRole","Principal":{"AWS":["AIDAOTHER","AIDAORIGINAL"]}}]}
+                """;
+        assertEquals(TrustDecision.EXPLICIT_DENY, evaluator.decide(document, user, CALLER_ACCOUNT, Map.of()));
+    }
+
+    @Test
+    void explicitIdentityDoesNotInventAConditionUserid() {
+        IamService.CallerArns session = new IamService.CallerArns(
+                "arn:aws:sts::111111111111:assumed-role/app", "arn:aws:iam::111111111111:role/app",
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, null, null);
+        String document = trust("{\"AWS\":\"AROAORIGINAL\"}");
+        assertEquals(TrustDecision.ALLOW, evaluator.decideWithPrincipalId(
+                document, session, CALLER_ACCOUNT, Map.of(), "AROAORIGINAL"));
+        String conditional = document.replace("\"Effect\":\"Allow\"",
+                "\"Effect\":\"Allow\",\"Condition\":{\"StringLike\":{\"aws:userid\":\"*\"}}");
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decideWithPrincipalId(
+                conditional, session, CALLER_ACCOUNT, Map.of(), "AROAORIGINAL"));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decideWithPrincipalId(
+                document, session, CALLER_ACCOUNT, Map.of(), "AROAREPLACEMENT"));
+    }
+
+    @Test
+    void permissionsOnlySessionActionsRetainTheirActionAndImmutableIdentity() {
+        IamService.CallerArns user = new IamService.CallerArns(CALLER_ARN, CALLER_ARN,
+                IamService.CallerArns.TYPE_USER, "AIDAORIGINAL", "alice");
+        String document = trust("{\"AWS\":\"AIDAORIGINAL\"}").replace("sts:AssumeRole", "sts:TagSession");
+        assertEquals(TrustDecision.ALLOW,
+                evaluator.decide(document, user, CALLER_ACCOUNT, Map.of(), "sts:TagSession"));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, user, CALLER_ACCOUNT, Map.of()));
+        IamService.CallerArns recreated = new IamService.CallerArns(CALLER_ARN, CALLER_ARN,
+                IamService.CallerArns.TYPE_USER, "AIDARECREATED", "alice");
+        assertEquals(TrustDecision.NEUTRAL,
+                evaluator.decide(document, recreated, CALLER_ACCOUNT, Map.of(), "sts:TagSession"));
     }
 
     @Test
@@ -64,45 +143,6 @@ class AssumeRolePolicyEvaluatorTest {
                 trust("{\"Service\":\"Redshift.amazonaws.com\"}"), "redshift.amazonaws.com"));
         assertFalse(evaluator.allowsService(
                 trust("{\"Service\":\"redshift.AMAZONAWS.COM.CN\"}"), "redshift.amazonaws.com"));
-    }
-
-    @Test
-    void anyPrincipalOfTheAccount_throughItsRootOrAPrincipalItNames() {
-        assertTrue(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::111111111111:root\"}"),
-                CALLER_ACCOUNT, "aws"));
-        assertTrue(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"111111111111\"}"), CALLER_ACCOUNT, "aws"));
-        assertTrue(evaluator.allowsAnyPrincipalOf(trust("\"*\""), CALLER_ACCOUNT, "aws"));
-        assertTrue(evaluator.allowsAnyPrincipalOf(
-                trust("{\"AWS\":[\"arn:aws:iam::999999999999:root\",\"arn:aws:iam::111111111111:role/cfn-exec\"]}"),
-                CALLER_ACCOUNT, "aws"));
-        assertTrue(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::111111111111:user/alice\"}"),
-                CALLER_ACCOUNT, "aws"));
-    }
-
-    @Test
-    void anyPrincipalOfTheAccount_notAnotherAccountNorAService() {
-        assertFalse(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::999999999999:root\"}"),
-                CALLER_ACCOUNT, "aws"));
-        assertFalse(evaluator.allowsAnyPrincipalOf(trust("{\"AWS\":\"arn:aws:iam::999999999999:role/cfn-exec\"}"),
-                CALLER_ACCOUNT, "aws"));
-        assertFalse(evaluator.allowsAnyPrincipalOf(trust("{\"Service\":\"lambda.amazonaws.com\"}"),
-                CALLER_ACCOUNT, "aws"));
-        assertFalse(evaluator.allowsAnyPrincipalOf(null, CALLER_ACCOUNT, "aws"));
-    }
-
-    /** A Deny on the account reaches each of its principals; a condition no key here answers grants nothing. */
-    @Test
-    void anyPrincipalOfTheAccount_honoursDenyAndConditions() {
-        assertFalse(evaluator.allowsAnyPrincipalOf("""
-                {"Version":"2012-10-17","Statement":[
-                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111111111111:role/cfn-exec"},"Action":"sts:AssumeRole"},
-                  {"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::111111111111:root"},"Action":"sts:AssumeRole"}]}
-                """, CALLER_ACCOUNT, "aws"));
-        assertFalse(evaluator.allowsAnyPrincipalOf("""
-                {"Version":"2012-10-17","Statement":[
-                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111111111111:root"},"Action":"sts:AssumeRole",
-                   "Condition":{"StringEquals":{"sts:ExternalId":"secret"}}}]}
-                """, CALLER_ACCOUNT, "aws"));
     }
 
     @Test
@@ -469,6 +509,19 @@ class AssumeRolePolicyEvaluatorTest {
         assertFalse(evaluator.allowsService(role, "lambda.amazonaws.com", null, null));
         role.setAssumeRolePolicyDocument(serviceTrust("{\"StringEquals\":{\"iam:ResourceTag/team\":\"Data\"}}"));
         assertTrue(evaluator.allowsService(role, "lambda.amazonaws.com", null, null));
+    }
+
+    @Test
+    void serviceTrustCombinesRoleTagsWithTheExplicitRequestTime() {
+        Instant requestTime = Instant.parse("2025-01-02T03:04:05Z");
+        IamRole role = new IamRole("id", "tagged", "/", "arn:aws:iam::000000000000:role/tagged",
+                serviceTrust("{\"StringEquals\":{\"aws:ResourceTag/Team\":\"data\"},"
+                        + "\"DateEquals\":{\"aws:CurrentTime\":\"2025-01-02T03:04:05Z\"}}"));
+        role.setTags(Map.of("team", "data"));
+        assertTrue(evaluator.allowsService(role, "lambda.amazonaws.com", null, null, requestTime));
+        assertFalse(evaluator.allowsService(role, "lambda.amazonaws.com", null, null, requestTime.plusSeconds(1)));
+        role.setTags(Map.of("team", "other"));
+        assertFalse(evaluator.allowsService(role, "lambda.amazonaws.com", null, null, requestTime));
     }
 
     private static String serviceTrust(String condition) {

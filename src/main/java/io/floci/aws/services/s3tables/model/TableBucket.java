@@ -15,6 +15,7 @@ public class TableBucket {
     private Object storageClassConfiguration;
     private Map<String, String> tags = new LinkedHashMap<>();
     private String resourcePolicy;
+    private boolean metricsConfigurationEnabled;
     private Map<String, Object> maintenanceConfigurations = new LinkedHashMap<>();
     private Map<String, Namespace> namespaces = new LinkedHashMap<>();
 
@@ -50,6 +51,10 @@ public class TableBucket {
     public void setTags(Map<String, String> tags) { this.tags = tags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(tags); }
     public String getResourcePolicy() { return resourcePolicy; }
     public void setResourcePolicy(String resourcePolicy) { this.resourcePolicy = resourcePolicy; }
+    public boolean isMetricsConfigurationEnabled() { return metricsConfigurationEnabled; }
+    public void setMetricsConfigurationEnabled(boolean metricsConfigurationEnabled) {
+        this.metricsConfigurationEnabled = metricsConfigurationEnabled;
+    }
     public Map<String, Object> getMaintenanceConfigurations() { return maintenanceConfigurations; }
     public void setMaintenanceConfigurations(Map<String, Object> maintenanceConfigurations) { this.maintenanceConfigurations = maintenanceConfigurations == null ? new LinkedHashMap<>() : new LinkedHashMap<>(maintenanceConfigurations); }
     public Map<String, Namespace> getNamespaces() { return namespaces; }

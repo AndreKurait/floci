@@ -2,10 +2,19 @@
   "_source": {
     "generator": "tools/aws/regen_request_condition_keys.py",
     "reference": "https://servicereference.us-east-1.amazonaws.com/",
-    "botocore": "botocore 1.43.118 (installed package)",
+    "botocore": "botocore 1.44.9 (local/aws/botocore)",
     "note": "make request-condition-keys-check re-derives members, their shapes and the protocols from botocore; make request-condition-keys-verify checks actions against AWS."
   },
   "actions": {
+    "account:DisableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:EnableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:GetRegionOptStatus": [
+      "account:TargetRegion"
+    ],
     "ec2-instance-connect:OpenTunnel": [
       "ec2-instance-connect:MaxTunnelDuration",
       "ec2-instance-connect:privateIpAddress",
@@ -52,6 +61,18 @@
       "route53:ChangeResourceRecordSetsNormalizedRecordNames",
       "route53:ChangeResourceRecordSetsRecordTypes"
     ],
+    "ssm:CreateResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:DeleteResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:ListResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:UpdateResourceDataSync": [
+      "ssm:SyncType"
+    ],
     "sts:AssumeRole": [
       "sts:ExternalId",
       "sts:RoleSessionName"
@@ -64,6 +85,21 @@
     ]
   },
   "members": {
+    "account:DisableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:EnableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:GetRegionOptStatus": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
     "ec2-instance-connect:OpenTunnel": {
       "ec2-instance-connect:MaxTunnelDuration": [
         "maxTunnelDuration"
@@ -131,6 +167,26 @@
         "ChangeBatch.Changes.Change.ResourceRecordSet.Type"
       ]
     },
+    "ssm:CreateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:DeleteResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:ListResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:UpdateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
     "sts:AssumeRole": {
       "sts:ExternalId": [
         "ExternalId"
@@ -146,6 +202,15 @@
     }
   },
   "memberShapes": {
+    "account:DisableRegion": {
+      "RegionName": "RegionName"
+    },
+    "account:EnableRegion": {
+      "RegionName": "RegionName"
+    },
+    "account:GetRegionOptStatus": {
+      "RegionName": "RegionName"
+    },
     "eks:CreateCluster": {
       "accessConfig.authenticationMode": "AuthenticationMode",
       "accessConfig.bootstrapClusterCreatorAdminPermissions": "BoxedBoolean",
@@ -174,6 +239,18 @@
       "ChangeBatch.Changes.Change.ResourceRecordSet.Name": "DNSName",
       "ChangeBatch.Changes.Change.ResourceRecordSet.Type": "RRType"
     },
+    "ssm:CreateResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:DeleteResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:ListResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:UpdateResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
     "sts:AssumeRole": {
       "ExternalId": "externalIdType",
       "RoleSessionName": "roleSessionNameType"
@@ -183,10 +260,12 @@
     }
   },
   "protocols": {
+    "account": "rest-json",
     "eks": "rest-json",
     "lambda": "rest-json",
     "redshift": "query",
     "route53": "rest-xml",
+    "ssm": "json",
     "sts": "query"
   }
 }

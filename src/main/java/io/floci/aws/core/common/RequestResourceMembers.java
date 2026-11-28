@@ -11,6 +11,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -137,10 +138,10 @@ final class RequestResourceMembers {
      * secret's {@code -??????}), or null.
      */
     record ArnFormat(String format, Pattern pattern, boolean unqualified, boolean minted, Pattern integers,
-                     String mintedSuffix) {
+                     String mintedSuffix, Pattern lowercase) {
 
         ArnFormat(String format, Pattern pattern, boolean unqualified, boolean minted) {
-            this(format, pattern, unqualified, minted, null, null);
+            this(format, pattern, unqualified, minted, null, null, null);
         }
 
         ArnFormat(String format, Pattern pattern, boolean unqualified) {
@@ -162,6 +163,23 @@ final class RequestResourceMembers {
                 }
             }
             return arn.substring(0, at);
+        }
+
+        String named(String arn) {
+            if (lowercase == null) {
+                return checked(arn);
+            }
+            Matcher values = lowercase.matcher(arn);
+            if (!values.matches()) {
+                return checked(arn);
+            }
+            StringBuilder normalized = new StringBuilder();
+            int at = 0;
+            for (int group = 1; group <= values.groupCount(); group++) {
+                normalized.append(arn, at, values.start(group)).append(values.group(group).toLowerCase(Locale.ROOT));
+                at = values.end(group);
+            }
+            return checked(normalized.append(arn.substring(at)).toString());
         }
 
         private String normalizeIntegers(String arn) {
@@ -447,7 +465,8 @@ final class RequestResourceMembers {
             throw new IllegalStateException(RESOURCE_NAME + " carries no operations");
         }
         Set<String> namespaces = Set.copyOf(document.path("namespaces").propertyStream().map(Map.Entry::getKey).toList());
-        validateIntegerVariables(document.path("integerVariables"), document.path("arnFormats"));
+        validateVariables("integerVariables", document.path("integerVariables"), document.path("arnFormats"));
+        validateVariables("lowercaseVariables", document.path("lowercaseVariables"), document.path("arnFormats"));
         Map<String, Map<String, ArnFormat>> formats = new LinkedHashMap<>();
         // A route type the developer guide gives a path of is a resource type as the Service Reference's are.
         for (String section : List.of("arnFormats", "pathFormats")) {
@@ -464,9 +483,11 @@ final class RequestResourceMembers {
                     }
                     Set<String> integers = names(document.path("integerVariables").path(namespace.getKey())
                             .path(type.getKey()));
+                    Set<String> lowercase = names(document.path("lowercaseVariables").path(namespace.getKey())
+                            .path(type.getKey()));
                     types.put(type.getKey(), new ArnFormat(format, pattern(format), unqualified.contains(type.getKey()),
                             minted.contains(type.getKey()), integers.isEmpty() ? null : pattern(format, integers),
-                            suffixes.path(type.getKey()).asText(null)));
+                            suffixes.path(type.getKey()).asText(null), lowercase.isEmpty() ? null : pattern(format, lowercase)));
                 });
                 formats.put(namespace.getKey(), Map.copyOf(types));
             });
@@ -1156,17 +1177,17 @@ final class RequestResourceMembers {
         return new Member(outer.name(), outer.list(), arnMember(operation, path.substring(dot + 1)), outer.map());
     }
 
-    /** Reject integer metadata that does not identify a resource variable in a known ARN format. */
-    private static void validateIntegerVariables(JsonNode integers, JsonNode formats) {
+    /** Reject normalization metadata that does not identify a resource variable in a known ARN format. */
+    private static void validateVariables(String property, JsonNode integers, JsonNode formats) {
         if (integers.isMissingNode()) {
             return;
         }
         if (!integers.isObject()) {
-            throw new IllegalStateException(RESOURCE_NAME + " integerVariables must be an object");
+            throw new IllegalStateException(RESOURCE_NAME + " " + property + " must be an object");
         }
         integers.properties().forEach(namespace -> {
             if (!namespace.getValue().isObject() || !formats.has(namespace.getKey())) {
-                throw new IllegalStateException(RESOURCE_NAME + " integerVariables has no formats for " + namespace.getKey());
+                throw new IllegalStateException(RESOURCE_NAME + " " + property + " has no formats for " + namespace.getKey());
             }
             namespace.getValue().properties().forEach(type -> {
                 String format = formats.path(namespace.getKey()).path(type.getKey()).asText("");
@@ -1176,7 +1197,7 @@ final class RequestResourceMembers {
                 JsonNode names = type.getValue();
                 if (!names.isArray() || names.isEmpty() || !names.valueStream().allMatch(
                         name -> name.isTextual() && variables.contains(name.asText()))) {
-                    throw new IllegalStateException(RESOURCE_NAME + " integerVariables names no variables for "
+                    throw new IllegalStateException(RESOURCE_NAME + " " + property + " names no variables for "
                             + namespace.getKey() + ":" + type.getKey());
                 }
             });

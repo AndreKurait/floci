@@ -94,6 +94,7 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
     private static final Pattern CUSTOMER_MANAGED_POLICY_PATH = Pattern.compile("((/[A-Za-z0-9\\.,\\+@=_-]+)*)/");
     private static final Pattern REGION_NAME = Pattern.compile("([a-z]+-){2,3}\\d");
     private static final Pattern APPLICATION_PROVIDER_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":sso::aws:applicationProvider/[a-zA-Z0-9-/]+");
+    private static final Pattern APPLICATION_PROVIDER_ID = Pattern.compile("[a-zA-Z0-9-/]+");
     private static final Pattern APPLICATION_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":sso::\\d{12}:application/(?:sso)?ins-[a-zA-Z0-9-.]{16}/apl-[a-zA-Z0-9]{16}");
     private static final Pattern TRUSTED_TOKEN_ISSUER_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":sso::\\d{12}:trustedTokenIssuer/(?:sso)?ins-[a-zA-Z0-9-.]{16}/tti-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}");
     private static final Pattern APPLICATION_ACCESS_SCOPE = Pattern.compile("([A-Za-z0-9_]{1,50})(:[A-Za-z0-9_]{1,50}){0,1}(:[A-Za-z0-9_]{1,50}){0,1}");
@@ -167,11 +168,14 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
     /** Source of permission-set creation times; the @Inject constructor passes the system clock. */
     private final Clock clock;
     private final SsoPermissionSetRoleProvisioner roleProvisioner;
+    private final SsoAdminRequestContext requestContext;
+    /** AWS-managed provider ids CreateApplication admits besides {@code custom}; set from configuration. */
+    private List<String> additionalApplicationProviders = List.of();
 
     @Inject
     public SsoAdminService(StorageFactory storageFactory, IdentityStoreService identityStoreService,
                            OrganizationsService organizationsService, EmulatorConfig config,
-                           SsoPermissionSetRoleProvisioner roleProvisioner) {
+                           SsoPermissionSetRoleProvisioner roleProvisioner, SsoAdminRequestContext requestContext) {
         this(
                 storageFactory.create("ssoadmin", "ssoadmin-permission-sets.json", new TypeReference<Map<String, PermissionSet>>() {}),
                 storageFactory.create("ssoadmin", "ssoadmin-assignments.json", new TypeReference<Map<String, Assignment>>() {}),
@@ -202,7 +206,28 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
                 organizationsService,
                 config.defaultAccountId(),
                 config.defaultRegion(),
-                Clock.systemUTC(), roleProvisioner);
+                Clock.systemUTC(), roleProvisioner, requestContext);
+        additionalApplicationProviders(config.services().ssoadmin().additionalApplicationProviders().orElse(List.of()));
+    }
+
+    /**
+     * Admits the given AWS-managed application provider ids in CreateApplication besides {@code custom}.
+     * Blank entries and {@code custom} itself are ignored; an id that is not a provider resource id is refused.
+     */
+    void additionalApplicationProviders(List<String> providerIds) {
+        List<String> admitted = new ArrayList<>();
+        for (String providerId : providerIds) {
+            String id = providerId.strip();
+            if (id.isEmpty() || "custom".equals(id) || admitted.contains(id)) {
+                continue;
+            }
+            if (!APPLICATION_PROVIDER_ID.matcher(id).matches()) {
+                throw new IllegalArgumentException(
+                        "floci.services.ssoadmin.additional-application-providers has an invalid provider id: " + id);
+            }
+            admitted.add(id);
+        }
+        additionalApplicationProviders = List.copyOf(admitted);
     }
 
     SsoAdminService(StorageBackend<String, PermissionSet> permissionSets,
@@ -234,8 +259,10 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
                     OrganizationsService organizationsService,
                     String defaultAccountId,
                     String defaultRegion,
-                    Clock clock, SsoPermissionSetRoleProvisioner roleProvisioner) {
+                    Clock clock, SsoPermissionSetRoleProvisioner roleProvisioner,
+                    SsoAdminRequestContext requestContext) {
         this.clock = clock;
+        this.requestContext = requestContext;
         this.roleProvisioner = roleProvisioner;
         this.permissionSets = permissionSets;
         this.assignments = assignments;
@@ -1484,8 +1511,8 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
         if (providerArn.length() > 1224 || !APPLICATION_PROVIDER_ARN.matcher(providerArn).matches()) {
             throw validation("ApplicationProviderArn is invalid.");
         }
-        String customProviderArn = globalArn("sso", region, "aws", "applicationProvider/custom");
-        if (!customProviderArn.equals(providerArn)) {
+        if (!customApplicationProviderArn(region).equals(providerArn) && additionalApplicationProviders.stream()
+                .noneMatch(id -> globalArn("sso", region, "aws", "applicationProvider/" + id).equals(providerArn))) {
             throw notFound("Application provider not found: " + providerArn);
         }
         String name = required(request, "Name");
@@ -2026,13 +2053,18 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
         return operation;
     }
 
-    /** The accounts the permission set is provisioned to. */
+    /** The accounts found for authorization, retained so execution cannot provision to an unchecked account. */
     private List<String> provisionedAccounts(String permissionSetArn) {
-        return permissionSetProvisionings.scan(key -> true).stream()
-                .filter(provisioning -> permissionSetArn.equals(provisioning.permissionSetArn()))
-                .map(PermissionSetProvisioning::accountId)
-                .distinct()
-                .toList();
+        List<String> accountIds = requestContext.provisionedAccounts(permissionSetArn);
+        if (accountIds == null) {
+            accountIds = permissionSetProvisionings.scan(key -> true).stream()
+                    .filter(provisioning -> permissionSetArn.equals(provisioning.permissionSetArn()))
+                    .map(PermissionSetProvisioning::accountId)
+                    .distinct()
+                    .toList();
+            requestContext.pinProvisionedAccounts(permissionSetArn, accountIds);
+        }
+        return accountIds;
     }
 
     @Override
@@ -2068,6 +2100,22 @@ public class SsoAdminService implements Resettable, StoredResourceArns {
             });
         }
         return held;
+    }
+
+    /**
+     * The accounts a permission set is provisioned to, in its partition, which a {@code ProvisionPermissionSet} for
+     * {@code ALL_PROVISIONED_ACCOUNTS} provisions it to again, as {@link #provisionPermissionSet} does: the same
+     * ones, found once for the request.
+     */
+    @Override
+    public List<String> through(String member, String value, String region) {
+        if (!"PermissionSetArn".equals(member) || !AwsArnUtils.isArn(value)) {
+            return List.of();
+        }
+        String partition = AwsArnUtils.parse(value).partition();
+        return provisionedAccounts(value).stream()
+                .map(accountId -> AwsArnUtils.Arn.global(partition, "sso", "", "account/" + accountId).toString())
+                .toList();
     }
 
     private void ensurePermissionSetProvisioned(String permissionSetArn, String accountId) {

@@ -2,6 +2,9 @@ package io.floci.aws.services.apigateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.Base64Url;
+import io.floci.aws.core.common.CallerCallAuthorizer;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigatewayv2.proxy.HttpProxyInvoker;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -9,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
 
 /**
  * Verifies that {@link ApiGatewayExecuteController#parseJwtClaims} flattens claim values into
@@ -30,7 +34,7 @@ class JwtClaimsWireFormatTest {
                 null, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, null, new HttpProxyInvoker());
+        , null, null, mock(ServiceCallAuthorizer.class), mock(ServiceRoleCallAuthorizer.class), mock(CallerCallAuthorizer.class), null);
     }
 
     private static String unsignedToken(String claimsJson) {

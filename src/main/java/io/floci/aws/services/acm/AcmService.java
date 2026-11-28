@@ -34,7 +34,9 @@ import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.security.cert.X509Certificate;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -77,15 +79,27 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
     /** Key algorithms real ACM accepts for RequestCertificate; the wider enum stays valid for ImportCertificate. */
     private static final Set<KeyAlgorithm> REQUESTABLE_KEY_ALGORITHMS =
         EnumSet.of(KeyAlgorithm.RSA_2048, KeyAlgorithm.EC_prime256v1, KeyAlgorithm.EC_secp384r1);
+    /** Validity of a PRIVATE certificate ACM issues from a private CA: 13 months, as ACM issues them. */
+    static final long PRIVATE_CERTIFICATE_VALIDITY_DAYS = 395;
+    /** {@code FailureReason} of a PRIVATE certificate whose CA is not ACTIVE. */
+    static final String PCA_INVALID_STATE = "PCA_INVALID_STATE";
     @Inject
     Instance<AcmCertificateReferenceProvider> referenceProviders;
+    @Inject
+    Instance<AcmPrivateCertificateAuthorities> privateAuthorities;
+    /** The EventBridge events ACM sends (Available, Approaching Expiration, Expired); absent in unit tests. */
+    @Inject
+    Instance<AcmEventPublisher> events;
 
     private final StorageBackend<String, Certificate> store;
     private final CertificateGenerator certificateGenerator;
     private final FlociCertificateAuthority certificateAuthority;
     private final RegionResolver regionResolver;
     private final int validationWaitSeconds;
+    private final Clock clock;
     private final AtomicInteger accountDaysBeforeExpiry = new AtomicInteger(45);
+    /** Whether PutAccountConfiguration has set DaysBeforeExpiry; until then public certificates use 30. */
+    private final AtomicBoolean accountExpiryConfigured = new AtomicBoolean(false);
     private final AtomicBoolean securityWarningLogged = new AtomicBoolean(false);
 
     /**
@@ -115,11 +129,19 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
     AcmService(StorageBackend<String, Certificate> store, CertificateGenerator certificateGenerator,
                FlociCertificateAuthority certificateAuthority, RegionResolver regionResolver,
                int validationWaitSeconds) {
+        this(store, certificateGenerator, certificateAuthority, regionResolver, validationWaitSeconds,
+                Clock.systemUTC());
+    }
+
+    AcmService(StorageBackend<String, Certificate> store, CertificateGenerator certificateGenerator,
+               FlociCertificateAuthority certificateAuthority, RegionResolver regionResolver,
+               int validationWaitSeconds, Clock clock) {
         this.store = store;
         this.certificateGenerator = certificateGenerator;
         this.certificateAuthority = certificateAuthority;
         this.regionResolver = regionResolver;
         this.validationWaitSeconds = validationWaitSeconds;
+        this.clock = clock;
     }
 
     /**
@@ -179,9 +201,13 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         // Determine certificate type and initial status
         CertificateType type;
         CertificateStatus status;
+        Optional<AcmPrivateCertificateAuthorities.PrivateCertificateAuthority> authority = Optional.empty();
         if (certAuthorityArn != null && !certAuthorityArn.isEmpty()) {
             type = CertificateType.PRIVATE;
-            status = CertificateStatus.ISSUED;
+            authority = privateAuthority(certAuthorityArn, region);
+            // A private CA that exists but is not ACTIVE cannot sign: ACM fails the certificate.
+            status = authority.isPresent() && !authority.get().active()
+                ? CertificateStatus.FAILED : CertificateStatus.ISSUED;
         } else {
             type = CertificateType.AMAZON_ISSUED;
             status = validationWaitSeconds > 0 ? CertificateStatus.PENDING_VALIDATION : CertificateStatus.ISSUED;
@@ -189,12 +215,20 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
 
         ValidationMethod method = validationMethod != null ? validationMethod : ValidationMethod.DNS;
 
-        // A server leaf signed by the local CA, so Certificate plus CertificateChain from
-        // GetCertificate validate the way an ACM certificate and its chain do on AWS.
-        CertificateGenerator.GeneratedCertificate generated = certificateAuthority.issueServerCertificate(
-            domainName, sans, alg, null);
+        // A server leaf signed by the private CA the request names when AWS Private CA holds it, else by
+        // the local CA, so Certificate plus CertificateChain from GetCertificate validate the way an ACM
+        // certificate and its chain do on AWS. A FAILED certificate has no material.
+        CertificateGenerator.GeneratedCertificate generated = null;
+        String chainPem = certificateAuthority.caPem();
+        if (authority.isPresent() && authority.get().active()) {
+            generated = certificateGenerator.generateIssuedCertificate(domainName, sans, alg, null,
+                authority.get().issuer(), CertificateGenerator.LeafUsage.SERVER, privateNotAfter(authority.get()));
+            chainPem = authority.get().chainPem();
+        } else if (status != CertificateStatus.FAILED) {
+            generated = certificateAuthority.issueServerCertificate(domainName, sans, alg, null);
+        }
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
 
         Certificate cert = new Certificate();
         cert.setArn(arn);
@@ -213,9 +247,15 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         cert.setValidationMethod(method);
         cert.setCreatedAt(now);
         cert.setIssuedAt(status == CertificateStatus.ISSUED ? now : null);
-        applyIssuedMaterial(cert, alg, generated);
+        if (generated != null) {
+            applyIssuedMaterial(cert, alg, generated, chainPem);
+        } else {
+            cert.setKeyAlgorithm(alg);
+            cert.setFailureReason(PCA_INVALID_STATE);
+        }
         cert.setCertOptions(options != null ? options : CertificateOptions.defaultOptions());
         cert.setCertAuthorityArn(certAuthorityArn);
+        cert.setManagedPrivateAuthority(authority.isPresent());
         cert.setIdempotencyToken(idempotencyToken);
         cert.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
 
@@ -233,10 +273,13 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         if (idempotencyToken != null && !idempotencyToken.isEmpty()) {
             int requestHash = computeRequestHash(domainName, sans, alg);
             idempotencyTokenIndex.put(region + "::" + idempotencyToken,
-                IdempotencyTokenEntry.create(arn, requestHash));
+                IdempotencyTokenEntry.create(arn, requestHash, now));
         }
 
         LOG.infov("Created certificate: {0} in region {1}", arn, region);
+        if (status == CertificateStatus.ISSUED) {
+            announce(cert, AcmEventPublisher.Action.ISSUANCE);
+        }
         return cert;
     }
 
@@ -246,7 +289,7 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         Certificate cert = getCertificateByArn(certificateArn, region);
 
         // Check for expiration
-        if (cert.isExpired() && cert.getStatus() != CertificateStatus.EXPIRED) {
+        if (cert.isExpired(clock.instant()) && cert.getStatus() != CertificateStatus.EXPIRED) {
             cert.setStatus(CertificateStatus.EXPIRED);
             store.put(regionKey(region, cert.extractCertificateId()), cert);
         }
@@ -459,7 +502,7 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
             String certId = existing == null ? UUID.randomUUID().toString() : existing.extractCertificateId();
             String arn = existing == null ? buildCertificateArn(region, certId) : existingArn;
 
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             KeyAlgorithm keyAlg = certificateGenerator.detectKeyAlgorithm(x509Cert.getPublicKey());
 
             cert = new Certificate();
@@ -480,7 +523,12 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
             cert.setCertificateBody(certificatePem);
             cert.setPrivateKey(privateKeyPem);
             cert.setCertificateChain(chainPem);
-            cert.setTags(existing != null ? existing.getTags() : tags);
+            if (existing != null && existing.getTags() != null) {
+                // A reimport cannot set tags: the certificate keeps the ones it has.
+                cert.setTags(new HashMap<>(existing.getTags()));
+            } else {
+                cert.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
+            }
 
             String storageKey = regionKey(region, certId);
             if (existing != null && existing.getInUseBy() != null) {
@@ -491,6 +539,8 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         if (existingArn != null && !existingArn.isEmpty()) {
             notifyCertificateReimported(cert.getArn(), region);
         }
+        announce(cert, existingArn != null && !existingArn.isEmpty()
+                ? AcmEventPublisher.Action.REIMPORT : AcmEventPublisher.Action.IMPORT);
         LOG.infov("Imported certificate: {0}", cert.getArn());
         return cert;
     }
@@ -503,6 +553,9 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         if (!cert.canExport()) {
             throw new AwsException("ValidationException",
                 "Certificate is not PRIVATE type and Export is not ENABLED", 400);
+        }
+        if (cert.getCertificateBody() == null) {
+            throw notIssued(cert);
         }
 
         String passphrase;
@@ -518,6 +571,14 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
 
         // Encrypt the private key
         String encryptedKey = certificateGenerator.encryptPrivateKey(cert.getPrivateKey(), passphrase);
+
+        synchronized (this) {
+            store.get(regionKey(region, cert.extractCertificateId())).filter(current -> !current.isExported())
+                .ifPresent(current -> {
+                    current.setExported(true);
+                    store.put(regionKey(region, current.extractCertificateId()), current);
+                });
+        }
 
         // Return certificate with encrypted private key
         Certificate exportCert = new Certificate();
@@ -620,6 +681,50 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
                 "DaysBeforeExpiry must be between 1 and 90", 400);
         }
         this.accountDaysBeforeExpiry.set(daysBeforeExpiry);
+        this.accountExpiryConfigured.set(true);
+    }
+
+    /**
+     * Days before expiry that ACM starts its daily "Approaching Expiration" events for a certificate of
+     * {@code type}: 45 for private and imported certificates and 30 for public ones, unless
+     * PutAccountConfiguration has set DaysBeforeExpiry.
+     */
+    int expiryNoticeDays(CertificateType type) {
+        if (accountExpiryConfigured.get()) {
+            return accountDaysBeforeExpiry.get();
+        }
+        return type == CertificateType.AMAZON_ISSUED ? 30 : 45;
+    }
+
+    /** One stored certificate with the account and Region that hold it. */
+    public record StoredCertificate(String accountId, String region, Certificate certificate) {}
+
+    /** Every stored certificate of every account, for the expiry sweep (it has no request to scope it). */
+    public List<StoredCertificate> listAllCertificates() {
+        List<StoredCertificate> all = new ArrayList<>();
+        if (store instanceof AccountAwareStorageBackend<Certificate> aware) {
+            for (AccountAwareStorageBackend.AccountEntry<Certificate> entry
+                    : aware.scanAllAccountEntries(k -> k.contains("::"))) {
+                all.add(new StoredCertificate(entry.accountId(),
+                        entry.key().substring(0, entry.key().indexOf("::")), entry.value()));
+            }
+            return all;
+        }
+        for (String key : store.keys()) {
+            int separator = key.indexOf("::");
+            if (separator > 0) {
+                store.get(key).ifPresent(cert -> all.add(new StoredCertificate(
+                        AwsArnUtils.parse(cert.getArn()).accountId(), key.substring(0, separator), cert)));
+            }
+        }
+        return all;
+    }
+
+    private void announce(Certificate cert, AcmEventPublisher.Action action) {
+        if (events != null && events.isResolvable()) {
+            // InUse as DescribeCertificate's InUseBy reports it: recorded consumers and live references.
+            events.get().available(cert, action, clock.instant(), !certificateInUseBy(cert).isEmpty());
+        }
     }
 
     @Override
@@ -634,7 +739,7 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
             resources.add(new ExplorerResource(
                     arn, "acm:certificate", "acm",
                     parsed.region(), parsed.accountId(),
-                    cert.getCreatedAt() != null ? cert.getCreatedAt() : Instant.now(),
+                    cert.getCreatedAt() != null ? cert.getCreatedAt() : clock.instant(),
                     cert.getTags() != null ? cert.getTags() : Map.of()));
         }
         return resources;
@@ -682,8 +787,27 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
                     }
                 }
             }
-            CertificateGenerator.GeneratedCertificate generated = certificateAuthority.issueServerCertificate(
-                cert.getDomainName(), sans, alg, null);
+            Optional<AcmPrivateCertificateAuthorities.PrivateCertificateAuthority> authority =
+                privateAuthority(cert.getCertAuthorityArn(), region);
+            if (authority.isPresent() && !authority.get().active()) {
+                // The CA that issued it can no longer sign: the certificate stays as it is, and no error is returned.
+                LOG.infov("Certificate {0} not renewed: its private CA is not ACTIVE", certificateArn);
+                return cert;
+            }
+            if (authority.isEmpty()
+                    && (cert.isManagedPrivateAuthority()
+                        || !certificateAuthority.isIssuedByUs(Pem.parseCertificate(cert.getCertificateBody())))) {
+                cert.setRenewalStatus("FAILED");
+                cert.setRenewalUpdatedAt(clock.instant());
+                store.put(regionKey(region, cert.extractCertificateId()), cert);
+                LOG.infov("Certificate {0} not renewed: its original private CA is unavailable", certificateArn);
+                return cert;
+            }
+            CertificateGenerator.GeneratedCertificate generated = authority.isPresent()
+                ? certificateGenerator.generateIssuedCertificate(cert.getDomainName(), sans, alg, null,
+                    authority.get().issuer(), CertificateGenerator.LeafUsage.SERVER, privateNotAfter(authority.get()))
+                : certificateAuthority.issueServerCertificate(cert.getDomainName(), sans, alg, null);
+            String chainPem = authority.isPresent() ? authority.get().chainPem() : certificateAuthority.caPem();
 
             renewed = new Certificate();
             renewed.setArn(cert.getArn());
@@ -694,25 +818,30 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
             renewed.setValidationMethod(cert.getValidationMethod());
             renewed.setCreatedAt(cert.getCreatedAt());
             renewed.setImportedAt(cert.getImportedAt());
-            renewed.setIssuedAt(Instant.now());
-            applyIssuedMaterial(renewed, alg, generated);
+            renewed.setIssuedAt(clock.instant());
+            applyIssuedMaterial(renewed, alg, generated, chainPem);
             renewed.setCertOptions(cert.getCertOptions());
             renewed.setCertAuthorityArn(cert.getCertAuthorityArn());
+            renewed.setManagedPrivateAuthority(cert.isManagedPrivateAuthority() || authority.isPresent());
             renewed.setIdempotencyToken(cert.getIdempotencyToken());
             renewed.setTags(cert.getTags() != null ? new HashMap<>(cert.getTags()) : new HashMap<>());
             renewed.setInUseBy(cert.getInUseBy() != null ? new ArrayList<>(cert.getInUseBy()) : new ArrayList<>());
             renewed.setDomainValidationOptions(cert.getDomainValidationOptions() != null
                 ? new ArrayList<>(cert.getDomainValidationOptions()) : new ArrayList<>());
+            renewed.setExported(cert.isExported());
+            renewed.setRenewalStatus("SUCCESS");
+            renewed.setRenewalUpdatedAt(clock.instant());
             store.put(regionKey(region, cert.extractCertificateId()), renewed);
         }
         notifyCertificateReimported(renewed.getArn(), region);
+        announce(renewed, AcmEventPublisher.Action.RENEWAL);
         LOG.infov("Renewed certificate: {0}", renewed.getArn());
         return renewed;
     }
 
-    /** The validity, identity and key material of a leaf issued by the local CA. */
+    /** The validity, identity and key material of an issued leaf, and the chain of the CA that signed it. */
     private void applyIssuedMaterial(Certificate cert, KeyAlgorithm alg,
-                                     CertificateGenerator.GeneratedCertificate generated) {
+                                     CertificateGenerator.GeneratedCertificate generated, String chainPem) {
         cert.setNotBefore(generated.notBefore());
         cert.setNotAfter(generated.notAfter());
         cert.setSerial(generated.serial());
@@ -722,7 +851,37 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         cert.setSignatureAlgorithm(generated.signatureAlgorithm());
         cert.setCertificateBody(generated.certificatePem());
         cert.setPrivateKey(generated.privateKeyPem());
-        cert.setCertificateChain(certificateAuthority.caPem());
+        cert.setCertificateChain(chainPem);
+    }
+
+    /**
+     * A certificate with no body to return: one that ACM failed to issue. Floci answers
+     * {@code RequestInProgressException}, the modeled error {@code GetCertificate} and {@code ExportCertificate}
+     * document for a certificate that has no body yet; the public docs do not name the error for a failed one.
+     */
+    static AwsException notIssued(Certificate cert) {
+        return new AwsException("RequestInProgressException",
+            "Certificate " + cert.getArn() + " is " + cert.getStatus().name() + " and has no certificate body.", 400);
+    }
+
+    /** 395 days from now, as ACM issues private certificates, but never past the signing CA's own certificate. */
+    private Instant privateNotAfter(AcmPrivateCertificateAuthorities.PrivateCertificateAuthority authority) {
+        Instant end = clock.instant().plus(PRIVATE_CERTIFICATE_VALIDITY_DAYS, ChronoUnit.DAYS);
+        Instant caEnd = authority.issuer().certificate().getNotAfter().toInstant();
+        return end.isAfter(caEnd) ? caEnd : end;
+    }
+
+    /**
+     * The private CA {@code certificateAuthorityArn} names, when AWS Private CA holds one of that ARN in the
+     * caller's account and the Region. Empty otherwise, which keeps the local CA as the signer.
+     */
+    private Optional<AcmPrivateCertificateAuthorities.PrivateCertificateAuthority> privateAuthority(
+            String certificateAuthorityArn, String region) {
+        if (certificateAuthorityArn == null || certificateAuthorityArn.isEmpty()
+                || privateAuthorities == null || !privateAuthorities.isResolvable()) {
+            return Optional.empty();
+        }
+        return privateAuthorities.get().find(certificateAuthorityArn, region);
     }
 
     /** A consumer may acquire IAM before ACM; never invoke it while holding this guard. */
@@ -780,11 +939,13 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         }
         cert = current;
         boolean changed = false;
+        Instant now = clock.instant();
         if (cert.getStatus() == CertificateStatus.PENDING_VALIDATION && cert.getCreatedAt() != null
-                && !Instant.now().isBefore(cert.getCreatedAt().plusSeconds(validationWaitSeconds))) {
+                && !now.isBefore(cert.getCreatedAt().plusSeconds(validationWaitSeconds))) {
             cert.setStatus(CertificateStatus.ISSUED);
-            cert.setIssuedAt(Instant.now());
+            cert.setIssuedAt(now);
             LOG.debugv("Certificate {0} issued after the validation wait", cert.getArn());
+            announce(cert, AcmEventPublisher.Action.ISSUANCE);
             changed = true;
         }
         boolean issued = cert.getStatus() == CertificateStatus.ISSUED || cert.getIssuedAt() != null;
@@ -824,7 +985,7 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         }
 
         // Lazy expiration: remove expired entries on lookup
-        if (entry.isExpired()) {
+        if (entry.isExpired(clock.instant())) {
             idempotencyTokenIndex.remove(indexKey);
             return Optional.empty();
         }
@@ -960,7 +1121,11 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
      */
     private DomainValidation generateDomainValidation(String domain, String requestedValidationDomain,
                                                       ValidationMethod method, CertificateStatus status) {
-        String validationStatus = status == CertificateStatus.ISSUED ? "SUCCESS" : "PENDING_VALIDATION";
+        String validationStatus = switch (status) {
+            case ISSUED -> "SUCCESS";
+            case FAILED -> "FAILED";
+            default -> "PENDING_VALIDATION";
+        };
 
         if (method == ValidationMethod.EMAIL) {
             String validationDomain = requestedValidationDomain != null ? requestedValidationDomain : baseDomain(domain);

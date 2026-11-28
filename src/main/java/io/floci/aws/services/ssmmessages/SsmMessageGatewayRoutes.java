@@ -31,15 +31,22 @@ public class SsmMessageGatewayRoutes implements DataChannelHandler {
     private final ChannelAuthentication authentication;
     private final ObjectMapper mapper;
     private final boolean enabled;
+    private final boolean standaloneControl;
 
     @Inject
     public SsmMessageGatewayRoutes(SsmMessageGateway gateway, ChannelAuthentication authentication,
                                    ObjectMapper mapper, EmulatorConfig config) {
-        this(gateway, authentication, mapper, config.services().ssm().enabled());
+        this(gateway, authentication, mapper, config.services().ssm().enabled(), false);
     }
 
     SsmMessageGatewayRoutes(SsmMessageGateway gateway, ChannelAuthentication authentication,
                             ObjectMapper mapper, boolean enabled) {
+        this(gateway, authentication, mapper, enabled, true);
+    }
+
+    SsmMessageGatewayRoutes(SsmMessageGateway gateway, ChannelAuthentication authentication,
+                            ObjectMapper mapper, boolean enabled, boolean standaloneControl) {
+        this.standaloneControl = standaloneControl;
         this.gateway = gateway;
         this.authentication = authentication;
         this.mapper = mapper;
@@ -51,9 +58,23 @@ public class SsmMessageGatewayRoutes implements DataChannelHandler {
             return;
         }
         BodyHandler body = BodyHandler.create().setBodyLimit(16 * 1024).setHandleFileUploads(false);
-        router.post(CONTROL_PATH).handler(body).handler(this::createControl);
-        router.get(CONTROL_PATH).handler(this::openControl);
-        router.post(DATA_PATH).handler(body).handler(this::createData);
+        if (standaloneControl) {
+            router.post(CONTROL_PATH).handler(body).handler(this::createControl);
+            router.get(CONTROL_PATH).handler(this::openControl);
+        }
+        router.post(DATA_PATH).handler(context -> {
+            if (supportsSession(context.pathParam("sessionId"))) {
+                body.handle(context);
+            } else {
+                context.next();
+            }
+        }).handler(context -> {
+            if (supportsSession(context.pathParam("sessionId"))) {
+                createData(context);
+            } else {
+                context.next();
+            }
+        });
     }
 
     @Override

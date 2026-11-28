@@ -174,6 +174,7 @@ nav:
     - AppIntegrations: services/appintegrations.md
     - Amazon Data Lifecycle Manager: services/dlm.md
     - ACM: services/acm.md
+    - AWS Private CA: services/acm-pca.md
     - AWS Signer: services/signer.md
     - Payment Cryptography: services/payment-cryptography.md
     - Payment Cryptography data plane: services/payment-cryptography-data.md
@@ -247,3 +248,4 @@ nav:
   - Development:
     - Contributing: contributing.md
     - Local concurrency primitives: concurrency.md
+    - Event-driven reconciliation: performance/reconciliation.md

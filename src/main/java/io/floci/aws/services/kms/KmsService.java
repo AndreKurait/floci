@@ -32,6 +32,7 @@ import org.jboss.logging.Logger;
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
@@ -124,11 +125,22 @@ public class KmsService implements ResourceProvider {
         return bytes;
     }
 
-    private String buildDefaultKeyPolicy() {
+    public String buildDefaultKeyPolicy() {
         String account = regionResolver.getAccountId();
         return "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Enable IAM User Permissions\"," +
                "\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"" + regionResolver.buildGlobalArn("iam", account, "root") + "\"}," +
                "\"Action\":\"kms:*\",\"Resource\":\"*\"}]}";
+    }
+
+    private String buildS3ManagedKeyPolicy(String region) {
+        String root = buildDefaultKeyPolicy().replace("\"kms:*\"",
+                "[\"kms:DescribeKey\",\"kms:Get*\",\"kms:List*\",\"kms:RevokeGrant\"]");
+        String delegated = "{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},"
+                + "\"Action\":[\"kms:Encrypt\",\"kms:Decrypt\",\"kms:ReEncrypt*\",\"kms:GenerateDataKey*\",\"kms:DescribeKey\"],"
+                + "\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{"
+                + "\"kms:CallerAccount\":\"" + regionResolver.getAccountId() + "\","
+                + "\"kms:ViaService\":\"s3." + region + "." + AwsRegions.dnsSuffixFor(region) + "\"}}}";
+        return root.substring(0, root.length() - 2) + "," + delegated + "]}";
     }
 
     public KmsKey createKey(String description, String region) {
@@ -849,7 +861,10 @@ public class KmsService implements ResourceProvider {
     public Map<String, Object> getKeyPolicy(String keyId, String region) {
         KmsKey key = resolveKey(keyId, region);
         Map<String, Object> result = new HashMap<>();
-        result.put("Policy", key.getPolicy());
+        boolean managedS3 = AWS_KEY_MANAGER.equals(key.getKeyManager())
+                && aliasStore.get(region + "::alias/aws/s3")
+                        .map(alias -> key.getKeyId().equals(alias.getTargetKeyId())).orElse(false);
+        result.put("Policy", managedS3 ? buildS3ManagedKeyPolicy(region) : key.getPolicy());
         result.put("PolicyName", "default");
         return result;
     }
@@ -1407,6 +1422,192 @@ public class KmsService implements ResourceProvider {
         }
     }
 
+    // ─────────────────── Another account's key, through a grant ───────────────────
+
+    /**
+     * Who a request comes from, as a grant's {@code GranteePrincipal} or
+     * {@code RetiringPrincipal} can name it: the caller's own ARN (a user, or a role session's
+     * assumed-role ARN), the ARN of the role a session assumed, and the caller's account root,
+     * which a grant to the whole account names.
+     *
+     * @param accountId  the caller's account
+     * @param arn        the caller's own ARN, used in the refusal message
+     * @param principals every principal ARN a grant may name to admit this caller
+     */
+    public record GrantCaller(String accountId, String arn, Set<String> principals) {
+        boolean is(String principal) {
+            return principal != null && principals.contains(principal);
+        }
+    }
+
+    /**
+     * The actions a grant can admit for a principal of another account, with the grant
+     * operation that admits each. A key policy can admit others too, but this emulator evaluates no
+     * key policy, so another account's key stays unusable for anything not listed here.
+     */
+    public static final Set<String> GRANT_ACTIONS = Set.of(
+            "DescribeKey", "Encrypt", "Decrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
+            "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext", "Sign", "Verify",
+            "GenerateMac", "VerifyMac", "GetPublicKey", "CreateGrant", "RetireGrant");
+
+    /** Grant operations whose constraints are checked against the request's encryption context. */
+    private static final Set<String> CONTEXT_BOUND_ACTIONS = Set.of(
+            "Encrypt", "Decrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
+            "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext");
+
+    /**
+     * The account that owns the key a key ARN names, when that is not the caller's. A bare key id
+     * or alias always names the caller's own key, as on AWS, where another account's key is
+     * reachable only by its ARN. Another account's alias ARN is not followed here: it stays not
+     * found, as before.
+     */
+    public Optional<String> foreignKeyOwner(String keyIdOrArn, String callerAccount) {
+        if (keyIdOrArn == null || !AwsArnUtils.isArnFor(keyIdOrArn, "kms")
+                || !AwsArnUtils.parse(keyIdOrArn).resource().startsWith("key/")) {
+            return Optional.empty();
+        }
+        String owner = AwsArnUtils.parse(keyIdOrArn).accountId();
+        return owner == null || owner.isEmpty() || owner.equals(callerAccount)
+                ? Optional.empty() : Optional.of(owner);
+    }
+
+    /**
+     * The account holding the key a symmetric ciphertext names, when the caller's account does
+     * not hold it. Decrypt may omit KeyId: the ciphertext identifies its key, in any account.
+     */
+    public Optional<String> foreignCiphertextOwner(byte[] ciphertext, String region, String callerAccount) {
+        Optional<String> keyId = ciphertextKeyId(ciphertext);
+        if (keyId.isEmpty() || !(keyStore instanceof AccountAwareStorageBackend<KmsKey> store)) {
+            return Optional.empty();
+        }
+        return store.findAnyAccountEntry(region + "::" + keyId.get())
+                .map(AccountAwareStorageBackend.OwnedEntry::account)
+                .filter(owner -> !owner.equals(callerAccount));
+    }
+
+    /** The account holding the grant a token names, when the caller's account does not hold it. */
+    public Optional<String> foreignGrantTokenOwner(String grantToken, String region, String callerAccount) {
+        if (grantToken == null || grantToken.isBlank() || findGrantByToken(grantToken, region).isPresent()
+                || !(grantStore instanceof AccountAwareStorageBackend<KmsGrant> store)) {
+            return Optional.empty();
+        }
+        String prefix = region + "::";
+        return store.scanAllAccountEntries(k -> k.startsWith(prefix)).stream()
+                .filter(entry -> grantToken.equals(entry.value().getGrantToken()))
+                .map(AccountAwareStorageBackend.AccountEntry::accountId)
+                .filter(owner -> !owner.equals(callerAccount))
+                .findFirst();
+    }
+
+    /** The key id a symmetric ciphertext blob names, or empty for a blob this emulator did not mint. */
+    public Optional<String> ciphertextKeyId(byte[] ciphertext) {
+        try {
+            String keyId = isEnvelopeV3(ciphertext) ? parseEnvelopeV3(ciphertext).keyId() : parseBlob(ciphertext).keyId;
+            if (keyId == null || keyId.isBlank()) {
+                return Optional.empty();
+            }
+            return Optional.of(AwsArnUtils.isArnFor(keyId, "kms") ? keyId.substring(keyId.lastIndexOf('/') + 1) : keyId);
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Admits a principal of another account to this account's key only through a grant on the key,
+     * which the other account uses by the key's ARN. A grant admits the action when it names the
+     * caller as grantee, lists the action among its operations and, for a cryptographic operation,
+     * the request's encryption context satisfies the grant's constraints. A grant that lists
+     * CreateGrant admits a derived grant with no more operations and no weaker constraints. Must run
+     * in the key owner's request context, where the key and its grants live.
+     */
+    public void requireGrantFor(String action, String keyIdOrArn, String region, GrantCaller caller,
+                                Map<String, String> encryptionContext, List<String> requestedOperations,
+                                Map<String, Object> requestedConstraints) {
+        KmsKey key = resolveKey(keyIdOrArn, region);
+        boolean admitted = grantsOn(key, region).stream()
+                .filter(grant -> caller.is(grant.getGranteePrincipal()))
+                .filter(grant -> grant.getOperations() != null && grant.getOperations().contains(action))
+                .filter(grant -> !CONTEXT_BOUND_ACTIONS.contains(action)
+                        || satisfiesConstraints(grant.getConstraints(), encryptionContext))
+                .anyMatch(grant -> !"CreateGrant".equals(action)
+                        || derivesFrom(grant, requestedOperations, requestedConstraints));
+        if (!admitted) {
+            throw notAuthorizedThroughGrant(caller, action, key.getArn());
+        }
+    }
+
+    /**
+     * Admits RetireGrant by a principal of another account: the grant's retiring principal, or its
+     * grantee when the grant lists RetireGrant. (The key owner's account may retire any grant; that
+     * is the same-account path.) Must run in the key owner's request context.
+     */
+    public void requireRetirableBy(String grantToken, String keyIdOrArn, String grantId, String region,
+                                   GrantCaller caller) {
+        KmsGrant grant;
+        if (grantToken != null && !grantToken.isBlank()) {
+            grant = findGrantByToken(grantToken, region)
+                    .orElseThrow(() -> new AwsException("NotFoundException", "Grant not found", 400));
+        } else {
+            KmsKey key = resolveKey(keyIdOrArn, region);
+            grant = grantStore.get(region + "::" + grantId)
+                    .filter(g -> key.getKeyId().equals(g.getKeyId()))
+                    .orElseThrow(() -> new AwsException("NotFoundException", "Grant not found", 400));
+        }
+        boolean admitted = caller.is(grant.getRetiringPrincipal())
+                || (caller.is(grant.getGranteePrincipal()) && grant.getOperations() != null
+                        && grant.getOperations().contains("RetireGrant"));
+        if (!admitted) {
+            throw notAuthorizedThroughGrant(caller, "RetireGrant", grant.getKeyArn());
+        }
+    }
+
+    private List<KmsGrant> grantsOn(KmsKey key, String region) {
+        String prefix = region + "::";
+        return grantStore.scan(k -> k.startsWith(prefix)).stream()
+                .filter(grant -> key.getKeyId().equals(grant.getKeyId()))
+                .toList();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> constraint(Map<String, Object> constraints, String name) {
+        Object value = constraints == null ? null : constraints.get(name);
+        return value instanceof Map<?, ?> map ? (Map<String, String>) map : null;
+    }
+
+    /** EncryptionContextSubset: every pair is in the request; EncryptionContextEquals: the same pairs exactly. */
+    static boolean satisfiesConstraints(Map<String, Object> constraints, Map<String, String> encryptionContext) {
+        Map<String, String> context = encryptionContext == null ? Map.of() : encryptionContext;
+        Map<String, String> subset = constraint(constraints, "EncryptionContextSubset");
+        Map<String, String> equals = constraint(constraints, "EncryptionContextEquals");
+        return (subset == null || context.entrySet().containsAll(subset.entrySet()))
+                && (equals == null || context.equals(equals));
+    }
+
+    /** A grant created through a parent grant: no operation the parent lacks, no weaker constraint. */
+    static boolean derivesFrom(KmsGrant parent, List<String> operations, Map<String, Object> constraints) {
+        if (operations == null || !parent.getOperations().containsAll(operations)) {
+            return false;
+        }
+        Map<String, String> parentSubset = constraint(parent.getConstraints(), "EncryptionContextSubset");
+        Map<String, String> parentEquals = constraint(parent.getConstraints(), "EncryptionContextEquals");
+        Map<String, String> subset = constraint(constraints, "EncryptionContextSubset");
+        Map<String, String> equals = constraint(constraints, "EncryptionContextEquals");
+        if (parentEquals != null) {
+            return parentEquals.equals(equals);
+        }
+        if (parentSubset == null) {
+            return true;
+        }
+        return (subset != null && subset.entrySet().containsAll(parentSubset.entrySet()))
+                || (equals != null && equals.entrySet().containsAll(parentSubset.entrySet()));
+    }
+
+    private static AwsException notAuthorizedThroughGrant(GrantCaller caller, String action, String keyArn) {
+        return new AwsException("AccessDeniedException",
+                "User: " + caller.arn() + " is not authorized to perform: kms:" + action + " on resource: "
+                        + keyArn + " because no resource-based policy allows the kms:" + action + " action", 400);
+    }
+
     // ──────────────────────── AWS Managed Keys ───────────────────────
 
     /**
@@ -1474,7 +1675,8 @@ public class KmsService implements ResourceProvider {
                 key.setArn(regionResolver.buildArn("kms", region, "key/" + keyId));
                 key.setDescription(def.description());
                 key.setKeyManager(AWS_KEY_MANAGER);
-                key.setPolicy(buildDefaultKeyPolicy());
+                key.setPolicy("alias/aws/s3".equals(def.aliasName())
+                        ? buildS3ManagedKeyPolicy(region) : buildDefaultKeyPolicy());
                 // AWS rotates its own keys yearly and the customer cannot turn that off, so
                 // GetKeyRotationStatus reports true for every AWS managed key.
                 key.setKeyRotationEnabled(true);
@@ -1582,6 +1784,11 @@ public class KmsService implements ResourceProvider {
         requireNotPendingDeletion(key);
 
         String aliasArn = regionResolver.buildArn("kms", region, aliasName);
+        if (aliasStore.get(region + "::" + aliasName).isPresent()) {
+            // Pointing an existing alias at another key is UpdateAlias; CreateAlias never replaces one.
+            throw new AwsException("AlreadyExistsException",
+                    "An alias with the name " + aliasArn + " already exists", 400);
+        }
         KmsAlias alias = new KmsAlias(aliasName, aliasArn, key.getKeyId());
         String storageKey = region + "::" + aliasName;
         synchronized (aliasCreateLock) {
@@ -2476,6 +2683,37 @@ public class KmsService implements ResourceProvider {
     public Optional<String> findKeyPolicy(String keyArn) {
         return keyAt(keyArn).map(KmsKey::getPolicy).filter(policy -> !policy.isBlank());
     }
+
+    /** Key policy and grants read for IAM without migrating records or changing the caller's account. */
+    Optional<KeyPolicyMaterial> findKeyPolicyMaterial(String keyArn) {
+        if (!AwsArnUtils.isArnFor(keyArn, "kms")) {
+            return Optional.empty();
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(keyArn);
+        String keyId = arn.resource().startsWith("key/") ? arn.resource().substring("key/".length()) : "";
+        synchronized (backingKeyMaterialLocks.lockFor(keyId)) {
+            return keyAt(keyArn).filter(key -> keyArn.equals(key.getArn())).map(key -> {
+                String prefix = arn.region() + "::";
+                List<KmsGrant> grants;
+                if (grantStore instanceof AccountAwareStorageBackend<KmsGrant> accounts) {
+                    grants = accounts.keysIncludingLegacyForAccount(arn.accountId(), name -> name.startsWith(prefix))
+                            .stream().map(name -> ofAccount(grantStore, arn.accountId(), name))
+                            .flatMap(Optional::stream).toList();
+                } else {
+                    grants = arn.accountId().equals(regionResolver.getAccountId())
+                            ? grantStore.scan(name -> name.startsWith(prefix)) : List.of();
+                }
+                List<Map<String, Object>> policies = grants.stream()
+                        .filter(grant -> key.getKeyId().equals(grant.getKeyId()))
+                        .filter(grant -> grant.getKeyArn() == null || keyArn.equals(grant.getKeyArn()))
+                        .sorted(Comparator.comparing(KmsGrant::getGrantId))
+                        .map(this::grantToMap).toList();
+                return new KeyPolicyMaterial(key.getPolicy(), KmsKeySpec.SYMMETRIC_DEFAULT == key.getKeySpec(), policies);
+            });
+        }
+    }
+
+    record KeyPolicyMaterial(String policy, boolean symmetric, List<Map<String, Object>> grants) {}
 
     /**
      * What {@code accountId} stores under {@code key}, an entry written before accounts were kept apart included; a

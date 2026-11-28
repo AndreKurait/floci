@@ -17,6 +17,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.ec2.ContainerNetworkReachability;
 import io.floci.aws.services.ec2.Ec2ContainerManager;
+import io.floci.aws.services.ec2.Ec2InstanceTypeCatalog;
 import io.floci.aws.services.ec2.Ec2MetadataServer;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceState;
@@ -26,6 +27,7 @@ import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.util.Map;
 
 import static org.mockito.Mockito.mock;
@@ -64,6 +66,19 @@ public final class Ec2LifecycleFixtures {
                 mock(PortAllocator.class), config, mock(Ec2MetadataServer.class), portForwards,
                 mock(RegionResolver.class), mock(ContainerNetworkReachability.class),
                 mock(VpcNetworkManager.class), mock(ContainerReachableEndpoint.class));
+    }
+
+    /** A manager that stamps native lifecycle transitions with the supplied clock. */
+    public static Ec2ContainerManager manager(EmulatorConfig config, DockerClient docker,
+                                              ContainerLifecycleManager lifecycle,
+                                              Ec2PortForwardManager portForwards, Clock clock) {
+        return new Ec2ContainerManager(
+                mock(ContainerBuilder.class), lifecycle, mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class), mock(DockerHostResolver.class), docker,
+                mock(PortAllocator.class), config, mock(Ec2MetadataServer.class), portForwards,
+                mock(RegionResolver.class), mock(ContainerNetworkReachability.class),
+                mock(VpcNetworkManager.class), mock(ContainerReachableEndpoint.class),
+                null, new Ec2InstanceTypeCatalog(), clock);
     }
 
     public static Instance instance(String id, InstanceState state, String containerId) {

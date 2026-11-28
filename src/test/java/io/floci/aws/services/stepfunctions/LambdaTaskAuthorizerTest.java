@@ -10,7 +10,6 @@ import io.floci.aws.services.iam.RoleResourceAccessAuthorizer;
 import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
-import io.floci.aws.services.lambda.LambdaResourcePolicyProvider;
 import io.floci.aws.services.stepfunctions.LambdaTaskAuthorizer.Permission;
 import io.floci.aws.services.stepfunctions.model.StateMachine;
 import jakarta.enterprise.inject.Instance;
@@ -65,7 +64,7 @@ class LambdaTaskAuthorizerTest {
               "Principal":{"Service":"states.amazonaws.com"}}]}""";
 
     private IamService iamService;
-    private LambdaResourcePolicyProvider functionPolicies;
+    private ResourcePolicyProvider functionPolicies;
     private ResourcePolicyProvider bucketPolicies;
     private Instance<ScpProvider> scpProvider;
     private LambdaTaskAuthorizer authorizer;
@@ -74,7 +73,7 @@ class LambdaTaskAuthorizerTest {
     @SuppressWarnings("unchecked")
     void setUp() {
         iamService = mock(IamService.class);
-        functionPolicies = mock(LambdaResourcePolicyProvider.class);
+        functionPolicies = mock(ResourcePolicyProvider.class);
         scpProvider = mock(Instance.class);
         when(functionPolicies.getResourcePolicies(eq("lambda"), anyString()))
                 .thenReturn(List.of(new ResourcePolicy(null, FUNCTION_ACCOUNT)));
@@ -620,6 +619,23 @@ class LambdaTaskAuthorizerTest {
                 () -> authorizer.authorizeMapS3(machine(), "States.ItemReaderFailed", List.of()));
 
         assertEquals("States.Permissions", refused.error);
+    }
+
+    @Test
+    void taskRoleTrustUsesTheExecutionRoleIdWithoutInventingAUserid() {
+        roleWithPolicies(ASSUME_ANY_ROLE);
+        IamRole execution = new IamRole("AROAEXECUTION", "sfn-exec", "/service-role/", ROLE, STATES_TRUST);
+        when(iamService.findRole(SFN_ACCOUNT, "sfn-exec")).thenReturn(Optional.of(execution));
+        taskRole(TASK_ROLE, trust("{\"AWS\":\"AROAEXECUTION\"}"));
+        assertEquals(Optional.empty(), authorizer.assumeRefusal(ROLE, TASK_ROLE, STATE_MACHINE));
+        taskRole(TASK_ROLE, """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                 "Principal":{"AWS":"AROAEXECUTION"},"Condition":{"StringLike":{"aws:userid":"*"}}}]}
+                """);
+        assertTrue(authorizer.assumeRefusal(ROLE, TASK_ROLE, STATE_MACHINE).isPresent());
+        taskRole(TASK_ROLE, trust("{\"AWS\":\"AROAEXECUTION\"}"));
+        execution.setRoleId("AROAREPLACEMENT");
+        assertTrue(authorizer.assumeRefusal(ROLE, TASK_ROLE, STATE_MACHINE).isPresent());
     }
 
     private static StateMachine machine() {

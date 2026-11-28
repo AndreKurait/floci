@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.services.cloudformation.CloudFormationDriftSnapshot;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sns.model.Subscription;
@@ -25,6 +26,7 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class SnsCfnProvisioner implements CfnResourceProvisioner {
 
+    private static final String DISPLAY_UNDO = "__FlociSnsDisplayUndo:";
     private static final String TOPIC = "AWS::SNS::Topic";
     private static final String SUBSCRIPTION = "AWS::SNS::Subscription";
     private static final String TOPIC_POLICY = "AWS::SNS::TopicPolicy";
@@ -76,9 +78,64 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void clearUpdate(StackResource resource) {
+        resource.getAttributes().keySet().removeIf(key -> key.startsWith(DISPLAY_UNDO));
         resource.getAttributes().remove(PRIOR_INLINE_ATTR);
         resource.getAttributes().remove(ADOPTED_ATTR);
         ReplacementCleanup.clear(resource);
+    }
+
+    @Override
+    public CfnDriftProjection readDrift(CloudFormationDriftSnapshot.Resource resource, JsonNode properties,
+                                       String account, String region) {
+        if (!TOPIC.equals(resource.type()) || !literalTopicProperties(properties)) {
+            throw new AwsException("ValidationError",
+                    "Drift currently supports only literal TopicName and DisplayName on AWS::SNS::Topic", 400);
+        }
+        SnsService.DriftTopic topic = snsService.readTopicForDrift(resource.physicalId(), region, account);
+        Map<String, String> expected = new HashMap<>();
+        Map<String, String> actual = new HashMap<>();
+        properties.properties().forEach(entry -> {
+            expected.put(entry.getKey(), entry.getValue().textValue());
+            if (!topic.absent()) {
+                String value = "TopicName".equals(entry.getKey()) ? topic.name()
+                        : topic.attributes().get("DisplayName");
+                if (value == null) {
+                    throw new AwsException("ValidationError", "Stored SNS declared attribute is missing", 400);
+                }
+                actual.put(entry.getKey(), value);
+            }
+        });
+        return new CfnDriftProjection(resource, expected, actual, topic.absent(),
+                new CfnDriftProjection.Permission("sns:GetTopicAttributes", topic.arn(), account,
+                        topic.attributes().get("Policy"), topic.tags()));
+    }
+
+    private static boolean literalTopicProperties(JsonNode properties) {
+        return properties != null && properties.isObject()
+                && properties.properties().stream().allMatch(entry ->
+                        Set.of("TopicName", "DisplayName").contains(entry.getKey()) && entry.getValue().isTextual()
+                                && !entry.getValue().textValue().contains("{{resolve:"));
+    }
+
+    private void rememberDisplayName(StackResource resource, JsonNode properties, ProvisionContext ctx,
+                                     SnsService.TopicCreation creation) {
+        if (creation.created() || !ctx.priorPhysicalId().equals(creation.topic().getTopicArn())
+                || !literalTopicProperties(properties) || !literalTopicProperties(ctx.priorProperties())
+                || !Objects.equals(properties.get("TopicName"), ctx.priorProperties().get("TopicName"))) {
+            return;
+        }
+        SnsService.DriftTopic topic = snsService.readTopicForDrift(
+                creation.topic().getTopicArn(), ctx.region(), ctx.accountId());
+        String displayName = topic.attributes().get("DisplayName");
+        if (topic.absent() || displayName == null) {
+            throw new AwsException("ValidationError", "SNS topic disappeared before DisplayName update", 400);
+        }
+        // Only this literal, same-topic update has an undo. Other SNS updates retain their prior limitations.
+        resource.getAttributes().put(DISPLAY_UNDO + "Arn", topic.arn());
+        resource.getAttributes().put(DISPLAY_UNDO + "Region", ctx.region());
+        resource.getAttributes().put(DISPLAY_UNDO + "Account", ctx.accountId());
+        resource.getAttributes().put(DISPLAY_UNDO + "CreatedAt", topic.createdAt().toString());
+        resource.getAttributes().put(DISPLAY_UNDO + "Value", displayName);
     }
 
     @Override
@@ -97,7 +154,7 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
             resource.getAttributes().remove(ADOPTED_ATTR);
         }
         if (!ReplacementCleanup.rollback(resource, this::delete)) {
-            return false;
+            return restoreDisplayName(resource);
         }
         String prior = resource.getAttributes().remove(PRIOR_INLINE_ATTR);
         if (prior != null) {
@@ -109,6 +166,38 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
             }
         }
         return true;
+    }
+
+    private boolean restoreDisplayName(StackResource resource) {
+        Map<String, String> saved = resource.getAttributes();
+        String arn = saved.get(DISPLAY_UNDO + "Arn");
+        if (arn == null) {
+            return false;
+        }
+        SnsService.DriftTopic current = snsService.readTopicForDrift(
+                arn, saved.get(DISPLAY_UNDO + "Region"), saved.get(DISPLAY_UNDO + "Account"));
+        if (current.absent() || !Objects.equals(resource.getPhysicalId(), arn)
+                || !Objects.equals(saved.get(DISPLAY_UNDO + "CreatedAt"), current.createdAt().toString())) {
+            return false;
+        }
+        snsService.setTopicAttributes(arn, "DisplayName", saved.get(DISPLAY_UNDO + "Value"),
+                saved.get(DISPLAY_UNDO + "Region"));
+        clearUpdate(resource);
+        return true;
+    }
+
+    @Override
+    public boolean retainsFailedUpdateState(StackResource resource) {
+        return resource.getAttributes().containsKey(DISPLAY_UNDO + "Arn");
+    }
+
+    @Override
+    public void mergeFailedUpdateResourceTracking(StackResource previous, StackResource attempted) {
+        attempted.getAttributes().forEach((key, value) -> {
+            if (key.startsWith(DISPLAY_UNDO)) {
+                previous.getAttributes().put(key, value);
+            }
+        });
     }
 
     private void provisionTopic(StackResource r, JsonNode props, ProvisionContext ctx) {
@@ -155,6 +244,9 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
         }
 
         Map<String, String> attributes = new HashMap<>();
+        if (displayName != null) {
+            attributes.put("DisplayName", displayName);
+        }
         if (contentBasedDedupFlag != null && !contentBasedDedupFlag.isBlank()) {
             attributes.put("ContentBasedDeduplication", contentBasedDedupFlag);
         }
@@ -194,6 +286,7 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
         // attributes itself. A property the template dropped is reset, not left standing.
         Map<String, String> desired = new HashMap<>();
         if (ctx.isUpdate()) {
+            rememberDisplayName(r, props, ctx, creation);
             desired.putAll(attributes);
             if (fifo) {
                 desired.putIfAbsent("ContentBasedDeduplication", "false");

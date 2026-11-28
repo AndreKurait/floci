@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -182,14 +183,17 @@ class SfnMockLoaderTest {
     }
 
     @Test
-    void reloadsFileWhenModified() throws IOException, InterruptedException {
+    void reloadsFileWhenModified() throws IOException {
         Path file = tempDir.resolve("mock-config.json");
         Files.writeString(file, CONFIG);
         SfnMockLoader loader = new SfnMockLoader(Optional.of(file.toString()), new ObjectMapper());
         assertEquals(2, loader.requireTestCase("Test", "Case").stateResponses().get("Call API").size());
 
-        Thread.sleep(1100);
+        // The loader reloads on a changed modification time; the rewrite is stamped one second
+        // later, the coarsest step a file system records, instead of waiting for that second.
+        FileTime loaded = Files.getLastModifiedTime(file);
         Files.writeString(file, CONFIG.replace("\"1-2\"", "\"1\""));
+        Files.setLastModifiedTime(file, FileTime.fromMillis(loaded.toMillis() + 1_000));
         List<MockedResponseStep> steps = loader.requireTestCase("Test", "Case").stateResponses().get("Call API");
         assertEquals(1, steps.get(1).toAttempt());
     }

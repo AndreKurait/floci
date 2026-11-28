@@ -18,6 +18,7 @@ ${prefix}AWSLogs/${accountId}/CloudTrail/${region}/yyyy/MM/dd/${accountId}_Cloud
 | --- | --- |
 | `CreateTrail` | Creates a trail, optionally tagged via `TagsList`, and returns its ARN |
 | `DescribeTrails` | Returns the settings for one or more trails |
+| `GetTrail` | Returns one trail's settings by name or ARN |
 | `DeleteTrail` | Deletes a trail |
 | `UpdateTrail` | Updates the settings of an existing trail |
 | `PutEventSelectors` | Configures the event selectors for a trail |
@@ -31,6 +32,12 @@ ${prefix}AWSLogs/${accountId}/CloudTrail/${region}/yyyy/MM/dd/${accountId}_Cloud
 | `RemoveTags` | Removes the given tag keys from a trail, identified by ARN |
 | `ListTags` | Returns the tags for one or more trails, identified by ARN |
 <!-- floci:actions:end -->
+
+`GetTrail` returns the configuration inside `Trail`, including the home Region,
+destination bucket and logging flags. Names resolve in the caller's Region;
+an ARN can identify another Region's trail within the caller's account.
+Missing and deleted trails return `TrailNotFoundException`. This read does not
+establish that log delivery or digest validation has completed.
 
 Selector matching honors `ReadWriteType` (`All`, `ReadOnly`, `WriteOnly`)
 and `AWS::S3::Object` data resource ARNs in any of these forms:

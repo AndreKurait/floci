@@ -23,6 +23,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.HashMap;
@@ -56,6 +57,7 @@ public class SchedulerService implements StoredResourceArns {
     private final StorageBackend<String, ScheduleGroup> groupStore;
     private final StorageBackend<String, Schedule> scheduleStore;
     private final RegionResolver regionResolver;
+    private final Clock clock;
 
     @Inject
     public SchedulerService(StorageFactory storageFactory, RegionResolver regionResolver) {
@@ -71,9 +73,18 @@ public class SchedulerService implements StoredResourceArns {
     SchedulerService(StorageBackend<String, ScheduleGroup> groupStore,
                      StorageBackend<String, Schedule> scheduleStore,
                      RegionResolver regionResolver) {
+        this(groupStore, scheduleStore, regionResolver, Clock.systemUTC());
+    }
+
+    /** Package-private so tests can stamp groups and schedules on a clock they control. */
+    SchedulerService(StorageBackend<String, ScheduleGroup> groupStore,
+                     StorageBackend<String, Schedule> scheduleStore,
+                     RegionResolver regionResolver,
+                     Clock clock) {
         this.groupStore = groupStore;
         this.scheduleStore = scheduleStore;
         this.regionResolver = regionResolver;
+        this.clock = clock;
     }
 
     // ──────────────────────────── IAM lookups ────────────────────────────
@@ -128,7 +139,7 @@ public class SchedulerService implements StoredResourceArns {
     public ScheduleGroup getOrCreateDefaultGroup(String region) {
         String key = groupKey(region, DEFAULT_GROUP);
         return groupStore.get(key).orElseGet(() -> {
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             ScheduleGroup group = new ScheduleGroup(
                     DEFAULT_GROUP,
                     buildGroupArn(region, DEFAULT_GROUP),
@@ -152,7 +163,7 @@ public class SchedulerService implements StoredResourceArns {
             throw new AwsException("ConflictException",
                     "ScheduleGroup already exists: " + name, 409);
         }
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         ScheduleGroup group = new ScheduleGroup(
                 name,
                 buildGroupArn(region, name),
@@ -219,7 +230,7 @@ public class SchedulerService implements StoredResourceArns {
             Map<String, String> updated = new HashMap<>(group.getTags());
             updated.putAll(tags);
             group.setTags(updated);
-            group.setLastModificationDate(Instant.now());
+            group.setLastModificationDate(clock.instant());
         }
         groupStore.put(groupKey(region, group.getName()), group);
     }
@@ -233,7 +244,7 @@ public class SchedulerService implements StoredResourceArns {
             Map<String, String> updated = new HashMap<>(group.getTags());
             tagKeys.forEach(updated::remove);
             group.setTags(updated);
-            group.setLastModificationDate(Instant.now());
+            group.setLastModificationDate(clock.instant());
         }
         groupStore.put(groupKey(region, group.getName()), group);
     }
@@ -274,7 +285,7 @@ public class SchedulerService implements StoredResourceArns {
                     "Schedule already exists: " + req.getName(), 409);
         }
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Schedule schedule = new Schedule();
         schedule.setName(req.getName());
         schedule.setArn(buildScheduleArn(region, effectiveGroup, req.getName()));
@@ -315,7 +326,7 @@ public class SchedulerService implements StoredResourceArns {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Schedule not found: " + req.getName(), 404));
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Schedule updated = new Schedule();
         updated.setName(req.getName());
         updated.setArn(existing.getArn());

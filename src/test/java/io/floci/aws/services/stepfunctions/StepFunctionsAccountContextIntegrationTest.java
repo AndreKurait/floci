@@ -7,7 +7,10 @@ import org.hamcrest.Matchers;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -239,27 +242,25 @@ class StepFunctionsAccountContextIntegrationTest {
                 .body("Item.v.S", Matchers.equalTo("B"));
     }
 
-    private String waitForTerminal(String execArn) throws InterruptedException {
-        for (int i = 0; i < 80; i++) {
-            Response resp = given()
-                    .header("Authorization", auth(ACCOUNT, "states"))
-                    .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                    .contentType(SFN_CT)
-                    .body("""
-                            {"executionArn": "%s"}
-                            """.formatted(execArn))
-                    .when().post("/");
-            String status = resp.jsonPath().getString("status");
-            if (!"RUNNING".equals(status)) {
-                if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                    fail("Execution " + status + ": " + resp.body().asString());
-                }
-                return status;
-            }
-            Thread.sleep(100);
+    private String waitForTerminal(String execArn) {
+        Response resp = await("execution " + execArn + " to leave RUNNING")
+                .atMost(Duration.ofSeconds(8))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> given()
+                                .header("Authorization", auth(ACCOUNT, "states"))
+                                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
+                                .contentType(SFN_CT)
+                                .body("""
+                                        {"executionArn": "%s"}
+                                        """.formatted(execArn))
+                                .when().post("/"),
+                        response -> !"RUNNING".equals(response.jsonPath().getString("status")));
+        String status = resp.jsonPath().getString("status");
+        if ("FAILED".equals(status) || "ABORTED".equals(status)) {
+            fail("Execution " + status + ": " + resp.body().asString());
         }
-        fail("Execution did not complete within timeout");
-        return null;
+        return status;
     }
 
     private static String quote(String raw) {

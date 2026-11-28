@@ -1772,7 +1772,7 @@ public class IamQueryHandler {
                 .elem("RoleId", r.getRoleId())
                 .elem("Arn", r.getArn())
                 .elem("CreateDate", isoDate(r.getCreateDate()))
-                .elem("AssumeRolePolicyDocument", r.getAssumeRolePolicyDocument())
+                .elem("AssumeRolePolicyDocument", iamService.renderAssumeRolePolicy(r.getAssumeRolePolicyDocument()))
                 .raw(tagsElement(r.getTags()))
                 .start("InstanceProfileList");
         for (InstanceProfile profile : iamService.listInstanceProfilesForRole(r.getRoleName())) {
@@ -2517,7 +2517,8 @@ public class IamQueryHandler {
     private void evaluationResult(XmlBuilder xml, CallerContext caller, String actionName,
                                   List<String> resourceArns, Map<String, List<String>> context) {
         List<IamPolicyEvaluator.SimulationReport> reports = resourceArns.stream()
-                .map(resourceArn -> policyEvaluator.simulate(caller, actionName, resourceArn, context))
+                .map(resourceArn -> policyEvaluator.simulate(caller, actionName, resourceArn,
+                        resourceSimulationContext(context, resourceArn)))
                 .toList();
         IamPolicyEvaluator.SimulationDecision decision = mostRestrictive(
                 reports.stream().map(IamPolicyEvaluator.SimulationReport::decision).toList());
@@ -2548,6 +2549,20 @@ public class IamQueryHandler {
             xml.end("ResourceSpecificResults");
         }
         xml.end("member");
+    }
+
+    private static Map<String, List<String>> resourceSimulationContext(
+            Map<String, List<String>> context, String resourceArn) {
+        Map<String, List<String>> resourceContext = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        context.forEach((key, values) -> {
+            // The ARN alias accepts overrides only in the lowercase aws: namespace.
+            if (!key.equalsIgnoreCase("aws:ARN") || key.startsWith("aws:")) {
+                resourceContext.put(key, values);
+            }
+        });
+        resourceContext.putIfAbsent("aws:ResourceArn", List.of(resourceArn));
+        resourceContext.putIfAbsent("aws:ARN", List.of(resourceArn));
+        return resourceContext;
     }
 
     /**
@@ -3797,7 +3812,7 @@ public class IamQueryHandler {
                 .elem("Arn", r.getArn())
                 .elem("CreateDate", isoDate(r.getCreateDate()))
                 .elem("MaxSessionDuration", (long) r.getMaxSessionDuration())
-                .elem("AssumeRolePolicyDocument", r.getAssumeRolePolicyDocument())
+                .elem("AssumeRolePolicyDocument", iamService.renderAssumeRolePolicy(r.getAssumeRolePolicyDocument()))
                 .elem("Description", r.getDescription())
                 .raw(detailed ? permissionsBoundaryXml(r.getPermissionsBoundaryArn()) : "")
                 .raw(detailed ? tagsElement(r.getTags()) : "")

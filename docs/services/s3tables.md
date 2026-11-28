@@ -12,7 +12,7 @@ S3 Tables requests are signed as `s3tables` and use REST JSON routes such as
 ## Scope
 
 This service stores table-bucket, namespace, table, policy, maintenance
-configuration, and metadata-location state, and gives every table a warehouse:
+configuration, bucket metrics configuration, and metadata-location state, and gives every table a warehouse:
 a bucket of its own, named like the ones AWS creates (`<id>--table-s3`), which
 `GetTable` and `GetTableMetadataLocation` report as `warehouseLocation`. An
 Iceberg client such as Spark's `S3TablesCatalog` writes the table's data and
@@ -35,10 +35,12 @@ was stored with, which ends in its name.
 | Area | Operations |
 |---|---|
 | Table buckets | CreateTableBucket, GetTableBucket, ListTableBuckets, DeleteTableBucket |
+| Storage classes | GetTableBucketStorageClass, PutTableBucketStorageClass, GetTableStorageClass |
 | Bucket encryption | GetTableBucketEncryption |
 | Bucket policy | PutTableBucketPolicy, GetTableBucketPolicy, DeleteTableBucketPolicy |
 | Bucket storage class | GetTableBucketStorageClass |
 | Bucket maintenance | PutTableBucketMaintenanceConfiguration, GetTableBucketMaintenanceConfiguration |
+| Bucket metrics configuration | PutTableBucketMetricsConfiguration, GetTableBucketMetricsConfiguration, DeleteTableBucketMetricsConfiguration |
 | Namespaces | CreateNamespace, GetNamespace, ListNamespaces, DeleteNamespace |
 | Tables | CreateTable, GetTable, ListTables, DeleteTable, RenameTable |
 | Metadata location | GetTableMetadataLocation, UpdateTableMetadataLocation |
@@ -55,6 +57,21 @@ without an explicit configuration, including those loaded from older
 snapshots, report `AES256`. This is configuration readback; Floci does not
 encrypt table data or perform KMS cryptographic operations. Updating or
 deleting a bucket's encryption configuration is not implemented.
+
+Storage classes support `STANDARD` (the default) and `INTELLIGENT_TIERING`.
+`PutTableBucketStorageClass` changes the default for new tables. Each table
+retains the class selected at creation, either its explicit configuration or
+the bucket's default at that time. Bucket settings and table classes survive
+restarts in persistent storage modes. These settings are metadata; Floci does
+not move table data between storage tiers.
+
+Bucket metrics configuration is disabled by default. `PutTableBucketMetricsConfiguration`
+enables it, and `GetTableBucketMetricsConfiguration` returns the bucket ARN and the
+fixed configuration ID `EntireBucket`. Repeated puts preserve that configuration.
+Deleting a configuration is idempotent; subsequent reads return `NotFoundException`
+until it is enabled again. This state uses the bucket's configured storage mode
+and is removed with the bucket. The three metrics APIs authorize their individual
+IAM actions against the exact table-bucket ARN.
 
 ## Example
 

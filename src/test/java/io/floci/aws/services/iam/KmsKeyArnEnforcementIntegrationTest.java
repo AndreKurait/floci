@@ -74,7 +74,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "ListKeyRotations", "{\"KeyId\":\"" + allowedArn + "\"}")
                 .then().statusCode(200).body("Truncated", equalTo(false));
         keyCall(session, "ListKeyRotations", "{\"KeyId\":\"" + otherArn + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -91,9 +91,9 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "DescribeKey", "{\"KeyId\": \"" + allowedArn + "\"}")
                 .then().statusCode(200).body("KeyMetadata.Arn", equalTo(allowedArn));
         keyCall(session, "Encrypt", encryptBody(otherArn))
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(session, "DescribeKey", "{\"KeyId\": \"" + otherArn + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -109,7 +109,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "Encrypt", encryptBody(keptArn))
                 .then().statusCode(200).body("KeyId", equalTo(keptArn));
         keyCall(session, "Encrypt", encryptBody(deniedArn))
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -129,6 +129,43 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .then().statusCode(200).body("KeyId", equalTo(keyArn));
     }
 
+    /**
+     * A key the account does not hold has no key policy to grant or refuse anything, so a caller
+     * whose own policy allows the action on the account's keys reaches the handler and gets the
+     * NotFoundException KMS answers, whether the key is named by id, by ARN, by alias or by alias ARN. A caller
+     * whose policy does not allow the action is still refused, and so is a call on another account's
+     * missing key that no grant could admit, since no key policy admits it across accounts.
+     */
+    @Test
+    void aMissingKeyAnswersNotFoundToACallerAllowedOnTheAccountsKeys() {
+        String missingId = UUID.randomUUID().toString();
+        String missingAlias = "alias/missing-" + UUID.randomUUID().toString().substring(0, 8);
+        Session allowed = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:DescribeKey","Resource":"%s*"}]}"""
+                .formatted(KEY_ARN_PREFIX));
+
+        for (String keyId : new String[]{missingId, KEY_ARN_PREFIX + missingId, missingAlias,
+                ALIAS_ARN_PREFIX + missingAlias.substring("alias/".length())}) {
+            keyCall(allowed, "DescribeKey", "{\"KeyId\": \"" + keyId + "\"}")
+                    .then().statusCode(400).body("__type", equalTo("NotFoundException"));
+        }
+
+        Session notAllowed = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:Encrypt","Resource":"%s*"}]}"""
+                .formatted(KEY_ARN_PREFIX));
+        keyCall(notAllowed, "DescribeKey", "{\"KeyId\": \"" + missingId + "\"}")
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
+
+        Session anyKey = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:GetKeyRotationStatus","Resource":"*"}]}""");
+        keyCall(anyKey, "GetKeyRotationStatus",
+                "{\"KeyId\": \"arn:aws:kms:us-east-1:222222222222:key/" + missingId + "\"}")
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
+    }
+
     @Test
     void aDecryptNamingNoKeyIdIsAuthorizedAgainstTheKeyThatEncryptedTheCiphertext() {
         String keyArn = createKey();
@@ -142,7 +179,7 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .then().statusCode(200)
                 .body("Plaintext", equalTo(PLAINTEXT)).body("KeyId", equalTo(keyArn));
         keyCall(onAnotherKey, "Decrypt", "{\"CiphertextBlob\": \"" + ciphertext + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -158,7 +195,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         // A ciphertext no stored key answers to names no key, so the request is checked on *, which a policy
         // granting every resource covers and the handler then refuses.
         keyCall(onKeys, "Decrypt", "{\"CiphertextBlob\": \"AAAA\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(onEverything, "Decrypt", "{\"CiphertextBlob\": \"AAAA\"}")
                 .then().statusCode(400).body("__type", equalTo("InvalidCiphertextException"));
     }
@@ -186,7 +223,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "ReEncrypt",
                 "{\"CiphertextBlob\": \"" + deniedCiphertext + "\", \"KeyId\": \"" + allowedArn
                         + "\", \"DestinationKeyId\": \"" + allowedArn + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
 
         keyCall(session, "ReEncrypt",
                 "{\"CiphertextBlob\": \"" + allowedCiphertext + "\", \"DestinationKeyId\": \""
@@ -224,30 +261,42 @@ class KmsKeyArnEnforcementIntegrationTest {
                   {"Effect":"Allow","Action":"kms:ReEncrypt","Resource":"*"}]}""");
 
         keyCall(backwards, "ReEncrypt", reEncrypt)
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(byItsName, "ReEncrypt", reEncrypt)
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(oneWay, "ReEncrypt", reEncrypt)
                 .then().statusCode(200).body("KeyId", equalTo(destinationArn)).body("SourceKeyId", equalTo(sourceArn));
     }
 
-    /**
-     * A RetireGrant naming its grant by its token alone names no key the table reads, so it is
-     * checked on {@code *}: a policy granting retirement on every resource allows it, one scoped
-     * to the grant's key does not.
-     */
+    /** The grant token identifies the key whose retirement permissions and denies must be evaluated. */
     @Test
-    void aTokenOnlyRetireGrantIsCheckedOnStar() {
+    void aTokenOnlyRetireGrantIsAuthorizedAgainstTheKeyItsGrantBelongsTo() {
         String keyArn = createKey();
-        Grant refused = createGrantOn(keyArn);
-        Grant retired = createGrantOn(keyArn);
+        String otherArn = createKey();
+        Grant grant = createGrantOn(keyArn);
         Session onTheGrantsKey = assumeRoleWith(grantOperationOn("kms:RetireGrant", keyArn));
-        Session onEverything = assumeRoleWith(grantOperationOn("kms:RetireGrant", "*"));
+        Session onAnotherKey = assumeRoleWith(grantOperationOn("kms:RetireGrant", otherArn));
 
-        keyCall(onTheGrantsKey, "RetireGrant", "{\"GrantToken\": \"" + refused.token() + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
-        keyCall(onEverything, "RetireGrant", "{\"GrantToken\": \"" + retired.token() + "\"}")
+        keyCall(onAnotherKey, "RetireGrant", "{\"GrantToken\": \"" + grant.token() + "\"}")
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
+        keyCall(onTheGrantsKey, "RetireGrant", "{\"GrantToken\": \"" + grant.token() + "\"}")
                 .then().statusCode(200);
+        accountCall("ListGrants", "{\"KeyId\": \"" + keyArn + "\"}")
+                .then().statusCode(200).body("Grants.size()", equalTo(0));
+    }
+
+    @Test
+    void aDenyOnTheGrantsKeyFiresForATokenOnlyRetireGrant() {
+        String keyArn = createKey();
+        Grant grant = createGrantOn(keyArn);
+        Session session = assumeRoleWith("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:RetireGrant","Resource":"%s*"},
+                  {"Effect":"Deny","Action":"kms:RetireGrant","Resource":"%s"}]}"""
+                .formatted(KEY_ARN_PREFIX, keyArn));
+
+        keyCall(session, "RetireGrant", "{\"GrantToken\": \"" + grant.token() + "\"}")
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         accountCall("ListGrants", "{\"KeyId\": \"" + keyArn + "\"}")
                 .then().statusCode(200).body("Grants.size()", equalTo(1));
     }
@@ -278,15 +327,15 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .formatted(aliasArn, currentArn, newArn));
 
         keyCall(aliasOnly, "CreateAlias", create)
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(withKeys, "CreateAlias", create).then().statusCode(200);
         cleanup.register(() -> accountCall("DeleteAlias", "{\"AliasName\": \"" + aliasName + "\"}"));
         String update = "{\"AliasName\": \"" + aliasName + "\", \"TargetKeyId\": \"" + newArn + "\"}";
         keyCall(withKeys, "UpdateAlias", update)
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(withBothKeys, "UpdateAlias", update).then().statusCode(200);
         keyCall(withKeys, "DeleteAlias", "{\"AliasName\": \"" + aliasName + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(withBothKeys, "UpdateAlias",
                 "{\"AliasName\": \"" + aliasName + "\", \"TargetKeyId\": \"" + currentArn + "\"}")
                 .then().statusCode(200);
@@ -300,7 +349,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         Session session = assumeRoleWith(grantOperationOn("kms:ReplicateKey", keyArn));
 
         keyCall(session, "ReplicateKey", "{\"KeyId\": \"" + keyArn + "\", \"ReplicaRegion\": \"us-west-2\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"))
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"))
                 .body("message", containsString("kms:CreateKey"));
     }
 
@@ -317,7 +366,7 @@ class KmsKeyArnEnforcementIntegrationTest {
 
         keyCall(onTheNamedKey, "RevokeGrant",
                 "{\"KeyId\": \"" + otherArn + "\", \"GrantId\": \"" + grant.id() + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         accountCall("ListGrants", "{\"KeyId\": \"" + grantKeyArn + "\"}")
                 .then().statusCode(200).body("Grants.size()", equalTo(1));
 
@@ -345,11 +394,11 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "Encrypt", dryRun(encryptBody(allowedArn)))
                 .then().statusCode(400).body("__type", equalTo("DryRunOperationException"));
         keyCall(session, "Encrypt", dryRun(encryptBody(otherArn)))
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(session, "CreateGrant", dryRun(grantBody(allowedArn)))
                 .then().statusCode(400).body("__type", equalTo("DryRunOperationException"));
         keyCall(session, "CreateGrant", dryRun(grantBody(otherArn)))
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
 
         accountCall("ListGrants", "{\"KeyId\": \"" + allowedArn + "\"}")
                 .then().statusCode(200).body("Grants.size()", equalTo(0));

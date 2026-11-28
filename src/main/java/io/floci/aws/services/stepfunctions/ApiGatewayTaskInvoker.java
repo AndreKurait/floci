@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.TlsProxyServer;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsEndpoints;
 import io.floci.aws.core.common.ServicePrincipals;
@@ -54,11 +55,12 @@ public class ApiGatewayTaskInvoker {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3))
             .followRedirects(HttpClient.Redirect.NEVER).build();
     private final HttpServer httpServer;
+    private final TlsProxyServer proxy;
 
     @Inject
     public ApiGatewayTaskInvoker(ApiGatewayService apiGateway, IamService iam,
                                  AssumeRolePolicyEvaluator trust, LambdaTaskAuthorizer authorizer, EmulatorConfig config,
-                                 ObjectMapper mapper, HttpServer httpServer) {
+                                 ObjectMapper mapper, HttpServer httpServer, TlsProxyServer proxy) {
         this.apiGateway = apiGateway;
         this.iam = iam;
         this.trust = trust;
@@ -66,6 +68,7 @@ public class ApiGatewayTaskInvoker {
         this.config = config;
         this.mapper = mapper;
         this.httpServer = httpServer;
+        this.proxy = proxy;
     }
 
     @PreDestroy
@@ -97,9 +100,8 @@ public class ApiGatewayTaskInvoker {
                 && api.getEndpointConfiguration().getTypes().contains(EndpointType.PRIVATE)) {
             throw unsupported("private APIs are not supported by this integration");
         }
-        if (api.getPolicy() != null && !api.getPolicy().isBlank()) {
-            throw unsupported("API resource policies are not supported by this integration");
-        }
+        // An API's resource policy is not checked here: the request goes to the execute-api listener,
+        // which evaluates it as execute-api:Invoke for the signed caller like any other request.
         String stage = input.path("Stage").asText();
         String path = input.path("Path").asText();
         if (path.startsWith("/")) {
@@ -126,7 +128,7 @@ public class ApiGatewayTaskInvoker {
         if (length != null && !length.equals(List.of(Integer.toString(payload.length)))) {
             throw unsupported("Content-Length must match the serialized request body");
         }
-        URI listener = httpServer.getLocalBaseUri();
+        URI listener = proxy.localApiEndpoint(httpServer.getLocalBaseUri());
         if (listener == null) {
             throw new AslExecutor.FailStateException("ApiGateway.IllegalStateException", "API listener is not ready");
         }

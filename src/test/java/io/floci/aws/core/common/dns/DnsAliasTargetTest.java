@@ -1,0 +1,87 @@
+package io.floci.aws.core.common.dns;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
+
+class DnsAliasTargetTest {
+    @Test
+    void unownedAliasesCannotUseSuffixSpoofingOrOrdinaryDnsResolution() {
+        DnsRecordSource source = mock(DnsRecordSource.class);
+        when(source.resolveAliasTargetInVpc("api.example", "ZTARGET", 1, null)).thenReturn(Optional.empty());
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of("example"), List.of(source));
+
+        assertTrue(server.resolveAliasTarget("api.example", "ZTARGET", 1).isEmpty());
+        verify(source).resolveAliasTargetInVpc("api.example", "ZTARGET", 1, null);
+        verifyNoMoreInteractions(source);
+    }
+
+    @Test
+    void competingAliasOwnersAreRefused() {
+        DnsRecordSource first = mock(DnsRecordSource.class);
+        DnsRecordSource second = mock(DnsRecordSource.class);
+        when(first.resolveAliasTargetInVpc("lb.example", "ZTARGET", 1, null))
+                .thenReturn(Optional.of(DnsAnswer.records(List.of("198.51.100.4"), 60)));
+        when(second.resolveAliasTargetInVpc("lb.example", "ZTARGET", 1, null))
+                .thenReturn(Optional.of(DnsAnswer.records(List.of("198.51.100.5"), 60)));
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(first, second));
+
+        assertEquals(5, server.resolveAliasTarget("lb.example", "ZTARGET", 1).orElseThrow().responseCode());
+    }
+
+    @Test
+    void failedResourceLookupCannotBecomeAnUpstreamQuery() {
+        DnsRecordSource source = mock(DnsRecordSource.class);
+        when(source.resolveAliasTargetInVpc("lb.example", "ZTARGET", 1, null))
+                .thenThrow(new IllegalStateException("storage"));
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of("example"), List.of(source));
+
+        assertEquals(5, server.resolveAliasTarget("lb.example", "ZTARGET", 1).orElseThrow().responseCode());
+    }
+
+    @Test
+    void existingAliasSourcesRetainTheirDefaultContextDelegation() {
+        DnsAnswer expected = DnsAnswer.records(List.of("198.51.100.4"), 60);
+        DnsRecordSource source = new DnsRecordSource() {
+            @Override
+            public Optional<DnsAnswer> resolveIpv4(String name) {
+                throw new AssertionError("Alias ownership must not use ordinary DNS resolution");
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolveAliasTarget(String name, String zone, int type) {
+                assertEquals("lb.example", name);
+                assertEquals("ZTARGET", zone);
+                assertEquals(1, type);
+                return Optional.of(expected);
+            }
+        };
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(source));
+        DnsClientVpcSource.ClientVpc origin =
+                new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-client");
+        assertEquals(expected, server.resolveAliasTargetInVpc("lb.example", "ZTARGET", 1, origin).orElseThrow());
+    }
+
+    @Test
+    void resourceLookupReceivesTheQueryingVpc() {
+        DnsRecordSource source = mock(DnsRecordSource.class);
+        DnsClientVpcSource.ClientVpc origin =
+                new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", "vpc-origin");
+        DnsAnswer answer = DnsAnswer.records(List.of("198.51.100.4"), 60);
+        when(source.resolveAliasTargetInVpc("lb.example", "ZTARGET", 1, origin))
+                .thenReturn(Optional.of(answer));
+        EmbeddedDnsServer server = new EmbeddedDnsServer(List.of(), List.of(source));
+
+        assertEquals(answer, server.resolveAliasTargetInVpc("lb.example", "ZTARGET", 1, origin).orElseThrow());
+        verify(source).resolveAliasTargetInVpc("lb.example", "ZTARGET", 1, origin);
+        verifyNoMoreInteractions(source);
+    }
+}

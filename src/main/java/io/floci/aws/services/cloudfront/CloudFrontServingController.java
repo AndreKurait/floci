@@ -315,11 +315,17 @@ public class CloudFrontServingController {
             return textError(403, "Invalid method.");
         }
 
+        Response protocolResponse = viewerProtocolResponse(config, normalized, viewerScheme, viewerHost,
+                rawViewerPath, method, currentVertxRequest.getCurrent().request());
+        if (protocolResponse != null) {
+            return protocolResponse;
+        }
+
         // The response-headers policy of the behavior that matches the request applies to the final
         // response CloudFront returns to the viewer, including any custom-error page substituted below.
         String policyId = CloudFrontRequestRouter.matchResponseHeadersPolicyId(config, normalized);
         ResponseHeadersPolicyConfigCodec.Directives directives = responseHeaderDirectives(
-                policyId, viewerOrigin, preflightRequest, pragma);
+                dist, policyId, viewerOrigin, preflightRequest, pragma);
 
         List<String> trustedKeyGroups =
                 CloudFrontRequestRouter.trustedKeyGroupsFor(config, normalized);
@@ -353,16 +359,37 @@ public class CloudFrontServingController {
         return toResponse(origin, includeBody, directives);
     }
 
+    private Response viewerProtocolResponse(DistributionConfig config, String normalizedPath, String scheme,
+                                            String host, String rawPath, String method, HttpServerRequest request) {
+        if ("https".equalsIgnoreCase(scheme)) {
+            return null;
+        }
+        String policy = CloudFrontRequestRouter.matchViewerProtocolPolicy(config, normalizedPath);
+        if ("https-only".equals(policy)) {
+            return textError(403, "This distribution requires HTTPS.");
+        }
+        if (!"redirect-to-https".equals(policy)) {
+            return null;
+        }
+        boolean read = "GET".equals(method) || "HEAD".equals(method);
+        if (!read && request.version() == HttpVersion.HTTP_1_0) {
+            return textError(403, "Redirecting this method requires HTTP/1.1 or later.");
+        }
+        String authority = host.endsWith(":80") ? host.substring(0, host.length() - 3) : host;
+        String query = request.query() == null ? "" : "?" + request.query();
+        return Response.status(read ? 301 : 307).location(URI.create("https://" + authority + rawPath + query)).build();
+    }
+
     /** Resolves the response-headers policy for a behavior into the headers it contributes, if any. */
     private ResponseHeadersPolicyConfigCodec.Directives responseHeaderDirectives(
-            String policyId, String viewerOrigin, boolean preflightRequest, String pragma) {
+            Distribution distribution, String policyId, String viewerOrigin, boolean preflightRequest, String pragma) {
         if (policyId == null || policyId.isBlank()) {
             return null;
         }
         try {
-            return ResponseHeadersPolicyConfigCodec.directives(
+            return service.readViewerConfiguration(distribution, () -> ResponseHeadersPolicyConfigCodec.directives(
                     service.getResponseHeadersPolicy(policyId).getConfig(), viewerOrigin,
-                    preflightRequest, isManagedPreflightPolicy(policyId), pragma);
+                    preflightRequest, isManagedPreflightPolicy(policyId), pragma));
         } catch (AwsException e) {
             // New distribution writes reject dangling references. A persisted legacy record can still
             // contain one, so keep serving it without policy headers but make the corruption visible.
@@ -401,8 +428,8 @@ public class CloudFrontServingController {
                 query,
                 cookies,
                 sourceIp,
-                keyPairId -> service.trustedPublicKeyPem(
-                        keyPairId, trustedKeyGroups),
+                keyPairId -> service.readViewerConfiguration(distribution,
+                        () -> service.trustedPublicKeyPem(keyPairId, trustedKeyGroups)),
                 java.time.Instant.now());
     }
 
@@ -517,7 +544,7 @@ public class CloudFrontServingController {
         CloudFrontOriginRequestBuilder.OriginRequest originRequest =
                 CloudFrontOriginRequestBuilder.build(
                         viewerRequest(currentVertxRequest.getCurrent().request(), method, viewerScheme),
-                        forwarding(config, normalized), distribution.getDomainName());
+                        forwarding(distribution, normalized), distribution.getDomainName());
         return fetchFromCustomOrigin(
                 distribution, origin, forwardUri, originRequest, viewerScheme, method, viewerBody);
     }
@@ -554,18 +581,18 @@ public class CloudFrontServingController {
      * policy, otherwise its cache policy parameters and origin request policy.
      */
     private CloudFrontOriginRequestBuilder.Forwarding forwarding(
-            DistributionConfig config, String normalized) {
+            Distribution distribution, String normalized) {
         CloudFrontRequestRouter.BehaviorForwarding behavior =
-                CloudFrontRequestRouter.matchForwarding(config, normalized);
+                CloudFrontRequestRouter.matchForwarding(distribution.getConfig(), normalized);
         boolean optionsCached = behavior.cachedMethods() != null
                 && behavior.cachedMethods().contains("OPTIONS");
         if (behavior.cachePolicyId() == null || behavior.cachePolicyId().isBlank()) {
             return CloudFrontOriginRequestBuilder.Forwarding.legacy(
                     behavior.forwardedValues(), optionsCached);
         }
-        return CloudFrontOriginRequestBuilder.Forwarding.policies(
+        return service.readViewerConfiguration(distribution, () -> CloudFrontOriginRequestBuilder.Forwarding.policies(
                 cachePolicyParameters(behavior.cachePolicyId()),
-                originRequestPolicyConfig(behavior.originRequestPolicyId()), optionsCached);
+                originRequestPolicyConfig(behavior.originRequestPolicyId()), optionsCached));
     }
 
     private Map<?, ?> cachePolicyParameters(String cachePolicyId) {
@@ -700,7 +727,8 @@ public class CloudFrontServingController {
             String viewerAuthorization) {
         String oacId = origin.getOriginAccessControlId();
         if (oacId != null && !oacId.isBlank()) {
-            OriginAccessControl oac = service.getOriginAccessControl(oacId);
+            OriginAccessControl oac = service.readViewerConfiguration(distribution,
+                    () -> service.getOriginAccessControl(oacId));
             String signingBehavior = oac.getSigningBehavior();
             boolean viewerSigned = viewerAuthorization != null && !viewerAuthorization.isBlank();
             boolean cloudFrontSigns = "always".equalsIgnoreCase(signingBehavior)
@@ -721,7 +749,8 @@ public class CloudFrontServingController {
 
         String oaiId = originAccessIdentityId(origin);
         if (oaiId != null) {
-            CloudFrontOriginAccessIdentity oai = service.getCloudFrontOriginAccessIdentity(oaiId);
+            CloudFrontOriginAccessIdentity oai = service.readViewerConfiguration(distribution,
+                    () -> service.getCloudFrontOriginAccessIdentity(oaiId));
             s3Service.authorizeCloudFrontOaiGetObject(
                     bucket, key, oaiId, oai.getS3CanonicalUserId());
             return;
@@ -892,7 +921,7 @@ public class CloudFrontServingController {
         }
         if (webEndpoint != null) {
             originHeaders.put("Host", webEndpoint);
-            if (alwaysAmzAuth(origin)) {
+            if (alwaysAmzAuth(distribution, origin)) {
                 originHeaders.putAll(lambdaWebIamAuth.cloudFrontSignature(distribution.getArn()));
             }
         }
@@ -930,6 +959,11 @@ public class CloudFrontServingController {
             if (!CloudFrontRequestRouter.matchAllowedMethods(config, normalized).contains("GET")) {
                 return null;
             }
+            String policy = CloudFrontRequestRouter.matchViewerProtocolPolicy(config, normalized);
+            if (!"https".equalsIgnoreCase(request.scheme())
+                    && ("https-only".equals(policy) || "redirect-to-https".equals(policy))) {
+                return null;
+            }
             List<String> trustedKeyGroups = CloudFrontRequestRouter.trustedKeyGroupsFor(config, normalized);
             if (!trustedKeyGroups.isEmpty()
                     && !verifySignedRequest(dist, request, rawViewerPath, trustedKeyGroups).allowed()) {
@@ -945,7 +979,7 @@ public class CloudFrontServingController {
                     origin.getOriginPath(), rawViewerPath, config.getDefaultRootObject());
             CloudFrontOriginRequestBuilder.OriginRequest originRequest =
                     CloudFrontOriginRequestBuilder.build(viewerRequest(request, "GET", viewerScheme),
-                            forwarding(config, normalized), dist.getDomainName());
+                            forwarding(dist, normalized), dist.getDomainName());
             CustomOriginTarget target = customOriginTarget(dist, origin, forwardUri, originRequest,
                     viewerScheme, request.localAddress());
             if (target.refusal() != null) {
@@ -964,10 +998,11 @@ public class CloudFrontServingController {
     }
 
     /** Whether the origin's access control is always-amz-auth, the one a Web Function origin is signed under. */
-    private boolean alwaysAmzAuth(Origin origin) {
+    private boolean alwaysAmzAuth(Distribution distribution, Origin origin) {
         String oacId = origin.getOriginAccessControlId();
         return oacId != null && !oacId.isBlank()
-                && "always-amz-auth".equals(service.getOriginAccessControl(oacId).getSigningBehavior());
+                && service.readViewerConfiguration(distribution,
+                        () -> "always-amz-auth".equals(service.getOriginAccessControl(oacId).getSigningBehavior()));
     }
 
     private String webFunctionEndpoint(Origin origin) {

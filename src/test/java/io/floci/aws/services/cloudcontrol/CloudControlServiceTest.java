@@ -11,14 +11,20 @@ import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.ec2.model.Vpc;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.s3.S3Service;
+import io.floci.aws.testing.CfnStackWaits;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -352,6 +358,75 @@ class CloudControlServiceTest {
         assertNotNull(service.createResource("us-east-1", "111111111111", "AWS::EC2::VPC", "{}"));
     }
 
+    @Test
+    void aReplayedCreateKeepsTheOrderStampItWasRecordedWith() throws Exception {
+        String accountId = "111111111111";
+        CountDownLatch started = new CountDownLatch(1);
+        CfnResourceDispatcher provisioner = blockingProvisioner(started, new CountDownLatch(1), new AtomicInteger());
+        AccountAwareStorageBackend<CloudControlService.PersistedRequest> requestStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        List<String> tokens = List.of("replay-1", "replay-2", "replay-3");
+        // Seeded with createdAt 1, 2 and 3.
+        seedInProgressCreates(requestStore, accountId, "us-east-1", "AWS::EC2::VPC", tokens);
+
+        track(new CloudControlService(
+                mock(S3Service.class), mock(Ec2Service.class), mock(IamService.class), provisioner,
+                new ObjectMapper(), requestStore, AccountAwareStorageBackend.inMemory("000000000000"), 1, 8));
+        assertTrue(started.await(10, TimeUnit.SECONDS), "the worker never started");
+
+        // Re-stamping a replayed create with the restart time would move it behind every request
+        // recorded after it, and put all replays of one restart in the same millisecond.
+        for (int i = 0; i < tokens.size(); i++) {
+            assertEquals(i + 1L, requestStore.getForAccount(accountId, tokens.get(i)).orElseThrow().createdAt(),
+                    tokens.get(i));
+        }
+    }
+
+    @Test
+    void requestsRecordedInTheSameMillisecondAreReplayedInRecordingOrder() throws Exception {
+        String accountId = "111111111111";
+        int creates = 20;
+        Clock sameMillisecond = Clock.fixed(Instant.parse("2026-03-01T00:00:00Z"), ZoneOffset.UTC);
+        AccountAwareStorageBackend<CloudControlService.PersistedRequest> requestStore =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        CountDownLatch started = new CountDownLatch(1);
+        CloudControlService first = track(new CloudControlService(
+                mock(S3Service.class), mock(Ec2Service.class), mock(IamService.class),
+                blockingProvisioner(started, new CountDownLatch(1), new AtomicInteger()),
+                new ObjectMapper(), requestStore, AccountAwareStorageBackend.inMemory("000000000000"),
+                1, creates, sameMillisecond));
+        for (int i = 0; i < creates; i++) {
+            first.createResource("us-east-1", accountId, "AWS::EC2::VPC", "{\"Sequence\":" + i + "}");
+        }
+        assertTrue(started.await(10, TimeUnit.SECONDS), "the worker never started");
+        first.shutdown();
+        assertTrue(first.awaitTermination(10, TimeUnit.SECONDS), "the worker outlived shutdown");
+
+        // One worker, so the restart provisions in exactly the order it restored the requests in.
+        List<Integer> replayed = new CopyOnWriteArrayList<>();
+        CountDownLatch allReplayed = new CountDownLatch(creates);
+        CfnResourceDispatcher recording = mock(CfnResourceDispatcher.class);
+        doAnswer(invocation -> {
+            JsonNode props = invocation.getArgument(1);
+            replayed.add(props.get("Sequence").asInt());
+            allReplayed.countDown();
+            StackResource resource = new StackResource();
+            resource.setPhysicalId("vpc-" + props.get("Sequence").asInt());
+            return resource;
+        }).when(recording).provisionStandalone(anyString(), any(), anyString(), anyString());
+        track(new CloudControlService(
+                mock(S3Service.class), mock(Ec2Service.class), mock(IamService.class), recording,
+                new ObjectMapper(), requestStore, AccountAwareStorageBackend.inMemory("000000000000"),
+                1, creates, sameMillisecond));
+        assertTrue(allReplayed.await(10, TimeUnit.SECONDS), "the restart did not replay every create");
+
+        List<Integer> recordingOrder = new ArrayList<>();
+        for (int i = 0; i < creates; i++) {
+            recordingOrder.add(i);
+        }
+        assertEquals(recordingOrder, replayed);
+    }
+
     /**
      * A provisioner whose every call counts down {@code started}, then blocks on {@code release}
      * before returning a VPC numbered by {@code completed}. A release that never comes fails the
@@ -387,11 +462,9 @@ class CloudControlServiceTest {
 
     private static void awaitSuccess(CloudControlService service, String accountId, String requestToken)
             throws InterruptedException {
-        CloudControlService.ProgressEvent status = service.requestStatus(accountId, requestToken);
-        for (int i = 0; i < 50 && !"SUCCESS".equals(status.operationStatus()); i++) {
-            Thread.sleep(10);
-            status = service.requestStatus(accountId, requestToken);
-        }
+        CloudControlService.ProgressEvent status = CfnStackWaits.lastStateWithin(Duration.ofMillis(500),
+                () -> service.requestStatus(accountId, requestToken),
+                event -> "SUCCESS".equals(event.operationStatus()));
         assertEquals("SUCCESS", status.operationStatus(),
                 requestToken + " ended " + status.operationStatus() + ": " + status.statusMessage());
     }

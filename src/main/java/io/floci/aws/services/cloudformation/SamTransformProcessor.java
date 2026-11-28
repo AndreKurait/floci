@@ -132,6 +132,7 @@ class SamTransformProcessor {
         // so expansion order between the Function and the HttpApi resource doesn't matter.
         List<HttpApiRoute> httpApiRoutes = collectHttpApiRoutes(samLogicalIds, resources);
         Map<String, String> generatedReferences = new LinkedHashMap<>();
+        SamDeploymentPreferences deployments = new SamDeploymentPreferences(objectMapper, expanded);
 
         for (String logicalId : samLogicalIds) {
             JsonNode resDef = resources.get(logicalId);
@@ -145,8 +146,11 @@ class SamTransformProcessor {
             // copyResourceLevelAttributes runs once per arm, right after that arm builds its node.
             switch (type) {
                 case "AWS::Serverless::Function" -> {
-                    String aliasId = expandServerlessFunction(logicalId, mergeGlobals(globals, "Function", properties),
+                    JsonNode functionProperties = mergeGlobals(globals, "Function", properties);
+                    String aliasId = expandServerlessFunction(logicalId, functionProperties,
                             resDef, expanded, expandedResources, parameterValues);
+                    deployments.add(logicalId, aliasId, resDef, functionProperties,
+                            value -> resolveParameterRefs(value, expanded, parameterValues));
                     if (aliasId != null) {
                         generatedReferences.put(logicalId + ".Alias", aliasId);
                     }
@@ -180,6 +184,7 @@ class SamTransformProcessor {
             }
         }
 
+        deployments.finish();
         // Synthesize the implicit REST API (RestApi + resources + methods + AWS_PROXY integrations +
         // deployment + stage + lambda permissions) for functions that declare Api events without an
         // explicit RestApiId — matching SAM's implicit-API behavior so the deployed service is reachable.
@@ -1209,6 +1214,10 @@ class SamTransformProcessor {
         JsonNode aliasName = properties.path("AutoPublishAlias");
         if (aliasName.isMissingNode() || aliasName.isNull()
                 || (aliasName.isTextual() && aliasName.asText().isBlank())) {
+            if (isTruthy(properties.path("ProvisionedConcurrencyConfig"))) {
+                throw invalidResource(functionLogicalId,
+                        "'ProvisionedConcurrencyConfig' requires 'AutoPublishAlias'.");
+            }
             return null;
         }
 
@@ -1241,6 +1250,10 @@ class SamTransformProcessor {
         aliasProps.set("FunctionName", ref(functionLogicalId));
         aliasProps.set("Name", aliasName.deepCopy());
         aliasProps.set("FunctionVersion", getAtt(versionId, "Version"));
+        if (isTruthy(properties.path("ProvisionedConcurrencyConfig"))) {
+            aliasProps.set("ProvisionedConcurrencyConfig",
+                    properties.get("ProvisionedConcurrencyConfig").deepCopy());
+        }
         aliasDef.set("Properties", aliasProps);
         aliasDef.setAll(passthrough.deepCopy());
         resources.set(aliasId, aliasDef);
@@ -2094,7 +2107,9 @@ class SamTransformProcessor {
         // no Body and no BodyS3Location for that case. The paths are empty either way, so the
         // runtime outcome (no method reachable) is the same, even though the stored Body differs.
         applyDefinitionSource(logicalId, properties, apiProps);
-        new SamRestApiAuth(objectMapper).apply(properties.path("Auth"), apiProps.path("Body"));
+        JsonNode stageName = properties.path("StageName");
+        new SamRestApiAuth(objectMapper).apply(properties.path("Auth"), apiProps.path("Body"),
+                stageName.isMissingNode() ? objectMapper.getNodeFactory().textNode("Prod") : stageName);
 
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
@@ -2121,7 +2136,6 @@ class SamTransformProcessor {
         deployRef.put("Ref", deploymentLogicalId);
         stageProps.set("DeploymentId", deployRef);
 
-        JsonNode stageName = properties.path("StageName");
         if (!stageName.isMissingNode()) {
             stageProps.set("StageName", stageName.deepCopy());
         } else {

@@ -20,7 +20,7 @@ class CodeDeployTagFilterHandlerTest {
         CodeDeployService service = mock(CodeDeployService.class);
         when(service.listOnPremisesInstances(eq("us-east-1"), isNull(), anyList())).thenReturn(List.of());
         ObjectMapper mapper = new ObjectMapper();
-        CodeDeployJsonHandler handler = new CodeDeployJsonHandler(service, mapper);
+        CodeDeployJsonHandler handler = new CodeDeployJsonHandler(service, mapper, mock(CodeDeployAgentJsonHandler.class));
 
         handler.handle("ListOnPremisesInstances", mapper.readTree("""
                 {"tagFilters":[{"Key":"team"},{"Value":"red"},{"Type":"KEY_ONLY"}]}
@@ -35,7 +35,7 @@ class CodeDeployTagFilterHandlerTest {
         CodeDeployService service = mock(CodeDeployService.class);
         when(service.listOnPremisesInstances(eq("us-east-1"), isNull(), anyList())).thenReturn(List.of());
         ObjectMapper mapper = new ObjectMapper();
-        CodeDeployJsonHandler handler = new CodeDeployJsonHandler(service, mapper);
+        CodeDeployJsonHandler handler = new CodeDeployJsonHandler(service, mapper, mock(CodeDeployAgentJsonHandler.class));
 
         handler.handle("ListOnPremisesInstances", mapper.readTree("{\"tagFilters\":null}"), "us-east-1");
 
@@ -47,7 +47,7 @@ class CodeDeployTagFilterHandlerTest {
         CodeDeployService service = mock(CodeDeployService.class);
         when(service.listOnPremisesInstances(eq("us-east-1"), isNull(), anyList())).thenReturn(List.of());
         ObjectMapper mapper = new ObjectMapper();
-        CodeDeployJsonHandler handler = new CodeDeployJsonHandler(service, mapper);
+        CodeDeployJsonHandler handler = new CodeDeployJsonHandler(service, mapper, mock(CodeDeployAgentJsonHandler.class));
 
         handler.handle("ListOnPremisesInstances", mapper.readTree("""
                 {"tagFilters":[{"Key":null,"Value":null,"Type":null}]}

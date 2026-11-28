@@ -3,7 +3,10 @@ package io.floci.aws.services.emr;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.emr.model.EmrCluster;
+import io.floci.aws.services.emrserverless.EmrServerlessSparkRunner;
+import io.floci.aws.services.emrserverless.SparkJobRunner;
 import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.CloudFormationSettingsProfile;
 import io.floci.aws.testing.DockerAvailability;
@@ -35,6 +38,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPInputStream;
 
 import static io.floci.aws.testing.EmrRequests.awaitStep;
 import static io.floci.aws.testing.EmrRequests.emr;
@@ -69,6 +73,9 @@ class EmrHiveStepsNightlyIntegrationTest {
     @Inject
     EmrReleaseImages releaseImages;
 
+    @Inject
+    EmulatorConfig config;
+
     private S3Client s3;
     private String bucket;
     private String clusterId;
@@ -86,7 +93,14 @@ class EmrHiveStepsNightlyIntegrationTest {
     }
 
     @BeforeEach
-    void putInputs() {
+    @Timeout(value = 5, unit = TimeUnit.MINUTES)
+    void putInputs() throws InterruptedException {
+        assumeTrue(DockerAvailability.isAvailable(), "Docker daemon must be available for EMR's Hive steps");
+        String release = "emr-7.5.0";
+        String spark = EmrServerlessSparkRunner.image(config.services().emr().imageTemplate().orElse(null), release);
+        String hive = EmrServerlessSparkRunner.image(config.services().emr().hiveImageTemplate().orElse(null),
+                release, SparkJobRunner.Engine.HIVE);
+        releaseImages.image(release, spark, hive, true, false);
         s3 = AwsTestClients.create(S3Client.builder().forcePathStyle(true), "000000000000", Region.US_EAST_1);
         cleanup.register(s3::close);
         bucket = "emr-hive-" + UUID.randomUUID().toString().substring(0, 8);

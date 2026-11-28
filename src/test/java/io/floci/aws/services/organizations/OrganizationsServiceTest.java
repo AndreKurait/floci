@@ -58,6 +58,25 @@ class OrganizationsServiceTest {
     }
 
     @Test
+    void organizationContextTracksTheMembersParentAndOmitsUnrelatedAccounts() {
+        Organization organization = service.createOrganization(MANAGEMENT_ACCOUNT, "ALL");
+        String root = organization.getRoot().getId();
+        String member = service.createAccount(MANAGEMENT_ACCOUNT, "member@example.com", "Member", null, false)
+                .getAccountId();
+        OrganizationalUnit unit = service.createOrganizationalUnit(MANAGEMENT_ACCOUNT, root, "Unit", null);
+        assertEquals(organization.getId() + "/" + root + "/",
+                service.organizationContextOf(MANAGEMENT_ACCOUNT).orElseThrow().path());
+        assertEquals(organization.getId() + "/" + root + "/",
+                service.organizationContextOf(member).orElseThrow().path());
+        service.moveAccount(MANAGEMENT_ACCOUNT, member, root, unit.getId());
+        assertEquals(organization.getId() + "/" + root + "/" + unit.getId() + "/",
+                service.organizationContextOf(member).orElseThrow().path());
+        assertEquals(MANAGEMENT_ACCOUNT,
+                service.organizationContextOf(member).orElseThrow().managementAccountId());
+        assertTrue(service.organizationContextOf("222222222222").isEmpty());
+    }
+
+    @Test
     void generatedIdsMatchTheAwsFormats() {
         Organization organization = service.createOrganization(MANAGEMENT_ACCOUNT, "ALL");
 

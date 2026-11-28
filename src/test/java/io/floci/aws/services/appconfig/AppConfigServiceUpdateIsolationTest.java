@@ -14,6 +14,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.Mockito.mock;
 
 /**
  * The update methods CloudFormation uses write a new copy of the entity rather than change the
@@ -26,7 +27,8 @@ class AppConfigServiceUpdateIsolationTest {
     private static final String ALARM = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-errors";
 
     private final AppConfigService service = new AppConfigService(new InMemoryStorageFactory("000000000000"),
-            new RegionResolver("us-east-1", "000000000000"));
+            new RegionResolver("us-east-1", "000000000000"), mock(AppConfigAlarmMonitor.class),
+            mock(AppConfigS3Source.class));
 
     @Test
     void aStrategyReadBeforeAnUpdateKeepsItsPriorSettings() {
@@ -90,7 +92,8 @@ class AppConfigServiceUpdateIsolationTest {
                 Map.of("Name", "settings", "LocationUri", "hosted", "Type", "AWS.Freeform"));
         ConfigurationProfile before = service.getConfigurationProfile(appId, created.getId());
 
-        service.updateConfigurationProfile(appId, created.getId(), "renamed", "Now described");
+        service.updateConfigurationProfile(appId, created.getId(),
+                Map.of("Name", "renamed", "Description", "Now described"));
 
         assertEquals("settings", before.getName());
         assertNull(before.getDescription());

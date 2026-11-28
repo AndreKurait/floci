@@ -9,6 +9,7 @@ import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.lifecycle.EmulatorInfoController;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.eventbridge.EventBridgeService;
+import io.floci.aws.testing.LockWaits;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,7 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -99,8 +100,8 @@ class SecretsManagerEventPublisherResetTest {
             write("queued-before-reset");
 
             Future<?> reset = resets.submit(() -> controller().reset());
-            assertThrows(TimeoutException.class, () -> reset.get(200, TimeUnit.MILLISECONDS),
-                    "reset must wait for active target deliveries before wiping storage");
+            LockWaits.awaitWaitingIn(SecretsManagerEventPublisher.class, "beforeReset");
+            assertFalse(reset.isDone(), "reset must wait for active target deliveries before wiping storage");
             verify(storage, never()).clearAll();
             release.countDown();
             reset.get(5, TimeUnit.SECONDS);
@@ -215,5 +216,39 @@ class SecretsManagerEventPublisherResetTest {
         Instance<ContainerTeardown> teardowns = mock(Instance.class);
         when(teardowns.iterator()).thenAnswer(call -> List.<ContainerTeardown>of().iterator());
         return new EmulatorInfoController(null, null, storage, services, teardowns, null, null, null);
+    }
+
+
+    @Test
+    void aResetGivesUpOnAStuckDeliveryExactlyWhenTheDrainTimeoutEnds() throws Exception {
+        long timeout = TimeUnit.SECONDS.toNanos(30);
+        // Readings of the monotonic source: the start, one nanosecond short of the timeout, the timeout.
+        Deque<Long> readings = new ArrayDeque<>(List.of(0L, timeout - 1, timeout));
+        AtomicInteger reads = new AtomicInteger();
+        ExecutorService workers = Executors.newSingleThreadExecutor();
+        publisher = new SecretsManagerEventPublisher(trails, events, new AccountResolver(ACCOUNT), mapper, workers,
+                () -> {
+                    reads.incrementAndGet();
+                    return readings.removeFirst();
+                });
+        CountDownLatch active = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        doAnswer(call -> {
+            active.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS), "the stuck delivery must be released by the test");
+            return null;
+        }).when(events).publishServiceEvent(anyString(), anyString(), anyString(), anyString(), anyString());
+        try {
+            write("stuck-delivery");
+            assertTrue(active.await(5, TimeUnit.SECONDS));
+
+            IllegalStateException refused = assertThrows(IllegalStateException.class, () -> publisher.beforeReset());
+
+            assertEquals("Secrets Manager event deliveries did not drain before reset", refused.getMessage());
+            // One nanosecond short of the timeout the reset was still waiting; at the timeout it gave up.
+            assertEquals(3, reads.get());
+        } finally {
+            release.countDown();
+        }
     }
 }

@@ -1104,4 +1104,27 @@ class CloudWatchMetricsServiceTest {
         }
         assertTrue(service.describeAlarms(List.of("a"), null, REGION).isEmpty());
     }
+
+    @Test
+    void listMetricsMatchesEachDimensionFilterAgainstAWholeDimension() {
+        MetricDatum three = datum("Latency", 1);
+        three.setDimensions(List.of(new Dimension("A", "one"), new Dimension("B", "two"),
+                new Dimension("C", "three")));
+        service.putMetricData(NAMESPACE, List.of(
+                datumWithDimension("Latency", 1, "InstanceId", "i-10"), three), REGION);
+
+        // A value that is only a prefix of the stored value is a different dimension.
+        assertEquals(0, service.listMetrics(NAMESPACE, "Latency",
+                List.of(new Dimension("InstanceId", "i-1")), REGION).size());
+        assertEquals(1, service.listMetrics(NAMESPACE, "Latency",
+                List.of(new Dimension("InstanceId", "i-10")), REGION).size());
+        // Filters need not name every dimension of the metric, nor neighbouring ones.
+        assertEquals(1, service.listMetrics(NAMESPACE, "Latency",
+                List.of(new Dimension("A", "one"), new Dimension("C", "three")), REGION).size());
+        // A filter without a value matches any metric that has the dimension.
+        assertEquals(1, service.listMetrics(NAMESPACE, "Latency",
+                List.of(new Dimension("B", null)), REGION).size());
+        assertEquals(0, service.listMetrics(NAMESPACE, "Latency",
+                List.of(new Dimension("A", "one"), new Dimension("C", "other")), REGION).size());
+    }
 }

@@ -63,6 +63,10 @@ public class CloudFormationTemplateEngine {
     @FunctionalInterface
     public interface AttributeValueResolver {
         JsonNode resolve(String logicalId, String attributeName, String value);
+
+        default String referenceValue(String logicalId, String physicalId) {
+            return physicalId;
+        }
     }
 
     private final String accountId;
@@ -468,6 +472,17 @@ public class CloudFormationTemplateEngine {
         return resolved.isTextual() ? resolved.asText() : resolved.toString();
     }
 
+    /** Resolves stored lifecycle metadata without accepting unresolved intrinsic placeholders. */
+    public JsonNode resolveNodeStrict(JsonNode node) {
+        int before = unresolvedIntrinsics.size();
+        JsonNode resolved = resolveNode(node);
+        if (unresolvedIntrinsics.size() > before) {
+            throw new AwsException("ValidationError", "Unresolved CloudFormation intrinsics: "
+                    + String.join(", ", unresolvedIntrinsics.subList(before, unresolvedIntrinsics.size())), 400);
+        }
+        return resolved;
+    }
+
     public String resolveJsonAttributeStrict(JsonNode node) {
         int before = unresolvedIntrinsics.size();
         String resolved = resolveJsonAttribute(node);
@@ -499,7 +514,9 @@ public class CloudFormationTemplateEngine {
             case "AWS::NoValue" -> "";
             default -> {
                 if (physicalIds.containsKey(name)) {
-                    yield physicalIds.get(name);
+                    String physicalId = physicalIds.get(name);
+                    yield attributeValueResolver == null ? physicalId
+                            : attributeValueResolver.referenceValue(name, physicalId);
                 }
                 if (parameters.containsKey(name)) {
                     yield parameters.get(name);

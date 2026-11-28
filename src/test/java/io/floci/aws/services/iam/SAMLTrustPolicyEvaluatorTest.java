@@ -54,6 +54,18 @@ class SAMLTrustPolicyEvaluatorTest {
     }
 
     @Test
+    void supplementaryActionsKeepTheAssertionSessionNameCondition() {
+        for (String action : List.of("sts:TagSession", "sts:SetSourceIdentity")) {
+            String document = policy("{\"StringEquals\":{\"sts:RoleSessionName\":\"alice\"}}")
+                    .replace("sts:AssumeRoleWithSAML", action);
+            assertTrue(evaluator.allowsAction(document, PROVIDER, CLAIMS, "alice", action));
+            assertFalse(evaluator.allowsAction(document, PROVIDER, CLAIMS, "mallory", action));
+            assertFalse(evaluator.allowsAction(document, PROVIDER, CLAIMS, null, action));
+            assertFalse(allows(document, "alice"));
+        }
+    }
+
+    @Test
     void allowsTheRoleSessionNameThePolicyRequires() {
         assertTrue(allows(policy("{\"StringEquals\":{\"sts:RoleSessionName\":\"alice\"}}"), "alice"));
         assertTrue(allows(policy("{\"StringLike\":{\"sts:RoleSessionName\":\"al*\"}}"), "alice"));

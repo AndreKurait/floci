@@ -27,15 +27,17 @@ class CloudFrontKeyValueStoreEtagTest {
         KeyValueStore data = service.putKey(first.getArn(), first.getDataEtag(), "key", "value");
         KeyValueStore current = service.update(first.getName(), first.getEtag(), "after");
 
-        if (delete) {
-            assertError("PreconditionFailed", 412, () -> service.delete("versions", first.getEtag()));
-        } else {
-            assertError("PreconditionFailed", 412, () -> service.update("versions", first.getEtag(), "lost"));
+        for (String stale : List.of(first.getEtag(), "E0000000000000")) {
+            if (delete) {
+                assertError("PreconditionFailed", 412, () -> service.delete("versions", stale));
+            } else {
+                assertError("PreconditionFailed", 412, () -> service.update("versions", stale, "lost"));
+            }
+            assertEquals("after", service.describe("versions").getComment());
+            assertEquals(current.getEtag(), service.describe("versions").getEtag());
+            assertEquals(data.getDataEtag(), service.describeByArn(first.getArn()).getDataEtag());
+            assertEquals("value", service.getKey(first.getArn(), "key").value());
         }
-        assertEquals("after", service.describe("versions").getComment());
-        assertEquals(current.getEtag(), service.describe("versions").getEtag());
-        assertEquals(data.getDataEtag(), service.describeByArn(first.getArn()).getDataEtag());
-        assertEquals("value", service.getKey(first.getArn(), "key").value());
         service.delete("versions", current.getEtag());
         assertError("EntityNotFound", 404, () -> service.describe("versions"));
     }
@@ -46,7 +48,8 @@ class CloudFrontKeyValueStoreEtagTest {
         KeyValueStore current = service.create("versions", "unchanged");
         assertError("InvalidIfMatchVersion", 400, () -> service.update("versions", null, "lost"));
         assertError("InvalidIfMatchVersion", 400, () -> service.delete("versions", null));
-        for (String malformed : List.of("", "stale", "not-a-version", " " + current.getEtag(), current.getEtag() + " ")) {
+        for (String malformed : List.of("", "stale", "not-a-version", "E0000", " E0000000000000",
+                "e0000000000000", " " + current.getEtag(), current.getEtag() + " ")) {
             assertError("InvalidIfMatchVersion", 400, () -> service.update("versions", malformed, "lost"));
             assertError("InvalidIfMatchVersion", 400, () -> service.delete("versions", malformed));
         }

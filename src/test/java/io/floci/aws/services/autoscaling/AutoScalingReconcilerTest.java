@@ -38,7 +38,9 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyList;
@@ -64,6 +66,7 @@ class AutoScalingReconcilerTest {
             adjustment.run();
             return null;
         }).when(service).reconcileIfPresent(any(), any());
+        when(service.saveAutoScalingGroupIfPresent(any())).thenReturn(true);
         return service;
     }
 
@@ -81,7 +84,7 @@ class AutoScalingReconcilerTest {
         assertEquals(failure, assertThrows(RuntimeException.class, () -> reconciler.reconcile(asg)));
 
         assertEquals(List.of("i-cleanup"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
-        verify(asgService, never()).saveAutoScalingGroupIfPresent(asg);
+        verify(asgService, times("scale-in".equals(phase) ? 1 : 0)).saveAutoScalingGroupIfPresent(asg);
         reconciler.reconcile(asg);
         assertEquals(List.of(), asg.getInstances());
         verify(elbV2Service, times(2)).deregisterTargets(eq("us-east-1"), eq("owned-target-group"),
@@ -129,7 +132,7 @@ class AutoScalingReconcilerTest {
         assertEquals(failure, assertThrows(RuntimeException.class, () -> reconciler.reconcile(asg)));
 
         assertEquals(List.of("i-cleanup"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
-        verify(asgService, never()).saveAutoScalingGroupIfPresent(asg);
+        verify(asgService, times("scale-in".equals(phase) ? 1 : 0)).saveAutoScalingGroupIfPresent(asg);
         reconciler.reconcile(asg);
         assertEquals(List.of(), asg.getInstances());
         verify(classic, times(2)).deregisterInstances("us-east-1", "first", List.of("i-cleanup"));
@@ -154,6 +157,148 @@ class AutoScalingReconcilerTest {
 
         assertEquals(List.of(), asg.getInstances());
         verify(classic).deregisterInstances("us-east-1", "remaining", List.of("i-cleanup"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scale-in", "refresh"})
+    void classicDrainCompletesBeforeEc2Termination(String phase) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                asgService, ec2Service, mock(ElbV2Service.class), classic, null);
+        AutoScalingGroup asg = cleanupGroup(phase, ec2Service);
+        asg.setLoadBalancerNames(List.of("first", "second"));
+        when(classic.deregisteringInstances("us-east-1", "second"))
+                .thenReturn(Set.of("i-cleanup"), Set.of());
+
+        reconciler.reconcile(asg);
+
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
+        assertEquals(List.of("i-cleanup"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        reconciler.reconcile(asg);
+        verify(ec2Service).terminateInstances("us-east-1", List.of("i-cleanup"));
+        assertTrue(asg.getInstances().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scale-in", "refresh"})
+    void classicDrainLookupFailurePreventsTerminationAndCanRetry(String phase) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                asgService, ec2Service, mock(ElbV2Service.class), classic, null);
+        AutoScalingGroup asg = cleanupGroup(phase, ec2Service);
+        asg.setLoadBalancerNames(List.of("first"));
+        AwsException failure = new AwsException("AccessDenied", "denied", 403);
+        when(classic.deregisteringInstances("us-east-1", "first"))
+                .thenThrow(failure).thenReturn(Set.of());
+
+        assertSame(failure, assertThrows(AwsException.class, () -> reconciler.reconcile(asg)));
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
+        assertEquals(1, asg.getInstances().size());
+        reconciler.reconcile(asg);
+        verify(ec2Service).terminateInstances("us-east-1", List.of("i-cleanup"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scale-in", "refresh"})
+    void deletedClassicDrainLookupDoesNotBlockTermination(String phase) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                asgService, ec2Service, mock(ElbV2Service.class), classic, null);
+        AutoScalingGroup asg = cleanupGroup(phase, ec2Service);
+        asg.setLoadBalancerNames(List.of("deleted"));
+        when(classic.deregisteringInstances("us-east-1", "deleted"))
+                .thenThrow(new AwsException("LoadBalancerNotFound", "deleted", 400));
+
+        reconciler.reconcile(asg);
+
+        verify(ec2Service).terminateInstances("us-east-1", List.of("i-cleanup"));
+        assertTrue(asg.getInstances().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scale-in", "refresh"})
+    void terminationWaitsForEveryClassicBalancerWithoutLosingSelection(String phase) {
+        AutoScalingService service = scalingService();
+        Ec2Service ec2 = mock(Ec2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler worker = new AutoScalingReconciler(
+                service, ec2, mock(ElbV2Service.class), classic, null);
+        AutoScalingGroup group = cleanupGroup(phase, ec2);
+        group.setLoadBalancerNames(List.of("finished", "draining"));
+        when(classic.deregisterInstances(eq("us-east-1"), anyString(), anyList())).thenAnswer(invocation -> {
+            // The reconciler filters its mutable batch after calling the balancer.
+            assertEquals(List.of("i-cleanup"), invocation.getArgument(2));
+            return List.of();
+        });
+        when(classic.deregisteringInstances("us-east-1", "draining")).thenReturn(Set.of("i-cleanup"));
+
+        worker.reconcile(group);
+        worker.reconcile(group);
+
+        assertEquals("Terminating", group.getInstances().getFirst().getLifecycleState());
+        assertEquals("scale-in".equals(phase), group.getInstances().getFirst().isScaleInTermination());
+        assertEquals(0, AutoScalingReconciler.activeCapacity(group));
+        verify(ec2, never()).terminateInstances(anyString(), anyList());
+        verify(service, never()).recordActivity(anyString(), anyString(), anyString(), anyString(), eq("Successful"));
+
+        when(classic.deregisteringInstances("us-east-1", "draining")).thenReturn(Set.of());
+        worker.reconcile(group);
+
+        assertTrue(group.getInstances().isEmpty());
+        verify(ec2).terminateInstances("us-east-1", List.of("i-cleanup"));
+        verify(classic, times(3)).deregisterInstances(eq("us-east-1"), eq("finished"), anyList());
+        verify(classic, times(3)).deregisterInstances(eq("us-east-1"), eq("draining"), anyList());
+    }
+
+    @Test
+    void failedDrainObservationKeepsSelectedInstanceAliveUntilRetry() {
+        AutoScalingService service = scalingService();
+        Ec2Service ec2 = mock(Ec2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler worker = new AutoScalingReconciler(
+                service, ec2, mock(ElbV2Service.class), classic, null);
+        AutoScalingGroup group = cleanupGroup("scale-in", ec2);
+        group.setLoadBalancerNames(List.of("classic"));
+        AwsException failure = new AwsException("Throttling", "drain status unavailable", 503);
+        when(classic.deregisteringInstances("us-east-1", "classic")).thenThrow(failure).thenReturn(Set.of());
+
+        assertEquals(failure, assertThrows(AwsException.class, () -> worker.reconcile(group)));
+        assertEquals("Terminating", group.getInstances().getFirst().getLifecycleState());
+        assertTrue(group.getInstances().getFirst().isScaleInTermination());
+        verify(ec2, never()).terminateInstances(anyString(), anyList());
+        worker.reconcile(group);
+
+        assertTrue(group.getInstances().isEmpty());
+        verify(ec2).terminateInstances("us-east-1", List.of("i-cleanup"));
+    }
+
+    @Test
+    void aDrainingMemberDoesNotDelayTerminationOfAnAlreadyDrainedMember() {
+        AutoScalingService service = scalingService();
+        Ec2Service ec2 = mock(Ec2Service.class);
+        ElbClassicService classic = mock(ElbClassicService.class);
+        AutoScalingReconciler worker = new AutoScalingReconciler(
+                service, ec2, mock(ElbV2Service.class), classic, null);
+        AutoScalingGroup group = cleanupGroup("scale-in", ec2);
+        group.getInstances().add(instance("i-draining", "InService"));
+        group.setLoadBalancerNames(List.of("classic"));
+        when(ec2.isInstanceContainerRunning("i-draining")).thenReturn(true);
+        when(ec2.describeInstances("us-east-1", List.of("i-draining"), null))
+                .thenReturn(List.of(reservation(runningEc2Instance("i-draining"))));
+        when(classic.deregisteringInstances("us-east-1", "classic")).thenReturn(Set.of("i-draining"));
+
+        worker.reconcile(group);
+
+        assertEquals(List.of("i-draining"), group.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals("Terminating", group.getInstances().getFirst().getLifecycleState());
+        verify(ec2).terminateInstances("us-east-1", List.of("i-cleanup"));
+        verify(ec2, never()).terminateInstances("us-east-1", List.of("i-cleanup", "i-draining"));
     }
 
     private static AutoScalingGroup cleanupGroup(String phase, Ec2Service ec2Service) {
@@ -196,7 +341,7 @@ class AutoScalingReconcilerTest {
     }
 
     @Test
-    void stopTerminatesReconcilerThread() throws Exception {
+    void shutdownEventTerminatesReconcilerThreadBeforeBeanDestruction() throws Exception {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
         ElbV2Service elbV2Service = mock(ElbV2Service.class);
@@ -208,7 +353,7 @@ class AutoScalingReconcilerTest {
                 .filter(t -> "asg-reconciler".equals(t.getName()) && !preexisting.contains(t))
                 .findFirst().orElseThrow();
 
-        reconciler.stop();
+        reconciler.onStop(null);
         reconcilerThread.join(5_000);
 
         assertFalse(reconcilerThread.isAlive());
@@ -624,6 +769,97 @@ class AutoScalingReconcilerTest {
         assertEquals("7", asg.getInstances().getFirst().getLaunchTemplateVersion());
     }
 
+    @ParameterizedTest
+    @MethodSource("launchTemplateVersionSelections")
+    void scaleOutDefaultsOmittedLaunchTemplateVersionAndPreservesExplicitVersions(
+            boolean mixed, String requestedVersion, String expectedSelector, String expectedVersion,
+            String expectedImage) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler =
+                new AutoScalingReconciler(asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        when(asgService.saveAutoScalingGroupIfPresent(asg)).thenReturn(true);
+        if (mixed) {
+            MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                    new MixedInstancesPolicy.LaunchTemplateSpecification();
+            specification.setLaunchTemplateId("lt-123");
+            specification.setVersion(requestedVersion);
+            MixedInstancesPolicy.LaunchTemplate policyTemplate = new MixedInstancesPolicy.LaunchTemplate();
+            policyTemplate.setLaunchTemplateSpecification(specification);
+            MixedInstancesPolicy policy = new MixedInstancesPolicy();
+            policy.setLaunchTemplate(policyTemplate);
+            asg.setMixedInstancesPolicy(policy);
+        } else {
+            asg.setLaunchTemplateId("lt-123");
+            asg.setLaunchTemplateVersion(requestedVersion);
+        }
+
+        LaunchTemplate template = new LaunchTemplate();
+        template.setLaunchTemplateId("lt-123");
+        template.setDefaultVersionNumber("1");
+        template.setLatestVersionNumber("2");
+        LaunchTemplate defaultVersion = new LaunchTemplate();
+        defaultVersion.setLatestVersionNumber("1");
+        defaultVersion.getData().setImageId("ami-default");
+        defaultVersion.getData().setInstanceType("t3.micro");
+        LaunchTemplate latestVersion = new LaunchTemplate();
+        latestVersion.setLatestVersionNumber("2");
+        latestVersion.getData().setImageId("ami-latest");
+        latestVersion.getData().setInstanceType("t3.small");
+        when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-123"), List.of(), Map.of()))
+                .thenReturn(List.of(template));
+        when(ec2Service.describeLaunchTemplateVersions(eq("us-east-1"), eq("lt-123"), isNull(), anyList()))
+                .thenAnswer(invocation -> {
+                    List<String> selectors = invocation.getArgument(3);
+                    String selector = selectors.isEmpty() ? "$Latest" : selectors.getFirst();
+                    return switch (selector) {
+                        case "$Default", "1" -> List.of(defaultVersion);
+                        case "$Latest", "2" -> List.of(latestVersion);
+                        default -> throw new AssertionError("Unexpected version selector: " + selectors);
+                    };
+                });
+        Instance ec2Instance = new Instance();
+        ec2Instance.setInstanceId("i-launched");
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(ec2Instance));
+        when(ec2Service.runInstances(eq("us-east-1"), anyString(), anyString(),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull())).thenReturn(reservation);
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size());
+        assertEquals(expectedVersion, asg.getInstances().getFirst().getLaunchTemplateVersion());
+        assertEquals(requestedVersion, mixed
+                ? asg.getMixedInstancesPolicy().getLaunchTemplate().getLaunchTemplateSpecification().getVersion()
+                : asg.getLaunchTemplateVersion());
+        verify(ec2Service).describeLaunchTemplateVersions(
+                "us-east-1", "lt-123", null, List.of(expectedSelector));
+        verify(ec2Service).runInstances(eq("us-east-1"), eq(expectedImage), anyString(),
+                eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
+                onlyGroupNameTag("app-asg"), eq(null), eq(null), eq(null),
+                isNull(), eq(0), isNull(), isNull(), isNull(), any(),
+                anyBoolean(), isNull(), isNull(), any(), eq(false), isNull(), isNull());
+    }
+
+    static Stream<Arguments> launchTemplateVersionSelections() {
+        return Stream.of(
+                Arguments.of(false, null, "$Default", "1", "ami-default"),
+                Arguments.of(true, null, "$Default", "1", "ami-default"),
+                Arguments.of(false, "$Default", "$Default", "1", "ami-default"),
+                Arguments.of(true, "$Default", "$Default", "1", "ami-default"),
+                Arguments.of(false, "$Latest", "$Latest", "2", "ami-latest"),
+                Arguments.of(true, "$Latest", "$Latest", "2", "ami-latest"),
+                Arguments.of(false, "2", "2", "2", "ami-latest"),
+                Arguments.of(true, "2", "2", "2", "ami-latest"));
+    }
+
     @Test
     void scaleOutUsesMixedInstancesLaunchTemplateSpecification() {
         AutoScalingService asgService = scalingService();
@@ -828,6 +1064,89 @@ class AutoScalingReconcilerTest {
     }
 
     @Test
+    void exitedContainerIsTerminatedBeforeItsAsgReferenceIsRemoved() {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        asg.setSuspendedProcesses(List.of("Launch"));
+        asg.getInstances().add(instance("i-exited", "InService"));
+        when(ec2Service.describeInstances("us-east-1", List.of("i-exited"), null))
+                .thenReturn(List.of(reservation(runningEc2Instance("i-exited"))));
+        when(ec2Service.terminateInstances("us-east-1", List.of("i-exited")))
+                .thenThrow(new AwsException("InternalError", "cleanup failed", 500))
+                .thenAnswer(invocation -> {
+                    assertEquals("i-exited", asg.getInstances().getFirst().getInstanceId());
+                    return List.of();
+                });
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size(), "Failed cleanup must remain retryable");
+        verify(elbV2Service, never()).deregisterTargets(anyString(), anyString(), anyList());
+
+        reconciler.reconcile(asg);
+
+        verify(ec2Service, times(2)).terminateInstances("us-east-1", List.of("i-exited"));
+        assertEquals(0, asg.getInstances().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Terminate", "HealthCheck", "ReplaceUnhealthy"})
+    void suspendedHealthReplacementKeepsExitedInstance(String suspendedProcess) {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(
+                asgService, ec2Service, mock(ElbV2Service.class));
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        asg.setSuspendedProcesses(List.of("Launch", suspendedProcess));
+        asg.getInstances().add(instance("i-exited", "InService"));
+        when(ec2Service.describeInstances("us-east-1", List.of("i-exited"), null))
+                .thenReturn(List.of(reservation(runningEc2Instance("i-exited"))));
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size());
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
+    }
+
+    @Test
+    void unknownEc2ContainerHealthPreservesMembershipAndTargetsUntilRetry() {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        asg.setTargetGroupARNs(List.of("owned-target-group"));
+        asg.getInstances().add(instance("i-probe", "InService"));
+        when(ec2Service.describeInstances("us-east-1", List.of("i-probe"), null))
+                .thenReturn(List.of(reservation(runningEc2Instance("i-probe"))));
+        when(ec2Service.isInstanceContainerRunning("i-probe"))
+                .thenThrow(new IllegalStateException("Docker probe unavailable")).thenReturn(true);
+
+        assertThrows(IllegalStateException.class, () -> reconciler.reconcile(asg));
+        assertEquals(List.of("i-probe"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, asg.getDesiredCapacity());
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
+        verify(elbV2Service, never()).deregisterTargets(anyString(), anyString(), anyList());
+
+        reconciler.reconcile(asg);
+        assertEquals(List.of("i-probe"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
+        verify(elbV2Service, never()).deregisterTargets(anyString(), anyString(), anyList());
+    }
+
+    @Test
     void reconcileDeregistersStaleInstanceFromClassicLoadBalancerBeforePruning() {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
@@ -957,7 +1276,7 @@ class AutoScalingReconcilerTest {
         asg.setDesiredCapacity(0);
         asg.setTargetGroupARNs(List.of("arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/app/123"));
         asg.getInstances().add(instance("i-keep", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-keep")).thenReturn(true);
+        stubRunningEc2Instance(ec2Service, "i-keep");
         when(ec2Service.terminateInstances("us-east-1", List.of("i-keep")))
                 .thenThrow(new AwsException("InsufficientInstanceCapacity", "termination refused", 500));
 
@@ -972,7 +1291,7 @@ class AutoScalingReconcilerTest {
                 eq("An instance was terminated in response to a desired capacity change."),
                 eq("Failed"));
         verify(asgService).completeActivity("activity-1", "Failed", "termination refused");
-        verify(elbV2Service, never()).deregisterTargets(
+        verify(elbV2Service).deregisterTargets(
                 eq("us-east-1"), eq(asg.getTargetGroupARNs().getFirst()), anyList());
     }
 
@@ -990,7 +1309,7 @@ class AutoScalingReconcilerTest {
         asg.setAutoScalingGroupName("app-asg");
         asg.setDesiredCapacity(0);
         asg.getInstances().add(instance("i-keep", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-keep")).thenReturn(true);
+        stubRunningEc2Instance(ec2Service, "i-keep");
         when(ec2Service.terminateInstances("us-east-1", List.of("i-keep")))
                 .thenThrow(new AwsException("InsufficientInstanceCapacity", "termination refused", 500));
 
@@ -1016,7 +1335,7 @@ class AutoScalingReconcilerTest {
         asg.setDesiredCapacity(0);
         asg.setTargetGroupARNs(List.of("arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/app/123"));
         asg.getInstances().add(instance("i-gone", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-gone")).thenReturn(true);
+        stubRunningEc2Instance(ec2Service, "i-gone");
 
         reconciler.reconcile(asg);
 
@@ -1252,7 +1571,7 @@ class AutoScalingReconcilerTest {
         asg.setAutoScalingGroupName("app-asg");
         asg.setDesiredCapacity(0);
         asg.getInstances().add(instance("i-keep", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-keep")).thenReturn(true);
+        stubRunningEc2Instance(ec2Service, "i-keep");
         when(ec2Service.terminateInstances("us-east-1", List.of("i-keep")))
                 .thenThrow(new AwsException("InsufficientInstanceCapacity", "termination refused", 500));
 
@@ -1280,7 +1599,7 @@ class AutoScalingReconcilerTest {
         asg.setAutoScalingGroupName("app-asg");
         asg.setDesiredCapacity(0);
         asg.getInstances().add(instance("i-keep", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-keep")).thenReturn(true);
+        stubRunningEc2Instance(ec2Service, "i-keep");
         when(ec2Service.terminateInstances("us-east-1", List.of("i-keep")))
                 .thenThrow(new AwsException("RequestLimitExceeded", "Request limit exceeded.", 503));
 
@@ -1307,7 +1626,7 @@ class AutoScalingReconcilerTest {
         asg.setAutoScalingGroupName("app-asg");
         asg.setDesiredCapacity(0);
         asg.getInstances().add(instance("i-keep", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-keep")).thenReturn(true);
+        stubRunningEc2Instance(ec2Service, "i-keep");
         when(ec2Service.terminateInstances("us-east-1", List.of("i-keep")))
                 .thenThrow(new IllegalStateException("x".repeat(300)));
 
@@ -1328,7 +1647,7 @@ class AutoScalingReconcilerTest {
         asg.setAutoScalingGroupName("app-asg");
         asg.setDesiredCapacity(0);
         asg.getInstances().add(instance("i-keep", "InService"));
-        when(ec2Service.isInstanceContainerRunning("i-keep")).thenReturn(true);
+        stubRunningEc2Instance(ec2Service, "i-keep");
         when(ec2Service.terminateInstances("us-east-1", List.of("i-keep")))
                 .thenThrow(new IllegalStateException());
 
@@ -1351,6 +1670,12 @@ class AutoScalingReconcilerTest {
         activity.setStatusCode("Failed");
         activity.setStatusMessage(statusMessage);
         return activity;
+    }
+
+    private static void stubRunningEc2Instance(Ec2Service ec2, String instanceId) {
+        when(ec2.isInstanceContainerRunning(instanceId)).thenReturn(true);
+        when(ec2.describeInstances("us-east-1", List.of(instanceId), null))
+                .thenReturn(List.of(reservation(runningEc2Instance(instanceId))));
     }
 
     private static Instance runningEc2Instance(String instanceId) {
@@ -1399,7 +1724,7 @@ class AutoScalingReconcilerTest {
                 && groupName.equals(tags.getFirst().getValue()));
     }
 
-    private static void stubLaunchTemplate(Ec2Service ec2Service, String imageId, String instanceType) {
+    private static LaunchTemplate stubLaunchTemplate(Ec2Service ec2Service, String imageId, String instanceType) {
         LaunchTemplate launchTemplate = new LaunchTemplate();
         launchTemplate.setLaunchTemplateId("lt-123");
         LaunchTemplate version = new LaunchTemplate();
@@ -1410,6 +1735,7 @@ class AutoScalingReconcilerTest {
                 .thenReturn(List.of(launchTemplate));
         when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-123", null, List.of("1")))
                 .thenReturn(List.of(version));
+        return version;
     }
 
     private static AsgInstance instance(String lifecycleState) {

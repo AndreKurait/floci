@@ -1,5 +1,6 @@
 package io.floci.aws.services.appsync.graphql.datasource;
 
+import io.floci.aws.config.TlsProxyServer;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServicePrincipals;
@@ -30,25 +31,27 @@ public class AwsIamHttpDataSourceInvoker {
     private final ServiceRegistry services;
     private final RegionResolver regions;
     private final HttpServer server;
+    private final TlsProxyServer proxy;
     // Its URL is exclusively the runtime-owned listener.
     private final HttpDataSourceTransport local;
 
     @Inject
     public AwsIamHttpDataSourceInvoker(IamService iam, ServiceRoleAuthorizer authorizer,
                                        ServiceRegistry services, RegionResolver regions,
-                                       HttpServer server) {
-        this(iam, authorizer, services, regions, server,
+                                       HttpServer server, TlsProxyServer proxy) {
+        this(iam, authorizer, services, regions, server, proxy,
                 new HttpDataSourceTransport(HttpDataSourceTransport.client(SystemDefaultDnsResolver.INSTANCE)));
     }
 
     AwsIamHttpDataSourceInvoker(IamService iam, ServiceRoleAuthorizer authorizer,
                                 ServiceRegistry services, RegionResolver regions,
-                                HttpServer server, HttpDataSourceTransport local) {
+                                HttpServer server, TlsProxyServer proxy, HttpDataSourceTransport local) {
         this.iam = iam;
         this.authorizer = authorizer;
         this.services = services;
         this.regions = regions;
         this.server = server;
+        this.proxy = proxy;
         this.local = local;
     }
 
@@ -62,7 +65,7 @@ public class AwsIamHttpDataSourceInvoker {
                 target.sourceApiArn(), List.of()).ifPresent(reason -> {
             throw new AwsException("AccessDeniedException", reason, 403);
         });
-        URI listener = server.getLocalBaseUri();
+        URI listener = proxy.localApiEndpoint(server.getLocalBaseUri());
         if (listener == null) {
             throw new AwsException("InternalFailureException", "The local AWS listener is not ready", 500);
         }

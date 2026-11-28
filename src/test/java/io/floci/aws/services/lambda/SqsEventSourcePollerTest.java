@@ -13,6 +13,7 @@ import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.model.Message;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import io.vertx.core.Vertx;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,6 +24,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -43,6 +45,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -51,6 +54,8 @@ class SqsEventSourcePollerTest {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private SqsEventSourcePoller poller;
+    private final PollExecutor polls = PollExecutor.onThreads();
+    private EmulatorConfig emulatorConfig;
     private SqsService sqsService;
     private LambdaExecutorService executorService;
     private LambdaFunctionStore functionStore;
@@ -79,8 +84,15 @@ class SqsEventSourcePollerTest {
                 mock(EsmStore.class),
                 config,
                 OBJECT_MAPPER,
-                new PipesFilterMatcher(OBJECT_MAPPER)
+                new PipesFilterMatcher(OBJECT_MAPPER),
+                polls
         );
+        emulatorConfig = config;
+    }
+
+    @AfterEach
+    void stopPolls() {
+        polls.shutdownNow();
     }
 
     @AfterEach
@@ -125,6 +137,21 @@ class SqsEventSourcePollerTest {
         assertTrue(record.get("messageAttributes").isObject());
         assertEquals(0, record.get("messageAttributes").size());
         assertNull(record.get("md5OfMessageAttributes"));
+    }
+
+    @Test
+    void firstReceiveTimestampOfAMessageWithoutOneIsReadFromThePollerClock() throws Exception {
+        Message msg = new Message();
+        msg.setBody("{}");
+        msg.setSentTimestamp(Instant.parse("2026-01-15T10:30:00Z"));
+        EventSourceMapping esm = esm();
+        poller.setClockForTest(() -> Instant.parse("2026-01-15T10:31:00.123Z").toEpochMilli());
+
+        JsonNode attrs = OBJECT_MAPPER.readTree(poller.buildSqsEvent(List.of(msg), esm))
+                .get("Records").get(0).get("attributes");
+
+        assertEquals(String.valueOf(Instant.parse("2026-01-15T10:31:00.123Z").toEpochMilli()),
+                attrs.get("ApproximateFirstReceiveTimestamp").asText());
     }
 
     @Test
@@ -557,6 +584,21 @@ class SqsEventSourcePollerTest {
                 .thenReturn(messages);
     }
 
+    /**
+     * Hard happens-after barrier: waits for poll #1 to finish, re-stubs the fetch to return empty, then runs a
+     * second poll to its end and checks that it fetched. {@code activePolls} serializes polls per ESM, so fetch
+     * #2 cannot begin until poll #1's finally-block ran. The empty re-stub makes poll #2 a no-op, so poll #1's
+     * exact delete/return counts are preserved for the assertions.
+     */
+    private void awaitPollCompleted(EventSourceMapping esm) {
+        polls.awaitIdle();
+        when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
+                .thenReturn(List.of());
+        awaitPoll(poller.pollAndInvoke(esm));
+        verify(sqsService, atLeast(2))
+                .receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1"));
+    }
+
     private static void awaitPoll(Future<?> poll) {
         try {
             poll.get(5, TimeUnit.SECONDS);
@@ -566,6 +608,13 @@ class SqsEventSourcePollerTest {
         } catch (ExecutionException | TimeoutException e) {
             throw new AssertionError("poll did not complete", e);
         }
+    }
+
+    /** Lets the polls started so far finish, then runs one more, which must invoke the function. */
+    private void pollAndExpectInvocation(EventSourceMapping esm, LambdaFunction fn) {
+        polls.awaitIdle();
+        awaitPoll(poller.pollAndInvoke(esm));
+        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @Test
@@ -597,8 +646,7 @@ class SqsEventSourcePollerTest {
 
         // Once the window elapses the buffered record is delivered.
         now.set(5000);
-        awaitPoll(poller.pollAndInvoke(esm));
-        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        pollAndExpectInvocation(esm, fn);
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
     }
 
@@ -618,10 +666,13 @@ class SqsEventSourcePollerTest {
         when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult());
 
+        // The first poll buffers one record of the two the batch needs
         awaitPoll(poller.pollAndInvoke(esm));
+        verify(executorService, never()).invoke(any(), any(), any());
+
+        // The second poll fills the batch, which is delivered without waiting for the window
         awaitPoll(poller.pollAndInvoke(esm));
         verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
-
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
     }
@@ -658,10 +709,9 @@ class SqsEventSourcePollerTest {
         when(lambdaConfig.pollIntervalMs()).thenReturn(1000L);
         when(lambdaConfig.initTimeoutSeconds()).thenReturn(120);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
-        poller.shutdown();
         poller = new SqsEventSourcePoller(mock(Vertx.class), sqsService,
                 executorService, new LambdaTargetResolver(functionStore, aliasStore), mock(EsmStore.class),
-                config, OBJECT_MAPPER, new PipesFilterMatcher(OBJECT_MAPPER));
+                config, OBJECT_MAPPER, new PipesFilterMatcher(OBJECT_MAPPER), polls);
         EventSourceMapping esm = esm();
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("throwfn");
@@ -702,8 +752,7 @@ class SqsEventSourcePollerTest {
 
         // Window turned off: the next poll must flush the stranded batch instead of ignoring it.
         esm.setMaximumBatchingWindowInSeconds(0);
-        awaitPoll(poller.pollAndInvoke(esm));
-        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        pollAndExpectInvocation(esm, fn);
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
     }
 
@@ -750,6 +799,7 @@ class SqsEventSourcePollerTest {
 
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
+        awaitPollCompleted(esm);
         verify(executorService, never()).invoke(any(), any(byte[].class), any());
     }
 
@@ -773,6 +823,7 @@ class SqsEventSourcePollerTest {
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
         // Matched m1 failed → returned to the queue (visibility reset), NOT deleted.
         verify(sqsService).changeMessageVisibilityIfUnchanged(esm.getQueueUrl(), "rh-m1", null, 5, "us-east-1");
+        awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
     }
 
@@ -795,6 +846,7 @@ class SqsEventSourcePollerTest {
         // m1 (delivered, not reported failed) is deleted post-success; m2 was deleted once as filtered-out.
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
+        awaitPollCompleted(esm);
         // The stale failure id does not cause a second delete or a visibility reset.
         verify(sqsService, never()).changeMessageVisibilityIfUnchanged(any(), any(), any(), anyInt(), any());
     }
@@ -859,6 +911,7 @@ class SqsEventSourcePollerTest {
         // message goes back to the queue for retry/redrive.
         verify(sqsService).changeMessageVisibilityIfUnchanged(esm.getQueueUrl(), "rh-m1", null, 2, "us-east-1");
         verify(sqsService).changeMessageVisibilityIfUnchanged(esm.getQueueUrl(), "rh-m2", null, 2, "us-east-1");
+        awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(any(), any(), any());
     }
 
@@ -874,6 +927,7 @@ class SqsEventSourcePollerTest {
 
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
+        awaitPollCompleted(esm);
         verify(sqsService, never()).changeMessageVisibilityIfUnchanged(any(), any(), any(), anyInt(), any());
     }
 
@@ -883,6 +937,7 @@ class SqsEventSourcePollerTest {
 
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
         verify(sqsService).changeMessageVisibilityIfUnchanged(esm.getQueueUrl(), "rh-m2", null, 2, "us-east-1");
+        awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
         verify(sqsService, never()).changeMessageVisibilityIfUnchanged(eq(esm.getQueueUrl()), eq("rh-m1"), any(), anyInt(), any());
     }
@@ -977,5 +1032,148 @@ class SqsEventSourcePollerTest {
                 esm.getQueueUrl(), "rh-m1", setByReceive, 2, "us-east-1");
         verify(sqsService, never()).changeMessageVisibilityIfUnchanged(
                 eq(esm.getQueueUrl()), eq("rh-m1-second"), any(), anyInt(), any());
+    }
+
+    // ─────────── The poll timer and the batching window on a controlled timeline ───────────
+
+    private static final Instant TIMELINE_START = Instant.parse("2026-01-15T10:30:00Z");
+
+    /** A poller whose timer, clock and polls all run on {@code time}: a tick returns once its poll is done. */
+    private SqsEventSourcePoller timelinePoller(TestTime time, EventSourceMapping stored) {
+        EsmStore store = mock(EsmStore.class);
+        when(store.getForAccount(stored.getAccountId(), stored.getUuid())).thenReturn(Optional.of(stored));
+        SqsEventSourcePoller timed = new SqsEventSourcePoller(TimelineVertx.timersOn(time), sqsService,
+                executorService, new LambdaTargetResolver(functionStore, aliasStore), store, emulatorConfig, OBJECT_MAPPER,
+                new PipesFilterMatcher(OBJECT_MAPPER), PollExecutor.inline());
+        timed.setClockForTest(time::currentTimeMillis);
+        return timed;
+    }
+
+    private void verifyReceives(EventSourceMapping esm, int polls) {
+        verify(sqsService, times(polls))
+                .receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1"));
+    }
+
+    @Test
+    void timerPollsAnEnabledMappingOncePerConfiguredIntervalUntilItIsStopped() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        stubReceive(esm, List.of());
+        SqsEventSourcePoller timed = timelinePoller(time, esm);
+
+        timed.startPolling(esm);
+        time.advance(Duration.ofMillis(999));
+        verifyReceives(esm, 0);
+        time.advance(Duration.ofMillis(1));
+        verifyReceives(esm, 1);
+        time.advance(Duration.ofSeconds(9));
+        verifyReceives(esm, 10);
+
+        esm.setEnabled(false);
+        time.advance(Duration.ofSeconds(5));
+        verifyReceives(esm, 10);
+        esm.setEnabled(true);
+        time.advance(Duration.ofSeconds(1));
+        verifyReceives(esm, 11);
+
+        timed.stopPolling(esm.getUuid());
+        time.advance(Duration.ofMinutes(1));
+        verifyReceives(esm, 11);
+        assertEquals(0, time.pendingTasks(), "stopPolling must cancel the timer");
+    }
+
+    @Test
+    void startingAMappingTwiceKeepsOneTimer() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        stubReceive(esm, List.of());
+        SqsEventSourcePoller timed = timelinePoller(time, esm);
+
+        timed.startPolling(esm);
+        timed.startPolling(esm);
+        time.advance(Duration.ofSeconds(3));
+
+        assertEquals(1, time.pendingTasks());
+        verifyReceives(esm, 3);
+    }
+
+    /**
+     * The first tick, at 1 s, receives the message and opens the 20 s window. The ticks from 2 s to 20 s find
+     * it 1 to 19 s old and hold it; the tick at 21 s finds it exactly 20 s old and delivers it.
+     */
+    @Test
+    void timerHoldsAnUnderfilledBatchUntilTheTickThatFindsItsBatchingWindowElapsed() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        esm.setBatchSize(2);
+        esm.setMaximumBatchingWindowInSeconds(20);
+        when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
+                .thenReturn(List.of(message("m1")))
+                .thenReturn(List.of());
+        when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+        timelinePoller(time, esm).startPolling(esm);
+
+        time.advanceTo(TIMELINE_START.plusMillis(20_999));
+        verifyReceives(esm, 20);
+        verify(executorService, never()).invoke(any(), any(), any());
+        verify(sqsService, never()).deleteMessage(any(), any(), any());
+
+        time.advance(Duration.ofMillis(1));
+        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+        verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
+
+        time.advance(Duration.ofMinutes(1));
+        verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
+    void stoppingAMappingDropsItsBufferedBatchSoARestartOpensANewWindow() {
+        TestTime time = TestTime.startingAt(TIMELINE_START);
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setEnabled(true);
+        esm.setBatchSize(2);
+        esm.setMaximumBatchingWindowInSeconds(20);
+        when(sqsService.receiveMessage(eq(esm.getQueueUrl()), anyInt(), anyInt(), anyInt(), eq("us-east-1")))
+                .thenReturn(List.of(message("m1")))
+                .thenReturn(List.of());
+        when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult());
+        SqsEventSourcePoller timed = timelinePoller(time, esm);
+        timed.startPolling(esm);
+        time.advance(Duration.ofSeconds(10));
+
+        timed.stopPolling(esm.getUuid());
+        timed.startPolling(esm);
+        time.advance(Duration.ofMinutes(1));
+
+        verify(executorService, never()).invoke(any(), any(), any());
+    }
+
+    @Test
+    void startPersistedPollersSkipsAnEnabledMappingWithoutAnEventSourceArn() {
+        EventSourceMapping selfManagedKafka = new EventSourceMapping();
+        selfManagedKafka.setUuid("kafka-esm");
+        selfManagedKafka.setAccountId("000000000000");
+        selfManagedKafka.setEnabled(true);
+        EventSourceMapping queueMapping = esm();
+        queueMapping.setEnabled(true);
+        EsmStore store = mock(EsmStore.class);
+        when(store.listAll()).thenReturn(List.of(selfManagedKafka, queueMapping));
+        Vertx vertx = mock(Vertx.class);
+        SqsEventSourcePoller persisted = new SqsEventSourcePoller(vertx, sqsService, executorService,
+                new LambdaTargetResolver(functionStore, aliasStore), store, emulatorConfig, OBJECT_MAPPER,
+                new PipesFilterMatcher(OBJECT_MAPPER), polls);
+
+        persisted.startPersistedPollers();
+
+        verify(vertx, times(1)).setPeriodic(eq(1000L), any());
     }
 }

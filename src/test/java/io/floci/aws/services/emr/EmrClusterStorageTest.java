@@ -42,6 +42,7 @@ import io.floci.aws.services.lambda.launcher.ImageCacheService;
 import io.floci.aws.services.lambda.launcher.LambdaExecutionRoleCredentials;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,6 +61,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -129,6 +131,8 @@ class EmrClusterStorageTest {
             new ClusterStorage.HiveMetastore("arn:aws:iam::123456789012:role/r", Map.of(),
                     new ClusterStorage.Trino("trinodb/trino:446", 2048, Map.of(), Map.of(), Map.of(), Map.of(),
                             Map.of(), null));
+    // One as the start begins and one each half second of its two minutes, the last as they end.
+    private static final int LOOKS_IN_THE_START_TIMEOUT = 241;
 
     private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
     private final DockerClient docker = mock(DockerClient.class);
@@ -2709,20 +2713,40 @@ class EmrClusterStorageTest {
 
     @Test
     void aClustersHdfsThatIsNotReadyInTimeFailsToStart() {
-        EmrClusterStorage impatient = new EmrClusterStorage(lifecycle, containerBuilder, awsEnv,
-                roleCredentials, currentContainer, config, s3, Duration.ZERO,
-                System::nanoTime);
+        TestTime time = TestTime.create();
+        EmrClusterStorage timed = onTimeline(time);
         when(lifecycle.probeContainer(hdfsName)).thenReturn(ContainerLiveness.NOT_RUNNING);
         when(lifecycle.createAndStart(any())).thenReturn(new ContainerLifecycleManager.ContainerInfo("c-4", Map.of()));
         when(lifecycle.probeContainer("c-4")).thenReturn(ContainerLiveness.RUNNING);
-        ContainerExecStubs.completeEveryExec(docker, "c-4", 1L, "", "");
+        List<List<String>> looks = ContainerExecStubs.completeEveryExec(docker, "c-4", 1L, "", "");
 
         IllegalStateException failure = assertThrows(IllegalStateException.class,
-                () -> impatient.hdfs("j-1", "123456789012", "us-east-1", HOST, IMAGE,
-                        "floci-network", null, null, NOT_STOPPED));
+                () -> timed.hdfs("j-1", "123456789012", "us-east-1", HOST, IMAGE, "floci-network", null, null, NOT_STOPPED));
 
-        assertEquals("The HDFS of EMR cluster j-1 did not start within 0 seconds", failure.getMessage());
-        verify(lifecycle).lastLogLines("c-4", 40, Duration.ofSeconds(5));
+        assertEquals("The HDFS of EMR cluster j-1 did not start within 120 seconds", failure.getMessage());
+        // Looked at as it starts and every half second after, the last time as its two minutes end.
+        assertEquals(LOOKS_IN_THE_START_TIMEOUT, looks.size());
+        assertEquals(TestTime.DEFAULT_START.plus(EmrClusterStorage.HDFS_START_TIMEOUT), time.now());
+    }
+
+    @Test
+    void aClustersHdfsFoundReadyByTheLookItsStartTimeoutEndsOnStarts() {
+        TestTime time = TestTime.create();
+        EmrClusterStorage timed = onTimeline(time);
+        when(lifecycle.probeContainer(hdfsName)).thenReturn(ContainerLiveness.NOT_RUNNING);
+        when(lifecycle.createAndStart(any())).thenReturn(new ContainerLifecycleManager.ContainerInfo("c-4", Map.of()));
+        when(lifecycle.probeContainer("c-4")).thenReturn(ContainerLiveness.RUNNING);
+        when(lifecycle.resolveContainerNetworkIp("c-4", hdfsName)).thenReturn("172.18.0.12");
+        // Not ready at any look before its two minutes end, and ready at the one made as they do.
+        List<Long> exitCodes = new ArrayList<>(Collections.nCopies(LOOKS_IN_THE_START_TIMEOUT - 1, 1L));
+        exitCodes.add(0L);
+        List<List<String>> looks = ContainerExecStubs.completeEveryExec(docker, "c-4", exitCodes, "", "");
+
+        assertEquals("172.18.0.12", timed.hdfs("j-1", "123456789012", "us-east-1", HOST, IMAGE, "floci-network",
+                null, null, NOT_STOPPED).hdfsAddress());
+
+        assertEquals(LOOKS_IN_THE_START_TIMEOUT, looks.size());
+        assertEquals(TestTime.DEFAULT_START.plus(EmrClusterStorage.HDFS_START_TIMEOUT), time.now());
     }
 
     @Test
@@ -2775,10 +2799,8 @@ class EmrClusterStorageTest {
 
     @Test
     void aStepWaitingForItsClustersHdfsThroughATeardownStopsAsItsDriverWouldAndStartsItNoMore() {
-        AtomicLong clock = new AtomicLong();
-        EmrClusterStorage timed = new EmrClusterStorage(lifecycle, containerBuilder, awsEnv,
-                roleCredentials, currentContainer, config, s3, Duration.ofMinutes(2),
-                clock::get);
+        TestTime time = TestTime.create();
+        EmrClusterStorage timed = onTimeline(time);
         when(lifecycle.probeContainer(hdfsName)).thenReturn(ContainerLiveness.NOT_RUNNING);
         when(lifecycle.createAndStart(any())).thenReturn(new ContainerLifecycleManager.ContainerInfo("c-5", Map.of()));
         when(lifecycle.probeContainer("c-5")).thenReturn(ContainerLiveness.RUNNING);
@@ -2786,7 +2808,7 @@ class EmrClusterStorageTest {
         // A reset or a shutdown tears it down while it is being looked at; each look takes a minute.
         onEachExec("c-5", () -> {
             timed.stopManagedContainers();
-            clock.addAndGet(Duration.ofMinutes(1).toNanos());
+            time.advance(Duration.ofMinutes(1));
         });
 
         assertThrows(ClusterStorage.Stopped.class,
@@ -2816,13 +2838,11 @@ class EmrClusterStorageTest {
 
     @Test
     void theFirstPullOfItsImageIsNoPartOfTheHdfsStartTimeout() {
-        AtomicLong clock = new AtomicLong();
-        EmrClusterStorage timed = new EmrClusterStorage(lifecycle, containerBuilder, awsEnv,
-                roleCredentials, currentContainer, config, s3, Duration.ofMinutes(2),
-                clock::get);
+        TestTime time = TestTime.create();
+        EmrClusterStorage timed = onTimeline(time);
         // The Hive image is not there yet, and its pull takes five minutes.
         when(lifecycle.resolveImageForLaunch(IMAGE, ImagePullBehavior.PREFER_CACHED, null)).thenAnswer(pull -> {
-            clock.addAndGet(Duration.ofMinutes(5).toNanos());
+            time.advance(Duration.ofMinutes(5));
             return new ImageCacheService.LaunchImage(IMAGE, null);
         });
         when(lifecycle.probeContainer(hdfsName)).thenReturn(ContainerLiveness.NOT_RUNNING);
@@ -2863,10 +2883,8 @@ class EmrClusterStorageTest {
     @Test
     void aStepCancelledWhileItsClustersHdfsStartsStopsAndLeavesItToTheClustersOtherSteps() {
         AtomicBoolean cancelled = new AtomicBoolean();
-        AtomicLong clock = new AtomicLong();
-        EmrClusterStorage timed = new EmrClusterStorage(lifecycle, containerBuilder, awsEnv,
-                roleCredentials, currentContainer, config, s3, Duration.ofMinutes(2),
-                clock::get);
+        TestTime time = TestTime.create();
+        EmrClusterStorage timed = onTimeline(time);
         when(lifecycle.probeContainer(hdfsName)).thenReturn(ContainerLiveness.NOT_RUNNING);
         when(lifecycle.createAndStart(any())).thenReturn(new ContainerLifecycleManager.ContainerInfo("c-8", Map.of()));
         when(lifecycle.probeContainer("c-8")).thenReturn(ContainerLiveness.RUNNING);
@@ -2874,7 +2892,7 @@ class EmrClusterStorageTest {
         // The step is cancelled while its HDFS is looked at; each look takes a minute.
         onEachExec("c-8", () -> {
             cancelled.set(true);
-            clock.addAndGet(Duration.ofMinutes(1).toNanos());
+            time.advance(Duration.ofMinutes(1));
         });
 
         assertThrows(ClusterStorage.Stopped.class,
@@ -3327,6 +3345,13 @@ class EmrClusterStorageTest {
         when(response.getId()).thenReturn(id);
     }
 
+    // The real start timeout and the real wait between looks, on the timeline of time: a wait moves it on.
+    private EmrClusterStorage onTimeline(TestTime time) {
+        return new EmrClusterStorage(lifecycle, containerBuilder, awsEnv, roleCredentials, currentContainer, config, s3,
+                EmrClusterStorage.HDFS_START_TIMEOUT, time::nanoTime, Runnable::run, Duration.ZERO, null,
+                time::sleepAdvancing);
+    }
+
     // Runs hook as each exec into containerId is made, which then answers as its stubs say.
     private void onEachExec(String containerId, Runnable hook) {
         ExecCreateCmd stubbed = docker.execCreateCmd(containerId);
@@ -3336,14 +3361,18 @@ class EmrClusterStorageTest {
         });
     }
 
-    // Waits until the thread of thread waits for a lock another holds, or has ended, or a second has passed.
+    // Waits until the thread of thread waits for a lock another holds, or has ended; a thread that does neither
+    // within ten seconds fails the caller, as the two starts then never overlapped the way the test needs.
     private static void awaitBlockedOrDone(AtomicReference<Thread> thread) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-        while (System.nanoTime() < deadline) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (true) {
             Thread waiting = thread.get();
             if (waiting != null && (waiting.getState() == Thread.State.BLOCKED
                     || waiting.getState() == Thread.State.TERMINATED || waiting.getState() == Thread.State.WAITING)) {
                 return;
+            }
+            if (System.nanoTime() - deadline > 0) {
+                throw new IllegalStateException("The second step neither waited for the first nor ended");
             }
             Thread.onSpinWait();
         }
@@ -3395,4 +3424,28 @@ class EmrClusterStorageTest {
         when(container.getLabels()).thenReturn(Map.of(ContainerStorageHelper.RESOURCE_ID_LABEL, clusterId));
         return container;
     }
+    @Test
+    void aResetSweepRemovesTheNetworksListedAfterOneThatCarriesNoClusterLabel() {
+        ListContainersCmd list = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(docker.listContainersCmd()).thenReturn(list);
+        when(list.exec()).thenReturn(List.of());
+        Network unlabelled = mock(Network.class);
+        when(unlabelled.getLabels()).thenReturn(Map.of());
+        when(unlabelled.getName()).thenReturn("unlabelled-net");
+        Network labelled = mock(Network.class);
+        when(labelled.getLabels()).thenReturn(Map.of(ContainerStorageHelper.RESOURCE_ID_LABEL, "j-ended"));
+        when(labelled.getName()).thenReturn("labelled-net");
+        ListNetworksCmd networks = mock(ListNetworksCmd.class, RETURNS_SELF);
+        when(docker.listNetworksCmd()).thenReturn(networks);
+        when(networks.exec()).thenReturn(List.of(unlabelled, labelled));
+        ListVolumesCmd volumes = mock(ListVolumesCmd.class, RETURNS_SELF);
+        when(docker.listVolumesCmd()).thenReturn(volumes);
+        when(volumes.exec()).thenReturn(mock(ListVolumesResponse.class));
+
+        storage.removeAllBut(Set.of());
+
+        verify(lifecycle).removeNetwork("unlabelled-net");
+        verify(lifecycle).removeNetwork("labelled-net");
+    }
+
 }

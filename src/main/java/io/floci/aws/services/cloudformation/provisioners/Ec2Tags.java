@@ -54,6 +54,28 @@ final class Ec2Tags {
         return current;
     }
 
+    /** Full-tag reconciliation used by DHCP options and their existing rollback snapshots. */
+    static boolean reconcile(Ec2Service ec2Service, String region, String resourceId, Map<String, String> desired) {
+        List<Tag> add = validatedTags(desired);
+        Map<String, String> current = current(ec2Service, region, resourceId);
+        List<String> stale = ProvisionContext.staleTagKeys(current, desired);
+        boolean changed = !stale.isEmpty();
+        for (Tag tag : add) {
+            changed |= !current.containsKey(tag.getKey()) || !Objects.equals(tag.getValue(), current.get(tag.getKey()));
+        }
+        if (!stale.isEmpty()) {
+            List<Tag> remove = new ArrayList<>();
+            for (String key : stale) {
+                remove.add(new Tag(key, current.get(key)));
+            }
+            ec2Service.deleteTags(region, List.of(resourceId), remove);
+        }
+        if (!add.isEmpty()) {
+            ec2Service.createTags(region, List.of(resourceId), add);
+        }
+        return changed;
+    }
+
     /**
      * Brings the keys a template owns to {@code desired} and leaves every other tag alone, as AWS
      * keeps a tag added outside the stack: removes the {@code owned} keys {@code desired} no longer

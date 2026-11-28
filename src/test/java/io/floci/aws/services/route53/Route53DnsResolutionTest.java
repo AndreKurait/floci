@@ -120,6 +120,106 @@ class Route53DnsResolutionTest {
     }
 
     @Test
+    void publicAliasUsesTheResourceAddressesAndTtlWithThePublicZoneAuthority() {
+        String zone = uniqueZone();
+        String id = createPublicZone(zone);
+        addAlias(id, zone, "A", "owned.elb.example.");
+        Mockito.when(embeddedDnsServer.resolvePublicAliasTarget(zone + ".", "owned.elb.example.", id, 1, null, null))
+                .thenReturn(Optional.of(DnsAnswer.records(List.of("198.51.100.4", "198.51.100.5"), 60)));
+
+        DnsAnswer answer = dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow();
+        assertEquals(List.of("198.51.100.4", "198.51.100.5"), answer.addresses());
+        assertEquals(60, answer.ttlSeconds());
+        assertEquals(zone + ".", answer.authority().name());
+        assertEquals(0, answer.responseCode());
+        DnsAnswer ipv6 = dnsRecordSource.resolveAuthoritative(zone, 28).orElseThrow();
+        assertTrue(ipv6.isEmpty());
+        assertTrue(ipv6.nameExists());
+        Mockito.verifyNoInteractions(dnsLookupHelper);
+    }
+
+    @Test
+    void publicAliasCannotResolveUnownedTargetsThroughUpstreamDns() {
+        String zone = uniqueZone();
+        String id = createPublicZone(zone);
+        addAlias(id, zone, "A", "unowned.localhost.floci.io.");
+        Mockito.when(embeddedDnsServer.resolvePublicAliasTarget(zone + ".", "unowned.localhost.floci.io.", id, 1, null, null))
+                .thenReturn(Optional.empty());
+
+        assertEquals(5, dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow().responseCode());
+        Mockito.verifyNoInteractions(dnsLookupHelper);
+    }
+
+    @Test
+    void validatedPublicAliasPreservesItsUpstreamTransportThroughZoneValidation() {
+        String zone = uniqueZone();
+        String id = createPublicZone(zone);
+        addAlias(id, zone, "A", "owned.elb.example.");
+        Mockito.when(embeddedDnsServer.resolvePublicAliasTarget(zone + ".", "owned.elb.example.", id, 1, null, null))
+                .thenReturn(Optional.of(DnsAnswer.records(List.of("172.18.0.2"), 45).viaUpstream()));
+
+        DnsAnswer answer = dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow();
+        assertTrue(answer.upstream());
+        assertEquals(List.of("172.18.0.2"), answer.addresses());
+        assertEquals(45, answer.ttlSeconds());
+        assertEquals(zone + ".", answer.authority().name());
+        assertFalse(dnsRecordSource.resolveAuthoritative(zone, 28).orElseThrow().upstream());
+        Mockito.verifyNoInteractions(dnsLookupHelper);
+    }
+
+    @Test
+    void publicAliasWithoutActiveAddressesPreservesTheNameAndNegativeAuthority() {
+        String zone = uniqueZone();
+        String id = createPublicZone(zone);
+        addAlias(id, zone, "A", "owned.elb.example.");
+        Mockito.when(embeddedDnsServer.resolvePublicAliasTarget(zone + ".", "owned.elb.example.", id, 1, null, null))
+                .thenReturn(Optional.of(DnsAnswer.noData()));
+
+        DnsAnswer answer = dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow();
+        assertTrue(answer.isEmpty());
+        assertTrue(answer.nameExists());
+        assertEquals(zone + ".", answer.authority().name());
+        assertEquals(0, answer.responseCode());
+    }
+
+    @Test
+    void publicWeightedAliasHealthEvaluationRemainsRefused() {
+        String zone = uniqueZone();
+        String id = createPublicZone(zone);
+        addAlias(id, zone, "A", "owned.elb.example.");
+        ResourceRecordSet alias = route53Service.listResourceRecordSets(id, null, null, 100).stream()
+                .filter(record -> record.getAliasTarget() != null).findFirst().orElseThrow();
+        alias.getAliasTarget().setEvaluateTargetHealth(true);
+        alias.setSetIdentifier("weighted");
+        alias.setWeight(1L);
+        route53Service.changeResourceRecordSets(id, List.of(Map.of("action", "UPSERT", "rrs", alias)), null);
+
+        assertEquals(5, dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow().responseCode());
+        Mockito.verify(embeddedDnsServer).getServerIp();
+        Mockito.verifyNoMoreInteractions(embeddedDnsServer);
+        Mockito.verifyNoInteractions(dnsLookupHelper);
+    }
+
+    @Test
+    void simplePublicAliasHealthEvaluationRetainsTheOwnedTargetAnswer() {
+        String zone = uniqueZone();
+        String id = createPublicZone(zone);
+        addAlias(id, zone, "A", "owned.elb.example.");
+        ResourceRecordSet alias = route53Service.listResourceRecordSets(id, null, null, 100).stream()
+                .filter(record -> record.getAliasTarget() != null).findFirst().orElseThrow();
+        alias.getAliasTarget().setEvaluateTargetHealth(true);
+        route53Service.changeResourceRecordSets(id, List.of(Map.of("action", "UPSERT", "rrs", alias)), null);
+        Mockito.when(embeddedDnsServer.resolvePublicAliasTarget(zone + ".", "owned.elb.example.", id, 1, null, null))
+                .thenReturn(Optional.of(DnsAnswer.records(List.of("198.51.100.4"), 60)));
+
+        DnsAnswer answer = dnsRecordSource.resolveAuthoritative(zone, 1).orElseThrow();
+        assertEquals(0, answer.responseCode());
+        assertEquals(List.of("198.51.100.4"), answer.addresses());
+        assertEquals(60, answer.ttlSeconds());
+        Mockito.verifyNoInteractions(dnsLookupHelper);
+    }
+
+    @Test
     void resolvesMultipleARecords() {
         String zone = uniqueZone();
         String zoneId = createPrivateZone(zone);
@@ -455,12 +555,12 @@ class Route53DnsResolutionTest {
         String id = createPrivateZone(zone);
         String name = "_api._tcp." + zone;
         addRecord(id, name, "SRV", " \t65535\t 65535  65535\tTarget." + zone + ". \t", 0L);
-        DnsAnswer answer = dnsRecordSource.resolve(name.toUpperCase() + ".", 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow();
+        DnsAnswer answer = resolveFromVpc(name.toUpperCase() + ".", 33).orElseThrow();
         assertEquals(0, answer.ttlSeconds());
         assertEquals(List.of(new DnsRecord.Srv(65535, 65535, 65535, "Target." + zone + ".")), answer.records());
         addRecord(id, "_unavailable._tcp." + zone, "SRV", "0 0 0 .");
         assertEquals(List.of(new DnsRecord.Srv(0, 0, 0, ".")),
-                dnsRecordSource.resolve("_unavailable._tcp." + zone, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow().records());
+                resolveFromVpc("_unavailable._tcp." + zone, 33).orElseThrow().records());
     }
 
     @ParameterizedTest
@@ -476,7 +576,7 @@ class Route53DnsResolutionTest {
         set.setRecords(List.of(new ResourceRecord("0 0 8080 target." + zone)));
         route53Service.changeResourceRecordSets(id, List.of(Map.of("action", "CREATE", "rrs", set)), null);
 
-        DnsAnswer answer = dnsRecordSource.resolve(name, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow();
+        DnsAnswer answer = resolveFromVpc(name, 33).orElseThrow();
         assertEquals(0, answer.responseCode());
         assertEquals(expectedTtl, answer.ttlSeconds());
         assertEquals(List.of(new DnsRecord.Srv(0, 0, 8080, "target." + zone)), answer.records());
@@ -496,7 +596,7 @@ class Route53DnsResolutionTest {
         values.add("0 100 8080 valid." + zone);
         values.add(value);
         addRecords(id, name, "SRV", values);
-        DnsAnswer answer = dnsRecordSource.resolve(name, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow();
+        DnsAnswer answer = resolveFromVpc(name, 33).orElseThrow();
         assertEquals(5, answer.responseCode());
         assertTrue(answer.isEmpty());
         Mockito.verifyNoInteractions(dnsLookupHelper);
@@ -507,10 +607,10 @@ class Route53DnsResolutionTest {
         String zone = uniqueZone();
         String id = createPrivateZone(zone);
         addRecord(id, "address." + zone, "A", "192.0.2.1");
-        assertEquals(DnsAnswer.noData(), dnsRecordSource.resolve("address." + zone, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow());
-        assertEquals(DnsAnswer.noData(), dnsRecordSource.resolve(zone, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow());
-        assertEquals(DnsAnswer.nxDomain(), dnsRecordSource.resolve("absent." + zone, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow());
-        assertEquals(List.of("192.0.2.1"), dnsRecordSource.resolve("address." + zone, 1, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow().addresses());
+        assertEquals(DnsAnswer.noData(), resolveFromVpc("address." + zone, 33).orElseThrow());
+        assertEquals(DnsAnswer.noData(), resolveFromVpc(zone, 33).orElseThrow());
+        assertEquals(DnsAnswer.nxDomain(), resolveFromVpc("absent." + zone, 33).orElseThrow());
+        assertEquals(List.of("192.0.2.1"), resolveFromVpc("address." + zone, 1).orElseThrow().addresses());
 
         String publicZone = uniqueZone();
         String publicId = route53Service.createHostedZone(publicZone, UUID.randomUUID().toString(),
@@ -518,10 +618,10 @@ class Route53DnsResolutionTest {
         createdZoneIds.add(publicId);
         String publicName = "_api._tcp." + publicZone;
         addRecord(publicId, publicName, "SRV", "0 100 8080 target." + publicZone);
-        assertTrue(dnsRecordSource.resolve(publicName, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).isEmpty());
+        assertTrue(resolveFromVpc(publicName, 33).isEmpty());
         assertTrue(dnsRecordSource.resolveAuthoritative(publicName, 33).isEmpty());
-        assertTrue(dnsRecordSource.resolve(null, 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).isEmpty());
-        assertTrue(dnsRecordSource.resolve(" ", 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).isEmpty());
+        assertTrue(resolveFromVpc(null, 33).isEmpty());
+        assertTrue(resolveFromVpc(" ", 33).isEmpty());
         Mockito.verifyNoInteractions(dnsLookupHelper);
     }
 
@@ -537,21 +637,16 @@ class Route53DnsResolutionTest {
         set.setWeight(100L);
         set.setRecords(List.of(new ResourceRecord("0 100 8080 target." + zone)));
         route53Service.changeResourceRecordSets(id, List.of(Map.of("action", "CREATE", "rrs", set)), null);
-        assertEquals(5, dnsRecordSource.resolve(set.getName(), 33, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345")).orElseThrow().responseCode());
+        assertEquals(5, resolveFromVpc(set.getName(), 33).orElseThrow().responseCode());
     }
 
     @Test
-    void unknownCallerRetainsPrivateRecords() {
+    void unknownCallerDoesNotReadPrivateRecords() {
         String zone = uniqueZone();
-        String id = createPrivateZone(zone);
-        addRecord(id, "api." + zone, "A", "10.0.1.100");
-        addRecord(id, "leaf.branch." + zone, "A", "10.0.1.101");
+        addRecord(createPrivateZone(zone), "api." + zone, "A", "10.0.1.100");
 
-        assertEquals(List.of("10.0.1.100"), dnsRecordSource.resolveIpv4("api." + zone).map(DnsAnswer::addresses).orElse(List.of()));
-        assertEquals(List.of("10.0.1.100"), dnsRecordSource.resolve("api." + zone, 1, null).orElseThrow().addresses());
-        assertEquals(DnsAnswer.noData(), dnsRecordSource.resolve("api." + zone, 28, null).orElseThrow());
-        assertEquals(DnsAnswer.noData(), dnsRecordSource.resolve("branch." + zone, 1, null).orElseThrow());
-        assertEquals(DnsAnswer.nxDomain(), dnsRecordSource.resolve("absent." + zone, 1, null).orElseThrow());
+        assertTrue(dnsRecordSource.resolveIpv4("api." + zone).isEmpty());
+        assertTrue(dnsRecordSource.resolve("api." + zone, 1, null).isEmpty());
     }
 
     @ParameterizedTest
@@ -573,11 +668,21 @@ class Route53DnsResolutionTest {
     }
 
     private Optional<DnsAnswer> resolveFromVpc(String name) {
-        return dnsRecordSource.resolve(name, 1, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345"));
+        return resolveFromVpc(name, 1);
+    }
+
+    private Optional<DnsAnswer> resolveFromVpc(String name, int type) {
+        return dnsRecordSource.resolve(name, type, new ClientVpc(config.defaultAccountId(), "us-east-1", "vpc-12345"));
     }
 
     private String createPrivateZone(String name) {
         return createPrivateZone(name, "vpc-12345");
+    }
+
+    private String createPublicZone(String name) {
+        String id = route53Service.createHostedZone(name, UUID.randomUUID().toString(), null, null).zone().getId();
+        createdZoneIds.add(id);
+        return id;
     }
 
     private String createPrivateZone(String name, String vpcId) {

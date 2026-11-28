@@ -30,6 +30,9 @@
         <!-- How JUnit runs test classes against each other. Quarkus test classes share one emulator and
              run one at a time; ci.yml runs the plain classes in a pass of their own with concurrent. -->
         <test.classes.mode>same_thread</test.classes.mode>
+        <!-- Maven user properties reach the test JVM: keep this build setting
+             outside the strictly validated floci.* application namespace. -->
+        <test.jvm.heap>6g</test.jvm.heap>
     </properties>
 
     <dependencyManagement>
@@ -384,13 +387,37 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>acmpca</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>sts</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>config</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>iam</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>appconfig</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>appconfigdata</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -414,6 +441,12 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kinesis</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>backup</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -432,12 +465,6 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
-            <artifactId>kinesis</artifactId>
-            <version>${aws.sdk.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
             <artifactId>eventbridgev2</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -445,6 +472,18 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>iotdataplane</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>iot</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>iotjobsdataplane</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -510,12 +549,6 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
-            <artifactId>config</artifactId>
-            <version>${aws.sdk.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
             <artifactId>organizations</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -576,6 +609,18 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>swf</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>resourcegroupstaggingapi</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>cloudformation</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -600,6 +645,12 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sfn</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>apigateway</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -619,6 +670,12 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>s3tables</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3control</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -666,7 +723,7 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
-            <artifactId>sfn</artifactId>
+            <artifactId>codedeploy</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -729,6 +786,12 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>docdb</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>ram</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -748,6 +811,12 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>secretsmanager</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>memorydb</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -830,11 +899,78 @@
             <version>2.5.252</version>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>neptune</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tinkerpop</groupId>
+            <artifactId>gremlin-driver</artifactId>
+            <version>3.7.3</version>
+            <scope>test</scope>
+        </dependency>
         <!-- openCypher/Bolt client for the Neptune neo4j db-type integration test -->
         <dependency>
             <groupId>org.neo4j.driver</groupId>
             <artifactId>neo4j-java-driver</artifactId>
             <version>6.3.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>mq</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apache-client</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cognitoidentity</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>resourcegroups</artifactId>
+
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>servicequotas</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudfrontkeyvaluestore</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>http-auth-aws-crt</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>account</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apigatewaymanagementapi</artifactId>
+            <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -881,7 +1017,7 @@
                 <configuration>
                     <!-- The suite's end-of-run live set exceeds the 4g default heap of
                          16g CI runners; a full GC near the end reclaims almost nothing. -->
-                    <argLine>@{argLine} -Xmx6g</argLine>
+                    <argLine>@{argLine} -Xmx${test.jvm.heap}</argLine>
                     <excludes>
                         <!-- Surefire's default exclude, kept since a configured list replaces it. -->
                         <exclude>**/*$*</exclude>
@@ -973,6 +1109,18 @@
             <properties>
                 <nightly.checks.excludes>**/*$*</nightly.checks.excludes>
             </properties>
+        </profile>
+        <profile>
+            <id>compat-clock</id>
+            <dependencies>
+                <!-- Install the isolated fixture with -f compatibility-tests/clock/pom.xml first.
+                     Its classes never enter this module's target/classes or ordinary artifacts. -->
+                <dependency>
+                    <groupId>io.floci.testing</groupId>
+                    <artifactId>appconfig-clock</artifactId>
+                    <version>1.0-SNAPSHOT</version>
+                </dependency>
+            </dependencies>
         </profile>
         <profile>
             <id>native</id>
