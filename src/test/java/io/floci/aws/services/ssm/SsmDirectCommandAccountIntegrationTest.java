@@ -9,6 +9,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.services.ssm.model.Command;
 import io.floci.aws.services.ssm.model.CommandInvocation;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -28,6 +29,7 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 @QuarkusTest
+@TestProfile(SsmDirectCommandProfile.class)
 class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixture {
     @Inject RegionResolver regionResolver;
 
@@ -84,7 +86,7 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
                     "CommandId", commandId, "InstanceId", instance));
             assertEquals(fallback ? "Pending" : "Success", result.jsonPath().getString("Status"));
             if (fallback) {
-                Response poll = call(account, region, "AmazonSSMMessageDeliveryService.GetMessages",
+                Response poll = call(account, region, "EC2WindowsMessageDeliveryService.GetMessages",
                         Map.of("Destination", instance, "MessagesRequestId", "owned-request"));
                 assertEquals(1, poll.jsonPath().getList("Messages").size());
                 assertEquals("aws.ssm.sendCommand." + region, poll.jsonPath().getString("Messages[0].Topic"));
@@ -159,7 +161,7 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
             assertFalse(blockedWorker.get().isAlive());
             assertEquals("Cancelled", call(account, region, "AmazonSSM.GetCommandInvocation",
                     Map.of("CommandId", firstId, "InstanceId", instance)).jsonPath().getString("Status"));
-            assertTrue(call(account, region, "AmazonSSMMessageDeliveryService.GetMessages",
+            assertTrue(call(account, region, "EC2WindowsMessageDeliveryService.GetMessages",
                     Map.of("Destination", instance)).jsonPath().getList("Messages").isEmpty());
         } finally {
             release.countDown();
@@ -182,9 +184,9 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
         String instance = "i-fallback-" + UUID.randomUUID();
         String command = directFallback(instance);
         try {
-            assertTrue(call(foreignAccount, foreignRegion, "AmazonSSMMessageDeliveryService.GetMessages",
+            assertTrue(call(foreignAccount, foreignRegion, "EC2WindowsMessageDeliveryService.GetMessages",
                     Map.of("Destination", instance)).jsonPath().getList("Messages").isEmpty());
-            Response own = call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.GetMessages",
+            Response own = call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.GetMessages",
                     Map.of("Destination", instance));
             assertEquals(1, own.jsonPath().getList("Messages").size());
             assertEquals(command, new ObjectMapper().readTree(own.jsonPath().getString("Messages[0].Payload")).path("CommandId").asText());
@@ -203,18 +205,18 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
         String instance = "i-fallback-" + UUID.randomUUID();
         String command = directFallback(instance);
         try {
-            String message = call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.GetMessages",
+            String message = call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.GetMessages",
                     Map.of("Destination", instance)).jsonPath().getString("Messages[0].MessageId");
             assertNotNull(message);
             Map<String, Object> body = Map.of("MessageId", message, "Payload", replyPayload(),
                     "FailureType", "foreign-failure");
-            call(foreignAccount, foreignRegion, "AmazonSSMMessageDeliveryService." + operation, body);
+            call(foreignAccount, foreignRegion, "EC2WindowsMessageDeliveryService." + operation, body);
             assertEquals("Pending", call("222222222222", "us-west-2", "AmazonSSM.GetCommandInvocation",
                     Map.of("CommandId", command, "InstanceId", instance)).jsonPath().getString("Status"));
-            call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.AcknowledgeMessage", body);
+            call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.AcknowledgeMessage", body);
             assertEquals("InProgress", call("222222222222", "us-west-2", "AmazonSSM.GetCommandInvocation",
                     Map.of("CommandId", command, "InstanceId", instance)).jsonPath().getString("Status"));
-            call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.SendReply", body);
+            call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.SendReply", body);
             Response result = call("222222222222", "us-west-2", "AmazonSSM.GetCommandInvocation",
                     Map.of("CommandId", command, "InstanceId", instance));
             assertEquals("Success", result.jsonPath().getString("Status"));
@@ -237,7 +239,7 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
         try {
             peerCommand = directFallback(peerAccount, peerRegion, instance);
             String message = polled ? call("222222222222", "us-west-2",
-                    "AmazonSSMMessageDeliveryService.GetMessages", Map.of("Destination", instance))
+                    "EC2WindowsMessageDeliveryService.GetMessages", Map.of("Destination", instance))
                     .jsonPath().getString("Messages[0].MessageId") : null;
             if (polled) {
                 assertNotNull(message);
@@ -248,14 +250,14 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
                 RequestScopes.runAs(peerAccount, peerRegion, () -> assertEquals(1,
                         commandService.failActiveInvocationsForInstance(peerRegion, instance, "peer stopped")));
             }
-            assertTrue(call(peerAccount, peerRegion, "AmazonSSMMessageDeliveryService.GetMessages",
+            assertTrue(call(peerAccount, peerRegion, "EC2WindowsMessageDeliveryService.GetMessages",
                     Map.of("Destination", instance)).jsonPath().getList("Messages").isEmpty());
             if (!polled) {
-                message = call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.GetMessages",
+                message = call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.GetMessages",
                         Map.of("Destination", instance)).jsonPath().getString("Messages[0].MessageId");
                 assertNotNull(message);
             }
-            call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.SendReply",
+            call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.SendReply",
                     Map.of("MessageId", message, "Payload", replyPayload()));
             assertEquals("Success", call("222222222222", "us-west-2", "AmazonSSM.GetCommandInvocation",
                     Map.of("CommandId", command, "InstanceId", instance)).jsonPath().getString("Status"));
@@ -272,14 +274,14 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
         String instance = "i-fallback-" + UUID.randomUUID();
         String command = directFallback(instance);
         try {
-            String message = call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.GetMessages",
+            String message = call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.GetMessages",
                     Map.of("Destination", instance)).jsonPath().getString("Messages[0].MessageId");
             assertNotNull(message);
             Map<String, Object> body = Map.of("MessageId", message, "FailureType", "owner failure",
                     "Payload", replyPayload());
-            call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService." + operation, body);
-            call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.AcknowledgeMessage", body);
-            call("222222222222", "us-west-2", "AmazonSSMMessageDeliveryService.SendReply", body);
+            call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService." + operation, body);
+            call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.AcknowledgeMessage", body);
+            call("222222222222", "us-west-2", "EC2WindowsMessageDeliveryService.SendReply", body);
             Response result = call("222222222222", "us-west-2", "AmazonSSM.GetCommandInvocation",
                     Map.of("CommandId", command, "InstanceId", instance));
             assertEquals(expected, result.jsonPath().getString("Status"));
@@ -324,7 +326,7 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
     }
 
     private static String replyPayload() {
-        return ("{\"runtimeStatus\":{\"aws:runShellScript\":{"
+        return ("{\"documentStatus\":\"Success\",\"runtimeStatus\":{\"aws:runShellScript\":{"
                 + "\"status\":\"Success\",\"code\":0,\"output\":\"owned agent output\"}}}");
     }
 
