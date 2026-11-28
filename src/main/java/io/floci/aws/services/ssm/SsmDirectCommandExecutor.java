@@ -3,6 +3,7 @@ package io.floci.aws.services.ssm;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import io.floci.aws.core.common.docker.StreamingDocker;
@@ -158,28 +159,32 @@ public class SsmDirectCommandExecutor {
             }
         });
 
-        boolean completed = latch.await(hostTimeoutSeconds(timeoutSeconds), TimeUnit.SECONDS);
-        if (!completed) {
-            closeQuietly(callback);
-            return ExecutionResult.timedOut(
-                    stdout.content(),
-                    "Timed out after " + timeoutSeconds + "s",
-                    start);
-        }
+        try {
+            boolean completed = latch.await(hostTimeoutSeconds(timeoutSeconds), TimeUnit.SECONDS);
+            InspectExecResponse execution = dockerClient.inspectExecCmd(execId).exec();
+            Long exitCode = execution.getExitCodeLong();
+            if (!completed && (!Boolean.FALSE.equals(execution.isRunning()) || exitCode == null)) {
+                return ExecutionResult.timedOut(
+                        stdout.content(),
+                        "Timed out after " + timeoutSeconds + "s",
+                        start);
+            }
 
-        Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
-        int responseCode = exitCode != null ? exitCode.intValue() : 1;
-        String standardOutput = stdout.content();
-        String standardError = timeout.standardError();
-        if (timeout.timedOut()) {
+            int responseCode = exitCode != null ? exitCode.intValue() : 1;
+            String standardOutput = stdout.content();
+            String standardError = timeout.standardError();
+            if (timeout.timedOut()) {
+                logFailureDiagnostics(containerId);
+                return ExecutionResult.timedOut(standardOutput, standardError, start);
+            }
+            if (responseCode == 0) {
+                return ExecutionResult.success(standardOutput, standardError, responseCode, start);
+            }
             logFailureDiagnostics(containerId);
-            return ExecutionResult.timedOut(standardOutput, standardError, start);
+            return ExecutionResult.failed(standardOutput, standardError, responseCode, start);
+        } finally {
+            closeQuietly(callback);
         }
-        if (responseCode == 0) {
-            return ExecutionResult.success(standardOutput, standardError, responseCode, start);
-        }
-        logFailureDiagnostics(containerId);
-        return ExecutionResult.failed(standardOutput, standardError, responseCode, start);
     }
 
     static String timeoutWrappedScript(String script, int timeoutSeconds) {
@@ -274,6 +279,7 @@ public class SsmDirectCommandExecutor {
             closeable.close();
         }
         catch (IOException ignored) {
+            // An already-ended attach stream does not change the captured command result.
         }
     }
 
