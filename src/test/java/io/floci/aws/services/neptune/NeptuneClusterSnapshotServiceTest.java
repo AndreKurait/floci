@@ -88,7 +88,7 @@ class NeptuneClusterSnapshotServiceTest {
                         + ":" + account + ":" + invocation.getArgument(2));
         when(factory.create(anyString(), anyString(), any())).thenAnswer(invocation ->
                 AccountAwareStorageBackend.inMemory("111111111111"));
-        when(containers.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString()))
+        when(containers.tryStart(anyString(), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
                 .thenAnswer(invocation -> new NeptuneContainerHandle("container-" + invocation.getArgument(0),
                         invocation.getArgument(0), "localhost", 8182));
         when(containers.snapshotGraph(any())).thenReturn(ARCHIVE);
@@ -146,7 +146,7 @@ class NeptuneClusterSnapshotServiceTest {
     void missingTargetBackendRollsBackAndPreservesSourceAndSnapshot() {
         NeptuneCluster source = service.createDbCluster("source", null, false);
         NeptuneClusterSnapshot snapshot = service.createDbClusterSnapshot("snapshot", "source", Map.of("kept", "yes"));
-        when(containers.tryStart(eq("target"), anyString(), any(NeptuneDbType.class), anyString(), anyString()))
+        when(containers.tryStart(eq("target"), anyString(), any(NeptuneDbType.class), anyString(), anyString(), any()))
                 .thenReturn(null);
         AwsException failure = assertThrows(AwsException.class, () -> restore("target", "snapshot"));
         assertEquals("InvalidRestoreFault", failure.getErrorCode());
