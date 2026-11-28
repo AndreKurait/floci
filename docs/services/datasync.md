@@ -1,6 +1,7 @@
 # AWS DataSync
 
 **Protocol:** JSON 1.1 (`X-Amz-Target: FmrsService.<Action>`)
+**Smithy RPC v2 CBOR:** `POST /service/FmrsService/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Endpoint:** `http://localhost:4566/` (SigV4 service `datasync`)
 
 DataSync's Smithy service shape is `FmrsService`, so that is the target prefix the SDK and
