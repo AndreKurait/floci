@@ -4362,6 +4362,11 @@ public class Ec2QueryHandler {
      * a snapshot it has just started; DescribeSnapshots then reports it {@code completed}.
      */
     private Response handleCreateSnapshot(MultivaluedMap<String, String> p, String region) {
+        String location = p.getFirst("Location");
+        if (p.getFirst("OutpostArn") != null || location != null && !"regional".equals(location)) {
+            throw new AwsException("UnsupportedOperation",
+                    "CreateSnapshot supports regional snapshots without an OutpostArn.", 400);
+        }
         List<Tag> snapshotTags = parseTagsForResource(p, "snapshot", Set.of("snapshot"));
         Snapshot snapshot = service.createSnapshot(region, p.getFirst("VolumeId"),
                 p.getFirst("Description"), snapshotTags, dryRun(p));

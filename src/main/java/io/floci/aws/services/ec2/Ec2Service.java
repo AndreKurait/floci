@@ -10800,10 +10800,18 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (volumeId == null || volumeId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter VolumeId", 400);
         }
+        if (!volumeId.matches("vol-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException("InvalidVolumeID.Malformed",
+                    "Invalid id: '" + volumeId + "' (expecting 'vol-...')", 400);
+        }
         return withVolumeLock(volumeId, () -> {
             Volume volume = volumes.get(key(region, volumeId)).flatMap(v -> settleEndedHolders(region, v))
                     .orElseThrow(() -> new AwsException("InvalidVolume.NotFound",
                             "The volume '" + volumeId + "' does not exist.", 400));
+            if (!"available".equals(volume.getState()) && !"in-use".equals(volume.getState())) {
+                throw new AwsException("IncorrectState",
+                        "The volume '" + volumeId + "' is not available or in-use.", 400);
+            }
             if (dryRun) {
                 throw dryRunOperation();
             }
@@ -10826,6 +10834,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public void deleteSnapshot(String region, String snapshotId, boolean dryRun) {
         if (snapshotId == null || snapshotId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter SnapshotId", 400);
+        }
+        if (!snapshotId.matches("snap-(?:[0-9a-f]{8}|[0-9a-f]{17})")) {
+            throw new AwsException("InvalidSnapshotID.Malformed", "Invalid snapshot id: " + snapshotId, 400);
         }
         // Under the lock registration publishes snapshot references under, so an AMI being
         // registered on this snapshot is either seen here or sees the snapshot gone, and under the
@@ -10913,8 +10924,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private void storeSnapshot(String region, Snapshot snapshot, List<Tag> snapshotTags) {
         if (snapshotTags != null && !snapshotTags.isEmpty()) {
-            snapshot.setTags(new ArrayList<>(snapshotTags));
-            putTags(region, snapshot.getSnapshotId(), new ArrayList<>(snapshotTags));
+            List<Tag> independentTags = snapshotTags.stream()
+                    .map(tag -> new Tag(tag.getKey(), tag.getValue())).collect(Collectors.toCollection(ArrayList::new));
+            snapshot.setTags(independentTags);
+            putTags(region, snapshot.getSnapshotId(), new ArrayList<>(independentTags));
         }
         snapshots.put(key(region, snapshot.getSnapshotId()), snapshot);
     }
@@ -11745,6 +11758,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private boolean matchesSnapshotFilter(Snapshot snapshot, String name, List<String> values) {
+        if (name != null && (name.startsWith("tag:") || "tag-key".equals(name))) {
+            return matchesTagFilter(snapshot.getTags(), name, values, Ec2Service::matchesFilterValue);
+        }
         return switch (name) {
             case "description" -> matchesFilterValue(values, snapshot.getDescription());
             case "owner-id" -> matchesFilterValue(values, snapshot.getOwnerId());
