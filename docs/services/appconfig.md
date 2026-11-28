@@ -217,3 +217,7 @@ aws appconfigdata get-latest-configuration \
   --configuration-token $TOKEN \
   --endpoint-url http://localhost:4566
 ```
+
+Deployment summaries preserve a recorded final bake time, including zero, when older stored
+deployments lack a deployment duration. The strategy supplies the bake time only when the
+deployment has no recorded bake time.
