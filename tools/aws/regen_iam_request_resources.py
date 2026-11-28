@@ -397,7 +397,7 @@ NAMESPACES = ("access-analyzer", "account", "acm", "acm-pca", "appconfig", "appl
               "sqs", "sns", "kinesis", "pipes", "dsql", "sts", "eks", "resource-groups", "logs", "ses", "cloudwatch",
               "comprehend", "config", "dms", "elasticache", "identitystore", "memorydb", "route53resolver",
               "sagemaker", "transcribe", "transfer", "ec2-instance-connect", "s3", "bedrock", "apigateway", "kms",
-              "dynamodb", "iam")
+              "dynamodb", "iam", "rds-data")
 
 # Stored MemoryDB parameter-group names are lowercase. Explicit ARNs retain their exact identity.
 LOWERCASE_VARIABLES = {"memorydb": {"parametergroup": ["ParameterGroupName"]}}
@@ -690,7 +690,6 @@ NOT_COVERED: dict[str, str] = {
     "mq": _REST,
     "network-firewall": _LATER,
     "organizations": _LATER,
-    "rds-data": _REST,
     "rum": _REST,
     "servicecatalog": "not read yet: CreatePortfolioShare, UpdatePortfolioShare and DeletePortfolioShare give in "
                       "AccountId the account a portfolio is shared with, which the rule reads as the portfolio's; a "
