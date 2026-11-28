@@ -8,7 +8,6 @@ import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testutil.ExecuteApiRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
-import io.restassured.RestAssured;
 import io.restassured.http.ContentType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -65,7 +64,7 @@ class SamRestApiAuthIntegrationTest {
         given().contentType(ContentType.JSON).queryParam("mode", "import")
                 .body(document.toString()).post("/restapis").then().statusCode(400)
                 .body("message", containsString("Only one Authorizer or IAM authorization"));
-        given().get("/restapis").then().statusCode(200)
+        given().get("/restapis?limit=500").then().statusCode(200)
                 .body("item.find { it.name == '" + title + "' }", equalTo(null));
     }
 
@@ -406,7 +405,7 @@ class SamRestApiAuthIntegrationTest {
 
     private Map<String, String> signed(String path) throws Exception {
         return ExecuteApiRequestSigner.signedHeaders("POST", path, Map.of(),
-                "localhost:" + RestAssured.port, null, "test", "test", "us-east-1", Instant.now());
+                endpoint.getRawAuthority(), null, "test", "test", "us-east-1", Instant.now());
     }
 
     private ObjectNode template(boolean swagger) throws Exception {
