@@ -1,6 +1,7 @@
 # Translate
 
 **Protocol:** JSON 1.1 (`X-Amz-Target: AWSShineFrontendService_20170701.*`)
+**Smithy RPC v2 CBOR:** `POST /service/AWSShineFrontendService_20170701/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Endpoint:** `POST http://localhost:4566/`
 
 ## Supported Actions

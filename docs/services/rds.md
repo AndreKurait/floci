@@ -896,7 +896,7 @@ Known gaps, all deliberate:
 ## Pagination
 
 `DescribeDBInstances`, `DescribeDBClusters`, `DescribeDBSubnetGroups`,
-`DescribeDBParameterGroups`, `DescribeDBParameters`,
+`DescribeDBParameterGroups`, `DescribeDBClusterParameterGroups`, `DescribeDBParameters`,
 `DescribeDBClusterParameters`, `DescribeOrderableDBInstanceOptions` and `DescribeOptionGroups`
 return all matching results without a `Marker`. These handlers do not yet split results by
 `MaxRecords` or resume from `Marker`. An absent marker ends pagination, including for an empty

@@ -1,5 +1,14 @@
 # KMS
 
+## CloudFormation keys
+
+`AWS::KMS::Key` honors `KeySpec`, `KeyUsage`, `KeyPolicy`, `MultiRegion`,
+`Description`, `Enabled`, and `Tags`. Key policies resolve CloudFormation
+intrinsic functions. Updates preserve key identity and cryptographic material;
+changes to immutable `KeySpec`, `KeyUsage`, or `MultiRegion` fail before mutable
+properties are applied. Omitting the key spec and usage creates a symmetric
+encryption key.
+
 **Protocol:** JSON 1.1 (`X-Amz-Target: TrentService.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
@@ -246,7 +255,9 @@ there.
 
 ## Grant Support Scope
 
-Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. However, grant lifecycle support **does not** imply grant-based authorization enforcement on cryptographic operations (`Encrypt`, `Decrypt`, `Sign`, `Verify`, `GenerateDataKey`, etc.). Grants are stored and queryable but are not evaluated during crypto operations.
+Cryptographic grant constraints match encryption-context keys without regard to case; values remain case-sensitive and literal. Ciphertext encryption-context authentication remains case-sensitive for both keys and values.
+
+Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. With IAM enforcement enabled, native KMS and delegated S3 authorization evaluate grants alongside key policies.
 
 ## DryRun
 
@@ -254,7 +265,7 @@ Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, 
 
 ## IAM Enforcement
 
-With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, a KMS request is checked as AWS checks it, read from the generated tables like other services' requests. An operation that names a key is evaluated against that key's ARN. A `KeyId` given as a key id, an alias name, an alias ARN or a key ARN resolves to the key it names, whatever the key's state, so a policy scoped to one key ARN allows that key and no other, and a `Deny` scoped to one fires for that key. A key KMS holds none of is checked on its id in the request's partition. A `Decrypt` that names no `KeyId` is evaluated against the key that encrypted its `CiphertextBlob`, as the [API reference](https://docs.aws.amazon.com/kms/latest/APIReference/API_Decrypt.html) says KMS reads it from the ciphertext's metadata. A request whose ciphertext names no key KMS holds is checked on `*`.
+With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, a KMS request is checked as AWS checks it, read from the generated tables like other services' requests. An operation that names a key is evaluated against that key's ARN. A `KeyId` given as a key id, an alias name, an alias ARN or a key ARN resolves to the key it names, whatever the key's state, so a policy scoped to one key ARN allows that key and no other, and a `Deny` scoped to one fires for that key. A key KMS holds none of is checked on its id in the request's partition. A `Decrypt` that names no `KeyId` is evaluated against the key that encrypted its `CiphertextBlob`, as the [API reference](https://docs.aws.amazon.com/kms/latest/APIReference/API_Decrypt.html) says KMS reads it from the ciphertext's metadata. A request whose ciphertext names no key KMS holds is checked on `*`. A ciphertext owned by another account is evaluated against its owning key ARN and requires that account's grant.
 
 Where an operation acts on several resources, the developer guide's [permissions table](https://docs.aws.amazon.com/kms/latest/developerguide/kms-api-permissions-reference.html) says which:
 
@@ -264,7 +275,7 @@ Where an operation acts on several resources, the developer guide's [permissions
 
 `RevokeGrant`, `RetireGrant` and `ListGrants` are evaluated against the key their `KeyId` names and the key the grant their `GrantId` names is on. A `RetireGrant` that names its grant by `GrantToken` alone names no key and is checked on `*`. `CreateKey`, `GenerateRandom`, `ListKeys`, `ListAliases`, `ListRetirableGrants` and the custom key store operations name no key resource and are evaluated against `*`, as on AWS. The `aws:ResourceTag/<key>` condition key holds the tags of the key a request is checked on.
 
-A key's policy is evaluated as its resource policy. An explicit `Deny` in it refuses the request, and an `Allow` naming the caller grants it. A key in another account needs both its key policy and the caller's own policies to allow the request. An `Allow` naming only the account, as the default key policy's does, leaves the decision to the account's IAM policies. Floci deviates from AWS here: a same-account identity policy grants access even when the key policy does not name the account, while AWS requires the key policy to allow it.
+A key's policy is evaluated as its resource policy. An explicit `Deny` in it refuses the request, and an `Allow` naming the caller grants it. A key in another account needs both its key policy and the caller's own policies to allow the request. An `Allow` naming only the account, as the default key policy's does, leaves the decision to the account's IAM policies. A key the account does not hold has no key policy: a request naming it, by id, ARN or alias, is decided by the caller's own policies, and KMS answers `NotFoundException`. A request naming another account's missing key is refused, since no key policy allows it across accounts, except for an operation a grant could admit, which KMS also answers with `NotFoundException`. Floci deviates from AWS here: a same-account identity policy grants access even when the key policy does not name the account, while AWS requires the key policy to allow it.
 
 The same check applies when another service asks KMS, as the caller, to use a key its resource is encrypted with. Restoring a Redshift or Redshift Serverless snapshot encrypted with a customer managed key needs `kms:Decrypt` on that key, read from the key policy in the snapshot owner's account and from the caller's own policies. The request carries `aws:ViaAWSService` as `true` and `kms:ViaService` naming the service's endpoint in the request's Region (`redshift-serverless.us-east-1.amazonaws.com`), as AWS's forward access sessions do. A key KMS would not use, disabled or pending deletion, refuses the restore whatever the policies say, as KMS refuses the request the service makes with it; Floci answers it as an access denial naming `kms:Decrypt`. A key AWS manages (`alias/aws/redshift`, which a snapshot copy grant made without a key records) needs no permission: AWS writes its key policy to let every principal of the account use it through the service. KMS itself still serves only the caller's own keys: a direct request naming another account's key is refused.
 
@@ -273,6 +284,7 @@ The same check applies when another service asks KMS, as the caller, to use a ke
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_KMS_ENABLED` | `true` | Enable or disable the service |
+| `FLOCI_SERVICES_KMS_LISTED_GRANTEE_SERVICE_PRINCIPALS` | unset | Comma-separated `<account-id>=<service principal>` entries. `ListGrants` and `ListRetirableGrants` list a grant's `GranteePrincipal` or `RetiringPrincipal` that is an IAM or STS principal of that account as that service principal, as KMS lists an AWS service's grantees ("if the grantee principal is an AWS service, the `GranteePrincipal` field contains an AWS service principal", GrantListEntry). The grant keeps the principal it was created with; the `GranteePrincipal` filter and authorization use it. |
 
 ## Examples
 

@@ -55,6 +55,7 @@
 characters. Empty or overlong tokens return `ValidationException`; unrecognized
 cursors within those bounds return `InvalidToken`.
 
+
 ## Find rules by target
 
 `ListRuleNamesByTarget` returns each matching rule name once when a target has the
@@ -476,7 +477,7 @@ refuses it. Across accounts the bus policy and the caller's identity policies bo
 - A `PutEvents` entry for an event bus that does not exist is answered as AWS answers it: with an event id, not counted in `FailedEntryCount`, and dropped, as no rule matches it. Floci logs the drop at `INFO`. Floci's own deliveries to a bus, for a rule, a pipe or a schedule, are unchanged: an entry for a bus that does not exist fails there.
 - A `Detail` forwarded to an event bus must be a JSON object, as in AWS; anything else is dropped, including an `InputPath` selecting a scalar such as `$.detail.orderId` or an envelope carrying `"detail": null`.
 - A bus ARN naming another account is forwarded under that account, so the target bus and its rules resolve there.
-- Onward delivery from that bus follows each target type: SQS and Step Functions resolve cross-account, while Lambda, SNS, Batch and Firehose resolve in the caller's account.
+- Onward delivery from that bus follows each target type: SQS, Lambda and Step Functions resolve cross-account, while SNS, Batch and Firehose resolve in the caller's account.
 - An event is forwarded between buses only once, matching AWS: a bus that received an event from another bus does not forward it on to a third. The second hop is dropped with only a `WARN` rather than reported to the caller.
 
 ### IAM resource tags
@@ -486,3 +487,25 @@ With IAM enforcement enabled, event bus and rule operations that support
 immediate effect. Request tags and another bus or rule's tags do not satisfy an
 existing-resource tag condition. The lookup validates the ARN's account, Region
 and partition before reading tags.
+
+### Lambda target permissions
+
+With IAM enforcement enabled, Lambda targets without `RoleArn` are checked against
+the function resource policy before each delivery attempt. The policy must allow
+`events.amazonaws.com` to invoke the exact function, version or alias named by the
+target. Source conditions use the rule ARN and its owning account, including rules
+on custom event buses. Permission refusal uses the existing `NO_PERMISSIONS`
+dead-letter path without scheduling a retry.
+
+Targets with an execution `RoleArn` use the execution-role checks below.
+The no-role resource-policy check alone does not implement AWS cross-account
+targets, which require an execution role and a target resource policy.
+API Gateway Lambda integration authorization remains separate.
+
+### Lambda target execution roles
+
+With IAM enforcement enabled, a Lambda target's configured `RoleArn` must name an existing role in the event-bus account that trusts EventBridge. Role trust conditions receive the rule ARN and its owning account. Lambda delivery then evaluates the role's identity policies, permissions boundary, applicable SCP levels and the exact qualified function's resource policy. Cross-account calls require both sides to grant access. Permission denial follows the existing `NO_PERMISSIONS` dead-letter path, and each retry checks current permissions again.
+
+Targets without `RoleArn` retain their service-principal resource-policy path. IAM enforcement off remains permissive. This support covers Lambda targets; configured-role authorization for other target types remains separate. Local tests exercise policy evaluation and SDK management with Lambda execution stubbed, not live AWS or Lambda runtime execution.
+
+Resource-policy `Deny` with `NotPrincipal` also applies to a role with an attached permissions boundary, even when that role and its account are excluded by `NotPrincipal`. Boundary attachment metadata is separate from the resolved boundary policy document. The shared authorizer resolves a temporary local role credential through IAM and revokes it after each evaluation. Its session identity and recorded issuance time are available to policy conditions.
