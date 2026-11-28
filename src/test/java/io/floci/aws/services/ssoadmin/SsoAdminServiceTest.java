@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
+import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.identitystore.IdentityStoreService;
@@ -29,6 +30,8 @@ import io.floci.aws.services.ssoadmin.model.TrustedTokenIssuer;
 import io.floci.aws.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mockito;
 
 import java.time.Clock;
@@ -109,7 +112,7 @@ class SsoAdminServiceTest {
                 organizationsService,
                 ACCOUNT_ID,
                 "us-east-1",
-                clock, roleProvisioner);
+                clock, roleProvisioner, new SsoAdminRequestContext());
         service.ensureBootstrapInstance(ACCOUNT_ID, "us-east-1");
     }
 
@@ -1261,6 +1264,42 @@ class SsoAdminServiceTest {
     }
 
     @Test
+    void createApplicationAdmitsOnlyTheConfiguredAwsManagedProviders() {
+        SsoAdminService emptyService = emptyService();
+        SsoInstance instance = emptyService.createInstance(mapper.createObjectNode(), ACCOUNT_ID, "eu-west-1");
+        ObjectNode request = mapper.createObjectNode();
+        request.put("InstanceArn", instance.instanceArn());
+        request.put("Name", "ServiceApplication");
+        request.put("ApplicationProviderArn", "arn:aws:sso::aws:applicationProvider/example-service");
+        assertError("ResourceNotFoundException", () -> emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1"));
+
+        emptyService.additionalApplicationProviders(List.of(" example-service ", "custom", "", "example/team", "example/team"));
+
+        SsoApplication application = emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1");
+        assertEquals("arn:aws:sso::aws:applicationProvider/example-service", application.applicationProviderArn());
+        request.put("Name", "TeamApplication");
+        request.put("ApplicationProviderArn", "arn:aws:sso::aws:applicationProvider/example/team");
+        assertEquals("arn:aws:sso::aws:applicationProvider/example/team",
+                emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1").applicationProviderArn());
+        for (String missing : List.of("arn:aws:sso::aws:applicationProvider/other-service",
+                "arn:aws-cn:sso::aws:applicationProvider/example-service")) {
+            request.put("ApplicationProviderArn", missing);
+            assertError("ResourceNotFoundException", () -> emptyService.createApplication(request, ACCOUNT_ID, "eu-west-1"));
+        }
+        ObjectNode describe = mapper.createObjectNode()
+                .put("ApplicationProviderArn", "arn:aws:sso::aws:applicationProvider/example-service");
+        assertError("ResourceNotFoundException", () -> emptyService.describeApplicationProvider(describe, "eu-west-1"));
+    }
+
+    @Test
+    void additionalApplicationProvidersRefuseAnIdThatIsNotAProviderResourceId() {
+        SsoAdminService emptyService = emptyService();
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> emptyService.additionalApplicationProviders(List.of("not a provider")));
+        assertTrue(refused.getMessage().contains("not a provider"));
+    }
+
+    @Test
     void addRegionValidatesAndRejectsDuplicates() {
         ObjectNode request = mapper.createObjectNode();
         request.put("InstanceArn", service.getInstanceArn());
@@ -1646,6 +1685,36 @@ class SsoAdminServiceTest {
     }
 
     @Test
+    void allProvisionedAccountsAreTheOnesThePermissionCheckFound() {
+        PermissionSet permissionSet = createPermissionSet("PinnedAccounts");
+        service.createAssignment(assignmentRequest(permissionSet.arn()));
+        assertEquals(List.of("arn:aws:sso:::account/" + ACCOUNT_ID),
+                service.through("PermissionSetArn", permissionSet.arn(), "us-east-1"));
+
+        ObjectNode other = assignmentRequest(permissionSet.arn());
+        other.put("TargetId", "222222222222");
+        service.createAssignment(other);
+        service.attachPolicy(service.getInstanceArn(), permissionSet.arn(), "arn:aws:iam::aws:policy/ReadOnlyAccess");
+        ObjectNode all = mapper.createObjectNode();
+        all.put("InstanceArn", service.getInstanceArn());
+        all.put("PermissionSetArn", permissionSet.arn());
+        all.put("TargetType", "ALL_PROVISIONED_ACCOUNTS");
+        service.provisionPermissionSet(all);
+
+        assertEquals(List.of(ACCOUNT_ID), accountsProvisioned(permissionSet.arn(), "LATEST_PERMISSION_SET_PROVISIONED"));
+        assertEquals(List.of("222222222222"),
+                accountsProvisioned(permissionSet.arn(), "LATEST_PERMISSION_SET_NOT_PROVISIONED"));
+    }
+
+    private List<String> accountsProvisioned(String permissionSetArn, String status) {
+        ObjectNode request = mapper.createObjectNode();
+        request.put("InstanceArn", service.getInstanceArn());
+        request.put("PermissionSetArn", permissionSetArn);
+        request.put("ProvisioningStatus", status);
+        return service.listAccountsForProvisionedPermissionSet(request).items();
+    }
+
+    @Test
     void provisionPermissionSetSupportsSingleAndAllProvisionedAccounts() {
         PermissionSet permissionSet = createPermissionSet("ProvisionAdmins");
 
@@ -1696,6 +1765,41 @@ class SsoAdminServiceTest {
         ObjectNode accountInstanceRequest = single.deepCopy();
         accountInstanceRequest.put("InstanceArn", accountInstance.instanceArn());
         assertError("AccessDeniedException", () -> accountInstanceService.provisionPermissionSet(accountInstanceRequest));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aws,us-east-1", "aws-cn,cn-north-1", "aws-us-gov,us-gov-west-1"})
+    void bulkProvisioningAuthorizationNamesExactlyTheStoredAccounts(String partition, String region) {
+        SsoAdminService regional = emptyService(region);
+        PermissionSet selected = regional.createPermissionSet(mapper.createObjectNode()
+                .put("InstanceArn", regional.getInstanceArn()).put("Name", "Selected"));
+        PermissionSet other = regional.createPermissionSet(mapper.createObjectNode()
+                .put("InstanceArn", regional.getInstanceArn()).put("Name", "Other"));
+        ObjectNode request = mapper.createObjectNode().put("InstanceArn", regional.getInstanceArn())
+                .put("PermissionSetArn", selected.arn()).put("TargetType", "AWS_ACCOUNT");
+        for (String account : List.of("111122223333", "444455556666")) {
+            request.put("TargetId", account);
+            assertEquals("SUCCEEDED", regional.provisionPermissionSet(request).status());
+        }
+        request.put("PermissionSetArn", other.arn()).put("TargetId", "777788889999");
+        assertEquals("SUCCEEDED", regional.provisionPermissionSet(request).status());
+        request.put("PermissionSetArn", selected.arn()).put("TargetType", "ALL_PROVISIONED_ACCOUNTS");
+        request.remove("TargetId");
+        Set<String> accounts = Set.of("arn:" + partition + ":sso:::account/111122223333",
+                "arn:" + partition + ":sso:::account/444455556666");
+        assertEquals(accounts, Set.copyOf(regional.through("PermissionSetArn", selected.arn(), region)));
+        assertEquals(Set.of(regional.getInstanceArn(), selected.arn(),
+                        "arn:" + partition + ":sso:::account/111122223333",
+                        "arn:" + partition + ":sso:::account/444455556666"),
+                Set.copyOf(RequestResources.ofBody("sso:ProvisionPermissionSet", request,
+                        partition, region, ACCOUNT_ID, regional)));
+        request.put("TargetType", "AWS_ACCOUNT").put("TargetId", "111122223333");
+        assertEquals(Set.of(regional.getInstanceArn(), selected.arn(),
+                        "arn:" + partition + ":sso:::account/111122223333"),
+                Set.copyOf(RequestResources.ofBody("sso:ProvisionPermissionSet", request,
+                        partition, region, ACCOUNT_ID, regional)));
+        assertEquals(List.of(), regional.through("InstanceArn", selected.arn(), region));
+        assertEquals(List.of(), regional.through("PermissionSetArn", "invalid", region));
     }
 
     @Test
@@ -1981,7 +2085,8 @@ class SsoAdminServiceTest {
                 organizationsService,
                 "999999999999",
                 defaultRegion,
-                Clock.systemUTC(), Mockito.mock(SsoPermissionSetRoleProvisioner.class, Mockito.RETURNS_MOCKS));
+                Clock.systemUTC(), Mockito.mock(SsoPermissionSetRoleProvisioner.class, Mockito.RETURNS_MOCKS),
+                new SsoAdminRequestContext());
     }
 
     private ObjectNode trustedTokenIssuerRequest(String name, String clientToken) {

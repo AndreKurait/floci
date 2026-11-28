@@ -1,6 +1,7 @@
 package io.floci.aws.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.floci.aws.services.iam.StsSessionTags;
 import jakarta.ws.rs.container.ContainerRequestContext;
 
 import java.util.ArrayList;
@@ -83,6 +84,16 @@ final class TagOnCreate {
      * twice keeps its last value, as the services keep it.
      */
     static Optional<Tagging> of(String operation, ContainerRequestContext ctx) {
+        if ("backup:CreateFramework".equals(operation)) {
+            JsonNode body = PassedRoles.jsonBody(ctx);
+            if (body == null || !body.path("FrameworkTags").isObject() || body.path("FrameworkTags").isEmpty()) {
+                return Optional.empty();
+            }
+            Map<String, String> tags = new LinkedHashMap<>();
+            body.path("FrameworkTags").properties().forEach(entry -> tags.put(entry.getKey(), entry.getValue().asText()));
+            return Optional.of(new Tagging("backup:TagResource", List.of(new TagSet(null, Map.copyOf(tags))),
+                    List.of(), false, true));
+        }
         TagOnCreateMembers.Entry entry = TagOnCreateMembers.of(operation);
         if (entry == null) {
             return Optional.empty();
@@ -102,6 +113,12 @@ final class TagOnCreate {
 
     private static Optional<Tagging> of(String operation, TagOnCreateMembers.Entry entry, Map<String, String> form,
                                         JsonNode body) {
+        // Trust conditions and issuance must see the same consumed STS tags.
+        if ("sts:AssumeRole".equals(operation) && !form.isEmpty()) {
+            Map<String, String> tags = StsSessionTags.readForm(form);
+            return tags.isEmpty() ? Optional.empty() : Optional.of(new Tagging(entry.tagging(),
+                    List.of(new TagSet(null, tags)), List.of(), entry.createAction(), entry.requestTags()));
+        }
         Set<TagSet> sets = new LinkedHashSet<>();
         Set<TagSet> otherSpellings = new LinkedHashSet<>();
         for (TagOnCreateMembers.Member member : entry.members()) {
@@ -529,7 +546,17 @@ final class TagOnCreate {
      */
     static List<String> resources(String operation, TagSet set, String partition, String region, String accountId,
                                   List<String> resources) {
-        if (set.resourceType() == null) {
+        String createdType = switch (operation) {
+            case "appconfig:CreateApplication" -> "application";
+            case "appconfig:CreateDeploymentStrategy" -> "deploymentstrategy";
+            case null, default -> null;
+        };
+        if (createdType != null) {
+            return List.of(new AwsArnUtils.Arn(partition, "appconfig", region, accountId,
+                    createdType + "/*").toString());
+        }
+        if (set.resourceType() == null
+                || ("ec2:CreatePlacementGroup".equals(operation) && "placement-group".equals(set.resourceType()))) {
             return resources;
         }
         String arn = TagOnCreateMembers.table().resourceArns()

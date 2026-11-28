@@ -5,12 +5,16 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import io.floci.aws.services.ec2.model.LaunchTemplate;
+import io.floci.aws.services.ec2.model.LaunchTemplateData;
+import io.floci.aws.services.iam.IamActionRegistry;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,10 +40,9 @@ import java.util.regex.Pattern;
  * such a member.
  *
  * <p>An EC2 request names an instance profile rather than a role, and passes the roles the profile
- * holds. Launching from a launch template passes nothing here: the EC2 user guide warns that a user
- * who can create launch template versions "can potentially update a launch template to pass an IAM
- * role to an instance even if they don't have the iam:PassRole permission", so the role is checked
- * where the template is created.
+ * holds. A direct RunInstances call also passes the profile inherited from its selected launch
+ * template version, unless the request overrides it. The EC2 guide's warning about unchecked
+ * later launches concerns fleets fulfilling capacity without another caller request.
  *
  * <p>IAM's {@code AddRoleToInstanceProfile} passes the role it adds to {@code ec2.amazonaws.com}, since
  * every instance running with the profile then gets that role's credentials: "The caller of this
@@ -139,6 +142,18 @@ final class PassedRoles {
     /** An IAM role ARN, the only resource {@code iam:PassRole} acts on. */
     private static final Pattern ROLE_ARN = Pattern.compile("^arn:[a-z0-9-]+:iam::\\d{12}:role/.+");
 
+    private static final Pattern V2_API = Pattern.compile("^/v2/apis/[^/]+$");
+    private static final Pattern REST_API = Pattern.compile("^/restapis/[^/]+$");
+    private static final Pattern REST_INTEGRATION = Pattern.compile(
+            "^/restapis/[^/]+/resources/[^/]+/methods/[^/]+/integration$");
+    private static final Pattern REST_AUTHORIZERS = Pattern.compile("^/restapis/[^/]+/authorizers$");
+    private static final Pattern REST_AUTHORIZER = Pattern.compile("^/restapis/[^/]+/authorizers/[^/]+$");
+    private static final Pattern V2_INTEGRATIONS = Pattern.compile("^/v2/apis/[^/]+/integrations$");
+    private static final Pattern V2_INTEGRATION = Pattern.compile("^/v2/apis/[^/]+/integrations/[^/]+$");
+    private static final Pattern V2_AUTHORIZERS = Pattern.compile("^/v2/apis/[^/]+/authorizers$");
+    private static final Pattern V2_AUTHORIZER = Pattern.compile("^/v2/apis/[^/]+/authorizers/[^/]+$");
+    private static final String API_GATEWAY = ServicePrincipals.of("apigateway");
+
     private static final String LAMBDA = ServicePrincipals.of("lambda");
     private static final String EC2 = ServicePrincipals.of("ec2");
     private static final String VPC_FLOW_LOGS = ServicePrincipals.of("vpc-flow-logs");
@@ -228,6 +243,16 @@ final class PassedRoles {
     /** What a request names that holds the roles it passes, looked up in the request's account and Region. */
     interface Lookups {
 
+        /** Execution roles assigned by an HTTP API import in the request account and region. */
+        default List<String> importedHttpApiRoles(String document) {
+            return List.of();
+        }
+
+        default List<String> importedRestApiRoles(String document) {
+            return List.of();
+        }
+
+
         /** The ARNs of the roles an EC2 instance profile holds, looked up by its name or its ARN. */
         List<String> instanceProfileRoleArns(String profileName, String profileArn);
 
@@ -282,6 +307,23 @@ final class PassedRoles {
      * passes none or the request names none.
      */
     static List<PassedRole> of(String operation, ContainerRequestContext ctx, Lookups lookups) {
+        if (operation.startsWith("apigateway:") && ctx.getUriInfo() != null
+                && ctx.getUriInfo().getRequestUri() != null) {
+            String path = IamActionRegistry.routedPath(ctx);
+            String method = switch (operation) {
+                case "apigateway:CreateApi" -> "/v2/apis".equals(path) ? "POST" : null;
+                case "apigateway:ImportApi", "apigateway:ReimportApi" ->
+                        "/v2/apis".equals(path) || V2_API.matcher(path).matches() ? "PUT" : null;
+                case "apigateway:ImportRestApi" -> "/restapis".equals(path) ? "POST" : null;
+                case "apigateway:PutRestApi" -> REST_API.matcher(path).matches() ? "PUT" : null;
+                default -> null;
+            };
+            if (method != null) {
+                // The owning importer knows which assignments it consumes; the model also contains
+                // credentials in ignored extensions and quick-create requests with no AWS target.
+                return apiGatewayRoles("apigateway:" + method, ctx, lookups);
+            }
+        }
         List<PassedRole> byHand = byHand(operation, ctx, lookups);
         return byHand != null ? byHand : fromTable(operation, PassedRoleMembers.of(operation), ctx, lookups);
     }
@@ -292,11 +334,13 @@ final class PassedRoles {
      */
     static List<PassedRole> byHand(String action, ContainerRequestContext ctx, Lookups lookups) {
         return switch (action) {
+            case "apigateway:POST", "apigateway:PUT", "apigateway:PATCH" -> apiGatewayRoles(action, ctx, lookups);
             case "lambda:CreateFunction", "lambda:UpdateFunctionConfiguration" -> fromJson(ctx, LAMBDA, "Role");
             case "lambda:CreateWebFunction" ->
                     fromJson(ctx, LAMBDA, "revisionConfig", "serviceConfig", "executionRoleArn");
             case "lambda:CreateWebFunctionRevision" -> fromJson(ctx, LAMBDA, "serviceConfig", "executionRoleArn");
-            case "ec2:RunInstances", "ec2:AssociateIamInstanceProfile", "ec2:ReplaceIamInstanceProfileAssociation" ->
+            case "ec2:RunInstances" -> runInstancesProfile(ctx, lookups);
+            case "ec2:AssociateIamInstanceProfile", "ec2:ReplaceIamInstanceProfileAssociation" ->
                     fromInstanceProfile(ctx, lookups, "IamInstanceProfile");
             case "ec2:RequestSpotInstances" ->
                     fromInstanceProfile(ctx, lookups, "LaunchSpecification.IamInstanceProfile");
@@ -307,7 +351,7 @@ final class PassedRoles {
             case "ecs:RegisterTaskDefinition", "ecs:RunTask", "ecs:StartTask", "ecs:CreateService", "ecs:UpdateService",
                  "ecs:CreateTaskSet", "ecs:CreateCapacityProvider", "ecs:UpdateCapacityProvider",
                  "scheduler:CreateSchedule", "scheduler:UpdateSchedule" -> byHandOfBody(action, jsonBody(ctx), lookups);
-            case "states:CreateStateMachine", "states:UpdateStateMachine" -> fromJson(ctx, STATES, "roleArn");
+            case "states:CreateStateMachine", "states:UpdateStateMachine", "states:TestState" -> fromJson(ctx, STATES, "roleArn");
             case "events:PutRule" -> fromJson(ctx, EVENTS, "RoleArn");
             case "events:PutTargets" -> fromJson(ctx, EVENTS, "Targets", "[]", "RoleArn");
             case "pipes:CreatePipe", "pipes:UpdatePipe" -> fromJson(ctx, PIPES, "RoleArn");
@@ -770,6 +814,89 @@ final class PassedRoles {
         }
     }
 
+    /** Direct integration and authorizer credential assignments, as the API Gateway service references list. */
+    private static List<PassedRole> apiGatewayRoles(String action, ContainerRequestContext ctx, Lookups lookups) {
+        String path = IamActionRegistry.routedPath(ctx);
+        boolean importRequest = "apigateway:POST".equals(action) && "/restapis".equals(path)
+                && ctx.getUriInfo().getQueryParameters() != null
+                && "import".equals(ctx.getUriInfo().getQueryParameters().getFirst("mode"));
+        boolean replaceRequest = "apigateway:PUT".equals(action) && REST_API.matcher(path).matches();
+        if (importRequest || replaceRequest) {
+            byte[] body = IamConditionContextResolver.bufferEntity(ctx);
+            return body == null ? List.of() : passed(lookups.importedRestApiRoles(
+                    new String(body, StandardCharsets.UTF_8)), API_GATEWAY);
+        }
+        if ("apigateway:PUT".equals(action)
+                && ("/v2/apis".equals(path) || V2_API.matcher(path).matches())) {
+            byte[] body = IamConditionContextResolver.bufferEntity(ctx);
+            if (body == null) {
+                return List.of();
+            }
+            String document = new String(body, StandardCharsets.UTF_8);
+            JsonNode envelope = jsonBody(ctx);
+            if (envelope != null && envelope.path("body").isTextual()) {
+                document = envelope.path("body").asText();
+            }
+            return passed(lookups.importedHttpApiRoles(document), API_GATEWAY);
+        }
+        return switch (action) {
+            case "apigateway:PUT" -> REST_INTEGRATION.matcher(path).matches()
+                    ? fromJson(ctx, API_GATEWAY, "credentials") : List.of();
+            case "apigateway:POST" -> {
+                if ("/v2/apis".equals(path)) {
+                    JsonNode body = jsonBody(ctx);
+                    if (body != null && (!body.has("protocolType") || "HTTP".equals(body.path("protocolType").asText()))
+                            && body.path("target").asText().startsWith("arn:")) { // partition-literal: match quick-create's legacy ARN prefix.
+                        yield passed(values(body, "credentialsArn"), API_GATEWAY);
+                    }
+                    yield List.of();
+                }
+                if (REST_AUTHORIZERS.matcher(path).matches()) {
+                    yield fromJson(ctx, API_GATEWAY, "authorizerCredentials");
+                }
+                if (V2_INTEGRATIONS.matcher(path).matches()) {
+                    yield fromJson(ctx, API_GATEWAY, "credentialsArn");
+                }
+                yield V2_AUTHORIZERS.matcher(path).matches()
+                        ? fromJson(ctx, API_GATEWAY, "authorizerCredentialsArn") : List.of();
+            }
+            case "apigateway:PATCH" -> {
+                if ("/account".equals(path)) {
+                    yield patchedRoles(ctx, "/cloudwatchRoleArn");
+                }
+                if (REST_INTEGRATION.matcher(path).matches()) {
+                    yield patchedRoles(ctx, "/credentials");
+                }
+                if (REST_AUTHORIZER.matcher(path).matches()) {
+                    yield patchedRoles(ctx, "/authorizerCredentials");
+                }
+                if (V2_INTEGRATION.matcher(path).matches()) {
+                    yield fromJson(ctx, API_GATEWAY, "credentialsArn");
+                }
+                yield V2_AUTHORIZER.matcher(path).matches()
+                        ? fromJson(ctx, API_GATEWAY, "authorizerCredentialsArn") : List.of();
+            }
+            default -> List.of();
+        };
+    }
+
+    private static List<PassedRole> patchedRoles(ContainerRequestContext ctx, String credentialPath) {
+        JsonNode body = jsonBody(ctx);
+        JsonNode operations = body == null ? null : body.get("patchOperations");
+        if (operations == null || !operations.isArray()) {
+            return List.of();
+        }
+        List<String> roles = new ArrayList<>();
+        for (JsonNode operation : operations) {
+            String op = operation.path("op").asText();
+            if (("add".equals(op) || "replace".equals(op))
+                    && credentialPath.equals(operation.path("path").asText())) {
+                roles.addAll(values(operation, "value"));
+            }
+        }
+        return passed(roles, API_GATEWAY);
+    }
+
     /**
      * The role AddRoleToInstanceProfile adds, which {@code RoleName} names without its path: the ARN IAM
      * holds it under, or else the one the name gives, so a role IAM does not hold is checked as named.
@@ -1094,6 +1221,22 @@ final class PassedRoles {
         return roleArn == null ? List.of() : passed(List.of(roleArn), service);
     }
 
+    /** A request override wins over the instance profile in the captured launch-template version. */
+    private static List<PassedRole> runInstancesProfile(ContainerRequestContext ctx, Lookups lookups) {
+        Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
+        if (blankToNull(form.get("IamInstanceProfile.Name")) != null
+                || blankToNull(form.get("IamInstanceProfile.Arn")) != null) {
+            return fromInstanceProfile(ctx, lookups, "IamInstanceProfile");
+        }
+        LaunchTemplate template = Ec2LaunchAuthorization.capturedTemplate(ctx);
+        if (template == null) {
+            return launchTemplateRoles(form, "LaunchTemplate.", lookups);
+        }
+        LaunchTemplateData.IamInstanceProfile profile = template.getData().getIamInstanceProfile();
+        return profile == null ? List.of()
+                : passed(lookups.instanceProfileRoleArns(profile.getName(), profile.getArn()), EC2);
+    }
+
     /** The roles of the instance profile named by {@code prefix}.Name or {@code prefix}.Arn. */
     private static List<PassedRole> fromInstanceProfile(ContainerRequestContext ctx, Lookups lookups, String prefix) {
         Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
@@ -1145,7 +1288,8 @@ final class PassedRoles {
         }
         try {
             String encoding = ctx.getHeaderString(HttpHeaders.CONTENT_ENCODING);
-            if (encoding != null && AwsJsonCborController.isGZipped(List.of(encoding))) {
+            if (!Boolean.TRUE.equals(ctx.getProperty(AwsJsonGzipBody.DECODED_PROPERTY))
+                    && encoding != null && AwsJsonCborController.isGZipped(List.of(encoding))) {
                 body = AwsJsonCborController.decodeBody(body);
             }
             JsonNode node = (isCbor(ctx.getMediaType()) ? CBOR_MAPPER : MAPPER).readTree(body);

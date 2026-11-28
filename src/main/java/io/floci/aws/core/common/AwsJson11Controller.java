@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import io.floci.aws.services.acm.AcmJsonHandler;
+import io.floci.aws.services.acmpca.AcmPcaJsonHandler;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2JsonHandler;
 import io.floci.aws.services.applicationautoscaling.ApplicationAutoScalingJsonHandler;
 import io.floci.aws.services.athena.AthenaJsonHandler;
@@ -110,6 +111,7 @@ public class AwsJson11Controller {
     private final KmsJsonHandler kmsJsonHandler;
     private final CognitoJsonHandler cognitoJsonHandler;
     private final AcmJsonHandler acmJsonHandler;
+    private final AcmPcaJsonHandler acmPcaJsonHandler;
     private final EcsJsonHandler ecsJsonHandler;
     private final EcrJsonHandler ecrJsonHandler;
     private final GlueJsonHandler glueJsonHandler;
@@ -169,7 +171,8 @@ public class AwsJson11Controller {
                                KinesisAnalyticsV2JsonHandler kinesisAnalyticsV2JsonHandler,
                                ApiGatewayV2JsonHandler apigwV2JsonHandler,
                                KmsJsonHandler kmsJsonHandler, CognitoJsonHandler cognitoJsonHandler,
-                               AcmJsonHandler acmJsonHandler, EcsJsonHandler ecsJsonHandler,
+                               AcmJsonHandler acmJsonHandler, AcmPcaJsonHandler acmPcaJsonHandler,
+                               EcsJsonHandler ecsJsonHandler,
                                EcrJsonHandler ecrJsonHandler, GlueJsonHandler glueJsonHandler,
                                AthenaJsonHandler athenaJsonHandler,
                                RedshiftDataJsonHandler redshiftDataJsonHandler,
@@ -230,6 +233,7 @@ public class AwsJson11Controller {
         this.kmsJsonHandler = kmsJsonHandler;
         this.cognitoJsonHandler = cognitoJsonHandler;
         this.acmJsonHandler = acmJsonHandler;
+        this.acmPcaJsonHandler = acmPcaJsonHandler;
         this.ecsJsonHandler = ecsJsonHandler;
         this.ecrJsonHandler = ecrJsonHandler;
         this.glueJsonHandler = glueJsonHandler;
@@ -355,7 +359,7 @@ public class AwsJson11Controller {
             case "elasticmapreduce" -> emrHandler.handle(action, request, region);
             case "wafv2" -> wafV2Handler.handle(action, request, region);
             case "memorydb" -> memoryDbHandler.handle(action, request, region);
-            case "logs" -> cloudWatchLogsHandler.handle(action, request, region);
+            case "logs" -> cloudWatchLogsHandler.handle(action, request, region, authorization);
             case "secretsmanager" -> secretsManagerJsonHandler.handle(action, request, region, authorization);
             case "kinesis" -> kinesisJsonHandler.handle(action, request, region);
             case "kinesisanalytics" -> kinesisAnalyticsV2JsonHandler.handle(action, request, region);
@@ -363,6 +367,7 @@ public class AwsJson11Controller {
             case "kms" -> kmsJsonHandler.handle(action, request, region);
             case "cognito-idp" -> cognitoJsonHandler.handle(action, request, region);
             case "acm" -> acmJsonHandler.handle(action, request, region);
+            case "acm-pca" -> acmPcaJsonHandler.handle(action, request, region);
             case "ecs" -> ecsJsonHandler.handle(action, request, region, baseUri);
             case "ecr" -> ecrJsonHandler.handle(action, request, region);
             case "glue" -> glueJsonHandler.handle(action, request, region);
@@ -374,6 +379,9 @@ public class AwsJson11Controller {
             case "tagging" -> resourceGroupsTaggingJsonHandler.handle(action, request, region);
             case "codebuild" -> codeBuildJsonHandler.handle(action, request, region, regionResolver.getAccountId());
             case "codedeploy" -> codeDeployJsonHandler.handle(action, request, region);
+            case "codedeploy-commands", "codedeploy-commands-secure" -> codeDeployJsonHandler.handleAgent(
+                    action, request, region, regionResolver.getAccountId(),
+                    "codedeploy-commands".equals(serviceKey));
             case "codepipeline" -> codePipelineJsonHandler.handle(
                     action, request, region, regionResolver.getAccountId());
             case "ec2messages" -> ec2MessagesJsonHandler.handle(action, request, region);
@@ -393,7 +401,8 @@ public class AwsJson11Controller {
             case "application-autoscaling" -> applicationAutoScalingJsonHandler.handle(action, request, region);
             case "lightsail" -> lightsailJsonHandler.handle(action, request, region);
             case "route53resolver" -> route53ResolverJsonHandler.handle(action, request, region, regionResolver.getAccountId());
-            case "cognito-identity" -> cognitoIdentityJsonHandler.handle(action, request, region);
+            case "cognito-identity" -> cognitoIdentityJsonHandler.handle(action, request, region,
+                    authorization != null && !authorization.isBlank());
             // Global Accelerator is a global service: its resources carry an empty ARN region
             // segment and are never partitioned by the region the caller signed with, so the
             // handler takes no region.

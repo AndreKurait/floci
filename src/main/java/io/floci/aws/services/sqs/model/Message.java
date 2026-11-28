@@ -60,10 +60,15 @@ public class Message {
     }
 
     public Message(String body) {
+        this(body, Instant.now());
+    }
+
+    /** A message sent at {@code sentTimestamp}, for a caller that keeps its own clock. */
+    public Message(String body, Instant sentTimestamp) {
         this.messageId = UUID.randomUUID().toString();
         this.body = body;
         this.messageAttributes = new HashMap<>();
-        this.sentTimestamp = Instant.now();
+        this.sentTimestamp = sentTimestamp;
         this.receiveCount = 0;
         this.md5OfBody = Digests.md5Hex(body.getBytes(StandardCharsets.UTF_8));
     }
@@ -111,6 +116,11 @@ public class Message {
      *  receipt handle, visibility) starts over. The source instance is untouched so a failed
      *  delivery can put it back as it was. */
     public Message copyForRedrive() {
+        return copyForRedrive(Instant.now());
+    }
+
+    /** {@link #copyForRedrive()} with the retention period starting over at {@code now}. */
+    public Message copyForRedrive(Instant now) {
         Message copy = copy();
         copy.messageId = UUID.randomUUID().toString();
         if (copy.messageAttributes == null) {
@@ -120,7 +130,7 @@ public class Message {
         copy.firstReceiveTimestamp = null;
         copy.receiptHandle = null;
         copy.visibleAt = null;
-        copy.retentionStartTimestamp = Instant.now();
+        copy.retentionStartTimestamp = now;
         return copy;
     }
 
@@ -183,7 +193,13 @@ public class Message {
 
     @JsonIgnore
     public boolean isVisible() {
-        return visibleAt == null || !Instant.now().isBefore(visibleAt);
+        return isVisible(Instant.now());
+    }
+
+    /** Whether the message can be received at {@code now}: it is, from the instant {@code visibleAt} on. */
+    @JsonIgnore
+    public boolean isVisible(Instant now) {
+        return visibleAt == null || !now.isBefore(visibleAt);
     }
 
     public void updateMd5OfMessageAttributes() {

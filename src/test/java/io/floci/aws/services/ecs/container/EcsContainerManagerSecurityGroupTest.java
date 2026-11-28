@@ -1,5 +1,6 @@
 package io.floci.aws.services.ecs.container;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.InspectVolumeCmd;
@@ -14,15 +15,20 @@ import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
+import io.floci.aws.services.ec2.SecurityGroupNftCompiler;
 import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.NetworkInterface;
 import io.floci.aws.services.ec2.model.SecurityGroup;
+import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
+import io.floci.aws.services.ecs.model.AwsVpcConfiguration;
+import io.floci.aws.services.ecs.model.Container;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.services.ecs.model.FirelensConfiguration;
 import io.floci.aws.services.ecs.model.LogConfiguration;
 import io.floci.aws.services.ecs.model.NetworkMode;
+import io.floci.aws.services.ecs.model.PortMapping;
 import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.floci.aws.services.s3.S3Service;
@@ -30,21 +36,37 @@ import io.floci.aws.services.secretsmanager.SecretsManagerService;
 import io.floci.aws.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.floci.aws.services.ecs.container.AwsvpcTaskFixtures.awsvpcTaskWithoutEni;
 import static io.floci.aws.services.ecs.container.AwsvpcTaskFixtures.container;
 import static io.floci.aws.services.ecs.container.AwsvpcTaskFixtures.taskDef;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -65,6 +87,8 @@ class EcsContainerManagerSecurityGroupTest {
     private RegionResolver regionResolver;
     private Ec2Service ec2Service;
     private SecurityGroupFirewallManager firewallManager;
+    private VpcNetworkManager vpcNetworks;
+    private EmulatorConfig config;
     private EcsContainerManager manager;
 
     @BeforeEach
@@ -82,7 +106,7 @@ class EcsContainerManagerSecurityGroupTest {
         when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
 
         containerDetector = mock(ContainerDetector.class);
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
         LaunchedContainerAwsEnv awsEnv = mock(LaunchedContainerAwsEnv.class);
@@ -92,6 +116,7 @@ class EcsContainerManagerSecurityGroupTest {
 
         ec2Service = mock(Ec2Service.class);
         firewallManager = mock(SecurityGroupFirewallManager.class);
+        vpcNetworks = mock(VpcNetworkManager.class);
 
         manager = new EcsContainerManager(
                 containerBuilder, lifecycleManager, mock(ContainerLogStreamer.class),
@@ -100,14 +125,178 @@ class EcsContainerManagerSecurityGroupTest {
                 ecrRegistryManager, mock(HostVolumePolicy.class),
                 ec2Service, firewallManager,
                 mock(EcsTaskRoleCredentials.class), mock(EcsCredentialsProxy.class),
-                new EcsTaskLinkLocalAddresses());
+                new EcsTaskLinkLocalAddresses(), null, vpcNetworks);
+    }
+
+    private void protectedTaskNetwork() {
+        protectedTaskNetwork(false);
+    }
+
+    private void protectedTaskNetwork(boolean ipv6) {
+        when(firewallManager.enabled()).thenReturn(true);
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
+                .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "172.20.0.5"));
+        NetworkInterface eni = new NetworkInterface();
+        eni.setNetworkInterfaceId("eni-1");
+        eni.setVpcId("vpc-1");
+        eni.setSubnetId("subnet-1");
+        eni.setPrivateIpAddress("10.0.0.10");
+        eni.setIpv6Addresses(ipv6 ? List.of("2600:1f18:abcd:ef01::1234") : List.of());
+        eni.setGroups(List.of(new GroupIdentifier("sg-1", "default")));
+        when(ec2Service.createNetworkInterface(any(), eq("subnet-1"), any(), any(), any(), any(), any()))
+                .thenReturn(eni);
+        SecurityGroup group = new SecurityGroup();
+        group.setGroupId("sg-1");
+        when(ec2Service.describeSecurityGroups(any(), eq(List.of("sg-1")), any(), any()))
+                .thenReturn(List.of(group));
+    }
+
+    @Test
+    void attachedVpcAddressIsRuntimeStateOnly() throws Exception {
+        Container container = new Container();
+        container.setName("app");
+        container.setAttachedVpcAddress("10.0.0.10");
+        ObjectMapper mapper = new ObjectMapper();
+
+        String json = mapper.writeValueAsString(container);
+
+        assertFalse(mapper.readTree(json).has("attachedVpcAddress"));
+        assertNull(mapper.readValue(json, Container.class).getAttachedVpcAddress());
+        assertNull(mapper.readValue("{\"attachedVpcAddress\":\"10.0.0.10\"}", Container.class)
+                .getAttachedVpcAddress());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void loadBalancerUsesTheActuallyAttachedVpcAddress(boolean inDocker) {
+        protectedTaskNetwork();
+        when(containerDetector.isRunningInContainer()).thenReturn(inDocker);
+        when(vpcNetworks.enabled()).thenReturn(true);
+        when(vpcNetworks.attach("000000000000", "us-east-1", "vpc-1", "subnet-1", "helper-id", "10.0.0.10", false))
+                .thenReturn(Optional.of("native-vpc-network"));
+        EcsTask task = awsvpcTaskWithoutEni();
+
+        manager.startTask(task, awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        Container container = task.getContainers().getFirst();
+        assertEquals("10.0.0.10", manager.resolveLoadBalancerHost(container));
+    }
+
+    @Test
+    void controlPlaneEniWithoutVpcAttachmentKeepsHostRouting() {
+        protectedTaskNetwork();
+        EcsTask task = awsvpcTaskWithoutEni();
+        manager.startTask(task, awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        assertEquals("10.0.0.10", task.getPrivateIpAddress());
+        assertEquals("127.0.0.1", manager.resolveLoadBalancerHost(task.getContainers().getFirst()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nativeVpcAddressIsAttachedBeforeItsFirewallPolicyIsRegistered(boolean ipv6) {
+        protectedTaskNetwork(ipv6);
+        when(vpcNetworks.enabled()).thenReturn(true);
+        when(vpcNetworks.attach("000000000000", "us-east-1", "vpc-1", "subnet-1", "helper-id", "10.0.0.10", ipv6))
+                .thenReturn(Optional.of("native-vpc-network"));
+
+        EcsTask task = awsvpcTaskWithoutEni();
+        manager.startTask(task, awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        ArgumentCaptor<SecurityGroupNftCompiler.Endpoint> endpoint =
+                ArgumentCaptor.forClass(SecurityGroupNftCompiler.Endpoint.class);
+        InOrder order = inOrder(vpcNetworks, firewallManager, lifecycleManager);
+        order.verify(vpcNetworks).attach("000000000000", "us-east-1", "vpc-1", "subnet-1", "helper-id", "10.0.0.10", ipv6);
+        order.verify(firewallManager).register(endpoint.capture(), eq("helper-id"), any());
+        order.verify(lifecycleManager).createAndStartEphemeral(any(), any());
+        assertEquals("10.0.0.10", endpoint.getValue().logicalAddress());
+        assertEquals("172.20.0.5", endpoint.getValue().transportAddress());
+        assertEquals(Set.of("10.0.0.10"), endpoint.getValue().additionalTransportAddresses());
+        assertEquals(Set.of("sg-1"), endpoint.getValue().groupIds());
+        assertEquals("10.0.0.10", task.getPrivateIpAddress());
+        verify(builder).withNetworkMode("container:helper-id");
+    }
+
+    @Test
+    void absentNativeAttachmentStopsBeforeRegisteringOrLaunchingWorkloads() {
+        protectedTaskNetwork();
+        when(vpcNetworks.enabled()).thenReturn(true);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.startTask(awsvpcTaskWithoutEni(), awsvpcTaskDef(List.of()), List.of(), "us-east-1"));
+
+        assertEquals("Protected ECS namespace could not attach to its VPC", failure.getMessage());
+        verify(firewallManager, never()).register(any(), any(), any());
+        verify(lifecycleManager, never()).createAndStartEphemeral(any(), any());
+        verify(lifecycleManager).removeIfExists("helper-id");
+        verify(ec2Service).releaseNetworkInterfaceFromService("us-east-1", "eni-1");
+        verify(ec2Service).deleteNetworkInterface("us-east-1", "eni-1");
+    }
+
+    @Test
+    void nativeAttachmentFailureKeepsItsCauseAndReleasesTheUnstartedTask() {
+        protectedTaskNetwork();
+        IllegalStateException denied = new IllegalStateException("Native subnet attachment failed");
+        when(vpcNetworks.attach("000000000000", "us-east-1", "vpc-1", "subnet-1", "helper-id", "10.0.0.10", false))
+                .thenThrow(denied);
+
+        assertSame(denied, assertThrows(IllegalStateException.class,
+                () -> manager.startTask(awsvpcTaskWithoutEni(), awsvpcTaskDef(List.of()), List.of(), "us-east-1")));
+
+        verify(firewallManager, never()).register(any(), any(), any());
+        verify(lifecycleManager, never()).createAndStartEphemeral(any(), any());
+        verify(lifecycleManager).removeIfExists("helper-id");
+        verify(ec2Service).deleteNetworkInterface("us-east-1", "eni-1");
+    }
+
+    @Test
+    void legacyVpcModeKeepsTheTransportAddressWithoutClaimingANativeAttachment() {
+        protectedTaskNetwork();
+
+        manager.startTask(awsvpcTaskWithoutEni(), awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        ArgumentCaptor<SecurityGroupNftCompiler.Endpoint> endpoint =
+                ArgumentCaptor.forClass(SecurityGroupNftCompiler.Endpoint.class);
+        verify(firewallManager).register(endpoint.capture(), eq("helper-id"), any());
+        assertEquals("172.20.0.5", endpoint.getValue().transportAddress());
+        assertEquals(Set.of(), endpoint.getValue().additionalTransportAddresses());
+        verify(builder).withNetworkMode("container:helper-id");
+    }
+
+    @Test
+    void operatorHostsEntriesGoOnTheNamespaceItsContainersRead() {
+        // In container network mode Docker takes no hosts entries on the workload itself.
+        when(config.services().ecs().dockerFlags())
+                .thenReturn(Optional.of("--add-host host.docker.internal:10.9.0.2"));
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(firewallManager.enabled()).thenReturn(true);
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
+                .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
+        NetworkInterface eni = new NetworkInterface();
+        eni.setNetworkInterfaceId("eni-1");
+        eni.setVpcId("vpc-1");
+        eni.setPrivateIpAddress("10.0.0.10");
+        eni.setGroups(List.of(new GroupIdentifier("sg-1", "default")));
+        when(ec2Service.createNetworkInterface(any(), eq("subnet-1"), any(), any(), any(), any(), any()))
+                .thenReturn(eni);
+        SecurityGroup sg = new SecurityGroup();
+        sg.setGroupId("sg-1");
+        when(ec2Service.describeSecurityGroups(any(), eq(List.of("sg-1")), any(), any())).thenReturn(List.of(sg));
+
+        manager.startTask(awsvpcTaskWithoutEni(), awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                eq(List.of("host.docker.internal:10.9.0.2")), eq(false), eq(List.of()));
     }
 
     @Test
     void awsvpcTaskWithFirewallJoinsHelperNamespaceAndSkipsHostPorts() {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
 
         NetworkInterface eni = new NetworkInterface();
@@ -136,6 +325,9 @@ class EcsContainerManagerSecurityGroupTest {
         verify(dockerClient).inspectContainerCmd("helper-id");
         verify(dockerClient, times(1)).inspectContainerCmd("docker-id");
         verify(firewallManager).register(any(), eq("helper-id"), any());
+        // The task's containers read the helper's hosts file: no entry ECS would not add.
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), eq(List.of()));
         assertEquals("eni-1", handle.getNetworkInterfaceId());
         assertEquals("us-east-1", handle.getRegion());
     }
@@ -158,7 +350,8 @@ class EcsContainerManagerSecurityGroupTest {
     void stopTaskUnregistersEniAndReleasingTheTaskNetworkDeletesIt() {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
 
         NetworkInterface eni = new NetworkInterface();
@@ -191,10 +384,45 @@ class EcsContainerManagerSecurityGroupTest {
     }
 
     @Test
+    void policyRetirementCanStillWriteToTheHelperNamespace() {
+        EcsTaskHandle handle = new EcsTaskHandle("task-arn", Map.of(), Map.of(), null, "eni-1", "us-east-1");
+        AtomicBoolean helperExists = new AtomicBoolean(true);
+        doAnswer(invocation -> {
+            helperExists.set(false);
+            return null;
+        }).when(firewallManager).removeNamespaceStrict("eni-1");
+        doAnswer(invocation -> {
+            assertTrue(helperExists.get(), "Policy retirement needs the helper until its writers finish");
+            return null;
+        }).when(firewallManager).unregister("eni-1");
+
+        assertTrue(manager.stopTaskAndCollectExitCodes(handle).isEmpty());
+
+        assertFalse(helperExists.get());
+        verify(ec2Service, never()).deleteNetworkInterface(any(), any());
+    }
+
+    @Test
+    void failedPolicyRetirementKeepsTheNamespaceForRetry() {
+        EcsTaskHandle handle = new EcsTaskHandle("task-arn", Map.of(), Map.of(), null, "eni-1", "us-east-1");
+        doThrow(new IllegalStateException("Policy writer not drained")).doNothing()
+                .when(firewallManager).unregister("eni-1");
+
+        assertThrows(IllegalStateException.class, () -> manager.stopTaskAndCollectExitCodes(handle));
+        verify(firewallManager, never()).removeNamespaceStrict("eni-1");
+        verify(ec2Service, never()).deleteNetworkInterface(any(), any());
+
+        assertTrue(manager.stopTaskAndCollectExitCodes(handle).isEmpty());
+
+        verify(firewallManager).removeNamespaceStrict("eni-1");
+    }
+
+    @Test
     void firelensRouterAndAppBothJoinTheHelperNamespace() {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any()))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
 
         NetworkInterface eni = new NetworkInterface();
@@ -242,9 +470,22 @@ class EcsContainerManagerSecurityGroupTest {
         verify(builder, times(2)).withNetworkMode("container:helper-id");
         verify(builder, times(2)).withLabels(Map.of("io.floci.security-group.workload", "true"));
 
-        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any());
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                any(), anyBoolean(), any());
         verify(lifecycleManager).create(any(), any());
         verify(lifecycleManager).startCreated(eq("router-id"), any());
         verify(lifecycleManager).createAndStartEphemeral(any(), any());
     }
+    private static TaskDefinition awsvpcTaskDef(List<PortMapping> ports) {
+        ContainerDefinition app = new ContainerDefinition();
+        app.setName("app");
+        app.setImage("app:latest");
+        app.setPortMappings(ports);
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("test-family");
+        taskDef.setNetworkMode(NetworkMode.awsvpc);
+        taskDef.setContainerDefinitions(List.of(app));
+        return taskDef;
+    }
+
 }

@@ -82,7 +82,7 @@ class RedshiftDataAuditTest {
                 releaseCommit.countDown();
                 releaseTail.countDown();
             }
-            Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            Awaitility.await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                     assertEquals("FINISHED", fixture.service.describeStatement(identifier).path("Status").asText()));
             assertEquals(List.of("alice"), fixture.loggedUsers());
         }

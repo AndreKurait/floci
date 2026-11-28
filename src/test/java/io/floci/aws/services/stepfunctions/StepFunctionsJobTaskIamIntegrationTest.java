@@ -910,6 +910,10 @@ class StepFunctionsJobTaskIamIntegrationTest {
             }
             ecs("DeleteCluster", Map.of("cluster", name)).then().statusCode(200);
         });
+        String instance = ecs("RegisterContainerInstance", Map.of("cluster", name)).then().statusCode(200)
+                .extract().path("containerInstance.containerInstanceArn");
+        cleanup.register(() -> ecs("DeregisterContainerInstance",
+                Map.of("cluster", name, "containerInstance", instance, "force", true)).then().statusCode(200));
         return name;
     }
 

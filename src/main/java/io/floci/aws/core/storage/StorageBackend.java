@@ -17,6 +17,15 @@ public interface StorageBackend<K, V> {
     void put(K key, V value);
 
     /**
+     * Persist a live value only while this exact object remains stored under the key.
+     * Coordinate the identity check with deletion, clearing and replacement. This never
+     * inserts a missing record and retains the backend's normal write durability.
+     */
+    default boolean persistIfCurrent(K key, V value) {
+        throw new UnsupportedOperationException("Conditional persistence is not supported by this backend");
+    }
+
+    /**
      * Store several entries as one logical write. Backends that can persist a batch more
      * efficiently should override this method; the default preserves compatibility for
      * lightweight and service-specific implementations.
@@ -35,6 +44,11 @@ public interface StorageBackend<K, V> {
         throw new UnsupportedOperationException("Atomic batches are not supported by this backend");
     }
 
+    /** Atomic batch persisted before publication, including in hybrid mode; memory remains volatile. */
+    default void putAllDurably(Map<K, V> entries) {
+        throw new UnsupportedOperationException("Durable atomic batches are not supported by this backend");
+    }
+
     Optional<V> get(K key);
 
     void delete(K key);
@@ -42,6 +56,16 @@ public interface StorageBackend<K, V> {
     /** Remove keys as one storage commit, with the same durability guarantees as atomic puts. */
     default void deleteAllAtomically(Set<K> keys) {
         throw new UnsupportedOperationException("Atomic deletions are not supported by this backend");
+    }
+
+    /**
+     * Replace values and remove keys as one storage commit. Deletion wins when a key
+     * occurs in both arguments. Values must not be mutated after publication. This has
+     * the same durability guarantees as atomic puts, including asynchronous hybrid writes.
+     * Unsupported backends reject the operation without changing any entries.
+     */
+    default void applyAtomically(Map<K, V> entries, Set<K> keys) {
+        throw new UnsupportedOperationException("Mixed atomic batches are not supported by this backend");
     }
 
     /**
@@ -60,6 +84,11 @@ public interface StorageBackend<K, V> {
 
     /** Persist data to disk if applicable. */
     void flush();
+
+    /** Persist current state and report failure before a dependent durable outcome is acknowledged. */
+    default void flushOrThrow() {
+        throw new UnsupportedOperationException("Checked persistence is not supported by this backend");
+    }
 
     /** Load data from disk on startup. */
     void load();

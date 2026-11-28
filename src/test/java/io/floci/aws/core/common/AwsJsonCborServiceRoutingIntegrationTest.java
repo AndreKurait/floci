@@ -58,6 +58,7 @@ class AwsJsonCborServiceRoutingIntegrationTest {
             operation("states", "ListStateMachines"),
             operation("swf", "ListDomains", "{\"registrationStatus\":\"REGISTERED\"}"),
             operation("acm", "ListCertificates"),
+            operation("acm-pca", "ListCertificateAuthorities"),
             operation("athena", "ListWorkGroups"),
             operation("glue", "GetDatabases"),
             operation("firehose", "ListDeliveryStreams"),
@@ -67,6 +68,8 @@ class AwsJsonCborServiceRoutingIntegrationTest {
             operation("codebuild", "ListProjects"),
             operation("sagemaker", "ListModels"),
             operation("codedeploy", "ListApplications"),
+            Map.entry("codedeploy-commands", new Operation("PollHostCommand", "{}", 400)),
+            Map.entry("codedeploy-commands-secure", new Operation("PollHostCommand", "{}", 400)),
             operation("codepipeline", "ListPipelines"),
             operation("servicequotas", "ListServices"),
             operation("config", "DescribeConfigRules"),
@@ -138,6 +141,10 @@ class AwsJsonCborServiceRoutingIntegrationTest {
         assertEquals(operation.status(), json.statusCode(), service + " JSON baseline: " + json.asString());
         JsonNode jsonBody = JSON.readTree(json.asByteArray());
         assertFalse(jsonBody.isEmpty(), service + " must return a service-specific response");
+        if (service.startsWith("codedeploy-commands")) {
+            assertEquals("ValidationException", jsonBody.path("__type").asText());
+            assertEquals("HostIdentifier must be a nonempty string", jsonBody.path("message").asText());
+        }
 
         String path = "/service/" + prefix.substring(0, prefix.length() - 1)
                 + "/operation/" + operation.action();

@@ -194,6 +194,8 @@ class CloudFormationGetStackOutputIntegrationTest {
         String cdkShape = name("cdk-shape");
         String lambdaOnly = name("lambda-only");
         String producer = name("trust-producer");
+        createRole(DEFAULT_ACCOUNT, "cdk-hnb659fds-cfn-exec-role-" + DEFAULT_ACCOUNT + "-us-east-1",
+                "{\"Service\":\"cloudformation.amazonaws.com\"}");
         createRole(OTHER_ACCOUNT, cdkShape, "{\"AWS\":\"arn:aws:iam::" + DEFAULT_ACCOUNT
                 + ":role/cdk-hnb659fds-cfn-exec-role-" + DEFAULT_ACCOUNT + "-us-east-1\"}");
         createRole(OTHER_ACCOUNT, lambdaOnly, "{\"Service\":\"lambda.amazonaws.com\"}");

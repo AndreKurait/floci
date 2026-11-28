@@ -22,6 +22,21 @@ class WebIdentityTrustPolicyEvaluatorTest {
     private final WebIdentityTrustPolicyEvaluator evaluator =
             new WebIdentityTrustPolicyEvaluator(new ObjectMapper());
 
+    @Test
+    void supplementaryActionsKeepTheRequestSessionNameAndSubjectConditions() {
+        for (String action : List.of("sts:TagSession", "sts:SetSourceIdentity")) {
+            String document = """
+                    {"Statement":[{"Effect":"Allow","Principal":{"Federated":"%s"},"Action":"%s",
+                     "Condition":{"StringEquals":{"sts:RoleSessionName":"%s","%s:sub":"%s"}}}]}
+                    """.formatted(PROVIDER_ARN, action, SESSION_NAME, PREFIX, SUBJECT);
+            assertTrue(evaluator.allowsAction(document, PROVIDER_ARN, PREFIX, claims(SUBJECT), SESSION_NAME, action));
+            assertFalse(evaluator.allowsAction(document, PROVIDER_ARN, PREFIX, claims(SUBJECT), "other", action));
+            assertFalse(evaluator.allowsAction(document, PROVIDER_ARN, PREFIX, claims(SUBJECT), null, action));
+            assertFalse(evaluator.allowsAction(document, PROVIDER_ARN, PREFIX, claims("other"), SESSION_NAME, action));
+            assertFalse(evaluator.allows(document, PROVIDER_ARN, PREFIX, claims(SUBJECT), SESSION_NAME));
+        }
+    }
+
     /** The canonical IRSA trust policy shape. */
     private String irsaTrustPolicy(String subject) {
         return """

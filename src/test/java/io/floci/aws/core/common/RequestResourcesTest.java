@@ -72,6 +72,29 @@ class RequestResourcesTest {
     }
 
     @Test
+    void commandTargetsRetainDocumentAndDistinguishEc2FromManagedInstances() throws IOException {
+        String body = """
+                {"DocumentName":"run","InstanceIds":["i-12345678","mi-12345678901234567","unknown"]}
+                """;
+        List<String> expected = List.of("arn:aws:ssm:us-east-1:000000000000:document/run",
+                "arn:aws:ec2:us-east-1:000000000000:instance/i-12345678",
+                "arn:aws:ssm:us-east-1:000000000000:managed-instance/mi-12345678901234567", "*");
+        assertEquals(expected, of("ssm:SendCommand", json(body)));
+        assertEquals(expected, RequestResources.ofBody("ssm:SendCommand", new ObjectMapper().readTree(body),
+                "aws", "us-east-1", "000000000000", null));
+        assertEquals(List.of(expected.getFirst()), of("ssm:SendCommand", json("{\"DocumentName\":\"run\"}")));
+    }
+
+    @Test
+    void mixedCommandTargetsPreserveExplicitPartitionAndUncataloguedRegion() {
+        assertEquals(List.of("arn:aws-iso:ssm:us-iso-future-1:123456789012:document/run",
+                        "arn:aws-iso:ec2:us-iso-future-1:123456789012:instance/i-12345678"),
+                RequestResources.of("ssm:SendCommand", json("""
+                        {"DocumentName":"run","InstanceIds":["i-12345678"]}
+                        """), "aws-iso", "us-iso-future-1", "123456789012"));
+    }
+
+    @Test
     void ec2ListsUseSdkWireNamesAndIgnoreForgedQuerySpellings() {
         String prefix = "arn:aws:ec2:us-east-1:000000000000:";
         List<String> expected = List.of(prefix + "network-interface/*", prefix + "security-group/sg-one",
@@ -229,6 +252,58 @@ class RequestResourcesTest {
                     "aws-us-gov", "us-gov-west-1", "111111111111", null));
             assertEquals(List.of("*", "*"), of(operation,
                     form("ResourceId.1=vpce-svc-22222222&ResourceId.2=eni-attach-11111111")));
+        }
+    }
+
+    @Test
+    void aConfigurationSessionAuthorizesItsCanonicalApplication() {
+        StoredResourceArns stored = new StoredResourceArns() {
+            @Override
+            public String namespace() {
+                return "appconfig";
+            }
+
+            @Override
+            public Optional<String> find(String type, List<String> names, String region) {
+                assertEquals("application", type);
+                assertEquals(List.of("orders"), names);
+                assertEquals("cn-north-1", region);
+                return Optional.of("arn:aws-cn:appconfig:cn-north-1:111122223333:application/app1234");
+            }
+        };
+        assertEquals(List.of("arn:aws-cn:appconfig:cn-north-1:111122223333:application/app1234"),
+                RequestResources.of("appconfig:StartConfigurationSession", json("""
+                        {"ApplicationIdentifier":"orders","EnvironmentIdentifier":"production",
+                         "ConfigurationProfileIdentifier":"settings"}
+                        """), "aws-cn", "cn-north-1", "111122223333", stored));
+    }
+
+    @Test
+    void anExtensionArnDoesNotAlsoNameEveryVersionOfTheExtension() {
+        String arn = "arn:aws:appconfig:us-east-1:000000000000:extension/ext1234/7";
+        for (String operation : List.of("GetExtension", "UpdateExtension", "DeleteExtension")) {
+            assertEquals(List.of(arn), RequestResources.of("appconfig:" + operation, json("{}"),
+                    "aws", "us-east-1", "000000000000", null, Map.of("ExtensionIdentifier", arn)));
+        }
+    }
+
+    @Test
+    void swfDomainOperationsUseTheDomainNameAndTagOperationsUseItsArn() {
+        String domain = "arn:aws:swf:us-east-1:000000000000:/domain/orders";
+        assertEquals(List.of(domain), of("swf:StartWorkflowExecution",
+                json("{\"domain\":\"orders\",\"workflowId\":\"delivery\"}")));
+        assertEquals(List.of(domain), of("swf:SignalWorkflowExecution", json("{\"domain\":\"orders\"}")));
+        assertEquals(List.of(domain), of("swf:DescribeDomain", json("{\"name\":\"orders\"}")));
+        assertEquals(List.of(domain), of("swf:TagResource", json("{\"resourceArn\":\"" + domain + "\"}")));
+        assertEquals(List.of("arn:aws-us-gov:swf:us-gov-west-1:123456789012:/domain/orders"),
+                RequestResources.of("swf:StartWorkflowExecution", json("{\"domain\":\"orders\"}"),
+                        "aws-us-gov", "us-gov-west-1", "123456789012"));
+    }
+
+    @Test
+    void injectingADomainDoesNotScopeGlobalSwfOperationsOrAnUnknownOperation() {
+        for (String operation : List.of("swf:ListDomains", "swf:RegisterDomain", "swf:NoSuchOperation")) {
+            assertEquals(List.of(), of(operation, json("{\"name\":\"orders\",\"domain\":\"orders\"}")));
         }
     }
 
@@ -430,6 +505,27 @@ class RequestResourcesTest {
                 json("{\"actions\":{}}"), "aws", "us-east-1", "000000000000", null, Map.of("id", "EXT1")));
     }
 
+    @Test
+    void memoryDbNamesAndAllCreatedResourcePathsUseCanonicalIdentity() throws Exception {
+        String body = "{\"ParameterGroupName\":\"Mixed-Name\"}";
+        String operation = "memorydb:CreateParameterGroup";
+        String expected = "arn:aws-cn:memorydb:future-memorydb-1:000000000000:parametergroup/mixed-name";
+        assertEquals(List.of(), of(operation, json(body)));
+        assertEquals(List.of(expected), RequestResources.of("memorydb:DescribeParameters", json(body),
+                "aws-cn", "future-memorydb-1", "000000000000"));
+        assertEquals(List.of(expected), RequestResources.created(operation, json(body),
+                "aws-cn", "future-memorydb-1", "000000000000"));
+        assertEquals(List.of(expected), RequestResources.created(operation, json(body),
+                "aws-cn", "future-memorydb-1", "000000000000", Map.of()));
+        assertEquals(List.of(expected), RequestResources.created(operation, "memorydb:TagResource", json(body),
+                "aws-cn", "future-memorydb-1", "000000000000", Map.of()));
+        assertEquals(List.of(expected), RequestResources.created(operation, "memorydb:TagResource",
+                new ObjectMapper().readTree(body), "aws-cn", "future-memorydb-1", "000000000000"));
+        String explicit = expected.replace("mixed-name", "Mixed-Name");
+        assertEquals(List.of(explicit), RequestResources.of("memorydb:TagResource",
+                json("{\"ResourceArn\":\"" + explicit + "\"}"), "aws-cn", "future-memorydb-1", "000000000000"));
+    }
+
     /**
      * A create whose action acts on no type tags the resource it makes where its tagging action acts on that type,
      * and is itself checked on {@code *}: Resource Explorer's {@code CreateView} tags its view; a Cloud Map namespace
@@ -462,6 +558,18 @@ class RequestResourcesTest {
                 + "\"ACLName\":\"open-access\",\"Tags\":[{\"Key\":\"team\",\"Value\":\"a\"}]}");
         assertEquals(List.of("arn:aws:memorydb:us-east-1:000000000000:cluster/cache"),
                 created("memorydb:CreateCluster", cluster));
+    }
+
+    @Test
+    void privateCaCreateTagsTheNewAuthorityWithoutScopingItsPrimaryAction() {
+        ContainerRequestContext request = json("{}");
+        String authority = "arn:aws-cn:acm-pca:cn-north-1:123456789012:certificate-authority/*";
+        assertEquals(List.of(), RequestResources.of("acm-pca:CreateCertificateAuthority", request,
+                "aws-cn", "cn-north-1", "123456789012"));
+        assertEquals(List.of(authority), RequestResources.created("acm-pca:CreateCertificateAuthority",
+                "acm-pca:TagCertificateAuthority", request, "aws-cn", "cn-north-1", "123456789012", Map.of()));
+        assertEquals(List.of(authority), RequestResources.created("acm-pca:CreateCertificateAuthority",
+                json("{}"), "aws-cn", "cn-north-1", "123456789012", Map.of()));
     }
 
     /** A namespace's stored ARNs that find nothing, and act on the resource {@code arn} names in its own account. */
@@ -624,17 +732,19 @@ class RequestResourcesTest {
     }
 
     /**
-     * Step Functions Local's {@code <stateMachineArn>#<test case>} is no ARN AWS has, and neither botocore nor the
-     * Service Reference says to read it otherwise, so a request giving one is checked on it as given.
+     * Execution starts run the machine before Step Functions Local's {@code #<test case>} suffix. Other operations
+     * keep the selector whole.
      */
     @Test
-    void aStateMachinesTestCaseIsCheckedAsGiven() {
-        assertEquals(List.of(MACHINE + "#HappyPath"), of("states:StartExecution",
+    void aStateMachinesTestCaseIsCheckedOnTheMachineItRuns() {
+        assertEquals(List.of(MACHINE), of("states:StartExecution",
                 json("{\"stateMachineArn\":\"" + MACHINE + "#HappyPath\"}")));
+        assertEquals(List.of(MACHINE), of("states:StartSyncExecution",
+                json("{\"stateMachineArn\":\"" + MACHINE + "#\"}")));
         assertEquals(List.of(MACHINE + "#x"), of("states:DescribeStateMachine",
                 json("{\"stateMachineArn\":\"" + MACHINE + "#x\"}")));
         assertEquals(List.of("arn:aws:states:us-east-1:000000000000:execution:orders:*"), created("states:StartExecution",
-                json("{\"stateMachineArn\":\"" + MACHINE + "\"}")));
+                json("{\"stateMachineArn\":\"" + MACHINE + "#HappyPath\"}")));
     }
 
     /**
@@ -1140,10 +1250,12 @@ class RequestResourcesTest {
             }
         };
         String provisioned = "{\"InstanceArn\":\"" + instance + "\",\"PermissionSetArn\":\"" + permissionSet + "\",";
-        assertEquals(List.of(instance, permissionSet), RequestResources.of("sso:ProvisionPermissionSet",
+        List<String> allAccounts = List.of(instance, permissionSet,
+                "arn:aws:sso:::account/111111111111", "arn:aws:sso:::account/222222222222");
+        assertEquals(allAccounts, RequestResources.of("sso:ProvisionPermissionSet",
                 json(provisioned + "\"TargetType\":\"ALL_PROVISIONED_ACCOUNTS\"}"), "aws", "us-east-1",
                 "000000000000", sso));
-        assertEquals(List.of(instance, permissionSet), RequestResources.of("sso:ProvisionPermissionSet",
+        assertEquals(allAccounts, RequestResources.of("sso:ProvisionPermissionSet",
                 json(provisioned + "\"TargetType\":\"ALL_PROVISIONED_ACCOUNTS\",\"TargetId\":null}"), "aws",
                 "us-east-1", "000000000000", sso));
         assertEquals(List.of(instance, permissionSet, "arn:aws:sso:::account/333333333333"), RequestResources.of(

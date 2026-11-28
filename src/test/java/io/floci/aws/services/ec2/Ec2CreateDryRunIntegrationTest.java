@@ -18,8 +18,9 @@ import static org.hamcrest.Matchers.equalTo;
 /**
  * DryRun on CreateVpc, CreateSubnet and CreateSecurityGroup is answered with DryRunOperation and HTTP 412,
  * and nothing is created, so the real create that follows can still take the same CIDR block or group
- * name. A subnet or group dry run first needs the VPC it names to exist; Floci then answers it before the
- * CIDR block, tenancy, overlap and group name are checked, an order AWS does not document.
+ * name. These create dry runs precede VPC existence, CIDR block, tenancy, overlap and group name validation.
+ * Corresponding real requests still validate their inputs and referenced resources. RunInstances has
+ * separate validation-order coverage in Ec2RunInstancesDryRunIntegrationTest.
  */
 @QuarkusTest
 class Ec2CreateDryRunIntegrationTest {
@@ -145,8 +146,8 @@ class Ec2CreateDryRunIntegrationTest {
     }
 
     /**
-     * A subnet or group dry run naming a VPC that does not exist, or a subnet dry run naming none, keeps the
-     * error the real create gives, as a RunInstances dry run keeps the error of a missing subnet.
+     * AWS answers these create dry runs before VPC validation, including an omitted VPC ID.
+     * The corresponding real requests still reject the missing VPC.
      */
     @ParameterizedTest
     @CsvSource({
@@ -154,10 +155,8 @@ class Ec2CreateDryRunIntegrationTest {
             "subnet-without-vpc-id, MissingParameter",
             "group-in-missing-vpc, InvalidVpcID.NotFound"
     })
-    void aDryRunKeepsTheErrorOfAMissingVpc(String request, String errorCode) {
-        missingVpcCreate(request).formParam("DryRun", "true")
-                .post("/").then().statusCode(400)
-                .body("Response.Errors.Error.Code", equalTo(errorCode));
+    void aDryRunPrecedesMissingVpcValidation(String request, String errorCode) {
+        assertDryRun(missingVpcCreate(request).formParam("DryRun", "true"));
 
         missingVpcCreate(request)
                 .post("/").then().statusCode(400)

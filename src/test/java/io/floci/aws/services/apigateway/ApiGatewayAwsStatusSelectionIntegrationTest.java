@@ -139,6 +139,20 @@ class ApiGatewayAwsStatusSelectionIntegrationTest {
                 eq(MESSAGE.getBytes(StandardCharsets.UTF_8)), eq(InvocationType.RequestResponse));
     }
 
+    @Test
+    void lambdaFunctionErrorIsSelectedByItsErrorMessageAlone() {
+        byte[] errorPayload = "{\"errorMessage\":\"Malformed input: id\",\"errorType\":\"Error\"}"
+                .getBytes(StandardCharsets.UTF_8);
+        when(lambdaService.invokeTarget(eq("us-east-1"), eq(LAMBDA_ARN), any(byte[].class),
+                eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult(200, "Unhandled", errorPayload, null, "function-error"));
+        String apiId = lambdaApi(502, "Malformed.*");
+
+        given().contentType(ContentType.JSON).body(MESSAGE)
+                .post("/execute-api/" + apiId + "/test/send")
+                .then().statusCode(502).body("result", equalTo("matched"));
+    }
+
     private String createQueue(String queueName) {
         String queueUrl = given().contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "CreateQueue").formParam("QueueName", queueName)

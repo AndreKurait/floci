@@ -21,6 +21,7 @@ import jakarta.ws.rs.core.Response;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -42,6 +43,7 @@ public class KinesisJsonHandler {
     private final KinesisService service;
     private final ObjectMapper objectMapper;
     private final long nextTokenTtlMillis;
+    private final Clock clock;
 
     @Inject
     public KinesisJsonHandler(KinesisService service, ObjectMapper objectMapper, EmulatorConfig config) {
@@ -49,9 +51,15 @@ public class KinesisJsonHandler {
     }
 
     KinesisJsonHandler(KinesisService service, ObjectMapper objectMapper, long nextTokenTtlMillis) {
+        this(service, objectMapper, nextTokenTtlMillis, Clock.systemUTC());
+    }
+
+    /** As above, with the clock a NextToken is issued on and its age is measured on. */
+    KinesisJsonHandler(KinesisService service, ObjectMapper objectMapper, long nextTokenTtlMillis, Clock clock) {
         this.service = service;
         this.objectMapper = objectMapper;
         this.nextTokenTtlMillis = nextTokenTtlMillis;
+        this.clock = clock;
     }
 
     /**
@@ -71,6 +79,9 @@ public class KinesisJsonHandler {
             case "ListStreams" -> () -> handleListStreams(request, region);
             case "DescribeStream" -> () -> handleDescribeStream(request, region);
             case "DescribeStreamSummary" -> () -> handleDescribeStreamSummary(request, region);
+            case "GetResourcePolicy" -> () -> handleGetResourcePolicy(request, region);
+            case "PutResourcePolicy" -> () -> handlePutResourcePolicy(request, region);
+            case "DeleteResourcePolicy" -> () -> handleDeleteResourcePolicy(request, region);
             case "RegisterStreamConsumer" -> () -> handleRegisterStreamConsumer(request, region);
             case "DeregisterStreamConsumer" -> () -> handleDeregisterStreamConsumer(request, region);
             case "DescribeStreamConsumer" -> () -> handleDescribeStreamConsumer(request, region);
@@ -259,7 +270,7 @@ public class KinesisJsonHandler {
         response.put("HasMoreStreams", streams.size() > limit);
         if (streams.size() > limit) {
             response.put("NextToken", encodeNextToken("ListStreams|" + region,
-                    Base64Url.encode(page.getLast().getStreamName()), System.currentTimeMillis()));
+                    Base64Url.encode(page.getLast().getStreamName()), clock.millis()));
         }
         return Response.ok(response).build();
     }
@@ -356,6 +367,22 @@ public class KinesisJsonHandler {
 
     private BigDecimal epochSeconds(Instant timestamp) {
         return BigDecimal.valueOf(timestamp.toEpochMilli(), 3);
+    }
+
+    private Response handleGetResourcePolicy(JsonNode request, String region) {
+        String policy = service.getResourcePolicy(KinesisResourcePolicies.requiredString(request, "ResourceARN"), region);
+        return Response.ok(objectMapper.createObjectNode().put("Policy", policy)).build();
+    }
+
+    private Response handlePutResourcePolicy(JsonNode request, String region) {
+        service.putResourcePolicy(KinesisResourcePolicies.requiredString(request, "ResourceARN"),
+                KinesisResourcePolicies.requiredString(request, "Policy"), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDeleteResourcePolicy(JsonNode request, String region) {
+        service.deleteResourcePolicy(KinesisResourcePolicies.requiredString(request, "ResourceARN"), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleRegisterStreamConsumer(JsonNode request, String region) {
@@ -834,7 +861,7 @@ public class KinesisJsonHandler {
         List<KinesisShard> page = paginateShards(snapshot.subList(start, snapshot.size()), maxResults);
         String nextCursor = start + page.size() < snapshot.size() && !page.isEmpty()
                 ? encodeNextToken(resolvedStreamName, page.get(page.size() - 1).getShardId(),
-                        System.currentTimeMillis())
+                        clock.millis())
                 : null;
 
         ObjectNode response = objectMapper.createObjectNode();
@@ -892,7 +919,7 @@ public class KinesisJsonHandler {
         } catch (NumberFormatException e) {
             throw invalidNextToken();
         }
-        long now = System.currentTimeMillis();
+        long now = clock.millis();
         if (issuedAtEpochMilli > now) {
             throw invalidNextToken();
         }

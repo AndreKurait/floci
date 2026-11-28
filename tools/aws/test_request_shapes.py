@@ -464,7 +464,8 @@ def vendored(script) -> tuple[str, ...]:
 
 
 @pytest.mark.parametrize("script", [
-    regen_apigateway_documentation_shapes, regen_ecr_shapes, regen_iam_shapes, regen_logs_delivery_shapes,
+    regen_apigateway_documentation_shapes, regen_cloudfront_keyvaluestore_shapes,
+    regen_ecr_shapes, regen_iam_shapes, regen_logs_delivery_shapes, regen_payment_cryptography_shapes,
     regen_resource_groups_shapes, regen_sts_shapes,
     regen_securityhub_shapes,
     regen_kinesis_shapes,

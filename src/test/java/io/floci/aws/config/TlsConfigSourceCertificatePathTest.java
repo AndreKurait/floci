@@ -116,6 +116,14 @@ class TlsConfigSourceCertificatePathTest {
     }
 
     @Test
+    void internalListenersRequireTheProxyTransportPreface() {
+        TlsConfigSource source = new TlsConfigSource();
+
+        assertEquals("true", source.getValue("quarkus.http.proxy.use-proxy-protocol"));
+        assertEquals("127.0.0.1", source.getValue("quarkus.http.host"));
+    }
+
+    @Test
     void theGeneratedPathIsAbsoluteAndUsableAsWritten() {
         TlsConfigSource source = new TlsConfigSource();
 

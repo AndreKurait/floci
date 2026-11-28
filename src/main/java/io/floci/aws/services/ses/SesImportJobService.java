@@ -35,6 +35,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -58,7 +59,7 @@ public class SesImportJobService implements Resettable {
     // Every record would mean serializing the job per row, so progress lands in batches.
     static final int PROGRESS_RECORD_INTERVAL = 100;
     static final String RESTART_FAILURE_MESSAGE = "The emulator restarted before the import finished";
-    private static final long RESET_ADMISSION_WAIT_MILLIS = 30_000L;
+    static final long RESET_ADMISSION_WAIT_MILLIS = 30_000L;
     // The drain only ever waits for the record being applied right now plus the read of the next
     // one, which is a store get/put and a line off a local file, so this deadline is a safety net
     // that a healthy import never reaches. 5s is what every other worker wait in Floci uses
@@ -81,7 +82,7 @@ public class SesImportJobService implements Resettable {
     private final RecordReaderFactory readerFactory;
     private final Clock clock;
     private final Executor workers;
-    private final long resetDrainTimeoutMillis;
+    private final SesResetWait resetWait;
     // Admission lock: serializes the concurrent-job count against the store write (so two creates
     // cannot both pass the limit check) and against reset, which flips {@code resetting} under it.
     private final Object createLock = new Object();
@@ -108,14 +109,14 @@ public class SesImportJobService implements Resettable {
                         SesSuppressionService suppressionService, SesContactService contactService,
                         ObjectMapper objectMapper, Clock clock, Executor workers) {
         this(importJobStore, s3Service, suppressionService, contactService, objectMapper, clock, workers,
-                RESET_DRAIN_TIMEOUT_MILLIS);
+                SesResetWait.SYSTEM);
     }
 
     SesImportJobService(StorageBackend<String, ImportJob> importJobStore, S3Service s3Service,
                         SesSuppressionService suppressionService, SesContactService contactService,
                         ObjectMapper objectMapper, Clock clock, Executor workers,
-                        long resetDrainTimeoutMillis) {
-        this.resetDrainTimeoutMillis = resetDrainTimeoutMillis;
+                        SesResetWait resetWait) {
+        this.resetWait = resetWait;
         this.importJobStore = importJobStore;
         this.s3Service = s3Service;
         this.suppressionService = suppressionService;
@@ -216,15 +217,15 @@ public class SesImportJobService implements Resettable {
     // Holds createLock. A create that arrives while a reset is in progress waits for afterReset
     // rather than persisting a job that the wipe would then race.
     private void awaitResetFinished() {
-        long deadline = System.currentTimeMillis() + RESET_ADMISSION_WAIT_MILLIS;
+        long deadline = resetWait.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESET_ADMISSION_WAIT_MILLIS);
         while (resetting) {
-            long remaining = deadline - System.currentTimeMillis();
+            long remaining = deadline - resetWait.nanoTime();
             if (remaining <= 0) {
                 throw new AwsException("TooManyRequestsException",
                         "Import jobs are not accepted while the emulator is resetting.", 429);
             }
             try {
-                createLock.wait(remaining);
+                resetWait.timedWait(createLock, remaining);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AwsException("TooManyRequestsException",
@@ -413,17 +414,17 @@ public class SesImportJobService implements Resettable {
         // only the record being applied right now. If the deadline passes anyway that one record
         // can still land after the wipe, which the warning below is there to explain.
         boolean interrupted = false;
-        long deadline = System.currentTimeMillis() + resetDrainTimeoutMillis;
+        long deadline = resetWait.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RESET_DRAIN_TIMEOUT_MILLIS);
         synchronized (workerMonitor) {
             while (activeWorkers > 0) {
-                long remaining = deadline - System.currentTimeMillis();
+                long remaining = deadline - resetWait.nanoTime();
                 if (remaining <= 0) {
                     LOG.warnv("{0} SES import worker(s) still running after {1}ms; a record in flight may "
-                            + "write after the reset", activeWorkers, resetDrainTimeoutMillis);
+                            + "write after the reset", activeWorkers, RESET_DRAIN_TIMEOUT_MILLIS);
                     break;
                 }
                 try {
-                    workerMonitor.wait(remaining);
+                    resetWait.timedWait(workerMonitor, remaining);
                 } catch (InterruptedException e) {
                     // Keep draining to the deadline; the interrupt is re-asserted on the way out.
                     interrupted = true;

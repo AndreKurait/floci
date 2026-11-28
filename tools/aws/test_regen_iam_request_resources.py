@@ -223,6 +223,20 @@ def test_types_named_only_through_the_same_members_are_alternatives():
         {"type": "lb", "fill": {"LoadBalancerName": "LoadBalancerName"}}]
 
 
+def test_types_with_identical_complete_arn_readings_are_aliases():
+    formats = {"thing": FORMATS["thing"], "thing-version": FORMATS["thing"]}
+    assert r.resources_for("svc:GetThingVersion", list(formats), formats, members("ThingName")) == [
+        {"type": "thing", "fill": {"ThingName": "ThingName"}}]
+    # A different ARN denotes another resource, even if the member names are identical.
+    formats["thing-version"] = FORMATS["thing"].replace("thing/", "version/")
+    assert r.resources_for("svc:GetThingVersion", list(formats), formats, members("ThingName")) == []
+
+
+def test_identical_partial_arn_readings_do_not_choose_an_ambiguous_resource():
+    formats = {"group": FORMATS["group"], "group-version": FORMATS["group"]}
+    assert r.resources_for("svc:GetGroupVersion", list(formats), formats, members("GroupName")) == []
+
+
 def test_a_type_is_filled_from_one_list_at_most():
     formats = {"pair": "arn:${Partition}:svc:${Region}:${Account}:pair/${LeftName}/${RightName}"}
     assert r.resources_for("svc:GetPair", ["pair"], formats, members("LeftNames[]", "RightNames[]")) == []
@@ -2133,7 +2147,10 @@ def test_generated_targets_match_botocores_actual_serialization(operation, targe
         # The skeleton's other members are placeholders (an empty tag key), so only the serialization is checked.
         request = create_serializer(model.metadata["protocol"], include_validation=False).serialize_to_request(
             parameters, operation_model)
-        assert [request["body"][target["query"] + "." + str(i)] for i in range(1, 4)] == ids
+        if model.metadata["protocol"] == "ec2":
+            assert [request["body"][target["query"] + "." + str(i)] for i in range(1, 4)] == ids
+        else:
+            assert json.loads(request["body"])[target["member"].removesuffix("[]")] == ids
         checked += 1
     assert checked > 0
 
@@ -3771,6 +3788,90 @@ def test_a_resource_named_after_its_path_or_signed_for_is_checked():
         assert r._resource_problems("iam:Op", bad, types, USERS_FORMATS), bad
 
 
+def test_required_arn_form_distinguishes_a_child_from_its_authority():
+    formats = {"authority": "arn:${Partition}:svc:${Region}:${Account}:authority/${AuthorityId}"}
+    authority = "<code>arn:aws:svc:<i>region</i>:<i>account</i>:authority/<i>id</i></code>"
+    child = authority.replace("</code>", "/certificate/<i>serial</i></code>")
+    model_ = documented("GetCertificate", {
+        "AuthorityArn": ("String", "This must be of the form: " + authority),
+        "CertificateArn": ("String", "The ARN of the issued certificate. It must be in the following form: " + child),
+    })
+    model_["shapes"]["In"]["required"] = ["AuthorityArn", "CertificateArn"]
+    assert r.read_resources("svc:GetCertificate", ["authority"], formats, {"svc": model_}) == [
+        {"types": ["authority"], "arn": "AuthorityArn"}]
+
+
+@pytest.mark.parametrize("description", [
+    "For example: <code>arn:aws:svc:<i>region</i>:<i>account</i>:authority/<i>id</i>/certificate/<i>serial</i></code>",
+    "This must be of the form: <code>arn:aws:svc:region:account:authority/id/certificate/serial</code>",
+    "This must be of the form: <code>arn:aws:svc:<i>region</i>:<i>account</i>:other/<i>id</i></code>",
+])
+def test_arn_examples_and_unrelated_forms_do_not_prove_a_child(description):
+    formats = {"authority": "arn:${Partition}:svc:${Region}:${Account}:authority/${AuthorityId}"}
+    model_ = documented("GetCertificate", {"ResourceArn": ("String", description)})
+    assert r.read_resources("svc:GetCertificate", ["authority"], formats, {"svc": model_}) == [
+        {"types": ["authority"], "arn": "ResourceArn"}]
+
+
+def test_required_arn_child_form_does_not_restrict_resource_name_paths():
+    formats = {"authority": "arn:${Partition}:svc:${Region}:${Account}:authority/${AuthorityName}"}
+    model_ = documented("GetAuthority", {"AuthorityArn": ("String", "This must be of the form: "
+        "<code>arn:aws:svc:<i>region</i>:<i>account</i>:authority/<i>name</i>/path/<i>name</i></code>")})
+    model_["shapes"]["In"]["required"] = ["AuthorityArn"]
+    assert r.read_resources("svc:GetAuthority", ["authority"], formats, {"svc": model_}) == [
+        {"types": ["authority"], "arn": "AuthorityArn"}]
+
+
+def test_required_child_form_preserves_the_child_type_when_it_is_acted_on():
+    formats = {
+        "authority": "arn:${Partition}:svc:${Region}:${Account}:authority/${AuthorityId}",
+        "certificate": "arn:${Partition}:svc:${Region}:${Account}:authority/${AuthorityId}/certificate/${CertificateId}",
+    }
+    model_ = documented("GetCertificate", {"ResourceArn": ("String", "This must be of the form: "
+        "<code>arn:aws:svc:<i>region</i>:<i>account</i>:authority/<i>id</i>/certificate/<i>serial</i></code>")})
+    assert r.read_resources("svc:GetCertificate", ["authority", "certificate"], formats, {"svc": model_}) == [
+        {"types": ["certificate"], "arn": "ResourceArn"}]
+
+
+def test_required_alternative_forms_keep_a_possible_parent():
+    formats = {"authority": "arn:${Partition}:svc:${Region}:${Account}:authority/${AuthorityId}"}
+    model_ = documented("GetCertificate", {"ResourceArn": ("String", "This must be of the form: "
+        "<code>arn:aws:svc:<i>region</i>:<i>account</i>:authority/<i>id</i>/certificate/<i>serial</i></code> or "
+        "<code>arn:aws:svc:<i>region</i>:<i>account</i>:authority/<i>id</i></code>")})
+    assert r.read_resources("svc:GetCertificate", ["authority"], formats, {"svc": model_}) == [
+        {"types": ["authority"], "arn": "ResourceArn"}]
+
+
+def test_memorydb_parameter_group_primary_and_created_resources_are_distinct():
+    models = {"memorydb": {"metadata": {"protocol": "json"}, "operations": {"CreateParameterGroup": {"input": {"shape": "Input"}}},
+                           "shapes": {"Input": {"type": "structure", "members": {
+                               "ParameterGroupName": {"shape": "String"}}}, "String": {"type": "string"}}}}
+    formats = {"parametergroup": "arn:${Partition}:memorydb:${Region}:${Account}:parametergroup/${ParameterGroupName}"}
+    entry = r.entry_for("memorydb:CreateParameterGroup", {"action": "memorydb:CreateParameterGroup", "types": []},
+                        formats, models)
+    assert entry["resources"] == []
+    assert entry["makes"] == [{"type": "parametergroup", "fill": {"ParameterGroupName": "ParameterGroupName"}}]
+    assert r.LOWERCASE_VARIABLES == {"memorydb": {"parametergroup": ["ParameterGroupName"]}}
+    assert r.reads("memorydb:DescribeParameters")
+    assert r.reads("memorydb:DescribeClusters")
+
+
+def test_mixed_json_targets_retain_the_named_document_and_derive_disjoint_prefixes():
+    ssm = model({"SendCommand": {"DocumentName": "String", "InstanceIds": "Strings"}}, "json")
+    ssm["shapes"]["InstanceId"] = {"type": "string", "pattern": r"(^i-(\w{8}|\w{17})$)|(^mi-\w{17}$)"}
+    ssm["shapes"]["ManagedInstanceId"] = {"type": "string", "pattern": r"(^mi-[0-9a-f]{17}$)"}
+    formats = {"document": "arn:${Partition}:ssm:${Region}:${Account}:document/${DocumentName}",
+               "instance": "arn:${Partition}:ec2:${Region}:${Account}:instance/${InstanceId}",
+               "managed-instance": "arn:${Partition}:ssm:${Region}:${Account}:managed-instance/${InstanceId}"}
+    upstream = {"action": "ssm:SendCommand", "types": list(formats)}
+    entry = r.entry_for("ssm:SendCommand", upstream, formats, {"ssm": ssm})
+    assert entry["resources"] == [{"type": "document", "fill": {"DocumentName": "DocumentName"}}]
+    assert entry["targets"]["prefixes"] == {"instance": "i-", "managed-instance": "mi-"}
+    assert entry["targets"]["member"] == "InstanceIds[]"
+    ssm["shapes"]["InstanceId"]["pattern"] = r"(^i-\w{17}$)|(^other-\w{17}$)"
+    with pytest.raises(ValueError, match="unambiguous"):
+        r.entry_for("ssm:SendCommand", upstream, formats, {"ssm": ssm})
+
 
 def reference_endpoint_model():
     return {"ec2": {"operations": {"CreateVpcEndpoint": {"output": {"shape": "Result"}}}, "shapes": {
@@ -3816,6 +3917,258 @@ def test_reference_example_path_drift_and_conflicting_prefixes_fail_closed():
         r.reference_id_prefixes(models, ("vpc-endpoint",), source)
 
 
+def test_documented_prefix_refuses_to_override_conflicting_botocore_evidence(monkeypatch, tmp_path):
+    source = tmp_path / "examples.json"
+    source.write_text(json.dumps(reference_endpoint_source()))
+    monkeypatch.setattr(r, "ID_EXAMPLE_SOURCES", {"ec2": source})
+    models = reference_endpoint_model()
+    assert r.documented_id_prefixes("ec2", models).prefixes == {"vpc-endpoint": "vpce-"}
+    monkeypatch.setattr(r, "namespace_id_prefixes", lambda *args: {"vpc-endpoint": "other-"})
+    with pytest.raises(ValueError, match="disagree"):
+        r.documented_id_prefixes("ec2", models)
+
+
+def test_vendored_ec2_examples_resolve_through_the_actual_pinned_response_members():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"ec2"})
+    source = json.loads(r.fetch_ec2_id_examples.OUTPUT.read_text())
+    assert r.reference_id_prefixes(models, r.ID_TARGETS["ec2"], source)["vpc-endpoint"] == "vpce-"
+    prefixes = r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    assert prefixes.prefixes["vpc-endpoint"] == "vpce-"
+    assert prefixes.prefixes["image"] == "ami-"
+    assert prefixes.prefixes["snapshot"] == "snap-"
+
+
+def test_identifier_reference_verification_reports_unavailable_pages(monkeypatch):
+    def unavailable(url):
+        raise OSError("offline")
+    monkeypatch.setattr(r.fetch_ec2_id_examples, "fetch_url", unavailable)
+    with pytest.raises(OSError, match="could not verify EC2 identifier examples"):
+        r.verify_id_examples()
+
+
+def test_reference_prefix_supplements_generic_lists_without_changing_typed_endpoint_deletion():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"ec2"})
+    known = r.namespace_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    generic = r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    formats = {"vpc-endpoint": "arn:${Partition}:ec2:${Region}:${Account}:vpc-endpoint/${VpcEndpointId}"}
+    for operation in ("ec2:CreateTags", "ec2:DeleteTags"):
+        assert r.id_targets(operation, ["vpc-endpoint"], formats, models, generic)["prefixes"] == {
+            "vpc-endpoint": "vpce-"}
+    assert r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, generic) == \
+        r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, known)
+
+
+@pytest.mark.parametrize("upstream,expected", [
+    ("arn:${Partition}:swf::${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}"),
+])
+def test_swf_restores_only_the_known_missing_region(upstream, expected):
+    document = reference("swf", {}, {"domain": upstream})
+    assert r.arn_formats([document], {"swf"}) == {"swf": {"domain": expected}}
+
+
+@pytest.mark.parametrize("kind", ["integer", "long"])
+def test_numeric_uri_labels_name_resources_but_body_and_query_numbers_do_not(kind):
+    svc = rest_model(
+        {"GetDeployment": {"DeploymentNumber": "Number", "Limit": "Number", "Count": "Number"}},
+        {"GetDeployment": {"DeploymentNumber": "uri:DeploymentNumber", "Limit": "querystring:limit"}})
+    svc["shapes"]["Number"] = {"type": kind}
+    assert r.request_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "DeploymentNumber"}
+    locations, clients = r.located_members({"svc": svc}, "GetDeployment")
+    assert locations["DeploymentNumber"] == "{DeploymentNumber}"
+    assert clients == {}
+    entry = r.entry_for("svc:GetDeployment", {"action": "svc:GetDeployment", "types": ["deployment"]},
+                        {"deployment": "arn:${Partition}:svc:${Region}:${Account}:deployment/${DeploymentNumber}"},
+                        {"svc": svc})
+    assert entry["located"] == {"DeploymentNumber": "{DeploymentNumber}"}
+
+
+@pytest.mark.parametrize("selector", ["RevisionName", "SnapshotName"])
+def test_a_documented_name_or_arn_selector_reaches_its_optional_parent(selector):
+    spec = model({"GetPayload": {"GroupName": "String", selector: "String"}}, "query")
+    spec["metadata"]["endpointPrefix"] = "svc"
+    spec["shapes"]["GetPayloadIn"]["members"][selector]["documentation"] = (
+        "<p>The name or Amazon Resource Name (ARN) of a revision. "
+        "If you specify a name, you must also specify the <code>GroupName</code>.</p>")
+    entry = r.entry_for("svc:GetPayload", {"action": "svc:GetPayload", "types": ["group"]},
+                        FORMATS, {"svc": spec})
+    assert entry["resources"] == [
+        {"type": "group", "fill": {"GroupName": "GroupName"}},
+        {"types": ["group"], "through": selector},
+    ]
+
+
+@pytest.mark.parametrize("change", ["name_only", "no_parent_contract", "wrong_parent", "required_parent", "list_selector"])
+def test_a_parent_relationship_is_not_inferred_without_the_documented_arn_alternative(change):
+    spec = model({"GetPayload": {"GroupName": "String", "RevisionName": "String"}}, "query")
+    spec["metadata"]["endpointPrefix"] = "svc"
+    request = spec["shapes"]["GetPayloadIn"]
+    child = request["members"]["RevisionName"]
+    child["documentation"] = (
+        "<p>The name or Amazon Resource Name (ARN) of a revision. "
+        "If you specify a name, you must also specify the <code>GroupName</code>.</p>")
+    if change == "name_only":
+        child["documentation"] = child["documentation"].replace(" or Amazon Resource Name (ARN)", "")
+    elif change == "no_parent_contract":
+        child["documentation"] = "<p>The name or Amazon Resource Name (ARN) of a revision.</p>"
+    elif change == "wrong_parent":
+        child["documentation"] = child["documentation"].replace("<code>GroupName</code>", "<code>OtherName</code>")
+    elif change == "required_parent":
+        request["required"] = ["GroupName"]
+    else:
+        child["shape"] = "Strings"
+    entry = r.entry_for("svc:GetPayload", {"action": "svc:GetPayload", "types": ["group"]},
+                        FORMATS, {"svc": spec})
+    assert entry["resources"] == [{"type": "group", "fill": {"GroupName": "GroupName"}}]
+
+
+APPCONFIG_FORMATS = {
+    "application": "arn:${Partition}:appconfig:${Region}:${Account}:application/${ApplicationId}",
+    "environment": ("arn:${Partition}:appconfig:${Region}:${Account}:"
+                    "application/${ApplicationId}/environment/${EnvironmentId}"),
+    "configurationprofile": ("arn:${Partition}:appconfig:${Region}:${Account}:"
+                             "application/${ApplicationId}/configurationprofile/${ConfigurationProfileId}"),
+    "configuration": ("arn:${Partition}:appconfig:${Region}:${Account}:"
+                      "application/${ApplicationId}/environment/${EnvironmentId}"
+                      "/configuration/${ConfigurationProfileId}"),
+}
+
+
+@pytest.mark.parametrize("operation", ["GetHostedConfigurationVersion", "DeleteHostedConfigurationVersion"])
+def test_hosted_versions_keep_the_profile_arn_shared_by_two_reference_types(operation):
+    formats = {**APPCONFIG_FORMATS, "hostedconfigurationversion": APPCONFIG_FORMATS["configurationprofile"]}
+    inputs = {"ApplicationId": "String", "ConfigurationProfileId": "String", "VersionNumber": "Number"}
+    svc = rest_model({operation: inputs}, {operation: {member: "uri:" + member for member in inputs}})
+    svc["shapes"][operation + "In"]["required"] = list(inputs)
+    svc["shapes"]["Number"] = {"type": "integer"}
+    types = ["application", "configurationprofile", "hostedconfigurationversion"]
+    entry = r.entry_for("appconfig:" + operation, {"action": "appconfig:" + operation, "types": types},
+                        formats, {"appconfig": svc})
+    assert entry["resources"] == [
+        {"type": "application", "fill": {"ApplicationId": "ApplicationId"}},
+        {"type": "configurationprofile",
+         "fill": {"ApplicationId": "ApplicationId", "ConfigurationProfileId": "ConfigurationProfileId"}},
+    ]
+    assert entry["located"] == {"ApplicationId": "{ApplicationId}",
+                                "ConfigurationProfileId": "{ConfigurationProfileId}"}
+
+
+def test_legacy_configuration_reads_the_profile_beside_the_application_and_environment():
+    inputs = {"Application": "String", "Environment": "String", "Configuration": "String"}
+    svc = rest_model({"GetConfiguration": inputs},
+                     {"GetConfiguration": {member: "uri:" + member for member in inputs}})
+    svc["shapes"]["GetConfigurationIn"]["required"] = list(inputs)
+    types = ["application", "configurationprofile", "environment"]
+    entry = r.entry_for("appconfig:GetConfiguration", {"action": "appconfig:GetConfiguration", "types": types},
+                        APPCONFIG_FORMATS, {"appconfig": svc})
+    assert entry["resources"] == [
+        {"type": "application", "fill": {"ApplicationId": "Application"}},
+        {"type": "environment", "fill": {"ApplicationId": "Application", "EnvironmentId": "Environment"}},
+        {"type": "configurationprofile",
+         "fill": {"ApplicationId": "Application", "ConfigurationProfileId": "Configuration"}},
+    ]
+    assert entry["located"] == {member: "{" + member + "}" for member in inputs}
+
+
+def test_configuration_token_reaches_the_configuration_and_keeps_its_query_location():
+    svc = rest_model({"GetLatestConfiguration": {"ConfigurationToken": "String"}},
+                     {"GetLatestConfiguration": {"ConfigurationToken": "querystring:configuration_token"}})
+    entry = r.entry_for("appconfig:GetLatestConfiguration",
+                        {"action": "appconfig:GetLatestConfiguration", "types": ["configuration"]},
+                        APPCONFIG_FORMATS, {"appconfigdata": svc})
+    assert entry["resources"] == [{"types": ["configuration"], "through": "ConfigurationToken"}]
+    assert entry["located"] == {"ConfigurationToken": "?configuration_token"}
+
+
+@pytest.mark.parametrize("change", ["missing_member", "missing_type", "changed_format"])
+def test_legacy_configuration_reader_rejects_model_or_reference_drift(change):
+    formats = dict(APPCONFIG_FORMATS)
+    types = ["application", "configurationprofile", "environment"]
+    inputs = members("Application", "Environment", "Configuration")
+    if change == "missing_member":
+        del inputs["Configuration"]
+    elif change == "missing_type":
+        types.remove("configurationprofile")
+    else:
+        formats["configurationprofile"] += "/version/${Version}"
+    with pytest.raises(ValueError, match="review"):
+        r.with_appconfig_resource_reads([], "appconfig:GetConfiguration", types, formats, inputs)
+
+
+LOG_DELIVERY_FORMATS = {
+    "delivery-source": "arn:${Partition}:logs:${Region}:${Account}:delivery-source:${DeliverySourceName}",
+    "delivery-destination": "arn:${Partition}:logs:${Region}:${Account}:delivery-destination:${DeliveryDestinationName}",
+}
+
+
+def test_deleting_a_delivery_source_keeps_source_scoped_permissions():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"logs"})
+    operation = "logs:DeleteDeliverySource"
+    entry = r.entry_for(operation, {"action": operation, "types": ["delivery-destination"]},
+                        LOG_DELIVERY_FORMATS, models)
+    expected = {"type": "delivery-source", "fill": {"DeliverySourceName": "name"}}
+    assert entry == {"action": operation, "types": ["delivery-destination"], "resources": [expected]}
+    assert r._resource_problems(operation, expected, {"delivery-destination"}, LOG_DELIVERY_FORMATS) == []
+    # Once the reference names the source itself, ordinary rules give the same resource.
+    fixed = r.entry_for(operation, {"action": operation, "types": ["delivery-source"]}, LOG_DELIVERY_FORMATS, models)
+    assert fixed["resources"] == entry["resources"]
+
+
+@pytest.mark.parametrize("change", ["operation", "types", "member", "format", "extra_field"])
+def test_delivery_source_correction_does_not_exempt_other_resource_readings(change):
+    operation = "logs:DeleteDeliverySource"
+    types = {"delivery-destination"}
+    formats = dict(LOG_DELIVERY_FORMATS)
+    resource = {"type": "delivery-source", "fill": {"DeliverySourceName": "name"}}
+    if change == "operation":
+        operation = "logs:PutDeliverySource"
+    elif change == "types":
+        types = {"delivery"}
+    elif change == "member":
+        resource["fill"] = {"DeliverySourceName": "other"}
+    elif change == "format":
+        formats["delivery-source"] += "/changed"
+    else:
+        resource["made"] = True
+    assert r._resource_problems(operation, resource, types, formats)
+
+
+def test_changed_delivery_metadata_requires_review_before_applying_the_correction():
+    with pytest.raises(ValueError, match="review"):
+        r.with_logs_delivery_source([], "logs:DeleteDeliverySource", ["delivery-destination"],
+                                    LOG_DELIVERY_FORMATS, {"name": "name"})
+
+
+def test_permission_set_provisioning_reads_every_affected_account():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"sso-admin"})
+    operation = "sso:ProvisionPermissionSet"
+    formats = {
+        "Account": "arn:${Partition}:sso:::account/${AccountId}",
+        "Instance": "arn:${Partition}:sso:::instance/${InstanceId}",
+        "PermissionSet": "arn:${Partition}:sso:::permissionSet/${InstanceId}/${PermissionSetId}",
+    }
+    types = ["Account", "Instance", "PermissionSet"]
+    entry = r.entry_for(operation, {"action": operation, "types": types}, formats, models)
+    assert entry["resources"] == [
+        {"types": types, "arn": "InstanceArn"},
+        {"types": types, "arn": "PermissionSetArn"},
+        {"type": "Account", "fill": {"AccountId": "TargetId"}, "when": {"TargetType": ["AWS_ACCOUNT"]}},
+        {"types": ["Account"], "through": "PermissionSetArn", "when": {"TargetType": ["ALL_PROVISIONED_ACCOUNTS"]}},
+    ]
+    assert r.with_sso_provisioned_accounts(entry["resources"], operation, types, formats, models) == entry["resources"]
+    assert r.with_sso_provisioned_accounts([], "sso:CreatePermissionSet", [], {}, {}) == []
+    with pytest.raises(ValueError, match="review"):
+        r.with_sso_provisioned_accounts(entry["resources"], operation, types, {}, models)
+    with pytest.raises(ValueError, match="review"):
+        r.with_sso_provisioned_accounts(entry["resources"], operation, types, formats, {})
 def test_a_reference_prefix_joins_botocores_without_making_a_typed_list(monkeypatch, tmp_path):
     source = tmp_path / "examples.json"
     source.write_text(json.dumps(reference_endpoint_source()))

@@ -18,10 +18,12 @@ import io.floci.aws.services.ecr.model.PullThroughCacheRule;
 import io.floci.aws.services.ecr.model.RegistrySettings;
 import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.model.RepositoryCreationTemplate;
+import io.floci.aws.services.ecr.registry.EcrRegistryAuthorization;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecr.registry.RegistryHttpClient;
 import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ParkingStore;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -33,10 +35,12 @@ import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -100,6 +104,12 @@ class EcrServiceTest {
                 registryManager,
                 config,
                 regionResolver);
+        service.registryAuthorization = Mockito.mock(
+                EcrRegistryAuthorization.class);
+        when(service.registryAuthorization.issue(REGION)).thenReturn(
+                new EcrRegistryAuthorization.IssuedToken(
+                        Base64.getEncoder().encodeToString("AWS:issued-test-token".getBytes(StandardCharsets.UTF_8)),
+                        Instant.now().plusSeconds(43200)));
     }
 
     // ------------------------------------------------------------
@@ -376,6 +386,59 @@ class EcrServiceTest {
     }
 
     @Test
+    void registryLookupReadsDefaultAccountLegacyEntryWithoutMigratingIt() {
+        InMemoryStorage<String, Repository> delegate = new InMemoryStorage<>();
+        Repository legacy = new Repository();
+        String key = REGION + "::" + ACCOUNT + "::" + REPO;
+        delegate.put(key, legacy);
+        EcrService accountAwareService = registryLookupService(delegate);
+
+        assertSame(legacy, accountAwareService.registryRepository(REPO, ACCOUNT, REGION).orElseThrow());
+        assertEquals(List.of(key), List.copyOf(delegate.keys()));
+        assertSame(legacy, delegate.get(key).orElseThrow());
+    }
+
+    @Test
+    void registryLookupPrefersExplicitAccountEntryOverLegacyEntry() {
+        InMemoryStorage<String, Repository> delegate = new InMemoryStorage<>();
+        Repository legacy = new Repository();
+        Repository scoped = new Repository();
+        String key = REGION + "::" + ACCOUNT + "::" + REPO;
+        delegate.put(key, legacy);
+        delegate.put(ACCOUNT + "/" + key, scoped);
+        EcrService accountAwareService = registryLookupService(delegate);
+
+        assertSame(scoped, accountAwareService.registryRepository(REPO, ACCOUNT, REGION).orElseThrow());
+        assertSame(legacy, delegate.get(key).orElseThrow());
+        assertEquals(2, delegate.keys().size());
+    }
+
+    @Test
+    void registryLookupRejectsForeignLegacyEntryButReadsItsExplicitAccountEntry() {
+        String foreign = "111111111111";
+        InMemoryStorage<String, Repository> delegate = new InMemoryStorage<>();
+        Repository legacy = new Repository();
+        Repository scoped = new Repository();
+        String key = REGION + "::" + foreign + "::" + REPO;
+        delegate.put(key, legacy);
+        EcrService accountAwareService = registryLookupService(delegate);
+
+        assertTrue(accountAwareService.registryRepository(REPO, foreign, REGION).isEmpty());
+        delegate.put(foreign + "/" + key, scoped);
+        assertSame(scoped, accountAwareService.registryRepository(REPO, foreign, REGION).orElseThrow());
+        assertTrue(accountAwareService.registryRepository(REPO, ACCOUNT, REGION).isEmpty());
+        assertTrue(accountAwareService.registryRepository(REPO, foreign, "eu-west-1").isEmpty());
+        assertSame(legacy, delegate.get(key).orElseThrow());
+        assertEquals(2, delegate.keys().size());
+    }
+
+    private EcrService registryLookupService(InMemoryStorage<String, Repository> delegate) {
+        return new EcrService(new AccountAwareStorageBackend<>(delegate, null, ACCOUNT),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), registryManager,
+                Mockito.mock(EmulatorConfig.class), new RegionResolver(REGION, ACCOUNT));
+    }
+
+    @Test
     void reconcilePreProxyRegistryNamespacePreservesItsStoragePath() {
         String repositoryName = "legacy/service";
 
@@ -525,6 +588,26 @@ class EcrServiceTest {
         List<Repository> repos = service.describeRepositories(List.of(REPO), null, REGION);
         assertEquals(1, repos.size());
         assertEquals(REPO, repos.get(0).getRepositoryName());
+    }
+
+    @Test
+    void describeRepositories_overlappingADelete_doesNotWriteTheRepositoryBack() {
+        InMemoryStorage<String, Repository> repositories = new InMemoryStorage<>();
+        EcrService racing = new EcrService(repositories, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                registryManager, Mockito.mock(EmulatorConfig.class), new RegionResolver(REGION, ACCOUNT));
+        racing.createRepository(REPO, null, null, null, null, null, null, REGION);
+        AtomicBoolean deleteDuringTheRead = new AtomicBoolean(true);
+        when(registryManager.getRepositoryUri(anyString(), anyString(), anyString())).thenAnswer(inv -> {
+            if (deleteDuringTheRead.compareAndSet(true, false)) {
+                // The delete lands after the describe read the repository and before it returns.
+                racing.deleteRepository(REPO, null, false, REGION);
+            }
+            return inv.getArgument(0) + ".dkr.ecr." + inv.getArgument(1) + ".localhost:4566/" + inv.getArgument(2);
+        });
+
+        racing.describeRepositories(List.of(REPO), null, REGION);
+
+        assertTrue(repositories.keys().isEmpty(), "the deleted repository stays deleted");
     }
 
     @Test
@@ -1000,6 +1083,14 @@ class EcrServiceTest {
                 }
                 super.put(key, metadata);
             }
+
+            @Override
+            public void putAllAtomically(Map<String, ImageMetadata> values) {
+                if (unavailable.get()) {
+                    throw new IllegalStateException("metadata store unavailable");
+                }
+                super.putAllAtomically(values);
+            }
         };
         EcrService withMeta = new EcrService(new InMemoryStorage<>(), metaStore, pullThroughCacheRuleStore,
                 registryManager, Mockito.mock(EmulatorConfig.class), new RegionResolver(REGION, ACCOUNT));
@@ -1405,14 +1496,10 @@ class EcrServiceTest {
         }
     }
 
-    /** Polls until the waiter is parked on the lock's semaphore, so it holds the entry. */
-    private static void awaitParkedOnTheLock(Thread waiter) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (waiter.getState() != Thread.State.WAITING) {
-            assertTrue(System.currentTimeMillis() < deadline,
-                    "the waiting writer never parked on the lock");
-            Thread.sleep(5);
-        }
+    /** Returns once the waiter is parked on the lock's semaphore, so it holds the entry. */
+    private static void awaitParkedOnTheLock(Thread waiter) {
+        ThreadStates.awaitState(waiter, EnumSet.of(Thread.State.WAITING), Duration.ofSeconds(5),
+                "the waiting writer");
     }
 
     @Test
@@ -1719,7 +1806,8 @@ class EcrServiceTest {
                 sendJson(exchange, 200, "{\"name\":\"" + repository + "\",\"tags\":[\"" + tag + "\"]}");
                 return;
             }
-            if (("/v2/" + repository + "/manifests/" + tag).equals(path) && "HEAD".equals(method)) {
+            if ((("/v2/" + repository + "/manifests/" + tag).equals(path)
+                    || ("/v2/" + repository + "/manifests/" + digest).equals(path)) && "HEAD".equals(method)) {
                 exchange.getResponseHeaders().add("Docker-Content-Digest", digest);
                 exchange.sendResponseHeaders(200, -1);
                 exchange.close();
@@ -2588,4 +2676,24 @@ class EcrServiceTest {
                 new InMemoryStorage<>(), store, registryManager, Mockito.mock(EmulatorConfig.class),
                 new RegionResolver(REGION, ACCOUNT));
     }
+    @Test
+    void requestedRegistryIdsEachReceiveTheirOwnEndpointWithoutStartingRegistry() {
+        when(registryManager.getProxyEndpoint("111111111111", REGION)).thenReturn("https://111111111111.dkr.ecr.us-east-1.amazonaws.com");
+        when(registryManager.getProxyEndpoint("222222222222", REGION)).thenReturn("https://222222222222.dkr.ecr.us-east-1.amazonaws.com");
+        List<AuthorizationData> tokens = service.getAuthorizationToken(List.of("111111111111", "222222222222"));
+        assertEquals(2, tokens.size());
+        assertTrue(tokens.get(0).getProxyEndpoint().contains("111111111111"));
+        assertTrue(tokens.get(1).getProxyEndpoint().contains("222222222222"));
+        Mockito.verify(registryManager, Mockito.never()).ensureStarted();
+    }
+
+    @Test
+    void invalidRegistryIdListsFailBeforeRegistryAccess() {
+        for (List<String> ids : List.of(List.<String>of(), List.of("bad"), List.of("12345678901"),
+                Collections.nCopies(11, "111111111111"))) {
+            assertThrows(AwsException.class, () -> service.getAuthorizationToken(ids));
+        }
+        Mockito.verify(registryManager, Mockito.never()).getProxyEndpoint(anyString(), anyString());
+    }
+
 }

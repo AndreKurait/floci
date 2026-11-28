@@ -13,8 +13,8 @@ import java.util.Optional;
 
 /**
  * What IAM asks CloudWatch Logs of the resources a request names: the caller's delivery of the id it was created
- * with, the delivery destinations the deliveries from a delivery source send to, which the Service Reference
- * checks a {@code DeleteDeliverySource} on, and the tags of a log group, a destination or a delivery source,
+ * with, the delivery destinations the deliveries from a delivery source send to, and the tags of a log group,
+ * a destination or a delivery source,
  * delivery destination or delivery.
  */
 @ApplicationScoped

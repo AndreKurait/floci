@@ -47,9 +47,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class PartitionCrossServiceSmokeIntegrationTest {
 
     static final Set<String> COVERED_PACKAGES = Set.of(
-            "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "applicationautoscaling", "appsync",
+            "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "appconfig", "applicationautoscaling", "appsync",
             "aps", "autoscaling", "backup", "batch", "bcmdataexports", "bedrock", "bedrockagentcorecontrol", "ce",
-            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito",
+            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito", "cognitoidentity",
             "configservice", "connect", "controlcatalog", "controltower", "datasync", "dlm", "dms", "dsql", "dynamodb", "ec2",
             "ec2instanceconnect", "ecr", "ecs", "efs", "eks", "elasticache", "elasticbeanstalk", "elb", "elbv2", "emr", "emrcontainers", "emrserverless",
             "eventbridge", "eventbridgev2", "firehose", "fis", "glue", "guardduty", "iot", "kinesis", "kinesisanalytics", "lambda",
@@ -97,6 +97,28 @@ class PartitionCrossServiceSmokeIntegrationTest {
                 .post(path).then().statusCode(202).extract().jsonPath().getString("Arn");
         cleanup.register(() -> signed(region, "quicksight").delete(path));
         PartitionMatrix.assertArnIn(partitionCase, arn);
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void appConfigApplicationTagArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "appconfig");
+        String id = signed(region, "appconfig").contentType(JSON)
+                .body("{\"Name\":\"" + unique("smoke-appconfig", partitionCase) + "\",\"Tags\":{\"created\":\"yes\"}}")
+                .post("/applications").then().statusCode(201).extract().path("Id");
+        cleanup.register(() -> signed(region, "appconfig").delete("/applications/" + id));
+        String resource = ":appconfig:" + region + ":" + PartitionMatrix.ACCOUNT + ":application/" + id;
+        String arn = "arn:" + partitionCase.partition() + resource;
+        // AppConfig returns an ID, not an ARN. Its tag handler checks the supplied ARN against
+        // one minted from the request context, so a successful read exercises that partition path.
+        assertEquals(Map.of("created", "yes"), signed(region, "appconfig")
+                .get("/tags/{arn}", arn).then().statusCode(200).extract().jsonPath().getMap("Tags"));
+        signed(region, "appconfig").contentType(JSON).body("{\"Tags\":{\"updated\":\"yes\"}}")
+                .post("/tags/{arn}", arn).then().statusCode(204);
+        signed(region, "appconfig").contentType(JSON).body("{\"Tags\":{\"foreign\":\"no\"}}")
+                .post("/tags/{arn}", "arn:aws" + resource).then().statusCode(404);
+        assertEquals(Map.of("created", "yes", "updated", "yes"), signed(region, "appconfig")
+                .get("/tags/{arn}", arn).then().statusCode(200).extract().jsonPath().getMap("Tags"));
     }
 
     @ParameterizedTest
@@ -687,6 +709,28 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void cognitoIdentityTokenIssuer(PartitionCase partitionCase) throws Exception {
+        String region = offered(partitionCase, "cognito-identity");
+        String target = "AWSCognitoIdentityService.";
+        String body = "{\"IdentityPoolName\":\"" + unique("identity-token", partitionCase)
+                + "\",\"AllowUnauthenticatedIdentities\":true,\"AllowClassicFlow\":true}";
+        String pool = json11(region, "cognito-identity", target + "CreateIdentityPool", body)
+                .post("/").then().statusCode(200).extract().path("IdentityPoolId");
+        String poolBody = "{\"IdentityPoolId\":\"" + pool + "\"}";
+        cleanup.register(() -> json11(region, "cognito-identity", target + "DeleteIdentityPool", poolBody).post("/"));
+        String identity = json11(region, "cognito-identity", target + "GetId", poolBody)
+                .post("/").then().statusCode(200).extract().path("IdentityId");
+        String token = json11(region, "cognito-identity", target + "GetOpenIdToken",
+                "{\"IdentityId\":\"" + identity + "\"}")
+                .post("/").then().statusCode(200).extract().path("Token");
+        String issuer = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(token.split("\\.")[1]))
+                .path("iss").asText();
+        PartitionMatrix.assertHostIn(partitionCase, issuer);
+        assertEquals("cognito-identity." + region + "." + partitionCase.dnsSuffix(), issuer);
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void cognitoUserPoolArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "cognito-idp");
         String name = unique("smoke-pool", partitionCase);
@@ -779,6 +823,20 @@ class PartitionCrossServiceSmokeIntegrationTest {
             .formParam("Version", "2015-02-02")
             .formParam("CacheParameterGroupName", name)
         .when().post("/"));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void memoryDbParameterGroupArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "memorydb");
+        String name = unique("smoke-group", partitionCase);
+        String arn = json11(region, "memorydb", "AmazonMemoryDB.CreateParameterGroup",
+                "{\"ParameterGroupName\":\"" + name + "\",\"Family\":\"memorydb_redis6\"}")
+        .when().post("/").then().statusCode(200)
+            .extract().jsonPath().getString("ParameterGroup.ARN");
+        cleanup.register(() -> json11(region, "memorydb", "AmazonMemoryDB.DeleteParameterGroup",
+                "{\"ParameterGroupName\":\"" + name + "\"}").when().post("/"));
         PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 
@@ -922,6 +980,25 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void backupFrameworkArnAndDefinition(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "backup");
+        String name = unique("Framework", partitionCase).replace("-", "_");
+        String body = "{\"FrameworkName\":\"" + name + "\",\"FrameworkControls\":["
+                + "{\"ControlName\":\"BACKUP_RECOVERY_POINT_ENCRYPTED\"}]}";
+        String arn = signed(region, "backup").contentType(JSON).body(body)
+                .when().post("/audit/frameworks").then().statusCode(200)
+                .extract().jsonPath().getString("FrameworkArn");
+        cleanup.register(() -> signed(region, "backup").when().delete("/audit/frameworks/" + name));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+        Response described = signed(region, "backup").when().get("/audit/frameworks/" + name)
+                .then().statusCode(200).extract().response();
+        assertEquals(arn, described.jsonPath().getString("FrameworkArn"));
+        assertEquals("UNAVAILABLE", described.jsonPath().getString("FrameworkStatus"));
+        assertEquals("BACKUP_RECOVERY_POINT_ENCRYPTED", described.jsonPath().getString("FrameworkControls[0].ControlName"));
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void backupVaultArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "backup");
         String name = unique("smoke-vault", partitionCase);
@@ -1026,23 +1103,50 @@ class PartitionCrossServiceSmokeIntegrationTest {
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void applicationAutoScalingScalableTargetArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "application-autoscaling");
-        String resourceId = "service/" + unique("smoke-cluster", partitionCase) + "/service";
+        String tableName = unique("smoke-scaling-table", partitionCase);
+        String body = """
+                {
+                  "TableName": "%s",
+                  "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                  "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+                  "BillingMode": "PROVISIONED",
+                  "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}
+                }
+                """.formatted(tableName);
+        json10(region, "dynamodb", "DynamoDB_20120810.CreateTable", body)
+                .when().post("/").then().statusCode(200);
+        cleanup.register(() -> json10(region, "dynamodb", "DynamoDB_20120810.DeleteTable",
+                "{\"TableName\":\"" + tableName + "\"}").when().post("/").then().statusCode(200));
+        String resourceId = "table/" + tableName;
+        String target = """
+                "ServiceNamespace": "dynamodb", "ResourceId": "%s",
+                "ScalableDimension": "dynamodb:table:ReadCapacityUnits"
+                """.formatted(resourceId);
+        String arn = json11(region, "application-autoscaling", "AnyScaleFrontendService.RegisterScalableTarget",
+                "{" + target + ", \"MinCapacity\": 1, \"MaxCapacity\": 5}")
+        .when().post("/").then().statusCode(200)
+            .extract().jsonPath().getString("ScalableTargetARN");
+        cleanup.register(() -> json11(region, "application-autoscaling",
+                "AnyScaleFrontendService.DeregisterScalableTarget", "{" + target + "}")
+                .when().post("/").then().statusCode(200));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+        String scheduledResourceId = "service/" + unique("smoke-cluster", partitionCase) + "/service";
         try (ApplicationAutoScalingClient client = AwsTestClients.create(ApplicationAutoScalingClient.builder(),
                 "000000000000", Region.of(region))) {
-            String arn = client.registerScalableTarget(b -> b.serviceNamespace("ecs").resourceId(resourceId)
+            String scheduledTargetArn = client.registerScalableTarget(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId)
                     .scalableDimension("ecs:service:DesiredCount").minCapacity(1).maxCapacity(5)).scalableTargetARN();
             try {
-                PartitionMatrix.assertArnIn(partitionCase, arn);
-                client.putScheduledAction(b -> b.serviceNamespace("ecs").resourceId(resourceId)
+                PartitionMatrix.assertArnIn(partitionCase, scheduledTargetArn);
+                client.putScheduledAction(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId)
                         .scalableDimension("ecs:service:DesiredCount").scheduledActionName("partition-action")
                         .schedule("at(2099-01-01T00:00:00)")
                         .scalableTargetAction(ScalableTargetAction.builder().minCapacity(0).build()));
-                String actionArn = client.describeScheduledActions(b -> b.serviceNamespace("ecs").resourceId(resourceId))
+                String actionArn = client.describeScheduledActions(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId))
                         .scheduledActions().getFirst().scheduledActionARN();
                 PartitionMatrix.assertArnIn(partitionCase, actionArn);
                 assertTrue(actionArn.contains(":autoscaling:" + region + ":000000000000:scheduledAction:"));
             } finally {
-                client.deregisterScalableTarget(b -> b.serviceNamespace("ecs").resourceId(resourceId)
+                client.deregisterScalableTarget(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId)
                         .scalableDimension("ecs:service:DesiredCount"));
             }
         }

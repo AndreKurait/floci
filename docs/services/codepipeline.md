@@ -4,6 +4,7 @@ Floci implements the AWS CodePipeline JSON 1.1 API and a local pipeline executio
 
 **Protocol:** `POST /` with `Content-Type: application/x-amz-json-1.1` and
 `X-Amz-Target: CodePipeline_20150709.<Action>`.
+**Smithy RPC v2 CBOR:** `POST /service/CodePipeline_20150709/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 
 ## Supported Operations (44 total)
 

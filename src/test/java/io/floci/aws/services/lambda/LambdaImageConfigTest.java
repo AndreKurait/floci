@@ -3,6 +3,8 @@ package io.floci.aws.services.lambda;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.WaitContainerCmd;
+import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import com.github.dockerjava.transport.DockerHttpClient;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
@@ -37,6 +39,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.io.Closeable;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Path;
@@ -234,6 +237,7 @@ class LambdaImageConfigTest {
         @Mock EmbeddedDnsServer embeddedDnsServer;
         @Mock RuntimeApiServer runtimeApiServer;
         @Mock DockerClient dockerClient;
+        @Mock DockerClient streamingDockerClient;
 
         ContainerLauncher launcher;
 
@@ -241,10 +245,13 @@ class LambdaImageConfigTest {
         void setUpLauncher() {
             EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
             EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
+            EmulatorConfig.IamServiceConfig iam = mock(EmulatorConfig.IamServiceConfig.class);
             EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
 
             when(config.services()).thenReturn(services);
             when(services.lambda()).thenReturn(lambda);
+            when(services.iam()).thenReturn(iam);
+            when(iam.lambdaIdentityVerificationEnabled()).thenReturn(false);
             when(lambda.dockerNetwork()).thenReturn(Optional.empty());
             when(config.docker()).thenReturn(docker);
             when(docker.logMaxSize()).thenReturn("10m");
@@ -259,7 +266,7 @@ class LambdaImageConfigTest {
             ContainerReachableEndpoint reachableEndpoint =
                     new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, null, 4566);
             LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
-            launcher = new ContainerLauncher(containerBuilder, lifecycleManager, mock(DockerClient.class),
+            launcher = new ContainerLauncher(containerBuilder, lifecycleManager, streamingDockerClient,
                     mock(DockerHttpClient.class), logStreamer, imageResolver,
                     runtimeApiServerFactory, dockerHostResolver, config,
                     new RegionResolver("us-east-1", "000000000000"), ecrRegistryManager,
@@ -275,6 +282,15 @@ class LambdaImageConfigTest {
             when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
             lenient().when(dockerClient.inspectContainerCmd(any()))
                     .thenReturn(mock(InspectContainerCmd.class, RETURNS_DEEP_STUBS));
+            WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+            when(streamingDockerClient.waitContainerCmd("container-123")).thenReturn(wait);
+            when(wait.exec(any())).thenAnswer(call -> {
+                WaitContainerResultCallback callback = call.getArgument(0);
+                callback.onStart(mock(Closeable.class));
+                return callback;
+            });
+            when(logStreamer.attachBeforeStartForAccount(any(), any(), any(), any(), any(), any(), any()))
+                    .thenReturn(mock(Closeable.class));
 
             lenient().when(dockerClient.copyArchiveToContainerCmd(any())).thenAnswer(inv -> {
                 CopyArchiveToContainerCmd cmd = mock(CopyArchiveToContainerCmd.class);

@@ -251,7 +251,7 @@ class ApiGatewayV2RouteAuthorizerDropTest {
                 mapper.readTree("{" + ROUTE_BASE.formatted(apiId) + ",\"Target\":\"integrations/int-1\"}"));
 
         assertTrue(result.getStatus().endsWith("_FAILED"), result.getStatus());
-        assertEquals("Route not found", result.getStatusReason());
+        assertEquals("Invalid API id specified", result.getStatusReason());
         assertEquals(created.getPhysicalId(), result.getPhysicalId());
         assertEquals("integrations/int-1", route(created).getTarget());
     }
@@ -383,7 +383,7 @@ class ApiGatewayV2RouteAuthorizerDropTest {
                 "{\"Name\":\"auth\",\"AuthorizerType\":\"REQUEST\"}");
 
         assertTrue(result.getStatus().endsWith("_FAILED"), result.getStatus());
-        assertEquals("Authorizer not found", result.getStatusReason());
+        assertEquals("Invalid API id specified", result.getStatusReason());
         assertEquals(created.getPhysicalId(), result.getPhysicalId());
         assertEquals(300, authorizer(created).getAuthorizerResultTtlInSeconds());
     }

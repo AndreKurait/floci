@@ -333,8 +333,13 @@ class ApiGatewayV2DomainCfnIntegrationTest {
         String stack = "apigwv2-domain-retain";
         String domain = "api.retain." + ZONE;
         String renamed = "gateway.retain." + ZONE;
+        // The retained domain still uses the stack's certificate, and ACM refuses to delete a certificate in use
+        // (DeleteCertificate: ResourceInUseException), so on AWS the stack delete would end DELETE_FAILED unless the
+        // certificate is retained too.
         String template = TEMPLATE.replace("\"Type\": \"AWS::ApiGatewayV2::DomainName\",",
-                "\"Type\": \"AWS::ApiGatewayV2::DomainName\", \"UpdateReplacePolicy\": \"Retain\",");
+                "\"Type\": \"AWS::ApiGatewayV2::DomainName\", \"UpdateReplacePolicy\": \"Retain\",")
+            .replace("\"Type\": \"AWS::CertificateManager::Certificate\",",
+                "\"Type\": \"AWS::CertificateManager::Certificate\", \"DeletionPolicy\": \"Retain\",");
         cloudFormation(stack, "CreateStack", template, parameters(domain, "v1", "$default", "first", "created"));
         describeStacks(stack, "CREATE_COMPLETE");
 

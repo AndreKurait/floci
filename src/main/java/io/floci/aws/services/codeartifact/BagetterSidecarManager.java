@@ -73,7 +73,7 @@ public class BagetterSidecarManager implements ContainerTeardown {
      * internal, client-unreachable address to leak into.
      */
     public String ensureReady(String nugetRepositoryId, String publicUrl) {
-        return pool.ensureReady(nugetRepositoryId, () -> startContainer(nugetRepositoryId));
+        return lease.ensureReady(nugetRepositoryId, () -> startContainer(nugetRepositoryId));
     }
 
     /** Stops and removes the container for one nuget repository, if one was ever started. */
@@ -145,7 +145,7 @@ public class BagetterSidecarManager implements ContainerTeardown {
             LOG.infov("BaGetter sidecar for nuget repository {0} is ready at {1}", nugetRepositoryId, url);
             return new PerKeyContainerPool.StartedContainer(containerId, url);
         } catch (RuntimeException e) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            pool.removeFailedStart(nugetRepositoryId, containerId, e);
             throw e;
         }
     }

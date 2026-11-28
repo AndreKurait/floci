@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.ssm.model.Command;
+import io.floci.aws.services.ssm.model.SsmDocument;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -45,7 +46,7 @@ class SsmShellExecutionBudgetTest {
                             "Success", "ok", "", 0, Instant.now(), Instant.now()));
                 });
         SsmCommandService service = new SsmCommandService(new InMemoryStorageFactory("000000000000"),
-                mapper, resolver, executor);
+                mapper, resolver, executor, null, true);
         try {
             Command command = service.sendCommand(request(supplied), "us-east-1");
             await().atMost(Duration.ofSeconds(5)).until(() -> worker.get() != null);
@@ -81,7 +82,7 @@ class SsmShellExecutionBudgetTest {
                     return Optional.empty();
                 });
         SsmCommandService service = new SsmCommandService(new InMemoryStorageFactory("000000000000"),
-                mapper, resolver, executor);
+                mapper, resolver, executor, null, true);
         try {
             Command command = service.sendCommand(request(supplied), "us-east-1");
             if (fallback) {
@@ -105,7 +106,7 @@ class SsmShellExecutionBudgetTest {
                     () -> {
                         if (supplied != 0) {
                             assertEquals(Integer.toString(supplied),
-                                    payload.at("/Parameters/executionTimeout/0").asText());
+                                    payload.at("/Parameters/executionTimeout").asText());
                         }
                     });
         } finally {
@@ -121,7 +122,7 @@ class SsmShellExecutionBudgetTest {
         when(resolver.getRegion()).thenReturn("us-east-1");
         SsmDirectCommandExecutor executor = mock(SsmDirectCommandExecutor.class);
         SsmCommandService service = new SsmCommandService(new InMemoryStorageFactory("000000000000"),
-                mapper, resolver, executor);
+                mapper, resolver, executor, null, true);
         try {
             String id = service.sendCommandToInstance("i-budget", "AWS-RunShellScript",
                     Map.of("commands", List.of("echo hook")), timeout, "us-east-1");
@@ -131,8 +132,8 @@ class SsmShellExecutionBudgetTest {
             assertEquals(timeout, command.getTimeoutSeconds());
             assertEquals(timeout, Duration.between(command.getRequestedDateTime(), command.getExpiresAfter())
                     .toSeconds());
-            assertEquals(Integer.toString(timeout),
-                    payload.at("/DocumentContent/parameters/executionTimeout/default").asText());
+            assertEquals("3600", payload.at("/DocumentContent/parameters/executionTimeout/default").asText());
+            assertEquals(Integer.toString(timeout), payload.at("/Parameters/executionTimeout").asText());
             verifyNoInteractions(executor);
         } finally {
             service.stop();
@@ -140,23 +141,41 @@ class SsmShellExecutionBudgetTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"AWS-RunPowerShellScript", "CustomDocument"})
-    void nonShellBudgetHandlingRemainsUnchanged(String document) throws Exception {
+    @CsvSource({"false,0,3600", "false,5,5", "true,0,3600", "true,5,5"})
+    void powerShellAndDeclaredCustomTimeoutsContributeToDeliveryExpiry(boolean custom, int supplied, int expected)
+            throws Exception {
         RegionResolver resolver = mock(RegionResolver.class);
         when(resolver.getAccountId()).thenReturn("000000000000");
         when(resolver.getRegion()).thenReturn("us-east-1");
+        SsmService documents = mock(SsmService.class);
+        when(documents.getDocument("CustomDocument", "us-east-1")).thenReturn(new SsmDocument(
+                "CustomDocument", """
+                {"schemaVersion":"2.2","parameters":{
+                  "commands":{"type":"StringList"},"executionTimeout":{"type":"String","default":"3600"}
+                },"mainSteps":[{"action":"aws:runShellScript","name":"customStep","inputs":{
+                  "runCommand":"{{ commands }}","timeoutSeconds":"{{ executionTimeout }}"
+                }}]}
+                """, "Command"));
         SsmCommandService service = new SsmCommandService(new InMemoryStorageFactory("000000000000"),
-                mapper, resolver, mock(SsmDirectCommandExecutor.class));
+                mapper, resolver, mock(SsmDirectCommandExecutor.class), documents, false);
         try {
-            ObjectNode request = request(5);
-            request.put("DocumentName", document);
+            service.updateInstanceInformation(mapper.createObjectNode().put("InstanceId", "i-budget"), "us-east-1");
+            ObjectNode request = request(supplied);
+            request.put("DocumentName", custom ? "CustomDocument" : "AWS-RunPowerShellScript");
             Command command = service.sendCommand(request, "us-east-1");
-            JsonNode payload = mapper.readTree((String)
-                    service.getMessages("i-budget", "other", 30).getFirst().get("Payload"));
-            assertEquals(30, Duration.between(command.getRequestedDateTime(), command.getExpiresAfter())
+            JsonNode payload = mapper.readTree(service.pendingAgentCommands("i-budget", "us-east-1").getFirst().content());
+            assertEquals(30L + expected, Duration.between(command.getRequestedDateTime(), command.getExpiresAfter())
                     .toSeconds());
-            assertEquals("30", payload.at("/DocumentContent/parameters/executionTimeout/default").asText());
-            assertEquals("5", payload.at("/Parameters/executionTimeout/0").asText());
+            assertEquals("3600", payload.at("/DocumentContent/parameters/executionTimeout/default").asText());
+            if (custom) {
+                assertEquals("customStep", payload.at("/DocumentContent/mainSteps/0/name").asText());
+            } else {
+                assertEquals("0.aws:runPowerShellScript", payload
+                        .at("/DocumentContent/runtimeConfig/aws:runPowerShellScript/properties/0/id").asText());
+            }
+            if (supplied != 0) {
+                assertEquals(Integer.toString(supplied), payload.at("/Parameters/executionTimeout").asText());
+            }
         } finally {
             service.stop();
         }
@@ -167,7 +186,7 @@ class SsmShellExecutionBudgetTest {
         RegionResolver resolver = mock(RegionResolver.class);
         when(resolver.getAccountId()).thenReturn("000000000000");
         SsmCommandService service = new SsmCommandService(new InMemoryStorageFactory("000000000000"),
-                mapper, resolver, mock(SsmDirectCommandExecutor.class));
+                mapper, resolver, mock(SsmDirectCommandExecutor.class), null, true);
         try {
             ObjectNode request = request(0);
             request.remove("TimeoutSeconds");

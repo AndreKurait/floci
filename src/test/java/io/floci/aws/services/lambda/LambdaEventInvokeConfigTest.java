@@ -167,4 +167,25 @@ class LambdaEventInvokeConfigTest {
         assertEquals(versionDestination, service.findEventInvokeConfig(executedVersion)
                 .orElseThrow().getDestinationConfig().getOnSuccess().getDestination());
     }
+
+    @Test
+    void deletingTheFunctionDeletesItsEventInvokeConfigs() {
+        service.putEventInvokeConfig(REGION, "test-fn", null, Map.of("MaximumRetryAttempts", 0));
+        service.putEventInvokeConfig(REGION, "test-fn", "prod", Map.of("MaximumRetryAttempts", 1));
+
+        service.deleteFunction(REGION, "test-fn");
+        service.createFunction(REGION, Map.of(
+                "FunctionName", "test-fn",
+                "PackageType", "Image",
+                "Role", "arn:aws:iam::000000000000:role/test-role",
+                "Code", Map.of("ImageUri", "public.ecr.aws/lambda/nodejs:20")
+        ));
+
+        assertTrue(service.listEventInvokeConfigs(REGION, "test-fn").isEmpty(),
+                "a function created under a deleted function's name must not inherit its async settings");
+        AwsException ex = assertThrows(AwsException.class,
+                () -> service.getEventInvokeConfig(REGION, "test-fn", null));
+        assertEquals("ResourceNotFoundException", ex.getErrorCode());
+        assertEquals(404, ex.getHttpStatus());
+    }
 }

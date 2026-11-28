@@ -3,6 +3,7 @@ package io.floci.aws.services.cloudfront.model;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.Map;
 
 @RegisterForReflection
 public class FieldLevelEncryptionProfile {
@@ -13,6 +14,7 @@ public class FieldLevelEncryptionProfile {
     private String name;
     private String callerReference;
     private String comment;
+    private Map<String, Object> encryptionEntities;
 
     public FieldLevelEncryptionProfile() {}
 
@@ -33,4 +35,6 @@ public class FieldLevelEncryptionProfile {
 
     public String getComment() { return comment; }
     public void setComment(String comment) { this.comment = comment; }
+    public Map<String, Object> getEncryptionEntities() { return encryptionEntities; }
+    public void setEncryptionEntities(Map<String, Object> value) { this.encryptionEntities = value; }
 }

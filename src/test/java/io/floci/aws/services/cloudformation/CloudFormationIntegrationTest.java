@@ -81,34 +81,21 @@ class CloudFormationIntegrationTest {
     }
 
     private static void awaitStackStatus(String stackNameOrArn, String expectedStatus) {
-        long deadline = System.currentTimeMillis() + 10_000;
-        String statusXml = "";
-        while (System.currentTimeMillis() < deadline) {
-            statusXml = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackNameOrArn)
             .when()
                 .post("/")
             .then()
-                .extract().body().asString();
-            if ("DELETE_COMPLETE".equals(expectedStatus)) {
-                assertThat(statusXml, not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
-                if (statusXml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")
-                        || statusXml.contains("does not exist")) {
-                    return;
-                }
-            } else if (statusXml.contains("<StackStatus>" + expectedStatus + "</StackStatus>")) {
-                return;
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("Interrupted while waiting for stack " + stackNameOrArn + " to reach " + expectedStatus, e);
-            }
-        }
-        assertThat(statusXml, containsString("<StackStatus>" + expectedStatus + "</StackStatus>"));
+                .extract().body().asString(), statusXml -> {
+                    if ("DELETE_COMPLETE".equals(expectedStatus)) {
+                        assertThat(statusXml, not(containsString("<StackStatus>DELETE_FAILED</StackStatus>")));
+                        return statusXml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")
+                                || statusXml.contains("does not exist");
+                    }
+                    return statusXml.contains("<StackStatus>" + expectedStatus + "</StackStatus>");
+                }, statusXml -> "Stack " + stackNameOrArn + " did not reach " + expectedStatus + ": " + statusXml);
     }
 
     private static String firstPhysicalResourceId(String xml) {
@@ -1512,6 +1499,7 @@ class CloudFormationIntegrationTest {
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStackResources")
             .formParam("StackName", stackName)
+            .formParam("LogicalResourceId", "MyFunction")
         .when()
             .post("/")
         .then()
@@ -1593,6 +1581,18 @@ class CloudFormationIntegrationTest {
         return """
             {
               "Resources": {
+                "Vpc": {
+                  "Type": "AWS::EC2::VPC",
+                  "Properties": {"CidrBlock": "10.92.0.0/16"}
+                },
+                "Subnet": {
+                  "Type": "AWS::EC2::Subnet",
+                  "Properties": {"VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.92.1.0/24"}
+                },
+                "SecurityGroup": {
+                  "Type": "AWS::EC2::SecurityGroup",
+                  "Properties": {"VpcId": {"Ref": "Vpc"}, "GroupDescription": "Lambda test network"}
+                },
                 "MyFunction": {
                   "Type": "AWS::Lambda::Function",
                   "Properties": {
@@ -1601,8 +1601,8 @@ class CloudFormationIntegrationTest {
                     "Handler": "index.handler",
                     "Role": "arn:aws:iam::000000000000:role/cfn-test-lambda-role",
                     "VpcConfig": {
-                      "SubnetIds": ["subnet-0123456789abcdef0"],
-                      "SecurityGroupIds": ["sg-0123456789abcdef0"]
+                      "SubnetIds": [{"Ref": "Subnet"}],
+                      "SecurityGroupIds": [{"Ref": "SecurityGroup"}]
                     }
                     %s
                   }
@@ -2259,10 +2259,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        String deletedEventsXml = null;
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            deletedEventsXml = given()
+        String deletedEventsXml = CfnStackWaits.lastStateWithin(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStackEvents")
                 .formParam("StackName", stackArn)
@@ -2270,13 +2267,8 @@ class CloudFormationIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
-                .extract().asString();
-
-            if (deletedEventsXml.contains("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>")) {
-                break;
-            }
-            Thread.sleep(200);
-        }
+                .extract().asString(),
+                events -> events.contains("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>"));
 
         assertThat(deletedEventsXml, containsString("<StackId>" + stackArn + "</StackId>"));
         assertThat(deletedEventsXml, containsString("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>"));
@@ -2360,10 +2352,7 @@ class CloudFormationIntegrationTest {
             .statusCode(200);
 
         // The stack must settle into DELETE_FAILED — never DELETE_COMPLETE.
-        String statusXml = null;
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            statusXml = given()
+        String statusXml = CfnStackWaits.lastStateWithin(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", "cfn-nonempty-delete-stack")
@@ -2371,14 +2360,9 @@ class CloudFormationIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
-                .extract().asString();
-
-            if (statusXml.contains("<StackStatus>DELETE_FAILED</StackStatus>")
-                    || statusXml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>")) {
-                break;
-            }
-            Thread.sleep(200);
-        }
+                .extract().asString(),
+                xml -> xml.contains("<StackStatus>DELETE_FAILED</StackStatus>")
+                        || xml.contains("<StackStatus>DELETE_COMPLETE</StackStatus>"));
 
         assertThat(statusXml, containsString("<StackStatus>DELETE_FAILED</StackStatus>"));
         assertThat(statusXml, not(containsString("<StackStatus>DELETE_COMPLETE</StackStatus>")));
@@ -2424,21 +2408,13 @@ class CloudFormationIntegrationTest {
             .body(containsString("<StackId>"));
 
         // Wait for CREATE_COMPLETE before deleting the secret out of band.
-        long createDeadline = System.currentTimeMillis() + 10_000;
-        String createStatus = "";
-        while (System.currentTimeMillis() < createDeadline) {
-            String xml = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", "cfn-1668-delete-stack")
-            .when().post("/").then().statusCode(200).extract().asString();
-            if (xml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>")) {
-                createStatus = "CREATE_COMPLETE";
-                break;
-            }
-            Thread.sleep(200);
-        }
-        assertEquals("CREATE_COMPLETE", createStatus, "Stack did not reach CREATE_COMPLETE within timeout");
+            .when().post("/").then().statusCode(200).extract().asString(),
+                xml -> xml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>"),
+                xml -> "Stack did not reach CREATE_COMPLETE within timeout: " + xml);
 
         // Simulate a persistent-state restore dropping the secret while the stack still tracks it.
         given()
@@ -2494,10 +2470,7 @@ class CloudFormationIntegrationTest {
         String stackArn = createResponse.substring(
                 createResponse.indexOf("<StackId>") + "<StackId>".length(), createResponse.indexOf("</StackId>"));
 
-        boolean created = false;
-        long createDeadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < createDeadline) {
-            String statusXml = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackArn)
@@ -2505,14 +2478,9 @@ class CloudFormationIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
-            .extract().asString();
-            if (statusXml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>")) {
-                created = true;
-                break;
-            }
-            Thread.sleep(200);
-        }
-        assertThat("Stack did not reach CREATE_COMPLETE within timeout", created, equalTo(true));
+                .extract().asString(),
+                xml -> xml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>"),
+                xml -> "Stack did not reach CREATE_COMPLETE within timeout: " + xml);
 
         String resourcesXml = given()
             .contentType("application/x-www-form-urlencoded")
@@ -2586,9 +2554,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        long readyDeadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < readyDeadline) {
-            String deletedEventsXml = given()
+        CfnStackWaits.lastStateWithin(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStackEvents")
                 .formParam("StackName", stackArn)
@@ -2596,15 +2562,30 @@ class CloudFormationIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
-                .extract().asString();
+                .extract().asString(),
+                events -> events.contains("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>"));
 
-            if (deletedEventsXml.contains("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>")) {
-                break;
+        for (String action : List.of("ListStackResources", "DescribeStackResources", "DescribeStackResource")) {
+            RequestSpecification request = given().contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", action).formParam("StackName", stackArn);
+            if ("DescribeStackResource".equals(action)) {
+                request.formParam("LogicalResourceId", "MyBucket");
             }
-            Thread.sleep(200);
+            request.when().post("/")
+            .then().statusCode(200).body(containsString("DELETE_COMPLETE"));
         }
 
         clock.advance(Duration.ofSeconds(31));
+
+        for (String action : List.of("ListStackResources", "DescribeStackResources", "DescribeStackResource")) {
+            RequestSpecification request = given().contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", action).formParam("StackName", stackArn);
+            if ("DescribeStackResource".equals(action)) {
+                request.formParam("LogicalResourceId", "MyBucket");
+            }
+            request.when().post("/")
+            .then().statusCode(400).body(containsString("does not exist"));
+        }
 
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -2760,9 +2741,7 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200);
 
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            String events = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStackEvents")
                 .formParam("StackName", stackArn)
@@ -2770,14 +2749,10 @@ class CloudFormationIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
-                .extract().asString();
-
-            if (events.contains("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>")) {
-                return stackArn;
-            }
-            Thread.sleep(200);
-        }
-        throw new AssertionError("stack " + stackName + " never reached DELETE_COMPLETE");
+                .extract().asString(),
+                events -> events.contains("<ResourceStatus>DELETE_COMPLETE</ResourceStatus>"),
+                events -> "stack " + stackName + " never reached DELETE_COMPLETE");
+        return stackArn;
     }
 
     private String listStacksXml(String statusFilter) {
@@ -3495,6 +3470,7 @@ class CloudFormationIntegrationTest {
             .statusCode(200);
 
         awaitStackStatus("ECR-Upper-Stack", "CREATE_COMPLETE");
+
         // ECR auto-name should be lowercase
         given()
             .contentType("application/x-www-form-urlencoded")
@@ -7646,21 +7622,15 @@ class CloudFormationIntegrationTest {
             .formParam("TemplateBody", parentTemplate)
         .when().post("/").then().statusCode(200);
 
-        String xml = null;
-        long deadline = System.currentTimeMillis() + 20_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = given()
+        String xml = CfnStackWaits.lastStateWithin(Duration.ofSeconds(20), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackName)
             .when().post("/")
             .then().statusCode(200)
-            .extract().asString();
-            if (xml.contains("<StackStatus>ROLLBACK_COMPLETE</StackStatus>")
-                    || xml.contains("<StackStatus>CREATE_COMPLETE</StackStatus>")) {
-                break;
-            }
-        }
+            .extract().asString(),
+                state -> state.contains("<StackStatus>ROLLBACK_COMPLETE</StackStatus>")
+                        || state.contains("<StackStatus>CREATE_COMPLETE</StackStatus>"));
 
         assertThat(xml, containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
         assertThat(xml, not(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>")));

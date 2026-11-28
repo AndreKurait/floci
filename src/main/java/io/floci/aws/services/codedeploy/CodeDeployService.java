@@ -6,11 +6,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.EpochSeconds;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
+import io.floci.aws.core.common.StripedLocks;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackedMap;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.codedeploy.model.Application;
@@ -25,10 +29,13 @@ import io.floci.aws.services.ecs.model.CreateTaskSetRequest;
 import io.floci.aws.services.ecs.model.TaskSet;
 import io.floci.aws.services.elbv2.ElbV2Service;
 import io.floci.aws.services.elbv2.model.TargetGroup;
+import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
+import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.InvokeResult;
 import io.floci.aws.services.ssm.SsmCommandService;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -38,6 +45,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -47,8 +55,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -60,43 +68,135 @@ public class CodeDeployService {
     // Lambda/ECS validation hooks must call PutLifecycleEventHookExecutionStatus within one hour.
     private static final Duration DEFAULT_HOOK_CALLBACK_TIMEOUT = Duration.ofHours(1);
     private static final Duration STOP_POLL_INTERVAL = Duration.ofMillis(200);
+    private static final Duration SSM_POLL_INTERVAL = Duration.ofMillis(500);
 
+    private final ServiceRoleCallAuthorizer roleAuthorizer;
     private final LambdaService lambdaService;
     private final EcsService ecsService;
     private final ElbV2Service elbV2Service;
     private final SsmCommandService ssmCommandService;
     private final Ec2Service ec2Service;
+    private final CodeDeployAgentDeployment agentDeployment;
+    private final CodeDeployLaunchHooks launchHooks;
     private final ObjectMapper mapper;
     private final ObjectMapper yamlMapper;
     private final RegionResolver regionResolver;
     private final StorageFactory storageFactory;
     private final Duration hookCallbackTimeout;
     private final Clock clock;
+    private final CodeDeployTimer timer;
 
-    @Inject
     public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                              ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
                              Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
-                             StorageFactory storageFactory) {
+                             StorageFactory storageFactory,
+                      ServiceRoleCallAuthorizer roleAuthorizer) {
         this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
-                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC());
+                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC(), roleAuthorizer);
     }
 
     CodeDeployService(LambdaService lambdaService, EcsService ecsService,
                       ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
                       Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
-                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock) {
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      ServiceRoleCallAuthorizer roleAuthorizer) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, hookCallbackTimeout, clock, null, roleAuthorizer);
+    }
+
+    public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                             ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                             Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                             StorageFactory storageFactory, CodeDeployAgentDeployment agentDeployment,
+                      ServiceRoleCallAuthorizer roleAuthorizer) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC(), agentDeployment, roleAuthorizer);
+    }
+
+    CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      CodeDeployAgentDeployment agentDeployment,
+                      ServiceRoleCallAuthorizer roleAuthorizer) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, hookCallbackTimeout, clock, agentDeployment, null, roleAuthorizer);
+    }
+
+    @Inject
+    public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                             ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                             Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                             StorageFactory storageFactory, CodeDeployAgentDeployment agentDeployment,
+                             CodeDeployLaunchHooks launchHooks,
+                      ServiceRoleCallAuthorizer roleAuthorizer) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, DEFAULT_HOOK_CALLBACK_TIMEOUT, Clock.systemUTC(),
+                agentDeployment, launchHooks, roleAuthorizer);
+    }
+
+    CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      CodeDeployAgentDeployment agentDeployment, CodeDeployLaunchHooks launchHooks,
+                      ServiceRoleCallAuthorizer roleAuthorizer) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, hookCallbackTimeout, clock, agentDeployment,
+                launchHooks, CodeDeployTimer.SYSTEM, roleAuthorizer);
+    }
+
+    CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      CodeDeployAgentDeployment agentDeployment, CodeDeployLaunchHooks launchHooks,
+                      CodeDeployTimer timer,
+                      ServiceRoleCallAuthorizer roleAuthorizer) {
+        this.roleAuthorizer = roleAuthorizer;
+        this.launchHooks = launchHooks;
         this.lambdaService = lambdaService;
         this.ecsService = ecsService;
         this.elbV2Service = elbV2Service;
         this.ssmCommandService = ssmCommandService;
         this.ec2Service = ec2Service;
+        this.agentDeployment = agentDeployment;
         this.mapper = mapper;
         this.yamlMapper = new ObjectMapper(new YAMLFactory());
         this.regionResolver = regionResolver;
         this.storageFactory = storageFactory;
         this.hookCallbackTimeout = hookCallbackTimeout;
         this.clock = clock;
+        this.timer = timer;
+    }
+
+    public CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, CodeDeployAgentDeployment agentDeployment,
+                      ServiceRoleCallAuthorizer roleAuthorizer, CodeDeployLaunchHooks launchHooks) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, agentDeployment, launchHooks, roleAuthorizer);
+    }
+
+    CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      CodeDeployAgentDeployment agentDeployment, ServiceRoleCallAuthorizer roleAuthorizer,
+                      CodeDeployLaunchHooks launchHooks) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, hookCallbackTimeout, clock, agentDeployment, launchHooks, roleAuthorizer);
+    }
+
+    CodeDeployService(LambdaService lambdaService, EcsService ecsService,
+                      ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                      Ec2Service ec2Service, ObjectMapper mapper, RegionResolver regionResolver,
+                      StorageFactory storageFactory, Duration hookCallbackTimeout, Clock clock,
+                      CodeDeployAgentDeployment agentDeployment, ServiceRoleCallAuthorizer roleAuthorizer,
+                      CodeDeployLaunchHooks launchHooks, CodeDeployTimer timer) {
+        this(lambdaService, ecsService, elbV2Service, ssmCommandService, ec2Service, mapper,
+                regionResolver, storageFactory, hookCallbackTimeout, clock, agentDeployment, launchHooks, timer, roleAuthorizer);
     }
 
     // ---- Durable (persisted) ----
@@ -108,22 +208,76 @@ public class CodeDeployService {
     private Map<String, Map<String, Application>> applications = new ConcurrentHashMap<>();
     // key: region -> appName -> groupName -> group
     private Map<String, Map<String, Map<String, DeploymentGroup>>> deploymentGroups = new ConcurrentHashMap<>();
+    private AccountAwareStorageBackend<Map<String, Map<String, DeploymentGroup>>> deploymentGroupsStore;
     // key: region -> configName -> config (pre-seeded with built-ins)
     private Map<String, Map<String, DeploymentConfig>> deploymentConfigs = new ConcurrentHashMap<>();
     // key: resourceArn -> tags
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
     // key: region -> instanceName -> OnPremisesInstance
     private Map<String, Map<String, OnPremisesInstance>> onPremisesInstances = new ConcurrentHashMap<>();
+    private Map<String, SuccessfulAgentRevision> successfulAgentRevisions = new ConcurrentHashMap<>();
+
 
     // ---- Transient runtime state (in memory only) ----
-    // key: account:region -> deploymentId -> Deployment
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Deployment>> deployments = new ConcurrentHashMap<>();
-    // key: account:region -> deploymentId -> targetId -> DeploymentTarget wrapper
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, ConcurrentHashMap<String, Map<String, Object>>>> deploymentTargets = new ConcurrentHashMap<>();
+    // key: account/region -> deploymentId -> Deployment
+    private final ConcurrentHashMap<RuntimeScope, ConcurrentHashMap<String, Deployment>> deployments =
+            new ConcurrentHashMap<>();
+    // key: account/region -> deploymentId -> targetId -> DeploymentTarget wrapper
+    private final ConcurrentHashMap<RuntimeScope,
+            ConcurrentHashMap<String, ConcurrentHashMap<String, Map<String, Object>>>> deploymentTargets =
+            new ConcurrentHashMap<>();
     // key: lifecycleEventHookExecutionId -> CompletableFuture<status>
     private final ConcurrentHashMap<String, CompletableFuture<String>> hookFutures = new ConcurrentHashMap<>();
     // key: deploymentId -> stop flag
     private final ConcurrentHashMap<String, AtomicBoolean> stopFlags = new ConcurrentHashMap<>();
+    private final StripedLocks agentGroupLocks = new StripedLocks(256);
+    private final ConcurrentHashMap<AgentGroupScope, String> activeAgentDeployments = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AgentDeploymentContext> agentDeploymentContexts = new ConcurrentHashMap<>();
+
+    private record RuntimeScope(String account, String region) {}
+    private record AgentGroupScope(String account, String region, String groupId) {
+        String historyKey() {
+            return account + ":" + region + ":" + groupId;
+        }
+    }
+
+    @RegisterForReflection
+    public record SuccessfulAgentRevision(String deploymentId, Map<String, Object> revision,
+                                           String fileExistsBehavior, String configName) {}
+
+    private record AgentDeploymentContext(AgentGroupScope scope, SuccessfulAgentRevision revision,
+                                          AgentRollbackPolicy policy, boolean rollback, AtomicBoolean stop,
+                                          AtomicBoolean rollbackRequested, boolean automatic) {}
+
+    private record AgentRollbackPolicy(boolean enabled, List<String> events) {
+        static AgentRollbackPolicy from(Map<String, Object> configuration) {
+            if (configuration == null) {
+                return new AgentRollbackPolicy(false, List.of());
+            }
+            Object enabled = configuration.getOrDefault("enabled", false);
+            Object events = configuration.getOrDefault("events", List.of());
+            if (!(enabled instanceof Boolean) || !(events instanceof List<?> values)
+                    || values.stream().anyMatch(value -> !(value instanceof String)
+                            || !Set.of("DEPLOYMENT_FAILURE", "DEPLOYMENT_STOP_ON_ALARM",
+                                    "DEPLOYMENT_STOP_ON_REQUEST").contains(value))) {
+                throw new AwsException("InvalidAutoRollbackConfigException",
+                        "Rollback configuration requires a boolean enabled and valid event names", 400);
+            }
+            List<String> names = values.stream().map(String.class::cast).toList();
+            if (Boolean.TRUE.equals(enabled) && names.stream().anyMatch(value -> !"DEPLOYMENT_FAILURE".equals(value))) {
+                throw new AwsException("UnsupportedOperationException",
+                        "S3 agent deployments support failure rollback; use StopDeployment for an explicit rollback. "
+                                + "Automatic alarm and request-stop triggers are not implemented", 400);
+            }
+            return new AgentRollbackPolicy((Boolean) enabled, names);
+        }
+
+        Map<String, Object> configuration() {
+            return Map.of("enabled", enabled, "events", events);
+        }
+    }
+
+    private record AutomaticTarget(String instanceId, boolean followup) {}
 
     @PostConstruct
     void initializeStorage() {
@@ -132,14 +286,17 @@ public class CodeDeployService {
         }
         this.applications = storageBacked("codedeploy-applications.json",
                 new TypeReference<Map<String, Map<String, Application>>>() {});
-        this.deploymentGroups = storageBacked("codedeploy-deployment-groups.json",
+        this.deploymentGroupsStore = storageFactory.create("codedeploy", "codedeploy-deployment-groups.json",
                 new TypeReference<Map<String, Map<String, Map<String, DeploymentGroup>>>>() {});
+        this.deploymentGroups = new StorageBackedMap<>(deploymentGroupsStore);
         this.deploymentConfigs = storageBacked("codedeploy-deployment-configs.json",
                 new TypeReference<Map<String, Map<String, DeploymentConfig>>>() {});
         this.tags = storageBacked("codedeploy-tags.json",
                 new TypeReference<Map<String, Map<String, String>>>() {});
         this.onPremisesInstances = storageBacked("codedeploy-on-premises-instances.json",
                 new TypeReference<Map<String, Map<String, OnPremisesInstance>>>() {});
+        this.successfulAgentRevisions = storageBacked("codedeploy-agent-successes.json",
+                new TypeReference<Map<String, SuccessfulAgentRevision>>() {});
         normalizeRegionMaps(applications);
         normalizeDeploymentGroups();
         normalizeRegionMaps(deploymentConfigs);
@@ -164,13 +321,13 @@ public class CodeDeployService {
 
     /** Three-level normalization for deploymentGroups (region -> app -> group). */
     private void normalizeDeploymentGroups() {
-        for (Map.Entry<String, Map<String, Map<String, DeploymentGroup>>> regionEntry
-                : new ArrayList<>(deploymentGroups.entrySet())) {
+        for (AccountAwareStorageBackend.AccountEntry<Map<String, Map<String, DeploymentGroup>>> regionEntry
+                : deploymentGroupsStore.scanAllAccountEntries(region -> true)) {
             Map<String, Map<String, DeploymentGroup>> appMap = new ConcurrentHashMap<>();
-            for (Map.Entry<String, Map<String, DeploymentGroup>> appEntry : regionEntry.getValue().entrySet()) {
+            for (Map.Entry<String, Map<String, DeploymentGroup>> appEntry : regionEntry.value().entrySet()) {
                 appMap.put(appEntry.getKey(), new ConcurrentHashMap<>(appEntry.getValue()));
             }
-            deploymentGroups.put(regionEntry.getKey(), appMap);
+            deploymentGroupsStore.putForAccount(regionEntry.accountId(), regionEntry.key(), appMap);
         }
     }
 
@@ -225,6 +382,7 @@ public class CodeDeployService {
         int containerPort;
         String beforeInstall;
         String afterInstall;
+        String afterAllowTestTraffic;
         String beforeAllowTraffic;
         String afterAllowTraffic;
     }
@@ -414,13 +572,16 @@ public class CodeDeployService {
                     "Application does not exist: " + name, 400);
         }
         persistRegion(applications, region);
-        tags.remove(applicationArn(region, name));
-        // As on AWS, the application's deployment groups go with it.
-        Map<String, DeploymentGroup> groups = deploymentGroupsFor(region).remove(name);
-        if (groups != null) {
-            groups.keySet().forEach(group -> tags.remove(deploymentGroupArn(region, name, group)));
+        Map<String, DeploymentGroup> removedGroups = deploymentGroupsFor(region).remove(name);
+        if (removedGroups != null) {
+            removedGroups.keySet().forEach(group -> tags.remove(deploymentGroupArn(region, name, group)));
+            removedGroups.values().forEach(group -> forgetAgentHistory(region, group.getDeploymentGroupId()));
+            if (launchHooks != null) {
+                removedGroups.values().forEach(group -> launchHooks.delete(region, group));
+            }
             persistRegion(deploymentGroups, region);
         }
+        tags.remove(applicationArn(region, name));
     }
 
     public List<String> listApplications(String region) {
@@ -452,27 +613,50 @@ public class CodeDeployService {
     public DeploymentGroup createDeploymentGroup(String region, String appName, String groupName,
                                                   String deploymentConfigName, String serviceRoleArn,
                                                   Map<String, Object> fields, List<Map<String, String>> tags) {
-        getApplication(region, appName);
+        Application application = getApplication(region, appName);
         Map<String, Map<String, DeploymentGroup>> appGroups = deploymentGroupsFor(region);
         Map<String, DeploymentGroup> groupStore = appGroups.computeIfAbsent(appName, a -> new ConcurrentHashMap<>());
-        if (groupStore.containsKey(groupName)) {
-            throw new AwsException("DeploymentGroupAlreadyExistsException",
-                    "Deployment group already exists: " + groupName, 400);
+        synchronized (groupStore) {
+            if (groupStore.containsKey(groupName)) {
+                throw new AwsException("DeploymentGroupAlreadyExistsException",
+                        "Deployment group already exists: " + groupName, 400);
+            }
+            DeploymentGroup group = new DeploymentGroup();
+            group.setApplicationName(appName);
+            group.setDeploymentGroupId(UUID.randomUUID().toString());
+            group.setDeploymentGroupName(groupName);
+            group.setDeploymentConfigName(deploymentConfigName != null
+                    ? deploymentConfigName : "CodeDeployDefault.OneAtATime");
+            group.setServiceRoleArn(serviceRoleArn);
+            group.setComputePlatform(application.getComputePlatform());
+            applyGroupFields(group, fields);
+            String groupArn = deploymentGroupArn(region, appName, groupName);
+            Map<String, String> previousTags = copyGroupTags(groupArn);
+            if (launchHooks != null) {
+                launchHooks.configure(region, null, group);
+            }
+            groupStore.put(groupName, group);
+            try {
+                persistRegion(deploymentGroups, region);
+                if (tags != null && !tags.isEmpty()) {
+                    tagResource(groupArn, tags);
+                }
+            } catch (RuntimeException failure) {
+                groupStore.remove(groupName, group);
+                compensateGroupWrite(region, failure);
+                compensateGroupChange(failure, () -> restoreEntry(this.tags, groupArn, previousTags));
+                if (launchHooks != null) {
+                    compensateGroupChange(failure, () -> {
+                        List<Map<String, Object>> remaining = launchHooks.delete(region, group);
+                        if (!remaining.isEmpty()) {
+                            throw new IllegalStateException("Managed launch hooks could not be removed: " + remaining);
+                        }
+                    });
+                }
+                throw failure;
+            }
+            return group;
         }
-
-        DeploymentGroup group = new DeploymentGroup();
-        group.setApplicationName(appName);
-        group.setDeploymentGroupId(UUID.randomUUID().toString());
-        group.setDeploymentGroupName(groupName);
-        group.setDeploymentConfigName(deploymentConfigName != null ? deploymentConfigName : "CodeDeployDefault.OneAtATime");
-        group.setServiceRoleArn(serviceRoleArn);
-        applyGroupFields(group, fields);
-        groupStore.put(groupName, group);
-        persistRegion(deploymentGroups, region);
-        if (tags != null && !tags.isEmpty()) {
-            tagResource(deploymentGroupArn(region, appName, groupName), tags);
-        }
-        return group;
     }
 
     public DeploymentGroup getDeploymentGroup(String region, String appName, String groupName) {
@@ -491,44 +675,210 @@ public class CodeDeployService {
                                                   String currentGroupName, String newGroupName,
                                                   String deploymentConfigName, String serviceRoleArn,
                                                   Map<String, Object> fields) {
-        DeploymentGroup group = getDeploymentGroup(region, appName, currentGroupName);
+        return updateDeploymentGroupWithHooks(region, appName, currentGroupName, newGroupName,
+                deploymentConfigName, serviceRoleArn, fields).group();
+    }
+
+    record UpdatedDeploymentGroup(DeploymentGroup group, List<Map<String, Object>> hooksNotCleanedUp) {}
+
+    UpdatedDeploymentGroup updateDeploymentGroupWithHooks(String region, String appName,
+                                                           String currentGroupName, String newGroupName,
+                                                           String deploymentConfigName, String serviceRoleArn,
+                                                           Map<String, Object> fields) {
+        DeploymentGroup previous = getDeploymentGroup(region, appName, currentGroupName);
         Map<String, DeploymentGroup> groupStore = deploymentGroupsFor(region)
                 .computeIfAbsent(appName, a -> new ConcurrentHashMap<>());
-
-        if (newGroupName != null && !newGroupName.equals(currentGroupName)
-                && groupStore.containsKey(newGroupName)) {
-            throw new AwsException("DeploymentGroupAlreadyExistsException",
-                    "Deployment group already exists: " + newGroupName, 400);
-        }
-
-        if (deploymentConfigName != null) { group.setDeploymentConfigName(deploymentConfigName); }
-        if (serviceRoleArn != null) { group.setServiceRoleArn(serviceRoleArn); }
-        applyGroupFields(group, fields);
-
-        if (newGroupName != null && !newGroupName.equals(currentGroupName)) {
-            String oldArn = deploymentGroupArn(region, appName, currentGroupName);
-            groupStore.remove(currentGroupName);
-            group.setDeploymentGroupName(newGroupName);
-            groupStore.put(newGroupName, group);
-            Map<String, String> groupTags = tags.remove(oldArn);
-            if (groupTags != null) {
-                tags.put(deploymentGroupArn(region, appName, newGroupName), groupTags);
+        AgentGroupScope scope = new AgentGroupScope(regionResolver.getAccountId(), region, previous.getDeploymentGroupId());
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            synchronized (groupStore) {
+                if (groupStore.get(currentGroupName) != previous) {
+                    throw new AwsException("DeploymentGroupDoesNotExistException",
+                            "The deployment group changed during update", 400);
+                }
+                String name = newGroupName == null ? currentGroupName : newGroupName;
+                if (!name.equals(currentGroupName) && groupStore.containsKey(name)) {
+                    throw new AwsException("DeploymentGroupAlreadyExistsException",
+                            "Deployment group already exists: " + name, 400);
+                }
+                DeploymentGroup group = mapper.convertValue(previous, DeploymentGroup.class);
+                group.setDeploymentGroupName(name);
+                if (deploymentConfigName != null) { group.setDeploymentConfigName(deploymentConfigName); }
+                if (serviceRoleArn != null) { group.setServiceRoleArn(serviceRoleArn); }
+                applyGroupFields(group, fields);
+                String previousArn = deploymentGroupArn(region, appName, currentGroupName);
+                String updatedArn = deploymentGroupArn(region, appName, name);
+                Map<String, String> previousTags = copyGroupTags(previousArn);
+                Map<String, String> updatedTags = copyGroupTags(updatedArn);
+                List<Map<String, Object>> remaining = launchHooks == null
+                        ? List.of() : launchHooks.configure(region, previous, group);
+                groupStore.remove(currentGroupName);
+                groupStore.put(name, group);
+                try {
+                    persistRegion(deploymentGroups, region);
+                    if (!name.equals(currentGroupName)) {
+                        Map<String, String> groupTags = tags.remove(previousArn);
+                        if (groupTags != null) {
+                            tags.put(updatedArn, groupTags);
+                        }
+                    }
+                } catch (RuntimeException failure) {
+                    groupStore.remove(name, group);
+                    groupStore.put(currentGroupName, previous);
+                    compensateGroupWrite(region, failure);
+                    if (!name.equals(currentGroupName)) {
+                        compensateGroupChange(failure, () -> restoreEntry(tags, previousArn, previousTags));
+                        compensateGroupChange(failure, () -> restoreEntry(tags, updatedArn, updatedTags));
+                    }
+                    if (launchHooks != null) {
+                        compensateGroupChange(failure, () -> {
+                            List<Map<String, Object>> unrecovered = launchHooks.configure(region, group,
+                                    mapper.convertValue(previous, DeploymentGroup.class));
+                            if (!unrecovered.isEmpty()) {
+                                throw new IllegalStateException("Managed launch hooks could not be removed: " + unrecovered);
+                            }
+                        });
+                    }
+                    throw failure;
+                }
+                return new UpdatedDeploymentGroup(group, remaining);
             }
         }
-        persistRegion(deploymentGroups, region);
-        return group;
     }
 
     public void deleteDeploymentGroup(String region, String appName, String groupName) {
-        getApplication(region, appName);
+        deleteDeploymentGroupWithHooks(region, appName, groupName);
+    }
+
+    private Map<String, String> copyGroupTags(String arn) {
+        Map<String, String> value = tags.get(arn);
+        return value == null ? null : new ConcurrentHashMap<>(value);
+    }
+
+    private <V> void restoreEntry(Map<String, V> store, String key, V previous) {
+        if (previous == null) {
+            store.remove(key);
+        } else {
+            store.put(key, previous);
+        }
+    }
+
+    private void compensateGroupWrite(String region, RuntimeException failure) {
+        compensateGroupChange(failure, () -> persistRegion(deploymentGroups, region));
+    }
+
+    private void compensateGroupChange(RuntimeException failure, Runnable compensation) {
+        try {
+            compensation.run();
+        } catch (RuntimeException compensationFailure) {
+            if (compensationFailure != failure) {
+                failure.addSuppressed(compensationFailure);
+            }
+            LOG.errorv(compensationFailure, "Unable to compensate a refused deployment group change");
+        }
+    }
+
+    List<Map<String, Object>> deleteDeploymentGroupWithHooks(String region, String appName, String groupName) {
+        DeploymentGroup group = getDeploymentGroup(region, appName, groupName);
         Map<String, Map<String, DeploymentGroup>> appGroups = deploymentGroupsFor(region);
         Map<String, DeploymentGroup> groupStore = appGroups.get(appName);
-        if (groupStore == null || groupStore.remove(groupName) == null) {
-            throw new AwsException("DeploymentGroupDoesNotExistException",
-                    "Deployment group does not exist: " + groupName, 400);
+        AgentGroupScope scope = new AgentGroupScope(regionResolver.getAccountId(), region, group.getDeploymentGroupId());
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            if (groupStore == null) {
+                throw new AwsException("DeploymentGroupDoesNotExistException",
+                        "Deployment group does not exist: " + groupName, 400);
+            }
+            synchronized (groupStore) {
+                String groupArn = deploymentGroupArn(region, appName, groupName);
+                Map<String, String> previousTags = copyGroupTags(groupArn);
+                SuccessfulAgentRevision previousRevision = successfulAgentRevisions.get(scope.historyKey());
+                if (!groupStore.remove(groupName, group)) {
+                    throw new AwsException("DeploymentGroupDoesNotExistException",
+                            "Deployment group changed during deletion: " + groupName, 400);
+                }
+                try {
+                    persistRegion(deploymentGroups, region);
+                    successfulAgentRevisions.remove(scope.historyKey());
+                    tags.remove(groupArn);
+                } catch (RuntimeException failure) {
+                    groupStore.put(groupName, group);
+                    compensateGroupWrite(region, failure);
+                    compensateGroupChange(failure,
+                            () -> restoreEntry(successfulAgentRevisions, scope.historyKey(), previousRevision));
+                    compensateGroupChange(failure, () -> restoreEntry(tags, groupArn, previousTags));
+                    throw failure;
+                }
+                return launchHooks == null ? List.of() : launchHooks.delete(region, group);
+            }
         }
-        tags.remove(deploymentGroupArn(region, appName, groupName));
-        persistRegion(deploymentGroups, region);
+    }
+
+    private void forgetAgentHistory(String region, String groupId) {
+        AgentGroupScope scope = new AgentGroupScope(regionResolver.getAccountId(), region, groupId);
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            successfulAgentRevisions.remove(scope.historyKey());
+        }
+    }
+
+    record AutoScalingGroupReference(String account, String region, String application, String groupId) {}
+    record AutoScalingLaunchView(DeploymentGroup group, SuccessfulAgentRevision revision, String foregroundDeployment) {}
+    record AutomaticDeployment(String deploymentId, String sourceDeploymentId) {}
+
+    List<AutoScalingGroupReference> autoScalingDeploymentGroups() {
+        if (deploymentGroupsStore == null) {
+            return List.of();
+        }
+        List<AutoScalingGroupReference> references = new ArrayList<>();
+        for (AccountAwareStorageBackend.AccountEntry<Map<String, Map<String, DeploymentGroup>>> entry
+                : deploymentGroupsStore.scanAllAccountEntries(region -> true)) {
+            entry.value().forEach((application, groups) -> groups.values().stream()
+                    .filter(group -> !CodeDeployLaunchHooks.groupNames(group).isEmpty())
+                    .forEach(group -> references.add(new AutoScalingGroupReference(
+                            entry.accountId(), entry.key(), application, group.getDeploymentGroupId()))));
+        }
+        return List.copyOf(references);
+    }
+
+    AutoScalingLaunchView autoScalingLaunchView(AutoScalingGroupReference reference) {
+        AgentGroupScope scope = autoScalingScope(reference);
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            DeploymentGroup group = findAgentGroup(scope, reference.application());
+            return group == null ? null : new AutoScalingLaunchView(
+                    mapper.convertValue(group, DeploymentGroup.class),
+                    successfulAgentRevisions.get(scope.historyKey()), activeAgentDeployments.get(scope));
+        }
+    }
+
+    AutomaticDeployment startAutomaticDeployment(AutoScalingGroupReference reference, String scalingGroup,
+                                                  String instanceId, boolean followup) {
+        AgentGroupScope scope = autoScalingScope(reference);
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            DeploymentGroup group = findAgentGroup(scope, reference.application());
+            if (group == null || !CodeDeployLaunchHooks.groupNames(group).contains(scalingGroup)) {
+                return null;
+            }
+            SuccessfulAgentRevision revision = successfulAgentRevisions.get(scope.historyKey());
+            if (revision == null || (followup && activeAgentDeployments.containsKey(scope))) {
+                return null;
+            }
+            String id = createServerDeployment(reference.region(), reference.application(), group.getDeploymentGroupName(),
+                    group, revision.configName(), revision.revision(),
+                    (followup ? "Update outdated Auto Scaling instance " : "Auto Scaling launch of ") + instanceId,
+                    revision.fileExistsBehavior(), Map.of("enabled", false, "events", List.of()), null,
+                    new AutomaticTarget(instanceId, followup));
+            return new AutomaticDeployment(id, revision.deploymentId());
+        }
+    }
+
+    private AgentGroupScope autoScalingScope(AutoScalingGroupReference reference) {
+        if (!reference.account().equals(regionResolver.getAccountId())) {
+            throw new IllegalStateException("Auto Scaling deployment must run in its owning account");
+        }
+        return new AgentGroupScope(reference.account(), reference.region(), reference.groupId());
+    }
+
+    private DeploymentGroup findAgentGroup(AgentGroupScope scope, String application) {
+        return deploymentGroupsFor(scope.region()).getOrDefault(application, Map.of()).values().stream()
+                .filter(group -> scope.groupId().equals(group.getDeploymentGroupId())).findFirst().orElse(null);
     }
 
     public List<String> listDeploymentGroups(String region, String appName) {
@@ -608,16 +958,13 @@ public class CodeDeployService {
     // ---- Deployments ----
 
     private Map<String, Deployment> deploymentsFor(String region) {
-        return deployments.computeIfAbsent(deploymentScope(region), r -> new ConcurrentHashMap<>());
+        return deployments.computeIfAbsent(new RuntimeScope(regionResolver.getAccountId(), region),
+                ignored -> new ConcurrentHashMap<>());
     }
 
     private Map<String, ConcurrentHashMap<String, Map<String, Object>>> deploymentTargetsFor(String region) {
-        return deploymentTargets.computeIfAbsent(deploymentScope(region), r -> new ConcurrentHashMap<>());
-    }
-
-    /** Deployments live in memory, so they are keyed by the caller's account as well as the region. */
-    private String deploymentScope(String region) {
-        return regionResolver.getAccountId() + ":" + region;
+        return deploymentTargets.computeIfAbsent(new RuntimeScope(regionResolver.getAccountId(), region),
+                ignored -> new ConcurrentHashMap<>());
     }
 
     /**
@@ -635,6 +982,19 @@ public class CodeDeployService {
 
     public String createDeployment(String region, String appName, String groupName,
                                    String configName, Map<String, Object> revision, String description) {
+        return createDeployment(region, appName, groupName, configName, revision, description, "DISALLOW");
+    }
+
+    public String createDeployment(String region, String appName, String groupName,
+                                   String configName, Map<String, Object> revision, String description,
+                                   String fileExistsBehavior) {
+        return createDeployment(region, appName, groupName, configName, revision, description,
+                fileExistsBehavior, null);
+    }
+
+    public String createDeployment(String region, String appName, String groupName,
+                                    String configName, Map<String, Object> revision, String description,
+                                    String fileExistsBehavior, Map<String, Object> autoRollbackConfiguration) {
         Application app = getApplication(region, appName);
         DeploymentGroup group = getDeploymentGroup(region, appName, groupName);
         // Compute platform is authoritative on the Application; the deployment group may also carry it
@@ -642,15 +1002,26 @@ public class CodeDeployService {
         if (computePlatform == null) {
             computePlatform = app.getComputePlatform();
         }
+        if (!"DISALLOW".equals(fileExistsBehavior)
+                && (!"Server".equals(computePlatform) || revision == null
+                    || !"S3".equals(revision.get("revisionType")))) {
+            throw new AwsException("InvalidFileExistsBehaviorException",
+                    "File behavior overrides require an S3 Server revision", 400);
+        }
+        if (autoRollbackConfiguration != null && (!"Server".equals(computePlatform) || revision == null
+                || !"S3".equals(revision.get("revisionType")))) {
+            throw new AwsException("UnsupportedOperationException",
+                    "Rollback overrides currently require an S3 Server revision", 400);
+        }
 
         if ("ECS".equals(computePlatform)) {
             return createEcsDeployment(region, appName, groupName, group, configName, revision, description);
         }
 
         if ("Server".equals(computePlatform)) {
-            return createServerDeployment(region, appName, groupName, group, configName, revision, description);
+            return createServerDeployment(region, appName, groupName, group, configName, revision, description,
+                    fileExistsBehavior, autoRollbackConfiguration, null);
         }
-
         AppSpecInfo appSpec = parseAppSpec(revision);
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
 
@@ -691,9 +1062,10 @@ public class CodeDeployService {
         AtomicBoolean stopFlag = new AtomicBoolean(false);
         stopFlags.put(deploymentId, stopFlag);
 
-        String finalEffectiveConfig = effectiveConfig;
+        String serviceRoleArn = group.getServiceRoleArn();
         startDeploymentThread("codedeploy-" + deploymentId, region,
-                () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag, finalEffectiveConfig));
+                () -> runStateMachine(region, deployment, appSpec, lambdaTargetMap, stopFlag,
+                        effectiveConfig, serviceRoleArn));
 
         return deploymentId;
     }
@@ -717,10 +1089,28 @@ public class CodeDeployService {
     }
 
     public Map<String, String> stopDeployment(String region, String deploymentId) {
+        return stopDeployment(region, deploymentId, false);
+    }
+
+    public Map<String, String> stopDeployment(String region, String deploymentId, boolean autoRollbackEnabled) {
         Deployment d = getDeployment(region, deploymentId);
+        AgentDeploymentContext agent = agentDeploymentContexts.get(deploymentId);
+        if (agent != null) {
+            synchronized (agentGroupLocks.lockFor(agent.scope())) {
+                if (agentDeploymentContexts.get(deploymentId) == agent) {
+                    agent.rollbackRequested().set(autoRollbackEnabled);
+                    agent.stop().set(true);
+                    return Map.of("status", "Pending", "statusMessage", "Stop request submitted.");
+                }
+            }
+        }
         String status = d.getStatus();
         if ("Succeeded".equals(status) || "Failed".equals(status) || "Stopped".equals(status)) {
             return Map.of("status", "Succeeded", "statusMessage", "Deployment is already in a terminal state.");
+        }
+        if (autoRollbackEnabled) {
+            throw new AwsException("UnsupportedActionForDeploymentTypeException",
+                    "Explicit stop rollback currently requires an S3 Server deployment", 400);
         }
         AtomicBoolean flag = stopFlags.get(deploymentId);
         if (flag != null) {
@@ -750,6 +1140,21 @@ public class CodeDeployService {
             return List.of();
         }
         return new ArrayList<>(targets.keySet());
+    }
+
+    public Map<String, Object> getDeploymentTarget(String region, String deploymentId, String targetId) {
+        if (deploymentId == null || deploymentId.isBlank()) {
+            throw new AwsException("DeploymentIdRequiredException", "A deployment ID is required", 400);
+        }
+        if (targetId == null || targetId.isBlank()) {
+            throw new AwsException("DeploymentTargetIdRequiredException", "A deployment target ID is required", 400);
+        }
+        List<Map<String, Object>> targets = batchGetDeploymentTargets(region, deploymentId, List.of(targetId));
+        if (targets.isEmpty()) {
+            throw new AwsException("DeploymentTargetDoesNotExistException",
+                    "The target does not belong to this deployment", 400);
+        }
+        return targets.getFirst();
     }
 
     public List<Map<String, Object>> batchGetDeploymentTargets(String region, String deploymentId, List<String> targetIds) {
@@ -854,9 +1259,27 @@ public class CodeDeployService {
 
     private String createServerDeployment(String region, String appName, String groupName,
                                           DeploymentGroup group, String configName,
-                                          Map<String, Object> revision, String description) {
-        ServerAppSpecInfo appSpec = parseServerAppSpec(revision);
+                                          Map<String, Object> revision, String description,
+                                          String fileExistsBehavior, Map<String, Object> rollbackOverride,
+                                          String rollbackTrigger) {
+        return createServerDeployment(region, appName, groupName, group, configName, revision, description,
+                fileExistsBehavior, rollbackOverride, rollbackTrigger, null);
+    }
+
+    private String createServerDeployment(String region, String appName, String groupName,
+                                          DeploymentGroup group, String configName,
+                                          Map<String, Object> revision, String description,
+                                          String fileExistsBehavior, Map<String, Object> rollbackOverride,
+                                          String rollbackTrigger, AutomaticTarget automatic) {
         String effectiveConfig = configName != null ? configName : group.getDeploymentConfigName();
+        boolean s3Revision = revision != null && "S3".equals(revision.get("revisionType"));
+        AgentRollbackPolicy policy = s3Revision ? AgentRollbackPolicy.from(rollbackOverride == null
+                ? group.getAutoRollbackConfiguration() : rollbackOverride) : null;
+        CodeDeployAgentDeployment.Prepared prepared = !s3Revision ? null : automatic == null
+                ? agentDeployment.prepare(region, group, effectiveConfig, revision, fileExistsBehavior)
+                : agentDeployment.prepareAutomatic(region, group, effectiveConfig, revision,
+                        fileExistsBehavior, automatic.instanceId());
+        ServerAppSpecInfo appSpec = s3Revision ? null : parseServerAppSpec(revision);
 
         String deploymentId = generateDeploymentId();
         double now = EpochSeconds.fromInstant(clock.instant());
@@ -865,51 +1288,175 @@ public class CodeDeployService {
         deployment.setDeploymentId(deploymentId);
         deployment.setApplicationName(appName);
         deployment.setDeploymentGroupName(groupName);
-        deployment.setDeploymentConfigName(effectiveConfig);
+        deployment.setDeploymentConfigName(prepared == null ? effectiveConfig : prepared.config());
         deployment.setStatus("Queued");
-        deployment.setRevision(revision);
+        deployment.setRevision(s3Revision ? captureAgentRevision(revision) : revision);
         deployment.setCreateTime(now);
         deployment.setDescription(description);
-        deployment.setCreator("user");
+        deployment.setCreator(automatic != null ? automatic.followup() ? "CodeDeploy" : "autoScaling"
+                : rollbackTrigger == null ? "user" : "codeDeployRollback");
         deployment.setComputePlatform("Server");
-        deploymentsFor(region).put(deploymentId, deployment);
-
-        // Resolve target instances
-        List<String> instanceIds = resolveServerTargets(region, group);
-        if (instanceIds.isEmpty()) {
-            deployment.setStatus("Failed");
-            deployment.setCompleteTime(now);
-            deployment.setErrorInformation(Map.of("code", "NoInstancesReachable",
-                    "message", "No instances found for deployment group"));
-            return deploymentId;
+        if (s3Revision) {
+            deployment.setFileExistsBehavior(fileExistsBehavior);
+            deployment.setAutoRollbackConfiguration(policy.configuration());
+            if (rollbackTrigger != null) {
+                deployment.setRollbackInfo(Map.of("rollbackTriggeringDeploymentId", rollbackTrigger,
+                        "rollbackDeploymentId", deploymentId,
+                        "rollbackMessage", "Redeploying the last successful revision"));
+            }
         }
-
-        ConcurrentHashMap<String, Map<String, Object>> allTargets = new ConcurrentHashMap<>();
-        List<Map<String, Object>> instanceTargetMaps = new ArrayList<>();
-        for (String instanceId : instanceIds) {
-            Map<String, Object> instanceTargetMap = new ConcurrentHashMap<>();
-            instanceTargetMap.put("deploymentId", deploymentId);
-            instanceTargetMap.put("targetId", instanceId);
-            instanceTargetMap.put("targetArn", instanceId);
-            instanceTargetMap.put("status", "Pending");
-            instanceTargetMap.put("lastUpdatedAt", now);
-            instanceTargetMap.put("lifecycleEvents", new CopyOnWriteArrayList<>());
-
-            Map<String, Object> targetWrapper = new ConcurrentHashMap<>();
-            targetWrapper.put("deploymentTargetType", "InstanceTarget");
-            targetWrapper.put("instanceTarget", instanceTargetMap);
-            allTargets.put(instanceId, targetWrapper);
-            instanceTargetMaps.add(instanceTargetMap);
-        }
-        deploymentTargetsFor(region).put(deploymentId, allTargets);
-
         AtomicBoolean stopFlag = new AtomicBoolean(false);
-        stopFlags.put(deploymentId, stopFlag);
+        AgentDeploymentContext agent = prepared == null ? null : admitAgentDeployment(
+                prepared, deployment, policy, rollbackTrigger != null, stopFlag,
+                automatic != null, automatic == null || automatic.followup());
+        try {
+            // Resolve target instances
+            List<String> instanceIds = prepared == null ? resolveServerTargets(region, group) : prepared.instanceIds();
+            if (instanceIds.isEmpty()) {
+                deploymentsFor(region).put(deploymentId, deployment);
+                CodeDeployAgentDeployment.Outcome outcome = new CodeDeployAgentDeployment.Outcome(
+                        "Failed", "NoInstancesReachable", "No instances found for deployment group");
+                if (agent == null) {
+                    outcome.publish(deployment, clock);
+                } else {
+                    completeAgentDeployment(deployment, agent, outcome);
+                }
+                return deploymentId;
+            }
 
-        startDeploymentThread("codedeploy-server-" + deploymentId, region,
-                () -> runServerStateMachine(region, deployment, appSpec, instanceIds,
-                        instanceTargetMaps, stopFlag));
-        return deploymentId;
+            ConcurrentHashMap<String, Map<String, Object>> allTargets = new ConcurrentHashMap<>();
+            List<Map<String, Object>> instanceTargetMaps = new ArrayList<>();
+            for (String instanceId : instanceIds) {
+                Map<String, Object> instanceTargetMap = new ConcurrentHashMap<>();
+                instanceTargetMap.put("deploymentId", deploymentId);
+                instanceTargetMap.put("targetId", instanceId);
+                instanceTargetMap.put("targetArn", prepared == null ? instanceId : prepared.hosts().get(instanceId));
+                instanceTargetMap.put("status", "Pending");
+                instanceTargetMap.put("lastUpdatedAt", now);
+                instanceTargetMap.put("lifecycleEvents", new CopyOnWriteArrayList<>());
+
+                Map<String, Object> targetWrapper = new ConcurrentHashMap<>();
+                targetWrapper.put("deploymentTargetType", "InstanceTarget");
+                targetWrapper.put("instanceTarget", instanceTargetMap);
+                allTargets.put(instanceId, targetWrapper);
+                instanceTargetMaps.add(instanceTargetMap);
+            }
+            CodeDeployAgentCommands.Session session = prepared == null ? null : agentDeployment.open(prepared, deployment);
+            deploymentsFor(region).put(deploymentId, deployment);
+            deploymentTargetsFor(region).put(deploymentId, allTargets);
+
+            stopFlags.put(deploymentId, stopFlag);
+
+            startDeploymentThread("codedeploy-server-" + deploymentId, region,
+                    () -> {
+                        try {
+                            if (prepared != null) {
+                                agentDeployment.run(prepared, session, deployment, instanceTargetMaps, stopFlag,
+                                        outcome -> RequestScopes.runAs(prepared.account(), prepared.region(),
+                                                () -> completeAgentDeployment(deployment, agent, outcome)));
+                            } else {
+                                runServerStateMachine(region, deployment, appSpec, instanceIds, instanceTargetMaps, stopFlag);
+                            }
+                        } finally {
+                            stopFlags.remove(deploymentId);
+                        }
+                    });
+            return deploymentId;
+        } catch (RuntimeException | Error failure) {
+            if (agent != null) {
+                synchronized (agentGroupLocks.lockFor(agent.scope())) {
+                    agentDeploymentContexts.remove(deploymentId, agent);
+                    activeAgentDeployments.remove(agent.scope(), deploymentId);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private Map<String, Object> captureAgentRevision(Map<String, Object> revision) {
+        JsonNode source = mapper.valueToTree(revision).path("s3Location");
+        Map<String, Object> location = new LinkedHashMap<>();
+        for (String key : List.of("bucket", "key", "bundleType", "version", "eTag")) {
+            if (source.hasNonNull(key)) {
+                location.put(key, source.path(key).asText());
+            }
+        }
+        return Map.of("revisionType", "S3", "s3Location", Map.copyOf(location));
+    }
+
+    private AgentDeploymentContext admitAgentDeployment(CodeDeployAgentDeployment.Prepared prepared,
+                                                          Deployment deployment, AgentRollbackPolicy policy,
+                                                          boolean rollback, AtomicBoolean stop,
+                                                          boolean automatic, boolean reserveGroup) {
+        AgentGroupScope scope = new AgentGroupScope(prepared.account(), prepared.region(), prepared.groupId());
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            if (reserveGroup && activeAgentDeployments.containsKey(scope)) {
+                throw new AwsException("DeploymentLimitExceededException",
+                        "An S3 agent deployment is already running in this deployment group", 400);
+            }
+            SuccessfulAgentRevision revision = new SuccessfulAgentRevision(deployment.getDeploymentId(),
+                    deployment.getRevision(), prepared.fileExistsBehavior(), prepared.config());
+            AgentDeploymentContext context = new AgentDeploymentContext(scope, revision, policy, rollback, stop,
+                    new AtomicBoolean(), automatic);
+            if (reserveGroup) {
+                activeAgentDeployments.put(scope, deployment.getDeploymentId());
+            }
+            agentDeploymentContexts.put(deployment.getDeploymentId(), context);
+            return context;
+        }
+    }
+
+    /** Called only after all old host and traffic workers have settled. */
+    private void completeAgentDeployment(Deployment deployment, AgentDeploymentContext context,
+                                          CodeDeployAgentDeployment.Outcome completed) {
+        AgentGroupScope scope = context.scope();
+        synchronized (agentGroupLocks.lockFor(scope)) {
+            if (agentDeploymentContexts.get(deployment.getDeploymentId()) != context) {
+                return;
+            }
+            CodeDeployAgentDeployment.Outcome outcome = context.stop().get()
+                    ? new CodeDeployAgentDeployment.Outcome("Stopped", null, null) : completed;
+            DeploymentGroup currentGroup = findAgentGroup(scope, deployment.getApplicationName());
+            boolean rollback = !context.automatic() && (("Stopped".equals(outcome.status()) && context.rollbackRequested().get())
+                    || (!context.rollback() && "Failed".equals(outcome.status()) && context.policy().enabled()
+                        && context.policy().events().contains("DEPLOYMENT_FAILURE")));
+            try {
+                if (!context.automatic() && "Succeeded".equals(outcome.status()) && currentGroup != null) {
+                    successfulAgentRevisions.put(scope.historyKey(), context.revision());
+                }
+                // Keep the group monitor across the handoff; no user deployment can interleave.
+                activeAgentDeployments.remove(scope, deployment.getDeploymentId());
+                if (rollback) {
+                    startAgentRollback(deployment, context, currentGroup);
+                }
+            } catch (RuntimeException failure) {
+                LOG.warnv("Deployment {0} rollback bookkeeping failed: {1}",
+                        deployment.getDeploymentId(), failure.getMessage());
+                deployment.setRollbackInfo(Map.of("rollbackMessage", "Rollback could not be started: "
+                        + failure.getMessage()));
+            } finally {
+                activeAgentDeployments.remove(scope, deployment.getDeploymentId());
+                agentDeploymentContexts.remove(deployment.getDeploymentId(), context);
+                outcome.publish(deployment, clock);
+            }
+        }
+    }
+
+    private void startAgentRollback(Deployment deployment, AgentDeploymentContext context, DeploymentGroup group) {
+        SuccessfulAgentRevision previous = successfulAgentRevisions.get(context.scope().historyKey());
+        if (group == null || previous == null) {
+            deployment.setRollbackInfo(Map.of("rollbackMessage", group == null
+                    ? "The original deployment group no longer exists"
+                    : "No successful S3 agent deployment is available for rollback"));
+            return;
+        }
+        String rollback = createServerDeployment(context.scope().region(), deployment.getApplicationName(),
+                group.getDeploymentGroupName(), group, previous.configName(), previous.revision(),
+                "Rollback of " + deployment.getDeploymentId(), previous.fileExistsBehavior(),
+                Map.of("enabled", false, "events", List.of()), deployment.getDeploymentId());
+        deployment.setRollbackInfo(Map.of("rollbackDeploymentId", rollback,
+                "rollbackTriggeringDeploymentId", deployment.getDeploymentId(),
+                "rollbackMessage", "Redeploying successful deployment " + previous.deploymentId()));
     }
 
     private void runServerStateMachine(String region, Deployment deployment,
@@ -1039,10 +1586,11 @@ public class CodeDeployService {
                         instanceId, "AWS-RunShellScript", Map.of("commands", List.of(script)),
                         timeout, region);
 
-                long deadline = clock.millis() + timeout * 1000L;
+                long started = timer.nanoTime();
+                long timeoutNanos = TimeUnit.SECONDS.toNanos(timeout);
                 String invocationStatus = "InProgress";
-                while (clock.millis() < deadline && "InProgress".equals(invocationStatus)) {
-                    Thread.sleep(500);
+                while (timer.nanoTime() - started < timeoutNanos && "InProgress".equals(invocationStatus)) {
+                    timer.sleepNanos(SSM_POLL_INTERVAL.toNanos());
                     invocationStatus = ssmCommandService.getCommandInvocationStatus(commandId, instanceId, region);
                 }
 
@@ -1300,6 +1848,9 @@ public class CodeDeployService {
                     if (hook.has("AfterInstall")) {
                         info.afterInstall = hook.get("AfterInstall").asText(null);
                     }
+                    if (hook.has("AfterAllowTestTraffic")) {
+                        info.afterAllowTestTraffic = hook.get("AfterAllowTestTraffic").asText(null);
+                    }
                     if (hook.has("BeforeAllowTraffic")) {
                         info.beforeAllowTraffic = hook.get("BeforeAllowTraffic").asText(null);
                     }
@@ -1339,7 +1890,6 @@ public class CodeDeployService {
         deployment.setDescription(description);
         deployment.setCreator("user");
         deployment.setComputePlatform("ECS");
-        deploymentsFor(region).put(deploymentId, deployment);
 
         // Determine ECS cluster/service from deployment group
         String clusterName = "default";
@@ -1359,6 +1909,7 @@ public class CodeDeployService {
         String blueTgArn = null;
         String greenTgArn = null;
         List<String> listenerArns = new ArrayList<>();
+        List<String> testListenerArns = new ArrayList<>();
         Map<String, Object> lbInfo = group.getLoadBalancerInfo();
         if (lbInfo != null) {
             List<Map<String, Object>> pairList = (List<Map<String, Object>>) lbInfo.get("targetGroupPairInfoList");
@@ -1377,6 +1928,11 @@ public class CodeDeployService {
                 if (prodRoute != null) {
                     List<String> arns = (List<String>) prodRoute.get("listenerArns");
                     if (arns != null) { listenerArns.addAll(arns); }
+                }
+                Map<String, Object> testRoute = (Map<String, Object>) pair.get("testTrafficRoute");
+                if (testRoute != null) {
+                    List<String> arns = (List<String>) testRoute.get("listenerArns");
+                    if (arns != null) { testListenerArns.addAll(arns); }
                 }
             }
         }
@@ -1398,6 +1954,7 @@ public class CodeDeployService {
         targetMap.put("ecsTarget", ecsTargetMap);
         ConcurrentHashMap<String, Map<String, Object>> ecsTargets = new ConcurrentHashMap<>();
         ecsTargets.put(targetId, targetMap);
+        deploymentsFor(region).put(deploymentId, deployment);
         deploymentTargetsFor(region).put(deploymentId, ecsTargets);
 
         AtomicBoolean stopFlag = new AtomicBoolean(false);
@@ -1411,7 +1968,7 @@ public class CodeDeployService {
         startDeploymentThread("codedeploy-ecs-" + deploymentId, region,
                 () -> runEcsStateMachine(region, deployment, appSpec, ecsTargetMap, stopFlag,
                         effectiveConfig, finalCluster, finalService,
-                        finalBlueTgArn, finalGreenTgArn, finalListenerArns));
+                        finalBlueTgArn, finalGreenTgArn, finalListenerArns, List.copyOf(testListenerArns)));
 
         return deploymentId;
     }
@@ -1420,7 +1977,7 @@ public class CodeDeployService {
                                     Map<String, Object> ecsTargetMap, AtomicBoolean stopFlag,
                                     String configName, String clusterName, String serviceName,
                                     String blueTgArn, String greenTgArn,
-                                    List<String> listenerArns) {
+                                    List<String> listenerArns, List<String> testListenerArns) {
         String deploymentId = deployment.getDeploymentId();
         TaskSet greenTaskSet = null;
         TaskSet blueTaskSet = null;
@@ -1481,6 +2038,38 @@ public class CodeDeployService {
                 if (!ok) {
                     finishEcsFailed(deployment, ecsTargetMap, "HOOK_EXECUTION_FAILURE",
                             "Hook function reported failure: AfterInstall");
+                    return;
+                }
+            }
+
+            if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
+
+            if (!testListenerArns.isEmpty()) {
+                Map<String, Object> testEvent = addLifecycleEvent(ecsTargetMap, "TestTraffic");
+                try {
+                    if (blueTgArn == null || greenTgArn == null) {
+                        throw new AwsException("InvalidDeploymentConfigException",
+                                "Test traffic requires both deployment target groups", 400);
+                    }
+                    for (String listenerArn : testListenerArns) {
+                        elbV2Service.shiftListenerForward(region, listenerArn, blueTgArn, greenTgArn, 100);
+                    }
+                    finishLifecycleEvent(testEvent, "Succeeded");
+                } catch (Exception e) {
+                    finishLifecycleEvent(testEvent, "Failed");
+                    throw e;
+                }
+            }
+
+            if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
+
+            if (appSpec.afterAllowTestTraffic != null) {
+                boolean ok = invokeHook(region, deployment, appSpec.afterAllowTestTraffic,
+                        "AfterAllowTestTraffic", ecsTargetMap, stopFlag);
+                if (stopFlag.get()) { finishEcsStopped(deployment, ecsTargetMap); return; }
+                if (!ok) {
+                    finishEcsFailed(deployment, ecsTargetMap, "HOOK_EXECUTION_FAILURE",
+                            "Hook function reported failure: AfterAllowTestTraffic");
                     return;
                 }
             }
@@ -1571,7 +2160,7 @@ public class CodeDeployService {
                     }
                     long waitMs = Math.min(trc.intervalSeconds * 1000L, 5000L);
                     if (waitMs > 0 && !stopFlag.get()) {
-                        Thread.sleep(waitMs);
+                        waitUnlessStopped(TimeUnit.MILLISECONDS.toNanos(waitMs), stopFlag);
                     }
                     if (!stopFlag.get()) {
                         for (String listenerArn : listenerArns) {
@@ -1591,7 +2180,7 @@ public class CodeDeployService {
                         if (pct < 100) {
                             long waitMs = Math.min(trc.intervalSeconds * 1000L, 2000L);
                             if (waitMs > 0) {
-                                Thread.sleep(waitMs);
+                                waitUnlessStopped(TimeUnit.MILLISECONDS.toNanos(waitMs), stopFlag);
                             }
                         }
                     }
@@ -1682,7 +2271,8 @@ public class CodeDeployService {
     }
 
     private void runStateMachine(String region, Deployment deployment, AppSpecInfo appSpec,
-                                  Map<String, Object> lambdaTargetMap, AtomicBoolean stopFlag, String configName) {
+                                  Map<String, Object> lambdaTargetMap, AtomicBoolean stopFlag, String configName,
+                                  String serviceRoleArn) {
         String deploymentId = deployment.getDeploymentId();
         try {
             deployment.setStatus("InProgress");
@@ -1691,7 +2281,11 @@ public class CodeDeployService {
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
 
+            requireLambdaPermission(region, serviceRoleArn, appSpec.functionName, appSpec.aliasName, "GetAlias");
+            lambdaService.getAlias(region, appSpec.functionName, appSpec.aliasName);
+
             if (appSpec.beforeAllowTraffic != null) {
+                requireLambdaPermission(region, serviceRoleArn, appSpec.beforeAllowTraffic, null, "InvokeFunction");
                 boolean ok = invokeHook(region, deployment, appSpec.beforeAllowTraffic,
                         "BeforeAllowTraffic", lambdaTargetMap, stopFlag);
                 if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
@@ -1701,11 +2295,12 @@ public class CodeDeployService {
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
 
-            executeAllowTraffic(region, deployment, appSpec, configName, lambdaTargetMap, stopFlag);
+            executeAllowTraffic(region, deployment, appSpec, configName, lambdaTargetMap, stopFlag, serviceRoleArn);
 
             if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
 
             if (appSpec.afterAllowTraffic != null) {
+                requireLambdaPermission(region, serviceRoleArn, appSpec.afterAllowTraffic, null, "InvokeFunction");
                 boolean ok = invokeHook(region, deployment, appSpec.afterAllowTraffic,
                         "AfterAllowTraffic", lambdaTargetMap, stopFlag);
                 if (stopFlag.get()) { finishStopped(deployment, lambdaTargetMap); return; }
@@ -1722,7 +2317,9 @@ public class CodeDeployService {
             finishStopped(deployment, lambdaTargetMap);
         } catch (Exception e) {
             LOG.warnv("Deployment {0} failed: {1}", deploymentId, e.getMessage());
-            finishFailed(deployment, lambdaTargetMap, "DeploymentFailed", e.getMessage());
+            String code = e instanceof AwsException failure && "IAM_ROLE_PERMISSIONS".equals(failure.getErrorCode())
+                    ? failure.getErrorCode() : "DeploymentFailed";
+            finishFailed(deployment, lambdaTargetMap, code, e.getMessage());
         } finally {
             stopFlags.remove(deploymentId);
         }
@@ -1730,7 +2327,7 @@ public class CodeDeployService {
 
     private void executeAllowTraffic(String region, Deployment deployment, AppSpecInfo appSpec,
                                       String configName, Map<String, Object> lambdaTargetMap,
-                                      AtomicBoolean stopFlag) throws InterruptedException {
+                                      AtomicBoolean stopFlag, String serviceRoleArn) throws InterruptedException {
         TrafficRoutingInfo trc = getTrafficRoutingInfo(region, configName);
         Map<String, Object> event = addLifecycleEvent(lambdaTargetMap, "AllowTraffic");
 
@@ -1740,42 +2337,40 @@ public class CodeDeployService {
                     // Step 1: shift canaryPercentage to targetVersion
                     double canaryWeight = trc.percentage / 100.0;
                     Map<String, Double> routing = Map.of(appSpec.targetVersion, canaryWeight);
-                    lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                            appSpec.currentVersion, null, routing);
+                    updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.currentVersion, routing);
 
-                    // Wait the canary interval (capped at 5s for emulator speed)
-                    long waitMs = Math.min(trc.intervalSeconds * 1000L, 5000L);
-                    if (waitMs > 0 && !stopFlag.get()) {
-                        Thread.sleep(waitMs);
+                    if (!waitForTrafficInterval(trc.intervalSeconds, stopFlag)) {
+                        finishLifecycleEvent(event, "Skipped");
+                        return;
                     }
-                    if (stopFlag.get()) { return; }
 
                     // Step 2: flip 100% to targetVersion
-                    lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                            appSpec.targetVersion, null, Map.of());
+                    updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.targetVersion, Map.of());
                 }
                 case "TimeBasedLinear" -> {
                     int steps = (int) Math.ceil(100.0 / trc.percentage);
-                    for (int step = 1; step <= steps && !stopFlag.get(); step++) {
+                    for (int step = 1; step <= steps; step++) {
+                        if (stopFlag.get()) {
+                            finishLifecycleEvent(event, "Skipped");
+                            return;
+                        }
                         int pct = Math.min(step * trc.percentage, 100);
                         if (pct >= 100) {
-                            lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                                    appSpec.targetVersion, null, Map.of());
+                            updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.targetVersion, Map.of());
                         } else {
                             double weight = pct / 100.0;
-                            lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                                    appSpec.currentVersion, null, Map.of(appSpec.targetVersion, weight));
-                            long waitMs = Math.min(trc.intervalSeconds * 1000L, 2000L);
-                            if (waitMs > 0) {
-                                Thread.sleep(waitMs);
+                            updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.currentVersion,
+                                    Map.of(appSpec.targetVersion, weight));
+                            if (!waitForTrafficInterval(trc.intervalSeconds, stopFlag)) {
+                                finishLifecycleEvent(event, "Skipped");
+                                return;
                             }
                         }
                     }
                 }
                 default -> {
                     // AllAtOnce: flip immediately
-                    lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName,
-                            appSpec.targetVersion, null, Map.of());
+                    updateLambdaAlias(region, serviceRoleArn, appSpec, appSpec.targetVersion, Map.of());
                 }
             }
             finishLifecycleEvent(event, "Succeeded");
@@ -1783,6 +2378,46 @@ public class CodeDeployService {
             finishLifecycleEvent(event, "Failed");
             throw e;
         }
+    }
+
+    private void updateLambdaAlias(String region, String roleArn, AppSpecInfo appSpec, String version,
+                                    Map<String, Double> routing) {
+        requireLambdaPermission(region, roleArn, appSpec.functionName, appSpec.aliasName, "UpdateAlias");
+        lambdaService.updateAlias(region, appSpec.functionName, appSpec.aliasName, version, null, routing);
+    }
+
+    private void requireLambdaPermission(String region, String roleArn, String function, String qualifier,
+                                           String operation) {
+        LambdaArnUtils.resolveWithRegion(region, function, qualifier);
+        String account = regionResolver.getAccountId();
+        String partition = AwsRegions.partitionFor(region);
+        String arn = LambdaArnUtils.functionArn(function, partition, region, account);
+        if (qualifier != null && LambdaArnUtils.resolve(function).qualifier() == null) {
+            arn += ":" + qualifier;
+        }
+        if (roleAuthorizer.authorizeWithoutSourceContext("codedeploy", roleArn, "lambda:" + operation,
+                arn, account, partition) != Decision.ALLOW) {
+            throw new AwsException("IAM_ROLE_PERMISSIONS",
+                    "The CodeDeploy service role cannot perform lambda:" + operation + " for " + arn, 403);
+        }
+    }
+
+    private boolean waitForTrafficInterval(int intervalSeconds, AtomicBoolean stopFlag)
+            throws InterruptedException {
+        return waitUnlessStopped(TimeUnit.SECONDS.toNanos(intervalSeconds), stopFlag);
+    }
+
+    /** Waits {@code duration} nanoseconds, looking at the stop flag every stop poll; false once it is set. */
+    private boolean waitUnlessStopped(long duration, AtomicBoolean stopFlag) throws InterruptedException {
+        long started = timer.nanoTime();
+        while (!stopFlag.get()) {
+            long remaining = duration - (timer.nanoTime() - started);
+            if (remaining <= 0) {
+                return true;
+            }
+            timer.sleepNanos(Math.min(remaining, STOP_POLL_INTERVAL.toNanos()));
+        }
+        return false;
     }
 
     private boolean invokeHook(String region, Deployment deployment, String hookFunctionName,
@@ -1817,13 +2452,13 @@ public class CodeDeployService {
             }
 
             String status = null;
-            long deadlineNanos = System.nanoTime() + hookCallbackTimeout.toNanos();
+            long deadlineNanos = timer.nanoTime() + hookCallbackTimeout.toNanos();
             while (status == null) {
                 if (stopFlag.get()) {
                     finishLifecycleEvent(event, "Skipped");
                     return false;
                 }
-                long remainingNanos = deadlineNanos - System.nanoTime();
+                long remainingNanos = deadlineNanos - timer.nanoTime();
                 if (remainingNanos <= 0) {
                     LOG.warnv("Hook {0} for lifecycle event {1} did not call PutLifecycleEventHookExecutionStatus within {2}",
                             hookFunctionName, lifecycleEventName, hookCallbackTimeout);
@@ -1834,10 +2469,11 @@ public class CodeDeployService {
                     break;
                 }
                 long sliceNanos = Math.min(remainingNanos, STOP_POLL_INTERVAL.toNanos());
-                try {
-                    status = future.get(sliceNanos, TimeUnit.NANOSECONDS);
-                } catch (TimeoutException e) {
+                if (!timer.awaitDone(future, sliceNanos)) {
                     continue;
+                }
+                try {
+                    status = future.get();
                 } catch (ExecutionException e) {
                     throw new IllegalStateException(e);
                 }
@@ -1951,14 +2587,23 @@ public class CodeDeployService {
         Object ec2TagFilters = fields.get("ec2TagFilters");
         if (ec2TagFilters instanceof List<?> list) {
             group.setEc2TagFilters((List<Map<String, String>>) list);
+        } else if (fields.containsKey("ec2TagFilters") && ec2TagFilters == null) {
+            group.setEc2TagFilters(null);
         }
         Object onPremTagFilters = fields.get("onPremisesInstanceTagFilters");
         if (onPremTagFilters instanceof List<?> list) {
             group.setOnPremisesInstanceTagFilters((List<Map<String, String>>) list);
+        } else if (fields.containsKey("onPremisesInstanceTagFilters") && onPremTagFilters == null) {
+            group.setOnPremisesInstanceTagFilters(null);
         }
         Object asg = fields.get("autoScalingGroups");
         if (asg instanceof List<?> list) {
-            group.setAutoScalingGroups((List<Map<String, Object>>) list);
+            group.setAutoScalingGroups(list.stream()
+                    .map(value -> value instanceof String name
+                            ? Map.<String, Object>of("name", name) : (Map<String, Object>) value)
+                    .toList());
+        } else if (fields.containsKey("autoScalingGroups") && asg == null) {
+            group.setAutoScalingGroups(null);
         }
         setMapField(group, fields, "deploymentStyle", DeploymentGroup::setDeploymentStyle);
         setMapField(group, fields, "blueGreenDeploymentConfiguration", DeploymentGroup::setBlueGreenDeploymentConfiguration);
@@ -1970,10 +2615,14 @@ public class CodeDeployService {
         Object triggerConfigs = fields.get("triggerConfigurations");
         if (triggerConfigs instanceof List<?> list) {
             group.setTriggerConfigurations((List<Map<String, Object>>) list);
+        } else if (fields.containsKey("triggerConfigurations") && triggerConfigs == null) {
+            group.setTriggerConfigurations(null);
         }
         Object ecsServices = fields.get("ecsServices");
         if (ecsServices instanceof List<?> list) {
             group.setEcsServices((List<Map<String, Object>>) list);
+        } else if (fields.containsKey("ecsServices") && ecsServices == null) {
+            group.setEcsServices(null);
         }
         if (fields.containsKey("computePlatform")) {
             group.setComputePlatform((String) fields.get("computePlatform"));
@@ -1988,10 +2637,19 @@ public class CodeDeployService {
 
     @SuppressWarnings("unchecked")
     private void setMapField(DeploymentGroup group, Map<String, Object> fields, String key,
-                              java.util.function.BiConsumer<DeploymentGroup, Map<String, Object>> setter) {
+                             BiConsumer<DeploymentGroup, Map<String, Object>> setter) {
         Object val = fields.get(key);
         if (val instanceof Map<?, ?> m) {
             setter.accept(group, (Map<String, Object>) m);
+        } else if (fields.containsKey(key) && val == null) {
+            setter.accept(group, null);
         }
+    }
+
+public DeploymentGroup createDeploymentGroup(String region, String appName, String groupName,
+                                                  String deploymentConfigName, String serviceRoleArn,
+                                                  Map<String, Object> fields) {
+        return createDeploymentGroup(region, appName, groupName,
+                deploymentConfigName, serviceRoleArn, fields, List.of());
     }
 }

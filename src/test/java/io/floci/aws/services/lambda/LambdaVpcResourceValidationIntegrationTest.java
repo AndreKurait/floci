@@ -35,7 +35,6 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -108,10 +107,19 @@ class LambdaVpcResourceValidationIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"mixed-subnets", "mixed-groups", "only-subnets", "only-groups",
+    @ValueSource(strings = {"missing-subnet", "missing-group", "missing-second-subnet", "missing-second-group",
+            "mixed-subnets", "mixed-groups", "only-subnets", "only-groups",
             "unknown-with-mixed-subnets", "unknown-with-mixed-groups"})
     void invalidVpcResourcesCannotCreateAFunction(String kind) {
         VpcConfig config = switch (kind) {
+            case "missing-subnet" -> VpcConfig.builder().subnetIds("subnet-fffffffffffffffff")
+                    .securityGroupIds(first.group()).build();
+            case "missing-group" -> VpcConfig.builder().subnetIds(first.subnet())
+                    .securityGroupIds("sg-fffffffffffffffff").build();
+            case "missing-second-subnet" -> VpcConfig.builder()
+                    .subnetIds(first.subnet(), "subnet-fffffffffffffffff").securityGroupIds(first.group()).build();
+            case "missing-second-group" -> VpcConfig.builder().subnetIds(first.subnet())
+                    .securityGroupIds(first.group(), "sg-fffffffffffffffff").build();
             case "mixed-subnets" -> VpcConfig.builder().subnetIds(first.subnet(), second.subnet())
                     .securityGroupIds(first.group()).build();
             case "mixed-groups" -> VpcConfig.builder().subnetIds(first.subnet())
@@ -133,44 +141,6 @@ class LambdaVpcResourceValidationIntegrationTest {
                 () -> lambda.getFunctionConfiguration(r -> r.functionName(name)));
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = {"both", "subnet", "group", "second-subnet", "second-group"})
-    void unknownVpcIdsRoundTripWithoutAnInferredVpc(String kind) {
-        VpcConfig config = switch (kind) {
-            case "both" -> VpcConfig.builder().subnetIds("subnet-fffffffffffffffff")
-                    .securityGroupIds("sg-fffffffffffffffff").build();
-            case "subnet" -> VpcConfig.builder().subnetIds("subnet-fffffffffffffffff")
-                    .securityGroupIds(first.group()).build();
-            case "group" -> VpcConfig.builder().subnetIds(first.subnet())
-                    .securityGroupIds("sg-fffffffffffffffff").build();
-            case "second-subnet" -> VpcConfig.builder().subnetIds(first.subnet(), "subnet-fffffffffffffffff")
-                    .securityGroupIds(first.group()).build();
-            case "second-group" -> VpcConfig.builder().subnetIds(first.subnet())
-                    .securityGroupIds(first.group(), "sg-fffffffffffffffff").build();
-            default -> throw new IllegalArgumentException(kind);
-        };
-        createFunction(config);
-        assertEquals(config.subnetIds(), configuration().vpcConfig().subnetIds());
-        assertEquals(config.securityGroupIds(), configuration().vpcConfig().securityGroupIds());
-        assertNull(configuration().vpcConfig().vpcId());
-    }
-
-    @Test
-    void unknownVpcUpdateClearsOnlyTheLatestInferredVpc() {
-        createFunction(first.config());
-        String version = lambda.publishVersion(r -> r.functionName(name)).version();
-        VpcConfig placeholders = VpcConfig.builder().subnetIds("subnet-fffffffffffffffff")
-                .securityGroupIds("sg-fffffffffffffffff").build();
-        lambda.updateFunctionConfiguration(r -> r.functionName(name).description("updated")
-                .vpcConfig(placeholders));
-        assertEquals("updated", configuration().description());
-        assertEquals(placeholders.subnetIds(), configuration().vpcConfig().subnetIds());
-        assertEquals(placeholders.securityGroupIds(), configuration().vpcConfig().securityGroupIds());
-        assertNull(configuration().vpcConfig().vpcId());
-        assertNetwork(first, lambda.getFunctionConfiguration(
-                r -> r.functionName(name).qualifier(version)).vpcConfig());
-    }
-
     @Test
     void rejectedVpcUpdatePreservesTheExistingConfigurationAndRevision() {
         createFunction(first.config());
@@ -179,7 +149,7 @@ class LambdaVpcResourceValidationIntegrationTest {
         InvalidParameterValueException failure = assertThrows(InvalidParameterValueException.class,
                 () -> lambda.updateFunctionConfiguration(r -> r.functionName(name)
                         .description("must-not-change").timeout(30).memorySize(256)
-                        .vpcConfig(VpcConfig.builder().subnetIds(first.subnet(), second.subnet())
+                        .vpcConfig(VpcConfig.builder().subnetIds("subnet-fffffffffffffffff")
                                 .securityGroupIds(first.group()).build())));
 
         assertEquals(400, failure.statusCode());
@@ -234,20 +204,20 @@ class LambdaVpcResourceValidationIntegrationTest {
 
     /**
      * A DeleteSubnet that runs after CreateFunction validated its subnets but before it stored the function sees no
-     * function naming the subnet and deletes it. The function then infers no VPC from it, as from a subnet never
-     * created, rather than storing the VPC of a subnet that is gone.
+     * function naming the subnet and deletes it. Validation under the subnet-reference lock must reject the
+     * create and leave no function pointing at the deleted subnet.
      */
     @Test
-    void aSubnetDeletedWhileAFunctionIsCreatedLeavesItNoInferredVpc() {
+    void aSubnetDeletedBeforePublicationRejectsTheCreateAndLeavesNoFunction() {
         doAnswer(invocation -> {
             ec2.deleteSubnet(r -> r.subnetId(first.subnet()));
             return invocation.callRealMethod();
         }).when(ec2Service).runWithSubnetReferencesHeld(anyString(), any(Runnable.class));
 
-        createFunction(first.config());
-
-        assertEquals(List.of(first.subnet()), configuration().vpcConfig().subnetIds());
-        assertNull(configuration().vpcConfig().vpcId());
+        InvalidParameterValueException failure = assertThrows(
+                InvalidParameterValueException.class, () -> createFunction(first.config()));
+        assertEquals(400, failure.statusCode());
+        assertThrows(ResourceNotFoundException.class, this::configuration);
     }
 
     private String subnetDeletionError(String subnet) {

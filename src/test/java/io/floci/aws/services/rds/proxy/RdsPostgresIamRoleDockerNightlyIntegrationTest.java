@@ -8,6 +8,7 @@ import io.floci.aws.testutil.SigV4TokenTestHelper;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
@@ -51,6 +52,11 @@ class RdsPostgresIamRoleDockerNightlyIntegrationTest {
 
     @Inject
     IamService iamService;
+
+    @BeforeEach
+    void registerPostgresDriver() throws ClassNotFoundException {
+        Class.forName("org.postgresql.Driver");
+    }
 
     @Test
     void standardDbProxyAcceptsClientIamWithoutDatabaseIamMembership() throws Exception {

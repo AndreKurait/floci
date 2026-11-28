@@ -8,7 +8,8 @@
     "GetGroup": "GetGroupInput",
     "DeleteGroup": "DeleteGroupInput",
     "GroupResources": "GroupResourcesInput",
-    "ListGroupResources": "ListGroupResourcesInput"
+    "ListGroupResources": "ListGroupResourcesInput",
+    "ListGroups": "ListGroupsInput"
   },
   "shapes": {
     "CreateGroupInput": {
@@ -248,6 +249,51 @@
       "type": "map",
       "key": "TagKey",
       "value": "TagValue"
+    },
+    "GroupFilter": {
+      "type": "structure",
+      "required": [
+        "Name",
+        "Values"
+      ],
+      "members": {
+        "Name": "GroupFilterName",
+        "Values": "GroupFilterValues"
+      }
+    },
+    "GroupFilterList": {
+      "type": "list",
+      "member": "GroupFilter"
+    },
+    "GroupFilterName": {
+      "type": "string",
+      "enum": [
+        "resource-type",
+        "configuration-type",
+        "owner",
+        "display-name",
+        "criticality"
+      ]
+    },
+    "GroupFilterValue": {
+      "type": "string",
+      "min": 1,
+      "max": 300,
+      "pattern": "AWS::(AllSupported|[a-zA-Z0-9]+::[a-zA-Z0-9]+)|[\\s\\p{L}0-9_\\.-]*"
+    },
+    "GroupFilterValues": {
+      "type": "list",
+      "min": 1,
+      "max": 5,
+      "member": "GroupFilterValue"
+    },
+    "ListGroupsInput": {
+      "type": "structure",
+      "members": {
+        "Filters": "GroupFilterList",
+        "MaxResults": "MaxResults",
+        "NextToken": "NextToken"
+      }
     }
   }
 }

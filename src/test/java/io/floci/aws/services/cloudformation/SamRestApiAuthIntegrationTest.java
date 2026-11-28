@@ -8,7 +8,6 @@ import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testutil.ExecuteApiRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
-import io.restassured.RestAssured;
 import io.restassured.http.ContentType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -406,7 +405,7 @@ class SamRestApiAuthIntegrationTest {
 
     private Map<String, String> signed(String path) throws Exception {
         return ExecuteApiRequestSigner.signedHeaders("POST", path, Map.of(),
-                "localhost:" + RestAssured.port, null, "test", "test", "us-east-1", Instant.now());
+                endpoint.getRawAuthority(), null, "test", "test", "us-east-1", Instant.now());
     }
 
     private ObjectNode template(boolean swagger) throws Exception {

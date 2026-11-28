@@ -41,6 +41,28 @@ class CfnCreateOnlyPropertiesTest {
     }
 
     @Test
+    void s3VectorsReplacementTracksNonFilterableKeysWithinMetadataConfiguration() throws IOException {
+        String type = "AWS::S3Vectors::Index";
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode absent = mapper.readTree("{\"IndexName\":\"index\"}");
+        JsonNode empty = mapper.readTree("{\"IndexName\":\"index\",\"MetadataConfiguration\":{}}");
+        JsonNode declared = mapper.readTree("""
+                {"IndexName":"index","MetadataConfiguration":{"NonFilterableMetadataKeys":["private"]}}
+                """);
+        JsonNode changed = mapper.readTree("""
+                {"IndexName":"index","MetadataConfiguration":{"NonFilterableMetadataKeys":["other"]}}
+                """);
+        JsonNode tagged = mapper.readTree("""
+                {"IndexName":"index","MetadataConfiguration":{"NonFilterableMetadataKeys":["private"]},
+                 "Tags":[{"Key":"environment","Value":"test"}]}
+                """);
+        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged(type, absent, empty));
+        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged(type, declared, changed));
+        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged(type, declared, absent));
+        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged(type, declared, tagged));
+    }
+
+    @Test
     void healthCheckEndpointTypeChangesRequireReplacement() throws IOException {
         ObjectMapper mapper = new ObjectMapper();
         JsonNode previous = mapper.readTree("""
@@ -152,6 +174,12 @@ class CfnCreateOnlyPropertiesTest {
         assertEquals(Set.of("Name", "ReplicateTo"),
                 CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::DeploymentStrategy"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::DeploymentStrategy", "GrowthFactor"));
+        assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "Content", "ContentType", "Description",
+                        "LatestVersionNumber", "VersionLabel"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::HostedConfigurationVersion"));
+        assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "ConfigurationVersion", "DeploymentStrategyId",
+                        "Description", "DynamicExtensionParameters", "EnvironmentId", "KmsKeyIdentifier", "Tags"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::Deployment"));
     }
 
     @Test

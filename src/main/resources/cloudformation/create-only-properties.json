@@ -1,4 +1,13 @@
 {
+  "AWS::ACMPCA::CertificateAuthority": [
+    "Type",
+    "KeyAlgorithm",
+    "SigningAlgorithm",
+    "Subject",
+    "CsrExtensions",
+    "KeyStorageSecurityStandard",
+    "UsageMode"
+  ],
   "AWS::ApiGateway::Account": [],
   "AWS::ApiGateway::ApiKey": [
     "GenerateDistinctId",
@@ -78,12 +87,32 @@
     "LocationUri",
     "ApplicationId"
   ],
+  "AWS::AppConfig::Deployment": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "DeploymentStrategyId",
+    "EnvironmentId",
+    "Description",
+    "ConfigurationVersion",
+    "KmsKeyIdentifier",
+    "DynamicExtensionParameters",
+    "Tags"
+  ],
   "AWS::AppConfig::DeploymentStrategy": [
     "Name",
     "ReplicateTo"
   ],
   "AWS::AppConfig::Environment": [
     "ApplicationId"
+  ],
+  "AWS::AppConfig::HostedConfigurationVersion": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "Description",
+    "Content",
+    "ContentType",
+    "LatestVersionNumber",
+    "VersionLabel"
   ],
   "AWS::AppSync::ApiKey": [
     "ApiId"
@@ -200,6 +229,8 @@
     "PermissionModel",
     "StackSetName"
   ],
+  "AWS::CloudFormation::WaitCondition": [],
+  "AWS::CloudFormation::WaitConditionHandle": [],
   "AWS::CloudFront::CachePolicy": [],
   "AWS::CloudFront::ConnectionGroup": [
     "Name"
@@ -228,12 +259,26 @@
   "AWS::CloudWatch::Dashboard": [
     "DashboardName"
   ],
+  "AWS::CloudWatch::InsightRule": [
+    "RuleName"
+  ],
   "AWS::CodeBuild::Project": [
     "Name"
   ],
   "AWS::CodeDeploy::Application": [
     "ApplicationName",
     "ComputePlatform"
+  ],
+  "AWS::CodeDeploy::DeploymentConfig": [
+    "DeploymentConfigName",
+    "MinimumHealthyHosts",
+    "ComputePlatform",
+    "ZonalConfig",
+    "TrafficRoutingConfig"
+  ],
+  "AWS::CodeDeploy::DeploymentGroup": [
+    "DeploymentGroupName",
+    "ApplicationName"
   ],
   "AWS::CodePipeline::CustomActionType": [
     "Category",
@@ -297,6 +342,14 @@
   "AWS::DynamoDB::Table": [
     "TableName",
     "ImportSourceSpecification"
+  ],
+  "AWS::EC2::DHCPOptions": [
+    "NetbiosNameServers",
+    "NetbiosNodeType",
+    "NtpServers",
+    "DomainName",
+    "DomainNameServers",
+    "Ipv6AddressPreferredLeaseTime"
   ],
   "AWS::EC2::EIP": [
     "NetworkBorderGroup",
@@ -429,6 +482,10 @@
     "Ipv4NetmaskLength",
     "VpcEncryptionControl"
   ],
+  "AWS::EC2::VPCDHCPOptionsAssociation": [
+    "DhcpOptionsId",
+    "VpcId"
+  ],
   "AWS::EC2::VPCEndpoint": [
     "ServiceName",
     "VpcEndpointType",
@@ -438,6 +495,10 @@
     "ServiceRegion",
     "DnsOptions/PrivateDnsPreference",
     "DnsOptions/PrivateDnsSpecifiedDomains"
+  ],
+  "AWS::EC2::VPCEndpointService": [],
+  "AWS::EC2::VPCEndpointServicePermissions": [
+    "ServiceId"
   ],
   "AWS::EC2::VPCGatewayAttachment": [
     "VpcId"
@@ -655,6 +716,10 @@
   "AWS::ElastiCache::UserGroup": [
     "UserGroupId"
   ],
+  "AWS::ElasticLoadBalancing::LoadBalancer": [
+    "LoadBalancerName",
+    "Scheme"
+  ],
   "AWS::ElasticLoadBalancingV2::Listener": [
     "LoadBalancerArn"
   ],
@@ -854,6 +919,10 @@
     "FilterName",
     "LogGroupName"
   ],
+  "AWS::Logs::SubscriptionFilter": [
+    "FilterName",
+    "LogGroupName"
+  ],
   "AWS::Organizations::Account": [],
   "AWS::Organizations::Organization": [],
   "AWS::Organizations::OrganizationalUnit": [
@@ -1035,8 +1104,28 @@
     "QueueName"
   ],
   "AWS::SQS::QueuePolicy": [],
+  "AWS::SSM::Association": [
+    "InstanceId"
+  ],
+  "AWS::SSM::Document": [
+    "Name",
+    "DocumentType"
+  ],
   "AWS::SSM::Parameter": [
     "Name"
+  ],
+  "AWS::SSM::PatchBaseline": [
+    "OperatingSystem"
+  ],
+  "AWS::SSM::ResourceDataSync": [
+    "KMSKeyArn",
+    "SyncFormat",
+    "BucketPrefix",
+    "SyncName",
+    "BucketRegion",
+    "BucketName",
+    "S3Destination",
+    "SyncType"
   ],
   "AWS::Scheduler::Schedule": [
     "Name"
@@ -1070,6 +1159,10 @@
     "ProfileName",
     "PlatformId",
     "SignatureValidityPeriod"
+  ],
+  "AWS::StepFunctions::Activity": [
+    "Name",
+    "EncryptionConfiguration"
   ],
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",

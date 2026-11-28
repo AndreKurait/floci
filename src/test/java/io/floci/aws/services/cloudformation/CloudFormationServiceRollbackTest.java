@@ -42,6 +42,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -71,6 +72,66 @@ import static org.mockito.Mockito.when;
  * second time nor updated by a change set.
  */
 class CloudFormationServiceRollbackTest {
+
+    @Test
+    void parentUpdateWithoutTokenClearsDirectChildOperationTokens() throws Exception {
+        assertParentUpdateClearsDirectChildTokens(null);
+    }
+
+    @Test
+    void parentUpdateWithTokenDoesNotReuseDirectChildOperationTokens() throws Exception {
+        assertParentUpdateClearsDirectChildTokens("parent-update-token");
+    }
+
+    private void assertParentUpdateClearsDirectChildTokens(String parentToken) throws Exception {
+        when(provisioner.completeUpdate(any())).thenReturn(UpdateCleanupResult.notApplicable());
+        AtomicReference<String> childInS3 = new AtomicReference<>(treeChildTemplate());
+        AtomicReference<String> grandchildInS3 = new AtomicReference<>(previousGrandchildTemplate());
+        serveTreeTemplates(childInS3, grandchildInS3);
+        createNestedTree(treeParentTemplate());
+        List<String> childNames = List.of("rollback-tree-Child", "rollback-tree-Child-Grandchild");
+        List<String> directTemplates = List.of(treeChildTemplate(), previousGrandchildTemplate());
+        List<List<StackEvent>> histories = new ArrayList<>();
+        for (int index = 0; index < childNames.size(); index++) {
+            String childName = childNames.get(index);
+            String directTemplate = '{' + "\"Description\":\"direct update\"," + directTemplates.get(index).substring(1);
+            service.createChangeSet(childName, "direct", "UPDATE", directTemplate, null,
+                    Map.of(), List.of(), null, REGION, ACCOUNT);
+            service.executeChangeSetWithToken(childName, "direct", REGION, "direct-token-" + index)
+                    .get(30, TimeUnit.SECONDS);
+            Stack child = service.describeStacks(childName, REGION, ACCOUNT).getFirst();
+            assertEquals("UPDATE_COMPLETE", child.getStatus());
+            assertEquals("direct-token-" + index, child.getClientRequestToken());
+            assertTrue(child.eventsSnapshot().stream()
+                    .anyMatch(event -> ("direct-token-" + childNames.indexOf(childName))
+                            .equals(event.getClientRequestToken())));
+            histories.add(child.eventsSnapshot());
+        }
+        grandchildInS3.set(previousGrandchildTemplate().replace("previous", "changed"));
+        service.createChangeSet("rollback-tree", "parent-update", "UPDATE", treeParentTemplate(), null,
+                Map.of(), List.of(), null, REGION, ACCOUNT);
+        service.executeChangeSetWithToken("rollback-tree", "parent-update", REGION, parentToken)
+                .get(30, TimeUnit.SECONDS);
+        Stack parent = service.describeStacks("rollback-tree", REGION, ACCOUNT).getFirst();
+        assertEquals("UPDATE_COMPLETE", parent.getStatus());
+        assertEquals(parentToken, parent.getClientRequestToken());
+        for (int index = 0; index < childNames.size(); index++) {
+            Stack child = service.describeStacks(childNames.get(index), REGION, ACCOUNT).getFirst();
+            List<StackEvent> history = histories.get(index);
+            List<StackEvent> newEvents = child.eventsSnapshot().stream()
+                    .filter(event -> !history.contains(event)).toList();
+            assertEquals("UPDATE_COMPLETE", child.getStatus());
+            assertFalse(newEvents.isEmpty());
+            for (StackEvent event : newEvents) {
+                assertNull(event.getClientRequestToken(), event.getResourceStatus());
+            }
+            assertTrue(child.eventsSnapshot().containsAll(history));
+            String directToken = "direct-token-" + index;
+            assertTrue(history.stream().anyMatch(event -> directToken.equals(event.getClientRequestToken())));
+        }
+        assertEquals("changed", service.describeStacks(childNames.getLast(), REGION, ACCOUNT)
+                .getFirst().getOutputs().get("Revision"));
+    }
 
     @Test
     void unchangedParent_schedulesNestedWorkWhenOnlyGrandchildTemplateChanges() throws Exception {
@@ -360,6 +421,7 @@ class CloudFormationServiceRollbackTest {
     @BeforeEach
     void setUp() {
         provisioner = mock(CfnResourceDispatcher.class);
+        when(provisioner.referenceValue(anyString(), anyString())).thenAnswer(invocation -> invocation.getArgument(1));
         // What the registry and the real provisioners say of a type: an unregistered Custom:: type
         // goes to the generic custom-resource handler, Custom::DynamoDBReplica has its own, and the
         // provisioners of the types whose ids relate to a parent's say how.
@@ -379,6 +441,29 @@ class CloudFormationServiceRollbackTest {
         templateStore = mock(S3Service.class);
         service = CloudFormationServiceFixture.create(provisioner, templateStore, Clock.systemUTC(),
                 new InMemoryStorageFactory(ACCOUNT));
+    }
+
+    @Test
+    void disabledCreateRollbackRetainsResourcesAndPublishesTheFailureBeforeItsStatus() {
+        StatusRecordingStack stack = new StatusRecordingStack();
+        stack.setStackName("retained-create-failure");
+        stack.setStackId("stack-id");
+        stack.setRegion(REGION);
+        stack.setDisableRollback(true);
+        StackResource created = resource("Queue", "queue-url", "AWS::SQS::Queue", "CREATE_COMPLETE");
+        StackResource failed = resource("Failure", null, "AWS::Test::Failure", "CREATE_FAILED");
+        failed.setStatusReason("simulated create failure");
+        stack.getResources().put(created.getLogicalId(), created);
+        stack.getResources().put(failed.getLogicalId(), failed);
+
+        service.rollbackFailedExecution(stack, REGION, true, failed, null, Set.of());
+
+        assertEquals(List.of("CREATE_FAILED"), stack.statuses());
+        assertEquals(List.of("CREATE_FAILED"), stackEventStatuses(stack));
+        stack.assertEachStatusFollowsItsEvent();
+        assertEquals("The following resource(s) failed to create: [Failure].", stack.getStatusReason());
+        assertEquals("CREATE_COMPLETE", created.getStatus());
+        verify(provisioner, never()).delete(any(StackResource.class), eq(REGION));
     }
 
     @Test
@@ -2031,7 +2116,8 @@ class CloudFormationServiceRollbackTest {
         stack.setUpdateRollbackResourceIds(List.of("LogGroup"));
         stack.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
         when(provisioner.rollbackUpdate(eq(logGroup), any())).thenReturn(true, false);
-        clock.failNextRead("simulated clock failure");
+        clock.failFirstReadAfter(() -> reported(stack, "LogGroup", "Resource update rolled back"),
+                "simulated clock failure");
 
         resumeService.resumeUpdateRollback(stack, List.of(), false, REGION);
 
@@ -2072,7 +2158,8 @@ class CloudFormationServiceRollbackTest {
         stack.setUpdateRollbackSnapshot(previousState);
         stack.setUpdateRollbackResourceIds(List.of("Skipped"));
         stack.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
-        clock.failNextRead("simulated clock failure");
+        clock.failFirstReadAfter(() -> reported(stack, "Skipped", "Resource skipped during UpdateRollback"),
+                "simulated clock failure");
 
         resumeService.resumeUpdateRollback(stack, List.of("Skipped"), false, REGION);
 
@@ -2265,11 +2352,23 @@ class CloudFormationServiceRollbackTest {
         return mapper.readValue(mapper.writeValueAsString(stack), Stack.class);
     }
 
-    /** The system clock, except that the read after {@link #failNextRead} throws. */
+    /** Whether the stack carries an event of {@code logicalId} with this reason. */
+    private static boolean reported(Stack stack, String logicalId, String reason) {
+        return stack.getEvents().stream().anyMatch(event -> logicalId.equals(event.getLogicalResourceId())
+                && reason.equals(event.getResourceStatusReason()));
+    }
+
+    /**
+     * The system clock, except that one read throws: the first one made once the step given to
+     * {@link #failFirstReadAfter} is reached. Stack events are stamped from this clock too, so
+     * "the next read" would fail the step itself instead of the body that follows it.
+     */
     private static final class FailingClock extends Clock {
         private final AtomicReference<String> failure = new AtomicReference<>();
+        private volatile BooleanSupplier reached = () -> false;
 
-        void failNextRead(String message) {
+        void failFirstReadAfter(BooleanSupplier reached, String message) {
+            this.reached = reached;
             failure.set(message);
         }
 
@@ -2285,8 +2384,8 @@ class CloudFormationServiceRollbackTest {
 
         @Override
         public Instant instant() {
-            String message = failure.getAndSet(null);
-            if (message != null) {
+            String message = failure.get();
+            if (message != null && reached.getAsBoolean() && failure.compareAndSet(message, null)) {
                 throw new IllegalStateException(message);
             }
             return Instant.now();

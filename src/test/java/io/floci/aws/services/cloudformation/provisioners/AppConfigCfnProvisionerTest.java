@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.services.appconfig.AppConfigAlarmMonitor;
+import io.floci.aws.services.appconfig.AppConfigS3Source;
 import io.floci.aws.services.appconfig.AppConfigService;
 import io.floci.aws.services.appconfig.model.Application;
 import io.floci.aws.services.appconfig.model.ConfigurationProfile;
@@ -18,6 +20,8 @@ import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -37,6 +41,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
@@ -69,9 +74,24 @@ class AppConfigCfnProvisionerTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        service = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT)));
+        service = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class)));
         provisioner = new AppConfigCfnProvisioner(service);
         engine = CloudFormationTemplateEngine.standalone(ACCOUNT, REGION, STACK, MAPPER, value -> value);
+    }
+
+    @Test
+    void anEnvironmentRecordedByTheForkKeepsItsIdentityOnUpdate() throws Exception {
+        StackResource app = create(APPLICATION, props("Name", "legacy-app"));
+        Map<String, Object> original = props("Name", "legacy-env", "ApplicationId", app.getPhysicalId());
+        StackResource environment = create(ENVIRONMENT, original);
+        String id = environment.getPhysicalId();
+        environment.getAttributes().remove(CfnRollback.USES_ATTR_PREFIX + "AppConfigCreateOnly");
+        environment.getAttributes().put("_floci_appconfig_properties", MAPPER.writeValueAsString(original));
+        provisioner.provision(environment, MAPPER.valueToTree(props("Name", "renamed-env",
+                "ApplicationId", app.getPhysicalId())), context(id));
+        assertEquals(id, environment.getPhysicalId());
+        assertEquals("renamed-env", service.findEnvironment(id).orElseThrow().getName());
     }
 
     @Test
@@ -224,6 +244,72 @@ class AppConfigCfnProvisionerTest {
 
         assertEquals("BadRequestException", failure.getErrorCode());
         assertEquals("beta", service.getEnvironment(appId, env.getPhysicalId()).getName());
+    }
+
+    @Test
+    void s3RetrievalRolesChangeInPlaceAndRollBackWithTheProfile() {
+        String app = create(APPLICATION, props("Name", "configuration")).getPhysicalId();
+        Map<String, Object> properties = props("ApplicationId", app, "Name", "settings",
+                "LocationUri", "s3://configuration-source/settings.json", "RetrievalRoleArn", ALARM_ROLE);
+        StackResource resource = create(PROFILE, properties);
+        String id = resource.getPhysicalId();
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        properties.put("RetrievalRoleArn", ALARM_ROLE + "-replacement");
+        update(resource, properties);
+        assertEquals(id, resource.getPhysicalId());
+        assertEquals(ALARM_ROLE + "-replacement", service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        provisioner.rollbackUpdate(resource);
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        properties.remove("RetrievalRoleArn");
+        assertThrows(AwsException.class, () -> update(resource, properties));
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+    }
+
+    @Test
+    void profileCreationStoresMalformedSchemaUntilContentValidation() {
+        String app = create(APPLICATION, props("Name", "deferred-validation")).getPhysicalId();
+        for (String declaration : List.of("{", "{\"type\":\"not-a-json-type\"}")) {
+            StackResource resource = create(PROFILE, props("ApplicationId", app, "Name", "settings",
+                    "LocationUri", "hosted", "Validators",
+                    List.of(Map.of("Type", "JSON_SCHEMA", "Content", declaration))));
+            String id = resource.getPhysicalId();
+            assertEquals(declaration, service.getConfigurationProfile(app, id).getValidators().getFirst().content());
+            service.createHostedConfigurationVersion(app, id, new byte[]{'1'}, "application/json", null);
+            assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        }
+    }
+
+    @Test
+    void profileValidatorsChangeInPlaceAndRollbackRestoresEnforcement() {
+        String app = create(APPLICATION, props("Name", "validated")).getPhysicalId();
+        List<Map<String, String>> original = List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"integer\"}"));
+        Map<String, Object> properties = props("ApplicationId", app, "Name", "settings",
+                "LocationUri", "hosted", "Validators", original);
+        StackResource resource = create(PROFILE, properties);
+        String id = resource.getPhysicalId();
+        service.createHostedConfigurationVersion(app, id, new byte[]{'1'}, "application/json", null);
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+
+        properties.put("Validators", List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"string\"}")));
+        update(resource, properties);
+        assertEquals(id, resource.getPhysicalId());
+        assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+
+        properties.put("Validators", List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"unknown\"}")));
+        update(resource, properties);
+        assertEquals("{\"type\":\"unknown\"}",
+                service.getConfigurationProfile(app, id).getValidators().getFirst().content());
+        assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+        properties.remove("Validators");
+        update(resource, properties);
+        assertNull(service.getConfigurationProfile(app, id).getValidators());
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals("{\"type\":\"integer\"}",
+                service.getConfigurationProfile(app, id).getValidators().getFirst().content());
     }
 
     @Test
@@ -608,7 +694,7 @@ class AppConfigCfnProvisionerTest {
         String appId = create(APPLICATION, props("Name", "orders")).getPhysicalId();
         StackResource env = create(ENVIRONMENT, props("ApplicationId", appId, "Name", "beta"));
         AwsException storage = new AwsException("InternalServerException", "storage failed", 500);
-        doThrow(storage).when(service).deleteEnvironmentById(env.getPhysicalId());
+        doThrow(storage).when(service).deleteEnvironmentById(appId, env.getPhysicalId());
 
         assertSame(storage, assertThrows(AwsException.class, () -> provisioner.delete(env, REGION)));
     }
@@ -622,6 +708,7 @@ class AppConfigCfnProvisionerTest {
         provisioner.delete(stub, REGION);
 
         verify(service, never()).deleteEnvironmentById(anyString());
+        verify(service, never()).deleteEnvironmentById(anyString(), anyString());
         verify(service, never()).deleteEnvironment(anyString(), anyString());
     }
 
@@ -635,6 +722,73 @@ class AppConfigCfnProvisionerTest {
                 () -> update(env, props("ApplicationId", appId, "Name", "gamma")));
 
         assertEquals("ResourceNotFoundException", failure.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {ENVIRONMENT, PROFILE, STRATEGY})
+    void childAndStrategyTagsFollowCreateUpdateRemovalAndRollback(String type) {
+        StackResource application = create(APPLICATION, props("Name", "parent"));
+        Map<String, Object> properties = tagProperties(type, application.getPhysicalId());
+        properties.put("Tags", List.of(tag("team", "first"), tag("remove", "yes")));
+        StackResource target = create(type, properties);
+        String id = target.getPhysicalId();
+        assertEquals(Map.of("team", "first", "remove", "yes"), resourceTags(target));
+
+        properties.put("Tags", List.of(tag("team", "second"), tag("empty", "")));
+        update(target, properties);
+        assertEquals(id, target.getPhysicalId());
+        assertEquals(Map.of("team", "second", "empty", ""), resourceTags(target));
+        assertTrue(provisioner.rollbackUpdate(target));
+        assertEquals(Map.of("team", "first", "remove", "yes"), resourceTags(target));
+
+        properties.remove("Tags");
+        update(target, properties);
+        assertEquals(id, target.getPhysicalId());
+        assertTrue(resourceTags(target).isEmpty());
+        assertTrue(provisioner.rollbackUpdate(target));
+        assertEquals(Map.of("team", "first", "remove", "yes"), resourceTags(target));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {ENVIRONMENT, PROFILE, STRATEGY})
+    void failedTagMutationRestoresMetadataAndTags(String type) {
+        StackResource application = create(APPLICATION, props("Name", "parent"));
+        Map<String, Object> properties = tagProperties(type, application.getPhysicalId());
+        properties.put("Description", "original");
+        properties.put("Tags", List.of(tag("team", "first")));
+        StackResource target = create(type, properties);
+        doThrow(new AwsException("InternalServerException", "tagging failed", 500)).doCallRealMethod()
+                .when(service).setResourceTags(anyString(), any(), anyString(), any());
+        properties.put("Description", "changed");
+        properties.put("Tags", List.of(tag("team", "second")));
+        assertThrows(AwsException.class, () -> update(target, properties));
+        assertEquals(Map.of("team", "first"), resourceTags(target));
+        String description = switch (type) {
+            case ENVIRONMENT -> service.findEnvironment(target.getPhysicalId()).orElseThrow().getDescription();
+            case PROFILE -> service.findConfigurationProfile(target.getPhysicalId()).orElseThrow().getDescription();
+            case STRATEGY -> service.getDeploymentStrategy(target.getPhysicalId()).getDescription();
+            default -> throw new IllegalArgumentException(type);
+        };
+        assertEquals("original", description);
+    }
+
+    private Map<String, String> resourceTags(StackResource resource) {
+        return switch (resource.getResourceType()) {
+            case ENVIRONMENT -> service.findEnvironment(resource.getPhysicalId()).orElseThrow().getTags();
+            case PROFILE -> service.findConfigurationProfile(resource.getPhysicalId()).orElseThrow().getTags();
+            case STRATEGY -> service.getDeploymentStrategy(resource.getPhysicalId()).getTags();
+            default -> throw new IllegalArgumentException(resource.getResourceType());
+        };
+    }
+
+    private static Map<String, Object> tagProperties(String type, String parent) {
+        return switch (type) {
+            case ENVIRONMENT -> props("ApplicationId", parent, "Name", "tagged");
+            case PROFILE -> props("ApplicationId", parent, "Name", "tagged", "LocationUri", "hosted");
+            case STRATEGY -> props("Name", "tagged", "ReplicateTo", "NONE",
+                    "DeploymentDurationInMinutes", 0, "GrowthFactor", 100);
+            default -> throw new IllegalArgumentException(type);
+        };
     }
 
     private StackResource create(String type, Map<String, Object> properties) {

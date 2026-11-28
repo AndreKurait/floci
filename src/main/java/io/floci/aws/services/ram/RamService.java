@@ -139,7 +139,8 @@ public class RamService implements StoredResourceArns {
                                              String region, String owningAccountId) {
         String arn = AwsArnUtils.Arn.of("ram", region, owningAccountId, "resource-share/" + UUID.randomUUID()).toString();
         ResourceShare share = new ResourceShare(
-                arn, name, owningAccountId, principals, resourceArns, allowExternalPrincipals);
+                arn, name, owningAccountId, principals, resourceArns, allowExternalPrincipals,
+                "ACTIVE", clock.instant(), null, Map.of());
         ResourceShare stored = putForOwner(share);
         inviteAccountPrincipals(stored, principals);
         return stored;
@@ -323,7 +324,7 @@ public class RamService implements StoredResourceArns {
                 String arn = AwsArnUtils.Arn.of("ram", region, share.getOwningAccountId(),
                         "resource-share-invitation/" + UUID.randomUUID()).toString();
                 putInvitation(new ResourceShareInvitation(arn, share.getResourceShareArn(), share.getName(),
-                        share.getOwningAccountId(), principal, Instant.now(), "PENDING"));
+                        share.getOwningAccountId(), principal, clock.instant(), "PENDING"));
             }
         }
     }
@@ -741,6 +742,30 @@ public class RamService implements StoredResourceArns {
             throw new AwsException("InvalidParameterException",
                     "resourceOwner must be one of [SELF, OTHER-ACCOUNTS].", 400);
         }
+    }
+
+    /** Resource use requires acceptance; pending invitations expose only discovery metadata. */
+    public boolean canUseResource(String resourceArn, String ownerAccountId, String callerAccountId, String region) {
+        return sharesIn(region).stream()
+                .filter(share -> "ACTIVE".equals(share.getStatus()))
+                .filter(share -> ownerAccountId.equals(share.getOwningAccountId()))
+                .filter(share -> share.getResourceArns().contains(resourceArn))
+                .anyMatch(share -> share.getPrincipals().stream().anyMatch(principal -> {
+                    if (!ACCOUNT_ID_PRINCIPAL.matcher(principal).matches()) {
+                        return isSharingWithOrganizationEnabled(ownerAccountId)
+                                && isMemberOfSameOrganization(ownerAccountId, callerAccountId)
+                                && isOrganizationPrincipalVisible(principal, callerAccountId);
+                    }
+                    if (!principal.equals(callerAccountId)) {
+                        return false;
+                    }
+                    return allInvitations().stream().anyMatch(invitation ->
+                            invitation.resourceShareArn().equals(share.getResourceShareArn())
+                                    && callerAccountId.equals(invitation.receiverAccountId())
+                                    && "ACCEPTED".equals(invitation.status()))
+                            || isSharingWithOrganizationEnabled(ownerAccountId)
+                                    && isMemberOfSameOrganization(ownerAccountId, callerAccountId);
+                }));
     }
 
     private boolean isVisible(ResourceShare share, String callerAccountId, String resourceOwner) {

@@ -3,6 +3,7 @@ package io.floci.aws.services.eventbridge;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import io.floci.aws.core.common.AwsErrorResponse;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
@@ -11,6 +12,7 @@ import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.eventbridge.model.ApiDestination;
 import io.floci.aws.services.eventbridge.model.ApiDestinationState;
 import io.floci.aws.services.eventbridge.model.Archive;
+import io.floci.aws.services.eventbridge.model.ArchivedEvent;
 import io.floci.aws.services.eventbridge.model.Connection;
 import io.floci.aws.services.eventbridge.model.EventBus;
 import io.floci.aws.services.eventbridge.model.Replay;
@@ -19,7 +21,9 @@ import io.floci.aws.services.eventbridge.model.Rule;
 import io.floci.aws.services.eventbridge.model.RuleState;
 import io.floci.aws.services.eventbridge.model.Target;
 import io.floci.aws.services.resourcegroupstagging.ResourceGroupsTaggingService;
+import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.PartitionMatrix;
+import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -32,6 +36,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -49,6 +55,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class EventBridgeServiceTest {
@@ -2023,6 +2030,71 @@ class EventBridgeServiceTest {
 
     // ─────────────── Envelope region/account propagation ───────────────
 
+    @ParameterizedTest
+    @MethodSource("eventTimestampCases")
+    void eventEnvelopeUsesWholeSecondsForGeneratedTimeAndPreservesExplicitTime(
+            String now, Object supplied, boolean request, String expected) throws Exception {
+        service = new EventBridgeService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"),
+                new ObjectMapper(), null, dispatcherMock, replayDispatcherMock,
+                new ResourceGroupsTaggingService(null), mock(AppSyncTargetValidator.class),
+                new ManualClock(Instant.parse(now)));
+        service.putRule("timestamp-rule", null, "{\"source\":[\"example.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target();
+        target.setId("queue");
+        target.setArn("arn:aws:sqs:us-east-1:000000000000:events");
+        service.putTargets("timestamp-rule", null, List.of(target), REGION);
+        Map<String, Object> entry = new HashMap<>(Map.of(
+                "Source", "example.app", "DetailType", "Example", "Detail", "{}"));
+        if (supplied != null) {
+            entry.put("Time", supplied);
+        }
+
+        if (request) {
+            EventBridgeHandler handler = new EventBridgeHandler(service, OBJECT_MAPPER);
+            try (Response response = handler.handle("PutEvents",
+                    OBJECT_MAPPER.valueToTree(Map.of("Entries", List.of(entry))), REGION)) {
+                assertEquals(200, response.getStatus());
+                assertEquals(0, ((JsonNode) response.getEntity()).path("FailedEntryCount").asInt());
+            }
+        } else {
+            assertEquals(0, service.putEvents(List.of(entry), REGION).failedCount());
+        }
+
+        ArgumentCaptor<String> json = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock).dispatch(anyString(), eq(target), json.capture(), eq(REGION), any());
+        assertEquals(expected, OBJECT_MAPPER.readTree(json.getValue()).path("time").asText());
+    }
+
+    static Stream<Arguments> eventTimestampCases() {
+        String now = "2030-04-05T06:07:08.123456789Z";
+        return Stream.of(
+                Arguments.of(now, null, false, "2030-04-05T06:07:08Z"),
+                Arguments.of("2030-04-05T06:07:59.999999999Z", null, true, "2030-04-05T06:07:59Z"),
+                Arguments.of("2030-04-05T06:07:08Z", null, true, "2030-04-05T06:07:08Z"),
+                Arguments.of(now, Instant.parse("2026-01-02T03:04:05.123456789Z"), false,
+                        "2026-01-02T03:04:05.123456789Z"),
+                Arguments.of(now, new BigDecimal("1700000000.125"), true, "2023-11-14T22:13:20.125Z"),
+                Arguments.of(now, BigDecimal.ZERO, true, "1970-01-01T00:00:00Z"),
+                Arguments.of(now, new BigDecimal("-0.125"), true, "1969-12-31T23:59:59.875Z")
+        );
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"\"not-a-timestamp\"", "\"2026-01-02T03:04:05Z\"", "{}", "true", "1e100"})
+    void putEventsRejectsInvalidExplicitTimeInsteadOfReplacingItWithNow(String supplied) throws Exception {
+        EventBridgeHandler handler = new EventBridgeHandler(service, OBJECT_MAPPER);
+        JsonNode request = OBJECT_MAPPER.readTree("{\"Entries\":[{\"Source\":\"example.app\","
+                + "\"DetailType\":\"Example\",\"Detail\":\"{}\",\"Time\":" + supplied + "}]}");
+        try (Response response = handler.handle("PutEvents", request, REGION)) {
+            assertEquals(400, response.getStatus());
+            assertEquals("SerializationException", ((AwsErrorResponse) response.getEntity()).type());
+        }
+        verifyNoInteractions(dispatcherMock);
+    }
+
     @Test
     void putEvents_envelopeRegionMatchesPutEventsCallRegion() throws Exception {
         service.putRule("my-rule", null, "{\"source\":[\"my.app\"]}", null, RuleState.ENABLED,
@@ -2540,6 +2612,42 @@ class EventBridgeServiceTest {
                 entry);
         assertEquals(0, ((ArrayNode) EventBridgeService.serviceEventEntry("s", "d", "{}", null).get("Resources")).size());
         assertEquals(0, ((ArrayNode) EventBridgeService.serviceEventEntry("s", "d", "{}", " ").get("Resources")).size());
+    }
+
+
+    // The instant an event is archived decides whether a replay window covers it, so it is read
+    // from the same clock as the dates of the bus, the archive and the replay.
+    @Test
+    @SuppressWarnings("unchecked")
+    void busesArchivesArchivedEventsAndReplaysAreDatedOnTheServiceClock() {
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        ManualClock clock = new ManualClock(start);
+        ReplayDispatcher replays = mock(ReplayDispatcher.class);
+        EventBridgeService timed = new EventBridgeService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"),
+                new ObjectMapper(), null, mock(TargetDispatcher.class), replays,
+                new ResourceGroupsTaggingService(null), mock(AppSyncTargetValidator.class), clock);
+
+        EventBus bus = timed.createEventBus("orders", null, null, REGION);
+        Archive archive = timed.createArchive("kept", bus.getArn(), null, null, 0, REGION);
+        assertEquals(start, bus.getCreatedTime());
+        assertEquals(start, archive.getCreationTime());
+
+        clock.advance(Duration.ofSeconds(90));
+        Map<String, Object> entry = Map.of("Source", "app", "DetailType", "placed", "Detail", "{}",
+                "EventBusName", "orders");
+        assertEquals(0, timed.putEvents(List.of(entry), REGION).failedCount());
+
+        clock.advance(Duration.ofSeconds(30));
+        Replay replay = timed.startReplay("again", null, archive.getArchiveArn(), start, start.plusSeconds(120),
+                bus.getArn(), REGION);
+
+        assertEquals(start.plusSeconds(120), replay.getReplayStartTime());
+        ArgumentCaptor<List<ArchivedEvent>> archived = ArgumentCaptor.forClass(List.class);
+        verify(replays).dispatch(any(), archived.capture(), any(), any(), any());
+        assertEquals(List.of(start.plusSeconds(90)),
+                archived.getValue().stream().map(ArchivedEvent::getEventTime).toList());
     }
 
     @Test

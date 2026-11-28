@@ -272,6 +272,11 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
     }
 
     @Override
+    public void flushOrThrow() {
+        flush();
+    }
+
+    @Override
     public synchronized void load() {
         // The flush schedule starts with the constructor: hold compaction off until the journal
         // has been replayed, or it could empty a journal whose records are not yet in memory.

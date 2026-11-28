@@ -6,6 +6,7 @@ import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.StoredResourceArns;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.services.cloudformation.model.ChangeSet;
+import io.floci.aws.services.cloudformation.model.ResourceToImport;
 import io.floci.aws.services.cloudformation.model.Stack;
 import io.floci.aws.services.cloudformation.model.StackEvent;
 import io.floci.aws.services.cloudformation.model.StackInstance;
@@ -16,6 +17,7 @@ import io.floci.aws.services.cloudformation.model.StackSetOperation;
 import io.floci.aws.services.cloudformation.model.TemplateSummary;
 import io.floci.aws.services.iam.IamService;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
@@ -38,12 +40,19 @@ public class CloudFormationQueryHandler {
     private static final DateTimeFormatter ISO = DateTimeFormatter.ISO_INSTANT;
     private static final String CF_NS = "http://cloudformation.amazonaws.com/doc/2010-05-15/";
 
+    @Inject
+    Instance<CloudFormationDriftHandler> driftHandler;
+
     private final CloudFormationService cfnService;
     /** Reads the delegation a caller holds, for the cap a stack's roles have to carry. */
     private final IamService iamService;
     /** The caller this request signed as, which says whether a delegation caps what it creates. */
     private final RequestContext requestContext;
     private final StackSetService stackSetService;
+
+    public CloudFormationQueryHandler(CloudFormationService cfnService, StackSetService stackSetService) {
+        this(cfnService, stackSetService, null, null);
+    }
 
     @Inject
     public CloudFormationQueryHandler(CloudFormationService cfnService, StackSetService stackSetService,
@@ -61,6 +70,9 @@ public class CloudFormationQueryHandler {
      * "created or managed through temporary access".
      */
     private String delegatedRoleBoundary() {
+        if (iamService == null || requestContext == null) {
+            return null;
+        }
         return iamService.delegatedRoleBoundaryArn(requestContext.getAccessKeyId()).orElse(null);
     }
 
@@ -74,9 +86,13 @@ public class CloudFormationQueryHandler {
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
         return switch (action) {
+            case "DetectStackDrift", "DetectStackResourceDrift",
+                    "DescribeStackDriftDetectionStatus", "DescribeStackResourceDrifts" ->
+                    driftHandler.get().handle(action, params, region);
             case "DescribeStacks" -> describeStacks(params, region);
             case "CreateStack" -> createStack(params, region);
             case "UpdateStack" -> updateStack(params, region);
+            case "SignalResource" -> signalResource(params, region);
             case "DeleteStack" -> deleteStack(params, region);
             case "ContinueUpdateRollback" -> continueUpdateRollback(params, region);
             case "UpdateTerminationProtection" -> updateTerminationProtection(params, region);
@@ -139,6 +155,11 @@ public class CloudFormationQueryHandler {
     // ── CreateStack ───────────────────────────────────────────────────────────
 
     private Response createStack(MultivaluedMap<String, String> params, String region) {
+        if (params.containsKey("DisableRollback") && params.containsKey("OnFailure")) {
+            throw new AwsException("ValidationError",
+                    "DisableRollback and OnFailure cannot both be specified.", 400);
+        }
+        boolean disableRollback = Boolean.parseBoolean(params.getFirst("DisableRollback"));
         String stackName = params.getFirst("StackName");
         String templateBody = params.getFirst("TemplateBody");
         String templateUrl = params.getFirst("TemplateURL");
@@ -151,10 +172,10 @@ public class CloudFormationQueryHandler {
         boolean terminationProtection = Boolean.parseBoolean(params.getFirst("EnableTerminationProtection"));
         ChangeSet initial = cfnService.createChangeSetForCreateStack(stackName, "initial-create",
                 templateBody, templateUrl, parameters, capabilities, tags, region,
-                terminationProtection, stackPolicy);
+                params.getFirst("RoleARN"), terminationProtection, stackPolicy);
         cfnService.recordDelegatedRoleBoundary(initial.getStackId(), region, delegatedRoleBoundary());
         try {
-            cfnService.executeChangeSetWithToken(initial.getStackId(), initial.getChangeSetId(), region,
+            cfnService.executeCreateChangeSet(initial.getStackId(), initial.getChangeSetId(), region, disableRollback,
                     params.getFirst("ClientRequestToken"));
         } catch (AwsException e) {
             if (terminationProtection) {
@@ -172,6 +193,12 @@ public class CloudFormationQueryHandler {
                 .end("CreateStackResponse")
                 .build();
         return Response.ok(xml).type("text/xml").build();
+    }
+
+    private Response signalResource(MultivaluedMap<String, String> params, String region) {
+        cfnService.signalResource(params.getFirst("StackName"), params.getFirst("LogicalResourceId"),
+                params.getFirst("UniqueId"), params.getFirst("Status"), region);
+        return Response.ok(emptyResult("SignalResourceResponse")).type("text/xml").build();
     }
 
     // ── UpdateStack ───────────────────────────────────────────────────────────
@@ -192,9 +219,9 @@ public class CloudFormationQueryHandler {
         String changeSetName = "update-" + UUID.randomUUID().toString().substring(0, 8);
         ChangeSet cs = usePreviousTemplate
                 ? cfnService.createChangeSetFromPreviousTemplate(stackName, changeSetName,
-                        parameters, capabilities, tags, region, stackPolicy)
+                        parameters, capabilities, tags, region, params.getFirst("RoleARN"), stackPolicy)
                 : cfnService.createChangeSetForUpdateStack(stackName, changeSetName,
-                        templateBody, templateUrl, parameters, capabilities, tags, region, stackPolicy);
+                        templateBody, templateUrl, parameters, capabilities, tags, region, params.getFirst("RoleARN"), stackPolicy);
         // An update that submits what the stack already has is refused, and leaves no change set
         // behind, as UpdateStack does on AWS.
         if (CloudFormationService.NO_CHANGES_REASON.equals(cs.getStatusReason())) {
@@ -224,7 +251,8 @@ public class CloudFormationQueryHandler {
         String stackName = params.getFirst("StackName");
         List<String> retainResources = extractList(params, "RetainResources.member.");
         try {
-            cfnService.deleteStackForRequest(stackName, retainResources, region, params.getFirst("ClientRequestToken"));
+            cfnService.deleteStackWithRole(stackName, retainResources, region, params.getFirst("RoleARN"),
+                    params.getFirst("ClientRequestToken"));
             String xml = new XmlBuilder()
                     .start("DeleteStackResponse", CF_NS)
                     .raw(AwsQueryResponse.responseMetadata())
@@ -242,12 +270,10 @@ public class CloudFormationQueryHandler {
         String stackName = params.getFirst("StackName");
         List<String> resourcesToSkip = extractList(params, "ResourcesToSkip.member.");
         boolean forceRollback = Boolean.parseBoolean(params.getFirst("ForceRollback"));
-        // RoleARN is accepted and has no effect: Floci assumes no role for stack operations.
-        // ClientRequestToken goes on the status events the operation sends; a repeated one is not
-        // refused, as Floci does not deduplicate retried requests.
+        // ClientRequestToken is accepted; retried requests are not deduplicated.
         try {
             cfnService.continueUpdateRollback(stackName, resourcesToSkip, forceRollback, region,
-                    params.getFirst("ClientRequestToken"));
+                    params.getFirst("RoleARN"), params.getFirst("ClientRequestToken"));
         } catch (AwsException e) {
             return xmlError(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
         }
@@ -333,9 +359,11 @@ public class CloudFormationQueryHandler {
         // internally, may attach a CREATE change set to a stack still in REVIEW_IN_PROGRESS.
         ChangeSet cs = usePreviousTemplate
                 ? cfnService.createChangeSetFromPreviousTemplate(stackName, changeSetName,
-                        parameters, capabilities, tags, region, null)
+                        parameters, capabilities, tags, region, params.getFirst("RoleARN"),
+                        changeSetType, extractResourcesToImport(params))
                 : cfnService.createChangeSetForRequest(stackName, changeSetName, changeSetType,
-                        templateBody, templateUrl, parameters, capabilities, tags, region);
+                        templateBody, templateUrl, parameters, capabilities, tags, region, params.getFirst("RoleARN"),
+                        extractResourcesToImport(params));
 
         String xml = new XmlBuilder()
                 .start("CreateChangeSetResponse", CF_NS)
@@ -374,7 +402,7 @@ public class CloudFormationQueryHandler {
                    .start("ResourceChange")
                    .elem("Action", change.action())
                    .elem("LogicalResourceId", change.logicalResourceId())
-                   .elem("PhysicalResourceId", change.physicalResourceId())
+                   .elem("PhysicalResourceId", cfnService.publicPhysicalId(change.resourceType(), change.physicalResourceId()))
                    .elem("ResourceType", change.resourceType())
                    .elem("Replacement", change.replacement())
                    .raw(scopeAndDetails(change))
@@ -503,8 +531,9 @@ public class CloudFormationQueryHandler {
                    .elem("EventId", e.getEventId())
                    .elem("StackId", e.getStackId())
                    .elem("StackName", e.getStackName())
+                    .elem("ClientRequestToken", e.getClientRequestToken())
                    .elem("LogicalResourceId", e.getLogicalResourceId())
-                   .elem("PhysicalResourceId", e.getPhysicalResourceId())
+                   .elem("PhysicalResourceId", cfnService.publicPhysicalId(e.getResourceType(), e.getPhysicalResourceId()))
                    .elem("ResourceType", e.getResourceType())
                    .elem("ResourceStatus", e.getResourceStatus())
                    .elem("ResourceStatusReason", e.getResourceStatusReason())
@@ -546,7 +575,7 @@ public class CloudFormationQueryHandler {
             for (StackResource r : resources) {
                 xml.start("member")
                    .elem("LogicalResourceId", r.getLogicalId())
-                   .elem("PhysicalResourceId", r.getPhysicalId())
+                   .elem("PhysicalResourceId", cfnService.publicPhysicalId(r.getResourceType(), r.getPhysicalId()))
                    .elem("ResourceType", r.getResourceType())
                    .elem("ResourceStatus", r.getStatus())
                    .elem("LastUpdatedTimestamp", ISO.format(r.getTimestamp()))
@@ -579,7 +608,7 @@ public class CloudFormationQueryHandler {
                     .elem("StackName", view.stackName())
                     .elem("StackId", view.stackId())
                     .elem("LogicalResourceId", res.getLogicalId())
-                    .elem("PhysicalResourceId", res.getPhysicalId())
+                    .elem("PhysicalResourceId", cfnService.publicPhysicalId(res.getResourceType(), res.getPhysicalId()))
                     .elem("ResourceType", res.getResourceType())
                     .elem("ResourceStatus", res.getStatus())
                     .elem("ResourceStatusReason", res.getStatusReason())
@@ -599,16 +628,18 @@ public class CloudFormationQueryHandler {
 
     private Response getTemplate(MultivaluedMap<String, String> params, String region) {
         String stackName = params.getFirst("StackName");
+        String changeSetName = params.getFirst("ChangeSetName");
         String templateStage = params.getFirst("TemplateStage");
         try {
-            String template = cfnService.getTemplate(stackName, templateStage, region);
+            CloudFormationService.TemplateResponse template =
+                    cfnService.getTemplate(stackName, changeSetName, templateStage, region);
             XmlBuilder xml = new XmlBuilder()
                     .start("GetTemplateResponse", CF_NS)
                     .start("GetTemplateResult")
-                    .elem("TemplateBody", template);
+                    .elem("TemplateBody", template.body());
 
             xml.start("StagesAvailable");
-            for (String stage : cfnService.templateStagesAvailable()) {
+            for (String stage : template.stagesAvailable()) {
                 xml.elem("member", stage);
             }
             xml.end("StagesAvailable");
@@ -678,7 +709,15 @@ public class CloudFormationQueryHandler {
             }
             xml.end("DeclaredTransforms");
 
-            xml.start("ResourceIdentifierSummaries").end("ResourceIdentifierSummaries");
+            xml.start("ResourceIdentifierSummaries");
+            for (TemplateSummary.ResourceIdentifierSummary identifiers : summary.resourceIdentifierSummaries()) {
+                xml.start("member").elem("ResourceType", identifiers.resourceType()).start("ResourceIdentifiers");
+                identifiers.resourceIdentifiers().forEach(identifier -> xml.elem("member", identifier));
+                xml.end("ResourceIdentifiers").start("LogicalResourceIds");
+                identifiers.logicalResourceIds().forEach(logicalId -> xml.elem("member", logicalId));
+                xml.end("LogicalResourceIds").end("member");
+            }
+            xml.end("ResourceIdentifierSummaries");
             xml.elem("Metadata", summary.metadata());
 
             xml.end("GetTemplateSummaryResult")
@@ -765,6 +804,7 @@ public class CloudFormationQueryHandler {
                 .elem("StackId", s.getStackId())
                 .elem("StackName", s.getStackName())
                 .elem("StackStatus", s.getStatus())
+                .elem("DisableRollback", String.valueOf(s.isDisableRollback()))
                 .elem("EnableTerminationProtection", String.valueOf(s.isEnableTerminationProtection()))
                 .elem("CreationTime", ISO.format(s.getCreationTime()));
         if (s.getLastUpdatedTime() != null) {
@@ -775,6 +815,9 @@ public class CloudFormationQueryHandler {
         }
         if (s.getStatusReason() != null) {
             xml.elem("StackStatusReason", s.getStatusReason());
+        }
+        if (s.getRoleArn() != null) {
+            xml.elem("RoleARN", s.getRoleArn());
         }
         xml.start("Capabilities");
         for (String cap : s.getCapabilities()) {
@@ -822,7 +865,7 @@ public class CloudFormationQueryHandler {
                .elem("StackName", view.stackName())
                .elem("StackId", view.stackId())
                .elem("LogicalResourceId", r.getLogicalId())
-               .elem("PhysicalResourceId", r.getPhysicalId())
+               .elem("PhysicalResourceId", cfnService.publicPhysicalId(r.getResourceType(), r.getPhysicalId()))
                .elem("ResourceType", r.getResourceType())
                .elem("ResourceStatus", r.getStatus())
                .elem("Timestamp", ISO.format(r.getTimestamp()))
@@ -832,6 +875,38 @@ public class CloudFormationQueryHandler {
            .raw(AwsQueryResponse.responseMetadata())
            .end("DescribeStackResourcesResponse");
         return Response.ok(xml.build()).type("text/xml").build();
+    }
+
+    private List<ResourceToImport> extractResourcesToImport(MultivaluedMap<String, String> params) {
+        List<ResourceToImport> resources = new ArrayList<>();
+        for (int index = 1; ; index++) {
+            String prefix = "ResourcesToImport.member." + index + ".";
+            if (params.keySet().stream().noneMatch(key -> key.startsWith(prefix))) {
+                break;
+            }
+            String type = params.getFirst(prefix + "ResourceType");
+            String logicalId = params.getFirst(prefix + "LogicalResourceId");
+            if (type == null || type.isBlank() || logicalId == null || logicalId.isBlank()) {
+                throw new AwsException("ValidationError",
+                        "Each ResourcesToImport member requires ResourceType and LogicalResourceId", 400);
+            }
+            Map<String, String> identifiers = new HashMap<>();
+            for (int entry = 1; ; entry++) {
+                String identifierPrefix = prefix + "ResourceIdentifier.entry." + entry + ".";
+                if (params.keySet().stream().noneMatch(key -> key.startsWith(identifierPrefix))) {
+                    break;
+                }
+                String key = params.getFirst(identifierPrefix + "key");
+                String value = params.getFirst(identifierPrefix + "value");
+                if (key == null || key.isBlank() || value == null || value.isBlank()
+                        || identifiers.putIfAbsent(key, value) != null) {
+                    throw new AwsException("ValidationError",
+                            "ResourceIdentifier must contain unique, nonempty keys and values", 400);
+                }
+            }
+            resources.add(new ResourceToImport(type, logicalId, identifiers));
+        }
+        return resources;
     }
 
     private Map<String, String> extractParameters(MultivaluedMap<String, String> params) {

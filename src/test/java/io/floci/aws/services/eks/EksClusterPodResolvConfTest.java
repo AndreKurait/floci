@@ -18,6 +18,7 @@ import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mockito;
 
 import java.io.InputStream;
@@ -35,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -165,7 +167,10 @@ class EksClusterPodResolvConfTest {
         assertThrows(RuntimeException.class, () -> manager.startCluster(cluster));
 
         verify(lifecycleManager, never()).startCreated(any(), any());
-        verify(lifecycleManager).removeIfExistsStrict(cluster.getDockerName(), true);
+        InOrder cleanup = inOrder(lifecycleManager);
+        cleanup.verify(lifecycleManager).removeIfExistsStrict(cluster.getDockerName(), true);
+        cleanup.verify(lifecycleManager).create(any());
+        cleanup.verify(lifecycleManager).removeIfExistsStrict(cluster.getDockerName(), true);
     }
 
     private void assertNoResolverFile() {

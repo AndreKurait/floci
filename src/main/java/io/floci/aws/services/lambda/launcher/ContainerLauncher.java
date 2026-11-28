@@ -8,6 +8,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.docker.AdditionalDockerNetworks;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerExitWatcher;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
@@ -16,6 +17,7 @@ import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.DockerCapacityExceededException;
 import io.floci.aws.core.common.docker.DockerExitEvents;
+import io.floci.aws.core.common.docker.DockerFlags;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.DockerPlatforms;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
@@ -24,9 +26,11 @@ import io.floci.aws.core.common.docker.StreamingDocker;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.iam.model.SessionCreds;
+import io.floci.aws.services.lambda.LambdaFunctionStore;
 import io.floci.aws.services.lambda.LambdaLayerService;
 import io.floci.aws.services.lambda.LambdaLogDestinations;
 import io.floci.aws.services.lambda.model.ContainerState;
+import io.floci.aws.services.lambda.model.InvocationTimer;
 import io.floci.aws.services.lambda.model.LambdaFileSystemConfig;
 import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.lambda.model.LambdaLayerVersion;
@@ -52,6 +56,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -62,6 +67,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -71,6 +77,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
@@ -126,6 +133,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final ContainerLifecycleManager lifecycleManager;
     private final DockerClient streamingDocker;
     private final DockerHttpClient controlPlaneHttp;
+    private final LambdaDnsResolver dnsResolver;
     private final ContainerLogStreamer logStreamer;
     private final ImageResolver imageResolver;
     private final RuntimeApiServerFactory runtimeApiServerFactory;
@@ -142,6 +150,103 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaContainerReconciler containerReconciler;
     /** The VPC address each VpcConfig function's container holds, returned once it is removed. */
     private final Map<String, VpcLease> vpcLeases = new ConcurrentHashMap<>();
+    private final LambdaImagePullService imagePulls;
+    private final LambdaFunctionStore functionStore;
+    private final LambdaVpcNetworkManager vpcNetworkManager;
+    /** Monotonic nanoseconds: every elapsed-time measurement in this class reads it. */
+    private final LongSupplier nanoTime;
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, null);
+    }
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             LambdaFunctionStore functionStore) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, functionStore, null);
+    }
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             LambdaFunctionStore functionStore,
+                             LambdaVpcNetworkManager vpcNetworkManager) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, functionStore, vpcNetworkManager, System::nanoTime, null);
+    }
+
+    ContainerLauncher(ContainerBuilder containerBuilder,
+                      ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer,
+                      ImageResolver imageResolver,
+                      RuntimeApiServerFactory runtimeApiServerFactory,
+                      DockerHostResolver dockerHostResolver,
+                      EmulatorConfig config,
+                      EcrRegistryManager ecrRegistryManager,
+                      LambdaLayerService layerService,
+                      LaunchedContainerAwsEnv awsEnv,
+                      LambdaExecutionRoleCredentials executionRoleCredentials,
+                      LambdaFunctionStore functionStore,
+                      LambdaVpcNetworkManager vpcNetworkManager,
+                      LongSupplier nanoTime) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, functionStore, vpcNetworkManager, nanoTime, null);
+    }
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             DockerClient streamingDocker,
+                             DockerHttpClient controlPlaneHttp,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             RegionResolver regionResolver,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             Ec2Service ec2Service,
+                             DockerExitEvents exitEvents) {
+        this(containerBuilder, lifecycleManager, streamingDocker, controlPlaneHttp, logStreamer,
+                imageResolver, runtimeApiServerFactory, dockerHostResolver, config, regionResolver,
+                ecrRegistryManager, layerService, awsEnv, executionRoleCredentials, ec2Service, exitEvents,
+                null, null, null, System::nanoTime);
+    }
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -159,7 +264,75 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LaunchedContainerAwsEnv awsEnv,
                              LambdaExecutionRoleCredentials executionRoleCredentials,
                              Ec2Service ec2Service,
-                             DockerExitEvents exitEvents) {
+                             DockerExitEvents exitEvents,
+                             LambdaFunctionStore functionStore,
+                             LambdaVpcNetworkManager vpcNetworkManager,
+                             LambdaImagePullService imagePulls) {
+        this(containerBuilder, lifecycleManager, streamingDocker, controlPlaneHttp, logStreamer,
+                imageResolver, runtimeApiServerFactory, dockerHostResolver, config, regionResolver,
+                ecrRegistryManager, layerService, awsEnv, executionRoleCredentials, ec2Service, exitEvents,
+                functionStore, vpcNetworkManager, imagePulls, System::nanoTime);
+    }
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                      ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer,
+                      ImageResolver imageResolver,
+                      RuntimeApiServerFactory runtimeApiServerFactory,
+                      DockerHostResolver dockerHostResolver,
+                      EmulatorConfig config,
+                      EcrRegistryManager ecrRegistryManager,
+                      LambdaLayerService layerService,
+                      LaunchedContainerAwsEnv awsEnv,
+                      LambdaExecutionRoleCredentials executionRoleCredentials,
+                      LambdaFunctionStore functionStore,
+                      LambdaVpcNetworkManager vpcNetworkManager,
+                      LambdaImagePullService imagePulls) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv, executionRoleCredentials,
+                functionStore, vpcNetworkManager, System::nanoTime, imagePulls);
+    }
+
+    ContainerLauncher(ContainerBuilder containerBuilder,
+                      ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer,
+                      ImageResolver imageResolver,
+                      RuntimeApiServerFactory runtimeApiServerFactory,
+                      DockerHostResolver dockerHostResolver,
+                      EmulatorConfig config,
+                      EcrRegistryManager ecrRegistryManager,
+                      LambdaLayerService layerService,
+                      LaunchedContainerAwsEnv awsEnv,
+                      LambdaExecutionRoleCredentials executionRoleCredentials,
+                      LambdaFunctionStore functionStore,
+                      LambdaVpcNetworkManager vpcNetworkManager,
+                      LongSupplier nanoTime, LambdaImagePullService imagePulls) {
+        this(containerBuilder, lifecycleManager, lifecycleManager.getDockerClient(), null, logStreamer,
+                imageResolver, runtimeApiServerFactory, dockerHostResolver, config,
+                new RegionResolver(config.defaultRegion(), config.defaultAccountId()), ecrRegistryManager, layerService,
+                awsEnv, executionRoleCredentials, null, null, functionStore, vpcNetworkManager, imagePulls, nanoTime);
+    }
+
+    ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             DockerClient streamingDocker,
+                             DockerHttpClient controlPlaneHttp,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             RegionResolver regionResolver,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             Ec2Service ec2Service,
+                             DockerExitEvents exitEvents,
+                             LambdaFunctionStore functionStore,
+                             LambdaVpcNetworkManager vpcNetworkManager,
+                             LambdaImagePullService imagePulls,
+                             LongSupplier nanoTime) {
         this.exitEvents = exitEvents;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -177,6 +350,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.executionRoleCredentials = executionRoleCredentials;
         this.ec2Service = ec2Service;
         this.containerReconciler = new LambdaContainerReconciler(config, lifecycleManager);
+        this.dnsResolver = new LambdaDnsResolver(containerBuilder, lifecycleManager, config);
+        this.functionStore = functionStore;
+        this.vpcNetworkManager = vpcNetworkManager;
+        this.nanoTime = nanoTime;
+        this.imagePulls = imagePulls;
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -248,14 +426,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // runtime-api port per failed attempt and eventually exhausts the pool, so launches keep
         // failing even after the daemon recovers.
         String containerId = null;
+        Closeable logHandle = null;
+        ContainerExitWatcher exitWatcher = null;
+        boolean registeredForExitEvents = false;
         // Hoisted alongside containerId, for the same reason: the resolved volume name (if any)
         // must be visible in the catch block below to release its in-flight reference on any
         // failure path, not just the one where useCodeVolume's block itself throws.
         String reservedCodeVolume = null;
+        String dnsResolverVolume = null;
         Optional<SessionCreds> roleCredentials = Optional.empty();
+        LambdaVpcNetworkManager.Attachment vpcNetwork = null;
         try {
 
-        LambdaDockerFlags dockerFlags = configuredDockerFlags();
+        DockerFlags dockerFlags = configuredDockerFlags();
         // Resolve the image for the same platform used by container creation.
         String image = "Image".equals(fn.getPackageType()) && fn.getImageUri() != null
                 ? fn.getImageUri()
@@ -289,9 +472,17 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (awsConfigPath.isEmpty()) {
             roleCredentials = executionRoleCredentials.forFunction(fn);
         }
+        if (vpcNetworkManager != null) {
+            vpcNetwork = vpcNetworkManager.prepare(fn, containerName, hostAddress,
+                    runtimeApiServer.getPort(), dockerFlags).orElse(null);
+        }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
-                awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
+                awsEnv.flociEndpointWithTls(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
+        if (vpcNetwork != null && config.network().vpcRouting().enabled()
+                && config.network().vpcRouting().publicAwsApi()) {
+            env.removeIf(value -> value.startsWith("AWS_ENDPOINT_URL="));
+        }
         LambdaRuntimeEnv.addFunctionEnvironment(env, fn, roleCredentials.isPresent());
         if (provisioned) {
             env.removeIf(value -> value.startsWith("AWS_LAMBDA_INITIALIZATION_TYPE="));
@@ -306,17 +497,25 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withEnv(env)
                 .withMemoryBytes(memoryBytes)
                 .withMemorySwapBytes(memoryBytes)
+                .withInit()
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
-                .withLogRotation()
-                .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                        "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
+                .withLogRotation();
         List<String> configuredExtraHosts = config.services().lambda().extraHosts().orElse(List.of());
         applyDockerFlags(specBuilder, dockerFlags);
+        specBuilder.withLabels(ContainerStorageHelper.resourceIdentityLabels(
+                "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
         specBuilder.withLabels(containerReconciler.ownershipLabels());
 
         specBuilder.withEmbeddedDns();
+        List<String> additionalNetworks = configuredAdditionalDockerNetworks();
+        if (vpcNetwork != null) {
+            specBuilder.withNetworkMode("container:" + vpcNetwork.helperId())
+                    .withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true",
+                            ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)));
+        }
         // A container image's runtime is its own, Java as likely as any.
-        if (isJavaRuntime(fn.getRuntime()) || "Image".equals(fn.getPackageType())) {
+        if ("Image".equals(fn.getPackageType())
+                || (isJavaRuntime(fn.getRuntime()) && !mountsRuntimeJavaTrustStore(dockerFlags, image))) {
             specBuilder.withJavaTrustStore();
         }
 
@@ -398,6 +597,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             specBuilder.withReadOnlyBind(hostPath, "/opt/aws-config");
         });
 
+        dnsResolverVolume = dnsResolver.prepare(specBuilder,
+                requestedDockerPlatform(fn, dockerFlags).orElse(null));
         ContainerSpec spec = specBuilder.build();
 
         // Create container without starting — provided.* runtimes exec
@@ -413,6 +614,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
+        AdditionalDockerNetworks.attach(dockerClient, containerId, additionalNetworks);
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -467,41 +669,62 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             WorkingDirectoryAccess.requireLambdaUserCanEnter(dockerClient, controlPlaneHttp, containerId, mountPaths);
         }
 
-        // Now start the container with code in place
-        joinVpcNetwork(fn, containerId, lambdaAccountId, lambdaRegion);
-        boolean exitByEvents = exitEvents.enabled();
-        if (exitByEvents) {
-            // Events report only what happens after the subscription, so register before the start.
-            exitEvents.register(containerId, runtimeApiServer::handleRuntimeProcessExited);
-        }
-        try {
-            lifecycleManager.startCreated(containerId, spec);
-        } catch (RuntimeException e) {
-            if (exitByEvents) {
-                exitEvents.unregister(containerId);
-            }
-            throw e;
-        }
-        runtimeApiServer.markContainerStarted();
-        if (!exitByEvents) {
-            watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
+        if (vpcNetwork == null) {
+            joinVpcNetwork(fn, containerId, lambdaAccountId, lambdaRegion);
         }
 
-        // Extensions can log as soon as they start, which is before the container's own log stream
-        // is attached below. Create the group/stream up front so those early lines are not dropped
-        // by CloudWatch; the call is idempotent, so attach() repeating it is harmless.
         LogDestination logDestination = new LogDestination(
                 lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
         logStreamer.ensureLogGroupAndStreamForAccount(
                 lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
+        Duration readinessBudget = Duration.ofSeconds(config.docker().connectionRequestTimeoutSeconds());
+        long readinessDeadline = nanoTime.getAsLong() + readinessBudget.toNanos();
+        if (exitEvents != null && exitEvents.enabled()) {
+            registeredForExitEvents = true;
+            exitEvents.register(containerId, runtimeApiServer::handleRuntimeProcessExited);
+        } else {
+            exitWatcher = ContainerExitWatcher.watchBeforeStart(dockerClient, streamingDocker, containerId,
+                    runtimeApiServer::handleRuntimeProcessExited, readinessBudget);
+        }
+        logHandle = logStreamer.attachBeforeStartForAccount(
+                lambdaAccountId, containerId, cwLogGroup, cwLogStream, lambdaRegion,
+                "lambda:" + fn.getFunctionName(),
+                Duration.ofNanos(Math.max(0, readinessDeadline - nanoTime.getAsLong())));
+        Objects.requireNonNull(logHandle, "Lambda output stream was not attached before start");
+        if (exitWatcher != null) {
+            exitWatcher.requireHealthy();
+        }
 
+        // Output and NEXT_EXIT are acknowledged before a fast runtime can exit and be removed.
+        if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
+            executionRoleCredentials.bindContainer(fn, roleCredentials.get().accessKeyId(), containerId);
+        }
+        lifecycleManager.startCreated(containerId, spec);
+        runtimeApiServer.markContainerStarted();
+        if (exitWatcher != null) {
+            exitWatcher.containerStarted();
+        }
+        if (config.services().iam().lambdaIdentityVerificationEnabled() && roleCredentials.isPresent()) {
+            try {
+                executionRoleCredentials.bindStartedContainer(fn, roleCredentials.get().accessKeyId(), containerId,
+                        dockerClient.inspectContainerCmd(containerId).exec().getState().getStartedAt());
+            } catch (RuntimeException unavailable) {
+                // Normal execution remains available; identity verification fails closed without this seal.
+                LOG.debug("Could not seal Lambda execution start time");
+            }
+        }
+        // Initialization may make authenticated calls while invocation admission waits on the probe.
+        LambdaContainerReadiness.await(dockerClient, containerId,
+                config.services().lambda().containerReadinessCommand(),
+                config.services().lambda().containerReadinessTimeoutSeconds());
         // Real AWS's runtime interface client discovers and launches every binary under
         // /opt/extensions/ as a sibling process to the main entrypoint before the runtime is
         // considered ready; Floci only runs the image's own ENTRYPOINT/CMD, so extensions
         // (e.g. aws-lambda-web-adapter) never start without this. Best-effort: an extension
         // launch failure shouldn't fail the whole container launch, since a function with no
         // extensions is the common case and this must be a no-op for it.
-        launchExtensions(dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
+        CompletableFuture<Void> extensionExit = launchExtensions(
+                dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
 
         // Init-readiness barrier: the execs above are detached, so without waiting here the caller
         // could enqueue the first invocation before an extension is ready to receive it — the
@@ -517,14 +740,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         ContainerHandle handle = new ContainerHandle(
                 containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM, fn.isHotReload(),
                 roleCredentials.map(SessionCreds::accessKeyId).orElse(null),
-                LambdaExecutionRoleCredentials.sessionAccountId(fn));
+                LambdaExecutionRoleCredentials.sessionAccountId(fn), vpcNetwork);
+        handle.setDnsResolverVolume(dnsResolverVolume);
 
-        // Attach log streaming
-        Closeable logHandle = logStreamer.attachForAccount(
-                lambdaAccountId, containerId, cwLogGroup, cwLogStream,
-                lambdaRegion, "lambda:" + fn.getFunctionName());
         handle.setLogStream(logHandle);
         handle.setLogTailReader(initialization -> InvocationLogTail.captureDocker(dockerClient, handle.getContainerId(), initialization));
+        handle.setExitWatcher(exitWatcher);
+        handle.setExtensionExit(extensionExit);
 
         return handle;
         } catch (RuntimeException e) {
@@ -541,12 +763,43 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 LOG.errorv("Container launch failed for function {0}; cleaning up: {1}",
                         fn.getFunctionName(), e.getMessage());
             }
+            runtimeApiServer.quiesce();
+            if (registeredForExitEvents) {
+                exitEvents.unregister(containerId);
+            }
+            if (exitWatcher != null) {
+                exitWatcher.cancel();
+            }
+            boolean workloadRetained = false;
             if (containerId != null) {
                 try {
-                    lifecycleManager.stopAndRemoveStrict(containerId, null);
+                    if (vpcNetwork != null) {
+                        lifecycleManager.stopAndRemoveStrict(containerId, logHandle, 1);
+                    } else {
+                        lifecycleManager.stopAndRemoveStrict(containerId, logHandle);
+                    }
                     releaseVpcLease(containerId);
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
+                    e.addSuppressed(cleanupError);
+                    workloadRetained = true;
+                }
+            }
+            if (dnsResolverVolume != null && !workloadRetained) {
+                try {
+                    dnsResolver.remove(dnsResolverVolume, containerId);
+                } catch (RuntimeException cleanupError) {
+                    if (cleanupError != e) {
+                        e.addSuppressed(cleanupError);
+                    }
+                }
+            }
+            if (vpcNetwork != null && !workloadRetained) {
+                try {
+                    vpcNetworkManager.release(vpcNetwork);
+                } catch (RuntimeException cleanupError) {
+                    LOG.warnv(cleanupError, "Could not release failed Lambda network {0}", vpcNetwork.eniId());
+                    e.addSuppressed(cleanupError);
                 }
             }
             if (roleCredentials.isPresent()) {
@@ -558,6 +811,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             // null by then); otherwise the failure happened before Docker ever saw the volume, so
             // its in-flight reference must be released here or cleanup would wait on it forever.
             releaseCodeVolumeReference(reservedCodeVolume);
+            if (workloadRetained) {
+                // The old process still owns its namespace and Runtime API port.
+                throw e;
+            }
             RuntimeApiServerFactory.stopBeforeRelease(runtimeApiServer);
             try {
                 runtimeApiServerFactory.release(runtimeApiServer);
@@ -580,116 +837,134 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         return Optional.ofNullable(DockerPlatforms.forArchitecture(architectures.getFirst()));
     }
 
-    private Optional<String> requestedDockerPlatform(LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+    private Optional<String> requestedDockerPlatform(LambdaFunction fn, DockerFlags dockerFlags) {
         if (dockerFlags.platform() != null) {
             return Optional.of(dockerFlags.platform());
         }
         return config.services().lambda().honourArchitectures() ? dockerPlatform(fn) : Optional.empty();
     }
 
-    private String createContainer(ContainerSpec spec, LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+    private String createContainer(ContainerSpec spec, LambdaFunction fn, DockerFlags dockerFlags) {
         Optional<String> platform = requestedDockerPlatform(fn, dockerFlags);
         if (platform.isEmpty() && config.services().lambda().honourArchitectures()) {
             throw new IllegalStateException("Invalid persisted architectures "
                     + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
         }
+        if ("Image".equals(fn.getPackageType()) && config.services().iam().enforcementEnabled()
+                && EcrRegistryManager.ecrImage(spec.image()).isPresent()) {
+            if (imagePulls == null) {
+                throw new IllegalStateException("The image-pull authorizer is unavailable");
+            }
+            return imagePulls.pull(fn, spec.image(),
+                    credentials -> lifecycleManager.create(spec, platform.orElse(null), credentials));
+        }
         return platform.map(value -> lifecycleManager.create(spec, value))
                 .orElseGet(() -> lifecycleManager.create(spec));
     }
 
-    private LambdaDockerFlags configuredDockerFlags() {
+    private List<String> configuredAdditionalDockerNetworks() {
+        return AdditionalDockerNetworks.validated(config.services().lambda().additionalDockerNetworks(), "Lambda");
+    }
+
+    private DockerFlags configuredDockerFlags() {
         Optional<String> configured = Optional.ofNullable(config.services().lambda().dockerFlags())
                 .orElse(Optional.empty());
         return configured.filter(value -> !value.isBlank())
-                .map(LambdaDockerFlags::parse)
-                .orElseGet(() -> LambdaDockerFlags.parse(null));
+                .map(DockerFlags::parse)
+                .orElseGet(() -> DockerFlags.none());
     }
 
-    private static void applyDockerFlags(ContainerBuilder.Builder builder, LambdaDockerFlags flags) {
-        builder.withEnv(flags.environment());
-        for (String volume : flags.volumes()) {
-            String[] parts = volume.split(":", -1);
-            if (parts.length < 2 || parts.length > 3 || parts[0].isBlank() || parts[1].isBlank()) {
-                throw new IllegalArgumentException("Invalid Lambda Docker volume: " + volume);
+    private static boolean mountsRuntimeJavaTrustStore(DockerFlags flags, String image) {
+        if (image == null
+                || !image.startsWith("public.ecr.aws/lambda/java:")) { // partition-literal: fixed public runtime image
+            return false;
+        }
+        List<String> stores = List.of("/var/lang/lib/security/cacerts",
+                "/etc/pki/ca-trust/extracted/java/cacerts");
+        return flags.volumes().stream()
+                .map(volume -> volume.split(":", -1))
+                .filter(parts -> parts.length > 1 && parts[1].startsWith("/"))
+                .map(parts -> normalizeContainerPath(parts[1]))
+                .anyMatch(target -> stores.stream().anyMatch(store -> store.equals(target)
+                        || store.startsWith(target.endsWith("/") ? target : target + "/")));
+    }
+
+    private static String normalizeContainerPath(String path) {
+        List<String> parts = new ArrayList<>();
+        for (String part : path.split("/")) {
+            if (part.isEmpty() || ".".equals(part)) {
+                continue;
             }
-            if (parts.length == 3 && "ro".equals(parts[2])) {
-                builder.withReadOnlyBind(parts[0], parts[1]);
-            } else if (parts.length == 2 || "rw".equals(parts[2])) {
-                builder.withBind(parts[0], parts[1]);
+            if ("..".equals(part)) {
+                if (!parts.isEmpty()) {
+                    parts.removeLast();
+                }
             } else {
-                throw new IllegalArgumentException("Invalid Lambda Docker volume mode: " + volume);
+                parts.add(part);
             }
         }
-        for (String publishedPort : flags.publishedPorts()) {
-            String[] parts = publishedPort.split(":", -1);
-            String hostIp = parts.length == 3 ? parts[0] : null;
-            String hostPort = parts.length == 2 ? parts[0] : parts.length == 3 ? parts[1] : "";
-            String containerPort = parts.length == 2 ? parts[1] : parts.length == 3 ? parts[2] : "";
-            if (hostPort.isBlank() || containerPort.isBlank()) {
-                throw new IllegalArgumentException("Invalid Lambda Docker published port: " + publishedPort);
-            }
-            int parsedHostPort = Integer.parseInt(hostPort);
-            int parsedContainerPort = Integer.parseInt(containerPort);
-            if (hostIp == null) {
-                builder.withPortBinding(parsedContainerPort, parsedHostPort);
-            } else if ("127.0.0.1".equals(hostIp)) {
-                builder.withLoopbackPortBinding(parsedContainerPort, parsedHostPort);
-            } else {
-                throw new IllegalArgumentException("Lambda Docker published ports only support "
-                        + "127.0.0.1 as an explicit host address: " + publishedPort);
-            }
-        }
-        for (String extraHost : flags.extraHosts()) {
-            int separator = extraHost.indexOf(':');
-            if (separator <= 0 || separator == extraHost.length() - 1) {
-                throw new IllegalArgumentException("Invalid Lambda Docker extra host: " + extraHost);
-            }
-            builder.withExtraHost(extraHost.substring(0, separator), extraHost.substring(separator + 1));
-        }
-        for (String dnsServer : flags.dnsServers()) {
-            builder.withDnsServer(dnsServer);
-        }
-        builder.withLabels(flags.labels());
-        if (flags.network() != null) {
-            builder.withNetworkMode(flags.network());
-        }
-        if (flags.user() != null) {
-            builder.withUser(flags.user());
-        }
-        builder.withPrivileged(flags.privileged());
+        return "/" + String.join("/", parts);
+    }
+
+    private static void applyDockerFlags(ContainerBuilder.Builder builder, DockerFlags flags) {
+        flags.applyTo(builder, "Lambda");
     }
 
     public void stop(ContainerHandle handle) {
+        synchronized (handle) {
+            stopOwnedContainer(handle);
+        }
+    }
+
+    private void stopOwnedContainer(ContainerHandle handle) {
         LOG.infov("Stopping container {0}", handle.getContainerId());
         handle.setState(ContainerState.STOPPED);
 
+        if (handle.isRuntimeApiReleased()) {
+            removeResolver(handle);
+            return;
+        }
         RuntimeApiServer server = handle.getRuntimeApiServer();
 
         // Quiesce first: stop accepting new work, notify extensions, complete pending
         // invocations. Existing runtime pollers on /invocation/next stay parked.
         server.quiesce();
+        handle.cancelExitWatcher();
+        if (exitEvents != null) {
+            exitEvents.unregister(handle.getContainerId());
+        }
 
-        // Then SIGTERM the container. The runtime library's default SIGTERM handler exits
-        // the process while the runtime API socket is still up, matching real AWS Lambda's
-        // shutdown flow.
+        // The container init forwards SIGTERM to the runtime while the runtime API socket
+        // stays up. Running the runtime directly as PID 1 would suppress the default
+        // SIGTERM action for runtimes without a handler, forcing the full kill timeout.
         //
-        // stopTimeoutSeconds is the ceiling docker waits for PID 1 to exit before SIGKILL,
-        // not a grace floor: the runtime typically exits promptly, so `docker stop`
-        // returns shortly after and this value rarely matters end-to-end. Sized against
-        // AWS's documented Shutdown-phase tiers as a defensive upper bound only — 2s
-        // when at least one extension is registered (matching AWS's 2000ms
-        // external-extensions budget), else 1s. NOTE: extensions run as sibling
-        // `docker exec`s (not children of PID 1) and are killed when the container
-        // exits; the 2s ceiling does not provide a guaranteed grace window for
-        // extension shutdown work — only that we will not preempt PID 1 for at least
-        // that long if it happens to be slow.
-        int stopTimeoutSeconds = server.hasRegisteredExtensions() ? 2 : 1;
+        // External extensions run as sibling execs and die when the container exits.
+        // Let their SHUTDOWN work and final output finish before signaling the runtime.
+        // Functions without extensions take the already-completed future immediately.
+        int stopTimeoutSeconds = shutdownTimeout(handle, server.hasRegisteredExtensions());
+        RuntimeException cleanupFailure = null;
         try {
             lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
                     stopTimeoutSeconds);
+        } catch (RuntimeException failure) {
+            cleanupFailure = failure;
+            throw failure;
         } finally {
-            executionRoleCredentials.unregister(
-                    handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
+            try {
+                executionRoleCredentials.unregister(
+                        handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
+            } catch (RuntimeException retirementFailure) {
+                if (cleanupFailure == null) {
+                    throw retirementFailure;
+                }
+                if (retirementFailure != cleanupFailure) {
+                    cleanupFailure.addSuppressed(retirementFailure);
+                }
+            }
+        }
+
+        if (handle.getVpcNetwork() != null) {
+            vpcNetworkManager.release(handle.getVpcNetwork());
         }
         // Only once the container is gone: a failed removal is retried, and until then Docker
         // still holds the address.
@@ -708,7 +983,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             LOG.warnv(e, "RuntimeApiServer did not close cleanly for container {0}",
                     handle.getContainerId());
         } finally {
-            runtimeApiServerFactory.release(server);
+            try {
+                runtimeApiServerFactory.release(server);
+                handle.markRuntimeApiReleased();
+            } finally {
+                removeResolver(handle);
+            }
         }
     }
 
@@ -742,6 +1022,40 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (lease != null) {
             ec2Service.releaseVpcPrivateIp(lease.accountId(), lease.region(), lease.subnetId(), lease.address());
         }
+    }
+
+    private void removeResolver(ContainerHandle handle) {
+        if (handle.getDnsResolverVolume() != null) {
+            dnsResolver.remove(handle.getDnsResolverVolume(), null);
+            handle.setDnsResolverVolume(null);
+        }
+    }
+
+    static int shutdownTimeout(ContainerHandle handle, boolean hasExtensions) {
+        return shutdownTimeout(handle, hasExtensions, InvocationTimer.SYSTEM);
+    }
+
+    static int shutdownTimeout(ContainerHandle handle, boolean hasExtensions, InvocationTimer timer) {
+        if (!hasExtensions) {
+            return 1;
+        }
+        if (handle.extensionExit().isDone()) {
+            return 2;
+        }
+        long deadline = timer.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        try {
+            timer.await(handle.extensionExit(), TimeUnit.SECONDS.toMillis(2));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return 0;
+        } catch (ExecutionException | TimeoutException | CancellationException failure) {
+            LOG.debugv(failure, "Extension shutdown did not complete cleanly for container {0}",
+                    handle.getContainerId());
+        }
+        long remaining = Math.max(0, deadline - timer.nanoTime());
+        // Docker accepts whole seconds. Rounding down keeps the total within the
+        // extension budget rather than adding another grace period after it expires.
+        return (int) TimeUnit.NANOSECONDS.toSeconds(remaining);
     }
 
     public static boolean isAwsCredentialVariable(String name) {
@@ -862,8 +1176,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             new ConcurrentHashMap<>();
 
     /**
-     * Superseded code volumes queued for cleanup, mapped to the time they were superseded (millis
-     * since epoch). Deletion is deferred rather than immediate: Docker auto-creates an empty named
+     * Superseded code volumes queued for cleanup, mapped to the {@link #nanoTime} reading at which
+     * they were superseded. Deletion is deferred rather than immediate: Docker auto-creates an empty named
      * volume for a container mount that doesn't reference an existing one rather than failing, so a
      * launch that resolved the old volume name just before a redeploy, but hasn't created its
      * container yet, could otherwise be handed an empty /var/task by an immediate delete. Waiting
@@ -886,9 +1200,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      */
     private final ConcurrentHashMap<String, AtomicInteger> volumesInFlight =
             new ConcurrentHashMap<>();
-    /** Non-final and package-private, like {@link #CODE_VOLUME_MIN_BYTES}, so tests can shrink it
-     *  instead of waiting out a real 60s window (restore it in a finally). */
-    static long VOLUME_CLEANUP_GRACE_MS = 60_000L;
+    /** How long a superseded code volume is kept before a sweep may remove it. */
+    static final long VOLUME_CLEANUP_GRACE_MS = 60_000L;
+    private static final long VOLUME_CLEANUP_GRACE_NANOS =
+            TimeUnit.MILLISECONDS.toNanos(VOLUME_CLEANUP_GRACE_MS);
     private final ScheduledExecutorService volumeCleanupScheduler =
             Executors.newSingleThreadScheduledExecutor(
                     r -> { Thread t = new Thread(r, "floci-code-volume-cleanup"); t.setDaemon(true); return t; });
@@ -922,21 +1237,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     LOG.infov("Reusing code volume {0} populated by a previous run (marker present)",
                             volName);
                 } else {
-                    long t0 = System.currentTimeMillis();
+                    long t0 = nanoTime.getAsLong();
                     LOG.infov("Populating code volume {0} for function {1} (one-time per code version)",
                             volName, fn.getFunctionName());
                     populateCodeVolume(volName, fn, image);
                     writeCodeVolumeMarkerAndPruneOrphans(volName);
                     LOG.infov("Populated code volume {0} in {1}ms; future cold starts mount it instead of copying",
-                            volName, System.currentTimeMillis() - t0);
+                            volName, TimeUnit.NANOSECONDS.toMillis(nanoTime.getAsLong() - t0));
                 }
                 populatedCodeVolumes.add(volName);
             }
-            // Reconcile bookkeeping for the resolved volume even when the check above already found
-            // it populated: a redeploy rolled back to an older code version resolves a volume name
-            // that's already populated but may have been queued as superseded by the deploy this
-            // just rolled back. Without pulling it back out of volumesPendingCleanup and marking it
-            // current again, the next sweep would delete the volume this function is actively using.
+            // Reconcile bookkeeping even for an already populated volume. With the authoritative
+            // store, keep pending candidates: its live-reference guard protects a rollback, while
+            // a stale launch for a deleted function must not cancel that volume's retirement retry.
             //
             // Under the per-function lock too: this specific read-modify-write (put, then queue
             // whatever was previously current) must be atomic across different code versions of the
@@ -946,10 +1259,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             Object functionLock = functionVolumeTransitionLocks.computeIfAbsent(
                     fn.getFunctionName(), k -> new Object());
             synchronized (functionLock) {
-                volumesPendingCleanup.remove(volName);
+                if (functionStore == null) {
+                    volumesPendingCleanup.remove(volName);
+                }
                 String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
                 if (previous != null && !previous.equals(volName)) {
-                    volumesPendingCleanup.put(previous, System.currentTimeMillis());
+                    volumesPendingCleanup.put(previous, nanoTime.getAsLong());
                 }
             }
             // Mark this volume as having an unconfirmed reference before releasing the lock: the
@@ -975,17 +1290,51 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         volumesInFlight.computeIfPresent(volName, (k, count) -> count.decrementAndGet() > 0 ? count : null);
     }
 
-    /**
-     * Whether a code volume carries this process's {@code floci_namespace} label (none when no
-     * namespace is set). The superseded sweep works from this process's own map of names, so it
-     * checks the label before deleting rather than trusting that a name it tracked is still its
-     * own. A volume whose labels cannot be read is left to {@code removeVolume}'s own checks.
-     */
-    private boolean inThisResourceNamespace(String volName) {
-        return lifecycleManager.tryVolumeLabels(volName)
-                .map(labels -> Objects.equals(labels.get(NAMESPACE_LABEL),
-                        ContainerStorageHelper.defaultLabels(config).get(NAMESPACE_LABEL)))
-                .orElse(true);
+    @Override
+    public void retireFunctionCode(List<LambdaFunction> deletedFunctions) {
+        if (functionStore == null) {
+            return;
+        }
+        for (LambdaFunction fn : deletedFunctions) {
+            String volName = codeVolumeName(config, fn);
+            Object lock = codeVolumeLocks.computeIfAbsent(volName, ignored -> new Object());
+            synchronized (lock) {
+                try {
+                    if (!populatedCodeVolumes.contains(volName)
+                            && !Files.isRegularFile(codeVolumeMarkerPath(volName), LinkOption.NOFOLLOW_LINKS)
+                            && lifecycleManager.tryVolumeLabels(volName).isEmpty()
+                            && codeVolumeKnownAbsent(volName)) {
+                        continue;
+                    }
+                } catch (RuntimeException e) {
+                    // Retain the captured candidate; a later sweep must verify ownership before removal.
+                    LOG.warnv("Could not inspect deleted function's code volume {0}: {1}", volName, e.getMessage());
+                }
+                Object functionLock = functionVolumeTransitionLocks.computeIfAbsent(
+                        fn.getFunctionName(), ignored -> new Object());
+                synchronized (functionLock) {
+                    functionCurrentVolume.remove(fn.getFunctionName(), volName);
+                    // Queued as already due: a deleted function's volume has no grace period.
+                    volumesPendingCleanup.put(volName, nanoTime.getAsLong() - VOLUME_CLEANUP_GRACE_NANOS);
+                }
+            }
+        }
+        cleanupSupersededVolumes();
+    }
+
+    private boolean codeVolumeStillReferenced(String volName) {
+        try {
+            return functionStore.listAll().stream()
+                    .anyMatch(fn -> volName.equals(codeVolumeName(config, fn)));
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not verify live references for code volume {0}: {1}", volName, e.getMessage());
+            return true;
+        }
+    }
+
+    private boolean codeVolumeKnownAbsent(String volName) {
+        // An empty label result also covers failed reads; only a successful inventory proves absence.
+        return lifecycleManager.tryListVolumeNames().map(names -> !names.contains(volName)).orElse(false);
     }
 
     /**
@@ -996,10 +1345,15 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * `docker volume prune --filter label=floci` same as before this existed).
      */
     void cleanupSupersededVolumes() {
-        long cutoff = System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS;
+        dnsResolver.retryCleanup();
+        // Legacy callers without the authoritative store cannot rule out an uninvoked live function.
+        if (functionStore == null) {
+            return;
+        }
+        long now = nanoTime.getAsLong();
         for (String volName : new ArrayList<>(volumesPendingCleanup.keySet())) {
             Long queuedAt = volumesPendingCleanup.get(volName);
-            if (queuedAt == null || queuedAt > cutoff) {
+            if (queuedAt == null || !graceElapsed(queuedAt, now)) {
                 continue;
             }
             // Same lock ensureCodeVolume holds for this volume name: claiming and deleting it here
@@ -1010,7 +1364,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 // volume (removed it from volumesPendingCleanup) or requeued it with a fresher
                 // timestamp between the check above and acquiring this lock.
                 Long stillQueuedAt = volumesPendingCleanup.get(volName);
-                if (stillQueuedAt == null || stillQueuedAt > cutoff) {
+                if (stillQueuedAt == null || !graceElapsed(stillQueuedAt, now)) {
+                    continue;
+                }
+                if (codeVolumeStillReferenced(volName)) {
                     continue;
                 }
                 AtomicInteger inFlight = volumesInFlight.get(volName);
@@ -1020,29 +1377,44 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     // to catch. The grace period alone isn't a safe upper bound on that launch's
                     // duration (create() has been observed taking ~80s under daemon load), so requeue
                     // for a later sweep instead of trusting elapsed time here.
-                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                    volumesPendingCleanup.put(volName, nanoTime.getAsLong());
                     continue;
                 }
-                volumesPendingCleanup.remove(volName, stillQueuedAt);
-                if (!inThisResourceNamespace(volName)) {
-                    LOG.debugv("Left superseded code volume {0} alone: it belongs to another resource namespace",
-                            volName);
-                    continue;
-                }
-                if (lifecycleManager.removeVolume(volName)) {
-                    populatedCodeVolumes.remove(volName);
-                    LOG.debugv("Removed superseded code volume {0}", volName);
-                } else {
-                    // Not confirmed gone: still in use (e.g. a slow-draining in-flight container
-                    // outlived the grace period), or the removal attempt itself failed for some
-                    // other reason (e.g. a transient daemon error). Either way, without this the
-                    // entry would be lost with no later sweep ever retrying it. Leave
-                    // populatedCodeVolumes alone too, since for all we know it's still there and
-                    // still valid.
-                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                try {
+                    Optional<Map<String, String>> labels = lifecycleManager.tryVolumeLabels(volName);
+                    if (labels.isEmpty()) {
+                        if (codeVolumeKnownAbsent(volName)) {
+                            volumesPendingCleanup.remove(volName, stillQueuedAt);
+                            populatedCodeVolumes.remove(volName);
+                        }
+                        continue;
+                    }
+                    if (!Objects.equals(labels.get().get(NAMESPACE_LABEL),
+                            ContainerStorageHelper.defaultLabels(config).get(NAMESPACE_LABEL))) {
+                        volumesPendingCleanup.remove(volName, stillQueuedAt);
+                        LOG.debugv("Left superseded code volume {0} alone: it belongs to another resource namespace",
+                                volName);
+                        continue;
+                    }
+                    if (lifecycleManager.removeVolume(volName)) {
+                        volumesPendingCleanup.remove(volName, stillQueuedAt);
+                        populatedCodeVolumes.remove(volName);
+                        LOG.debugv("Removed superseded code volume {0}", volName);
+                    } else {
+                        // Still in use or unconfirmed: retain the populated cache and retry later.
+                        volumesPendingCleanup.put(volName, nanoTime.getAsLong());
+                    }
+                } catch (RuntimeException e) {
+                    // One transport failure must neither forget this candidate nor cancel periodic cleanup.
+                    LOG.warnv("Deferred code volume cleanup for {0}: {1}", volName, e.getMessage());
                 }
             }
         }
+    }
+
+    /** Whether the grace period has passed since {@code queuedAt}; a difference, so it survives wraparound. */
+    private static boolean graceElapsed(long queuedAt, long now) {
+        return now - queuedAt >= VOLUME_CLEANUP_GRACE_NANOS;
     }
 
     /** Test-only: whether a per-volume lock object has ever been created for this volume name. */
@@ -1068,11 +1440,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     void populateCodeVolume(String volName, LambdaFunction fn, String image) {
         lifecycleManager.ensureVolume(volName);
         String shortId = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        String helperName = ContainerStorageHelper.prefixedDockerName(config, resolveContainerNamePrefix(config),
+                "codevol-" + fn.getFunctionName() + "-" + shortId);
         // A minimal helper container (sleep) with the volume mounted read-write at /var/task; we
         // tar-copy the code into it, then discard it — the data persists in the volume.
         ContainerBuilder.Builder helperBuilder = containerBuilder.newContainer(image)
-                .withName(ContainerStorageHelper.prefixedDockerName(config, resolveContainerNamePrefix(config),
-                        "codevol-" + fn.getFunctionName() + "-" + shortId))
+                .withName(helperName)
                 .withEnv(List.of())
                 .withEntrypoint(List.of("sleep"))
                 .withCmd(List.of("3600"))
@@ -1095,6 +1468,16 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     lifecycleManager.stopAndRemove(helperId, null, 0);
                 } catch (Exception e) {
                     LOG.warnv("Could not remove code-volume helper {0}: {1}", helperId, e.getMessage());
+                }
+            } else {
+                // A create that threw may still have made the helper: the daemon can accept it while
+                // its response is lost. Left behind, it outlives this run and makes every later
+                // shutdown keep the Floci parent for cleanup. The name is unique to this call.
+                try {
+                    lifecycleManager.removeIfExistsStrict(helperName);
+                } catch (Exception e) {
+                    LOG.warnv("Could not remove code-volume helper {0} after its create failed: {1}",
+                            helperName, e.getMessage());
                 }
             }
             populateSemaphore.release();
@@ -1481,13 +1864,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 runtimeApiServer::handleRuntimeProcessExited);
     }
 
-    private void launchExtensions(DockerClient dockerClient, String containerId, String functionName,
+    private CompletableFuture<Void> launchExtensions(DockerClient dockerClient, String containerId, String functionName,
                                   RuntimeApiServer runtimeApiServer, LogDestination logDestination, boolean strict) {
         List<String> extensionNames = listExtensionBinaries(dockerClient, containerId, functionName, strict);
         // Arm the readiness barrier before starting any extension process, so the latch already
         // exists when the first one starts polling /extension/event/next — otherwise a
         // fast-starting extension could become ready before there is anything to count it down.
         runtimeApiServer.expectExtensions(extensionNames.size());
+        List<CompletableFuture<Void>> exits = new ArrayList<>();
         for (String name : extensionNames) {
             try {
                 String path = EXTENSIONS_DIR + "/" + name;
@@ -1505,13 +1889,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 // the container log and an observability extension's output would vanish entirely.
                 // Draining is also required in its own right — an unread exec pipe fills up and
                 // stalls the extension process.
-                //
-                // The stream holds its connection while the extension runs, so it uses the
-                // streaming pool, where it cannot starve short control-plane calls.
-                streamingDocker.execStartCmd(execId).exec(logStreamer.execLogCallbackForAccount(
+                ExtensionLogCallback callback = new ExtensionLogCallback(logStreamer.execLogCallbackForAccount(
                         logDestination.accountId(), logDestination.logGroup(), logDestination.logStream(),
                         logDestination.region(),
                         "lambda:" + functionName + ":" + name));
+                streamingDocker.execStartCmd(execId).exec(callback);
+                exits.add(callback.completion());
                 LOG.infov("Launched extension {0} for function {1} (container {2})",
                         name, functionName, containerId);
             } catch (Exception e) {
@@ -1522,6 +1905,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         name, functionName);
             }
         }
+        return CompletableFuture.allOf(exits.toArray(CompletableFuture[]::new));
     }
 
     /**

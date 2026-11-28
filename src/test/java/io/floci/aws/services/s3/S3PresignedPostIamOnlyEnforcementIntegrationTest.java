@@ -279,40 +279,55 @@ class S3PresignedPostIamOnlyEnforcementIntegrationTest {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String bucket = "presigned-post-encryption-" + suffix;
         String userName = "presigned-post-encryption-user-" + suffix;
-        String value = field.endsWith("key-id") ? "approved-key" : "aws:kms";
-        boolean isDenied = "Deny".equals(effect);
-        createBucketAsRoot(bucket);
-        String accessKeyId = createUser(userName);
-        if (isDenied) {
-            putUserPolicy(userName, "AllowPutObject", """
+        String keyArn = given().header("Authorization", auth("test", "kms"))
+                .header("X-Amz-Target", "TrentService.CreateKey").contentType("application/x-amz-json-1.1")
+                .body("{}").post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        try {
+            String value = field.endsWith("key-id") ? keyArn : "aws:kms";
+            boolean isDenied = "Deny".equals(effect);
+            createBucketAsRoot(bucket);
+            String accessKeyId = createUser(userName);
+            putUserPolicy(userName, "EncryptOwnedKey", """
                     {"Version":"2012-10-17","Statement":[
-                      {"Effect":"Allow","Action":"s3:PutObject","Resource":"*"}
-                    ]}""");
+                      {"Effect":"Allow","Action":"kms:GenerateDataKey","Resource":"%s"}
+                    ]}""".formatted(keyArn));
+            if (isDenied) {
+                putUserPolicy(userName, "AllowPutObject", """
+                        {"Version":"2012-10-17","Statement":[
+                          {"Effect":"Allow","Action":"s3:PutObject","Resource":"*"}
+                        ]}""");
+            }
+            putUserPolicy(userName, "EncryptionCondition", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"%s","Action":"s3:PutObject","Resource":"arn:aws:s3:::%s/*",
+                       "Condition":{"StringEquals":{"s3:%s":"%s"}}}
+                    ]}""".formatted(effect, bucket, field, value));
+
+            given()
+                    .header(field, "header-only-value")
+                    .multiPart("key", "encrypted.txt")
+                    .multiPart("x-amz-credential", presignedCredential(accessKeyId))
+                    .multiPart("X-Amz-Server-Side-Encryption", encryption)
+                    .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", keyArn)
+                    .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
+            .when()
+                    .post("/" + bucket)
+            .then()
+                    .statusCode(isDenied ? 403 : 204);
+
+            given()
+                    .header("Authorization", auth("test", "s3"))
+            .when()
+                    .get("/" + bucket + "/encrypted.txt")
+            .then()
+                    .statusCode(isDenied ? 404 : 200);
+        } finally {
+            given().header("Authorization", auth("test", "kms"))
+                    .header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                    .contentType("application/x-amz-json-1.1")
+                    .body("{\"KeyId\":\"" + keyArn + "\",\"PendingWindowInDays\":7}")
+                    .post("/").then().statusCode(200);
         }
-        putUserPolicy(userName, "EncryptionCondition", """
-                {"Version":"2012-10-17","Statement":[
-                  {"Effect":"%s","Action":"s3:PutObject","Resource":"arn:aws:s3:::%s/*",
-                   "Condition":{"StringEquals":{"s3:%s":"%s"}}}
-                ]}""".formatted(effect, bucket, field, value));
-
-        given()
-                .header(field, "header-only-value")
-                .multiPart("key", "encrypted.txt")
-                .multiPart("x-amz-credential", presignedCredential(accessKeyId))
-                .multiPart("X-Amz-Server-Side-Encryption", encryption)
-                .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "approved-key")
-                .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
-        .when()
-                .post("/" + bucket)
-        .then()
-                .statusCode(isDenied ? 403 : 204);
-
-        given()
-                .header("Authorization", auth("test", "s3"))
-        .when()
-                .get("/" + bucket + "/encrypted.txt")
-        .then()
-                .statusCode(isDenied ? 404 : 200);
     }
 
     @ParameterizedTest

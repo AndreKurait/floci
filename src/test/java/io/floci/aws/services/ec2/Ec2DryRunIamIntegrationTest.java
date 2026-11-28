@@ -13,6 +13,7 @@ import software.amazon.awssdk.services.ec2.model.AttributeValue;
 import software.amazon.awssdk.services.ec2.model.Instance;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 import software.amazon.awssdk.services.ec2.model.Volume;
+import software.amazon.awssdk.services.ec2.model.VpcEndpoint;
 
 import java.net.URI;
 import java.time.Duration;
@@ -202,6 +203,50 @@ class Ec2DryRunIamIntegrationTest {
             assertAwsError("UnauthorizedOperation", 403, () -> dryRun.accept(caller));
 
             assertEquals(before, state.get());
+        }
+    }
+
+    @Test
+    void vpcEndpointDryRunsRequireCurrentPermissionAndPreserveState() throws Exception {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[{
+                  "Effect":"Allow","Action":"ec2:*VpcEndpoint*","Resource":"*"
+                }]}
+                """;
+        try (Ec2Client admin = AwsTestClients.create(Ec2Client.builder(), "test", Region.US_EAST_1, endpoint);
+                SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "endpoint-dryrun-", "endpoints", policy);
+                Ec2Client caller = AwsTestClients.create(Ec2Client.builder(), user.accessKeyId(),
+                        user.secretAccessKey(), Region.US_EAST_1, endpoint)) {
+            String vpcId = admin.createVpc(r -> r.cidrBlock("10.96.0.0/16")).vpc().vpcId();
+            try {
+                String endpointId = admin.createVpcEndpoint(r -> r.vpcId(vpcId)
+                        .serviceName("com.amazonaws.us-east-1.s3").vpcEndpointType("Gateway"))
+                        .vpcEndpoint().vpcEndpointId();
+                try {
+                    List<VpcEndpoint> before = admin.describeVpcEndpoints().vpcEndpoints();
+                    List<Runnable> requests = List.of(
+                            () -> caller.describeVpcEndpoints(r -> r.vpcEndpointIds(endpointId).dryRun(true)),
+                            () -> caller.createVpcEndpoint(r -> r.vpcId(vpcId)
+                                    .serviceName("com.amazonaws.us-east-1.s3").vpcEndpointType("Gateway").dryRun(true)),
+                            () -> caller.modifyVpcEndpoint(r -> r.vpcEndpointId(endpointId)
+                                    .policyDocument("{\"Statement\":[]}").dryRun(true)),
+                            () -> caller.deleteVpcEndpoints(r -> r.vpcEndpointIds(endpointId).dryRun(true)));
+                    for (Runnable request : requests) {
+                        assertAwsError("DryRunOperation", 412, request::run);
+                    }
+                    assertEquals(before, admin.describeVpcEndpoints().vpcEndpoints());
+                    SignedIamUsers.iam(endpoint, "DeleteUserPolicy",
+                            Map.of("UserName", user.name(), "PolicyName", "endpoints")).then().statusCode(200);
+                    for (Runnable request : requests) {
+                        assertAwsError("UnauthorizedOperation", 403, request::run);
+                    }
+                    assertEquals(before, admin.describeVpcEndpoints().vpcEndpoints());
+                } finally {
+                    admin.deleteVpcEndpoints(r -> r.vpcEndpointIds(endpointId));
+                }
+            } finally {
+                admin.deleteVpc(r -> r.vpcId(vpcId));
+            }
         }
     }
 

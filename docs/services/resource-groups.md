@@ -16,11 +16,12 @@ Floci supports service-configured EC2 capacity reservation pools. This is a sepa
 | `DeleteGroup` | Delete the group and membership, preserving its reservations |
 | `GroupResources` | Add verified active reservations |
 | `ListGroupResources` | Read stored membership with scoped pagination |
+| `ListGroups` | List capacity pools in the calling account and region |
 <!-- floci:actions:end -->
 
-The standard REST routes are `POST /groups`, `/get-group`, `/delete-group`, `/group-resources`, and `/list-group-resources`. Get, delete and list also accept the deprecated `GroupName` selector. Supplying both `Group` and `GroupName` is rejected.
+The standard REST routes are `POST /groups`, `/get-group`, `/delete-group`, `/group-resources`, `/list-group-resources`, and `/groups-list`. Get, delete and membership listing also accept the deprecated `GroupName` selector. Supplying both `Group` and `GroupName` is rejected.
 
-With IAM enforcement enabled, signed management operations are checked against their `resource-groups:` actions and the selected group ARN. Signed S3 requests to buckets with the same names retain S3 routing.
+With IAM enforcement enabled, signed management operations are checked against their `resource-groups:` actions and the selected group ARN. `ListGroups` requires an account-wide grant on `*`; group selectors in its body cannot change that scope. Signed S3 requests to buckets with the same names retain S3 routing.
 
 ## Capacity pools
 
@@ -46,9 +47,16 @@ Groups use the caller's account and region. Their ARNs use the region's AWS part
 
 Deleting a group removes its membership and tokens. It does not cancel or delete the EC2 reservations.
 
+`ListGroups` returns `GroupIdentifiers` and the deprecated `Groups` representation. Its `maxResults`
+and `nextToken` parameters are in the query string; `Filters` is in the JSON body. Pages contain up to
+fifty groups and tokens bind the account, region and filters, sharing the bounded token cache above.
+Later group names do not enter an existing traversal and deleted groups are omitted. The
+`configuration-type` filter selects capacity pools. Supported pools have no query `ResourceTypeFilter`,
+owner, display-name or criticality, so filters for those attributes return no matches.
+
 ## Scope
 
-Only the five operations and capacity-pool configuration above are implemented. Dynamic tag/CloudFormation queries, other service configurations, independent tag-update operations and `UngroupResources` are not supported. Unsupported configurations are rejected. Membership does not allocate physical capacity. EC2 launches that target the group consume matching available member reservations; the launch preference controls On-Demand fallback. No asynchronous membership transition is simulated: accepted additions complete synchronously and `Pending` is empty.
+Only the six operations and capacity-pool configuration above are implemented. Dynamic tag/CloudFormation queries, other service configurations, independent tag-update operations and `UngroupResources` are not supported. Unsupported configurations are rejected. Membership does not allocate physical capacity. EC2 launches that target the group consume matching available member reservations; the launch preference controls On-Demand fallback. No asynchronous membership transition is simulated: accepted additions complete synchronously and `Pending` is empty.
 
 Group state follows the configured Floci storage mode. Pagination tokens are in memory and are intentionally invalidated by restart/reset.
 
@@ -62,7 +70,8 @@ Group state follows the configured Floci storage mode. Pagination tokens are in 
 
 The public wire contracts and capacity-pool example are documented in the AWS references for
 [CreateGroup](https://docs.aws.amazon.com/ARG/latest/APIReference/API_CreateGroup.html),
-[GroupResources](https://docs.aws.amazon.com/ARG/latest/APIReference/API_GroupResources.html), and
+[GroupResources](https://docs.aws.amazon.com/ARG/latest/APIReference/API_GroupResources.html),
+[ListGroups](https://docs.aws.amazon.com/ARG/latest/APIReference/API_ListGroups.html), and
 [ListGroupResources](https://docs.aws.amazon.com/ARG/latest/APIReference/API_ListGroupResources.html).
 
 Requests use botocore's modeled field, tag-pattern and size constraints; unknown fields are ignored. In the supported service-configured capacity-pool mode, valid `Criticality`, `Owner` and `DisplayName` values are rejected as unsupported parameters, matching live AWS.

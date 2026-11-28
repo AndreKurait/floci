@@ -67,11 +67,7 @@ public class KinesisEventSourcePoller implements Resettable {
     private volatile boolean quiesced;
     /** Mappings stopped since their last start; a delete stops the mapping before the store forgets it. */
     final Set<String> stopped = ConcurrentHashMap.newKeySet();
-    private final ExecutorService pollExecutor = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "kinesis-esm-poller");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService pollExecutor;
 
     @Inject
     public KinesisEventSourcePoller(Vertx vertx, KinesisService kinesisService,
@@ -93,6 +89,20 @@ public class KinesisEventSourcePoller implements Resettable {
                              PipesFilterMatcher filterMatcher,
                              StreamBatchFailures batchFailures,
                              LongSupplier clock) {
+        this(vertx, kinesisService, executorService, targetResolver, esmStore, config, objectMapper,
+                filterMatcher, batchFailures, clock, newPollExecutor());
+    }
+
+    /** Test seam: {@code pollExecutor} runs the polls, so a test can wait for them or run them inline. */
+    KinesisEventSourcePoller(Vertx vertx, KinesisService kinesisService,
+                             LambdaExecutorService executorService,
+                             LambdaTargetResolver targetResolver,
+                             EsmStore esmStore, EmulatorConfig config,
+                             ObjectMapper objectMapper,
+                             PipesFilterMatcher filterMatcher,
+                             StreamBatchFailures batchFailures,
+                             LongSupplier clock,
+                             ExecutorService pollExecutor) {
         this.vertx = vertx;
         this.kinesisService = kinesisService;
         this.executorService = executorService;
@@ -103,12 +113,22 @@ public class KinesisEventSourcePoller implements Resettable {
         this.filterMatcher = filterMatcher;
         this.batchFailures = batchFailures;
         this.clock = clock;
+        this.pollExecutor = pollExecutor;
+    }
+
+    private static ExecutorService newPollExecutor() {
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "kinesis-esm-poller");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public void startPersistedPollers() {
         List<EventSourceMapping> esms = esmStore.listAll();
         for (EventSourceMapping esm : esms) {
-            if (esm.isEnabled() && esm.getEventSourceArn().contains(":kinesis:")) {
+            if (esm.isEnabled() && esm.getEventSourceArn() != null
+                    && esm.getEventSourceArn().contains(":kinesis:")) {
                 startPolling(esm);
             }
         }
@@ -204,7 +224,11 @@ public class KinesisEventSourcePoller implements Resettable {
         }
 
         String iterator;
-        if (lastSeq == null) {
+        if (lastSeq == null && "AT_TIMESTAMP".equals(esm.getStartingPosition())
+                && esm.getStartingPositionTimestamp() != null) {
+            iterator = kinesisService.getShardIteratorForAccount(esm.getAccountId(),
+                    streamName, shardId, "AT_TIMESTAMP", null, esm.getStartingPositionTimestamp(), esm.getRegion());
+        } else if (lastSeq == null) {
             iterator = kinesisService.getShardIteratorForAccount(esm.getAccountId(),
                     streamName, shardId, "TRIM_HORIZON", null, esm.getRegion());
         } else {
@@ -540,6 +564,10 @@ public class KinesisEventSourcePoller implements Resettable {
 
     private void advanceCheckpoint(EventSourceMapping esm, String shardId, String newestSeq) {
         esm.getShardSequenceNumbers().put(shardId, newestSeq);
+        if (esmStore.getForAccount(esm.getAccountId(), esm.getUuid()).isEmpty()) {
+            // Deleted while its batch was with the function: saving it would bring the mapping back.
+            return;
+        }
         esmStore.saveForAccount(esm.getAccountId(), esm);
     }
 
