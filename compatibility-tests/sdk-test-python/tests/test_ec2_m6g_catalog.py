@@ -1,5 +1,9 @@
 """M6g discovery verified against live EC2 in us-east-1 and eu-west-1."""
 
+import json
+from contextlib import closing
+from decimal import Decimal
+
 import boto3
 import pytest
 
@@ -28,6 +32,28 @@ def test_m6g_descriptor(catalog_client):
     assert len(network["NetworkCards"]) == 1
     assert network["NetworkCards"][0]["NetworkCardIndex"] == 0
     assert network["NetworkCards"][0]["MaximumNetworkInterfaces"] == 3
+
+
+def test_m6g_has_a_bundled_on_demand_price(aws_config, client_config):
+    with closing(boto3.client(
+            "pricing", config=client_config,
+            **{**aws_config, "region_name": "us-east-1"})) as pricing:
+        response = pricing.get_products(
+            ServiceCode="AmazonEC2",
+            Filters=[{"Type": "TERM_MATCH", "Field": field, "Value": value}
+                     for field, value in {
+                         "instanceType": "m6g.large", "regionCode": "us-east-1",
+                         "operatingSystem": "Linux", "tenancy": "Shared",
+                         "preInstalledSw": "NA", "capacitystatus": "Used",
+                     }.items()])
+    assert len(response["PriceList"]) == 1
+    product = json.loads(response["PriceList"][0])
+    assert product["product"]["attributes"]["usagetype"] == "BoxUsage:m6g.large"
+    rates = [dimension for term in product["terms"]["OnDemand"].values()
+             for dimension in term["priceDimensions"].values()]
+    assert len(rates) == 1
+    assert rates[0]["unit"] == "Hrs"
+    assert Decimal(rates[0]["pricePerUnit"]["USD"]) == Decimal("0.077")
 
 
 def test_m6g_offerings(catalog_client):

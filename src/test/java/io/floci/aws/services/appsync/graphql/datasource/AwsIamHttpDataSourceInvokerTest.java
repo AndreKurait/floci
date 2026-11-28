@@ -1,6 +1,7 @@
 package io.floci.aws.services.appsync.graphql.datasource;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.config.TlsProxyServer;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceRegistry;
@@ -41,6 +42,7 @@ class AwsIamHttpDataSourceInvokerTest {
     private final IamService iam = mock(IamService.class);
     private final ServiceRoleAuthorizer authorizer = mock(ServiceRoleAuthorizer.class);
     private final ServiceRegistry services = mock(ServiceRegistry.class);
+    private final TlsProxyServer proxy = mock(TlsProxyServer.class);
     private final HttpServer server = mock(HttpServer.class);
     private final HttpDataSourceTransport transport = mock(HttpDataSourceTransport.class);
     private DataSource source;
@@ -49,6 +51,7 @@ class AwsIamHttpDataSourceInvokerTest {
 
     @BeforeEach
     void setUp() {
+        when(proxy.localApiEndpoint(any())).thenAnswer(call -> call.getArgument(0));
         when(services.isServiceEnabled("scheduler")).thenReturn(true);
         when(server.getLocalBaseUri()).thenReturn(URI.create("http://localhost:4566"));
         when(authorizer.refusal(any(), any(), any(), any(), any())).thenReturn(Optional.empty());
@@ -61,7 +64,24 @@ class AwsIamHttpDataSourceInvokerTest {
         request = HttpDataSourceRequest.parse(source, Map.of("method", "GET", "resourcePath", "/schedules/example"),
                 new ObjectMapper());
         invoker = new AwsIamHttpDataSourceInvoker(iam, authorizer, services, new RegionResolver(REGION, ACCOUNT),
-                server, transport);
+                server, proxy, transport);
+    }
+
+    @Test
+    void proxyEndpointOwnsTheSignedRequestDestination() {
+        when(proxy.localApiEndpoint(any())).thenReturn(URI.create("http://127.0.0.1:4567"));
+        when(transport.send(any())).thenReturn(Map.of("statusCode", 200));
+        assertEquals(200, invoker.invoke(source, request, REGION).get("statusCode"));
+        ArgumentCaptor<HttpDataSourceRequest> outgoing = ArgumentCaptor.forClass(HttpDataSourceRequest.class);
+        verify(transport).send(outgoing.capture());
+        assertEquals(URI.create("http://127.0.0.1:4567/schedules/example"), outgoing.getValue().uri());
+        assertEquals("127.0.0.1:4567", outgoing.getValue().headers().get("host"));
+    }
+
+    @Test
+    void unavailableProxyCannotIssueCredentials() {
+        when(proxy.localApiEndpoint(any())).thenReturn(null);
+        assertRefusedBeforeCredentials("InternalFailureException");
     }
 
     @ParameterizedTest

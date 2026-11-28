@@ -321,8 +321,7 @@ class WebSocketLambdaAuthorizerTest {
 
         WebSocket ws = connectWebSocket(wsApiId, "test");
         assertNotNull(ws, "WebSocket connection should succeed when authorizer returns Allow");
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 2: Authorizer denies connection ────────────────────────────
@@ -400,8 +399,7 @@ class WebSocketLambdaAuthorizerTest {
             JsonNode requestContext = event.get("requestContext");
             assertNotNull(requestContext, "Event should have requestContext");
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
         } finally {
             given().when().delete("/v2/apis/" + wsApiId + "/routes/" + defaultRouteId);
         }
@@ -427,8 +425,7 @@ class WebSocketLambdaAuthorizerTest {
         // Now connect WITH the Authorization header — should succeed
         WebSocket ws = connectWebSocketWithHeader(wsApiId, "test", "Authorization", "Bearer test-token");
         assertNotNull(ws, "Connection should succeed when identity source header is present");
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 6: Authorizer event payload matches AWS format ────────────────────────────
@@ -469,8 +466,7 @@ class WebSocketLambdaAuthorizerTest {
             JsonNode messageEvent = wrapper.get("proxyEvent");
             assertNotNull(messageEvent, "Response should contain proxyEvent");
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
 
             WebSocketTestSupport.MessageCapture capture2 = new WebSocketTestSupport.MessageCapture();
             WebSocket ws2 = connectWebSocketWithQueryAndListener(wsApiId, "test", "token=verify123", capture2);
@@ -502,8 +498,7 @@ class WebSocketLambdaAuthorizerTest {
             assertTrue(authEvent.get("methodArn").asText().contains("$connect"),
                     "methodArn should contain $connect");
 
-            ws2.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws2);
         } finally {
             given().when().delete("/v2/apis/" + wsApiId + "/routes/" + defaultRouteId);
         }

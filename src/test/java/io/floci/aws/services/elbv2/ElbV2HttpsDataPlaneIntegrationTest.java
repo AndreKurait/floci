@@ -22,6 +22,7 @@ import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
+import org.awaitility.core.ThrowingRunnable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -35,7 +36,6 @@ import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
-
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.EOFException;
@@ -45,6 +45,7 @@ import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.MessageDigest;
@@ -167,6 +168,11 @@ class ElbV2HttpsDataPlaneIntegrationTest {
                         .formParam("Actions.member.1.FixedResponseConfig.MessageBody", "local-only")
                         .when().post("/").then().statusCode(200);
             }
+            given().header("Host", loadBalancer.dnsName() + ":" + HTTP_PORT)
+                    .when().get("/").then().statusCode(200).body(equalTo("fallback"));
+            Response sharedHttps = given().header("Host", loadBalancer.dnsName() + ":" + HTTPS_PORT)
+                    .when().get("/");
+            assertNotEquals(200, sharedHttps.statusCode(), "Shared HTTP must not execute an HTTPS listener action");
             awaitPlainResponse(host, HTTP_PORT, "local-only");
             awaitHttpsMaterial(host, 200, "local-only", certificate, certificate);
             Certificate expected = certificate;
@@ -744,9 +750,14 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void awaitPlainResponse(String host, int port, String body) {
-        await().ignoreException(ConnectException.class)
-                .atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
-                assertPlainResponse(host, port, body));
+        awaitPlainResponse(() -> assertPlainResponse(host, port, body), Duration.ofSeconds(10));
+    }
+
+    static void awaitPlainResponse(ThrowingRunnable response, Duration timeout) {
+        await().ignoreExceptionsMatching(SocketException.class::isInstance)
+                .atMost(timeout).pollInterval(Duration.ofMillis(100))
+                .pollDelay(Duration.ZERO)
+                .untilAsserted(response);
     }
 
     @Test
@@ -1497,13 +1508,15 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void awaitListenerPortClosed(int port) {
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            try (Socket socket = new Socket()) {
-                IOException failure = assertThrows(IOException.class,
-                        () -> socket.connect(new InetSocketAddress("127.0.0.1", port), 1000));
-                assertTrue(hasCause(failure, ConnectException.class), failure.toString());
-            }
-        });
+        await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> {
+                    try (Socket socket = new Socket()) {
+                        IOException failure = assertThrows(IOException.class,
+                                () -> socket.connect(new InetSocketAddress("127.0.0.1", port), 1000));
+                        assertTrue(hasCause(failure, ConnectException.class), failure.toString());
+                    }
+                });
     }
 
     @Test
@@ -1644,17 +1657,19 @@ class ElbV2HttpsDataPlaneIntegrationTest {
     }
 
     private static void awaitTargetHealthy(String targetGroupArn) {
-        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
-                given()
-                        .formParam("Action", "DescribeTargetHealth")
-                        .formParam("TargetGroupArn", targetGroupArn)
-                        .header("Authorization", AUTH)
-                    .when()
-                        .post("/")
-                    .then()
-                        .statusCode(200)
-                        .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.State",
-                                equalTo("healthy")));
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+                .pollDelay(Duration.ZERO)
+                .untilAsserted(() ->
+                        given()
+                                .formParam("Action", "DescribeTargetHealth")
+                                .formParam("TargetGroupArn", targetGroupArn)
+                                .header("Authorization", AUTH)
+                            .when()
+                                .post("/")
+                            .then()
+                                .statusCode(200)
+                                .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.TargetHealth.State",
+                                        equalTo("healthy")));
     }
 
     private static void describeHttpsListener(String listenerArn, String certificateArn) {

@@ -26,6 +26,7 @@ import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.stepfunctions.model.Activity;
 import io.floci.aws.services.stepfunctions.model.ActivityTask;
 import io.floci.aws.services.stepfunctions.model.Execution;
+import io.floci.aws.services.stepfunctions.model.ExecutionConfiguration;
 import io.floci.aws.services.stepfunctions.model.HistoryEvent;
 import io.floci.aws.services.stepfunctions.model.MapRun;
 import io.floci.aws.services.stepfunctions.model.MockedTestCase;
@@ -52,6 +53,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
+import java.util.function.LongSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -78,6 +80,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     private final Map<String, ClosedTask> closedTaskTokens = new LinkedHashMap<>();
     private static final long CLOSED_TOKEN_RETENTION_NANOS = TimeUnit.MINUTES.toNanos(5);
     private static final int MAX_CLOSED_TOKENS = 1024;
+    // How long GetActivityTask holds its long poll open before answering with no task.
+    private static final long ACTIVITY_TASK_POLL_NANOS = TimeUnit.SECONDS.toNanos(60);
 
     private record PendingTask(String accountId, String resourceArn,
                                CompletableFuture<JsonNode> future, TaskResult result) {}
@@ -113,6 +117,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     private final SfnMockLoader mockLoader;
     private final StepFunctionsEventPublisher eventPublisher;
     private final Clock clock;
+    // The monotonic clock task-token heartbeats and closures are stamped on: the one the executor
+    // measures their deadlines against. Tests move it forward.
+    private final LongSupplier nanoTime;
+    private final BoundedWaits waits;
     private final SignedMarkers listExecutionTokens = new SignedMarkers();
 
     // Fields that are valid only in JSONPath mode. Validated against real AWS:
@@ -183,6 +191,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                                 AslExecutor aslExecutor, ObjectMapper objectMapper,
                                 SfnMockLoader mockLoader, StepFunctionsEventPublisher eventPublisher,
                                 Clock clock) {
+        this(storageFactory, regionResolver, aslExecutor, objectMapper, mockLoader, eventPublisher,
+                clock, System::nanoTime, BoundedWaits.BLOCKING);
+    }
+
+    /** Test seam: the monotonic clock and the bounded waits, which production never replaces. */
+    StepFunctionsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                         AslExecutor aslExecutor, ObjectMapper objectMapper,
+                         SfnMockLoader mockLoader, StepFunctionsEventPublisher eventPublisher,
+                         Clock clock, LongSupplier nanoTime, BoundedWaits waits) {
         this.stateMachineStore = storageFactory.create("stepfunctions", "sfn-state-machines.json",
                 new TypeReference<Map<String, StateMachine>>() {});
         this.executionStore = storageFactory.create("stepfunctions", "sfn-executions.json",
@@ -202,6 +219,12 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         this.mockLoader = mockLoader;
         this.eventPublisher = eventPublisher;
         this.clock = clock;
+        this.nanoTime = nanoTime;
+        this.waits = waits;
+    }
+
+    private double nowEpochSeconds() {
+        return EpochSeconds.fromMillis(clock.millis());
     }
 
     public void clear() {
@@ -247,7 +270,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             resources.add(new ExplorerResource(
                     arn, "states:stateMachine", "states",
                     parsed.region(), parsed.accountId(),
-                    sm.getCreationDate() > 0 ? Instant.ofEpochMilli((long) (sm.getCreationDate() * 1000)) : Instant.now(),
+                    sm.getCreationDate() > 0 ? Instant.ofEpochMilli((long) (sm.getCreationDate() * 1000)) : clock.instant(),
                     sm.getTags() != null ? sm.getTags() : Map.of()));
         }
         return resources;
@@ -402,7 +425,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         StateMachine sm = new StateMachine();
+        sm.setCreationDate(nowEpochSeconds());
         sm.setStateMachineArn(arn);
+        sm.setIncarnationId(UUID.randomUUID().toString());
         sm.setName(name);
         sm.setDefinition(definition);
         sm.setRoleArn(roleArn);
@@ -496,7 +521,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         updated.setRevisionId(UUID.randomUUID().toString());
-        updated.setUpdateDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+        updated.setUpdateDate(nowEpochSeconds());
         StateMachineVersion version = request.publish()
                 ? addVersion(updated, request.versionDescription())
                 : null;
@@ -652,6 +677,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         StateMachineAlias alias = new StateMachineAlias();
+        double createdAt = nowEpochSeconds();
+        alias.setCreationDate(createdAt);
+        alias.setUpdateDate(createdAt);
         alias.setStateMachineAliasArn(aliasArn);
         alias.setStateMachineArn(stateMachineArn);
         alias.setName(name);
@@ -740,7 +768,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         if (routingConfiguration != null) {
             updated.setRoutingConfiguration(copyRoutingConfiguration(routingConfiguration));
         }
-        updated.setUpdateDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+        updated.setUpdateDate(nowEpochSeconds());
         stateMachineAliasStore.put(aliasArn, updated);
         return copyAlias(updated);
     }
@@ -845,10 +873,16 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             }
 
             exec = new Execution();
+            double startedAt = nowEpochSeconds();
+            exec.setStartDate(startedAt);
             exec.setExecutionArn(arn);
             exec.setStateMachineArn(resolved.baseArn());
             exec.setStateMachineVersionArn(resolved.versionArn());
             exec.setStateMachineAliasArn(resolved.aliasArn());
+            if (!express) {
+                exec.setStateMachineIncarnationId(sm.getIncarnationId());
+                exec.setStateMachineConfiguration(resolved.configuration());
+            }
             exec.setName(execName);
             exec.setInput(input);
             exec.setStatus("RUNNING");
@@ -858,6 +892,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                 }
             });
             HistoryEvent startEvent = new HistoryEvent();
+            startEvent.setTimestamp(startedAt);
             startEvent.setId(1L);
             startEvent.setPreviousEventId(0L);
             startEvent.setType("ExecutionStarted");
@@ -909,13 +944,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         String execName = (name != null && !name.isBlank()) ? name : UUID.randomUUID().toString();
         // Real AWS express execution ARN format: express:<smName>:<startDate>:<execName>
         // where startDate is ISO-8601 UTC, e.g. 2024-01-15T10:30:00.123Z
+        Instant startedAt = clock.instant();
         String startDate = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
                 .withZone(ZoneOffset.UTC)
-                .format(Instant.now());
+                .format(startedAt);
         String arn = regionResolver.buildArn("states", region,
                 "express:" + sm.getName() + ":" + startDate + ":" + execName);
 
         Execution exec = new Execution();
+        exec.setStartDate(EpochSeconds.fromMillis(startedAt.toEpochMilli()));
         exec.setExecutionArn(arn);
         exec.setStateMachineArn(resolved.baseArn());
         exec.setStateMachineVersionArn(resolved.versionArn());
@@ -926,6 +963,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
 
         ArrayList<HistoryEvent> history = new ArrayList<>();
         HistoryEvent startEvent = new HistoryEvent();
+        startEvent.setTimestamp(exec.getStartDate());
         startEvent.setId(1L);
         startEvent.setPreviousEventId(0L);
         startEvent.setType("ExecutionStarted");
@@ -945,17 +983,24 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     }
 
     private record ResolvedStateMachine(
-            StateMachine stateMachine, String baseArn, String versionArn, String aliasArn) {
+            StateMachine stateMachine, String baseArn, String versionArn, String aliasArn,
+            ExecutionConfiguration configuration) {
+        private ResolvedStateMachine {
+            // Descriptions are detached copies; execution identity remains the base machine.
+            stateMachine.setStateMachineArn(baseArn);
+        }
     }
 
     private ResolvedStateMachine resolveStateMachineForExecution(String arn) {
         QualifiedStateMachineArn qualifiedArn = parseQualifiedStateMachineArn(arn);
         if (qualifiedArn == null) {
-            return new ResolvedStateMachine(describeStateMachine(arn), arn, null, null);
+            StateMachine stateMachine = describeStateMachine(arn);
+            return new ResolvedStateMachine(stateMachine, arn, null, null,
+                    ExecutionConfiguration.capture(stateMachine, arn));
         }
         if (qualifiedArn.isVersion()) {
-            return new ResolvedStateMachine(
-                    describeStateMachine(arn), qualifiedArn.baseArn(), arn, null);
+            validateDescribeStateMachineArn(arn);
+            return resolveVersionForExecution(qualifiedArn.baseArn(), arn, null);
         }
 
         StateMachineAlias alias = stateMachineAliasStore.get(arn)
@@ -973,9 +1018,22 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             }
         }
         String versionArn = selected.getStateMachineVersionArn();
-        return new ResolvedStateMachine(
-                describeStateMachineVersion(alias.getStateMachineArn(), versionArn),
-                alias.getStateMachineArn(), versionArn, arn);
+        return resolveVersionForExecution(alias.getStateMachineArn(), versionArn, arn);
+    }
+
+    private ResolvedStateMachine resolveVersionForExecution(
+            String baseArn, String versionArn, String aliasArn) {
+        StateMachine owner = stateMachineStore.get(baseArn)
+                .orElseThrow(() -> new AwsException(
+                        "StateMachineDoesNotExist", "State machine does not exist", 400));
+        StateMachineVersion version = owner.getVersions().stream()
+                .filter(candidate -> versionArn.equals(candidate.getStateMachineVersionArn()))
+                .findFirst()
+                .orElseThrow(() -> new AwsException(
+                        "StateMachineDoesNotExist", "State machine does not exist", 400));
+        StateMachine described = stateMachineFromVersion(owner, version);
+        ExecutionConfiguration configuration = ExecutionConfiguration.captureVersion(described, baseArn, version);
+        return new ResolvedStateMachine(described, baseArn, versionArn, aliasArn, configuration);
     }
 
     /**
@@ -1035,6 +1093,57 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                 .orElseThrow(() -> new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400));
     }
 
+    public Execution describeExecutionForApi(String arn) {
+        validateExecutionScope(arn);
+        return visibleExecution(arn);
+    }
+
+    private Execution visibleExecution(String arn) {
+        Execution execution = describeExecution(arn);
+        if (StepFunctionsEventPublisher.isStandard(execution)) {
+            StateMachine owner = stateMachineStore.get(execution.getStateMachineArn())
+                    .orElseThrow(() -> new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400));
+            if (!Objects.equals(owner.getIncarnationId(), execution.getStateMachineIncarnationId())) {
+                throw new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400);
+            }
+        }
+        return execution;
+    }
+
+    private AwsArnUtils.Arn validateExecutionScope(String arn) {
+        if (arn == null || arn.isBlank() || arn.length() > MAX_ARN_LENGTH) {
+            throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);
+        }
+        try {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            if (!"states".equals(parsed.service()) || parsed.accountId().isBlank()
+                    || !regionResolver.getRegion().equals(parsed.region())
+                    || !regionResolver.getPartition().equals(parsed.partition())) {
+                throw new IllegalArgumentException("Execution ARN is outside the request scope");
+            }
+            if (!regionResolver.getAccountId().equals(parsed.accountId())) {
+                throw new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400);
+            }
+            return parsed;
+        } catch (IllegalArgumentException error) {
+            throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);
+        }
+    }
+
+    public ExecutionConfiguration describeStateMachineForExecution(String arn) {
+        AwsArnUtils.Arn parsed = validateExecutionScope(arn);
+        if (!parsed.resource().matches("execution:[^:\\s]+:[^:\\s]+")) {
+            throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);
+        }
+        Execution execution = visibleExecution(arn);
+        ExecutionConfiguration configuration = execution.getStateMachineConfiguration();
+        if (configuration == null) {
+            throw new AwsException("UnsupportedOperation",
+                    "This execution predates configuration capture; its original definition is unavailable.", 400);
+        }
+        return configuration.copy();
+    }
+
     public List<Execution> listExecutions(String stateMachineArn) {
         QualifiedStateMachineArn qualifiedArn = parseQualifiedStateMachineArn(stateMachineArn);
         return executionStore.scan(k -> executionStore.get(k).map(execution -> {
@@ -1081,17 +1190,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
      * Aborts a running execution. The caller's {@code error} and {@code cause} land on the
      * Execution itself, not only on the history event, so DescribeExecution reports them.
      * {@link #markAborted} carries the terminal write and the reasons it is made under the
-     * Execution's own monitor.
+     * Execution's own monitor. Returns the execution, whose stop date is the one the caller is
+     * told: the instant of this abort, or of the outcome that was already published.
      */
-    public void stopExecution(String arn, String cause, String error) {
+    public Execution stopExecution(String arn, String cause, String error) {
         Execution exec = describeExecution(arn);
         if (!markAborted(arn, exec, error, cause)) {
-            return;
+            return exec;
         }
         executionStore.put(arn, exec);
         if (StepFunctionsEventPublisher.isStandard(exec)) {
             eventPublisher.emitStatusChange(exec);
         }
+        return exec;
     }
 
     /**
@@ -1140,13 +1251,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
      * told is finished.
      */
     private boolean markAborted(String arn, Execution exec, String error, String cause) {
+        double stoppedAt;
         synchronized (exec) {
             if (!"RUNNING".equals(exec.getStatus())) {
                 return false;
             }
             exec.setError(error);
             exec.setCause(cause);
-            exec.setStopDate(EpochSeconds.fromMillis(System.currentTimeMillis()));
+            stoppedAt = nowEpochSeconds();
+            exec.setStopDate(stoppedAt);
             exec.setStatus("ABORTED");
         }
 
@@ -1162,7 +1275,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         ExecutionHistory history = historyCache.computeIfAbsent(arn,
                 key -> new ExecutionHistory(exec.getHistory(), () -> { }, false));
         exec.setHistory(history);
-        history.sealWith("ExecutionAborted", details);
+        history.sealWith("ExecutionAborted", details, stoppedAt);
         return true;
     }
 
@@ -1223,8 +1336,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
 
         /** Appends the terminal event, numbered from the end of the history, and takes no more. */
-        synchronized void sealWith(String terminalEventType, Map<String, Object> details) {
+        synchronized void sealWith(String terminalEventType, Map<String, Object> details, double timestamp) {
             HistoryEvent terminalEvent = new HistoryEvent();
+            terminalEvent.setTimestamp(timestamp);
             terminalEvent.setId(size() + 1L);
             terminalEvent.setPreviousEventId((long) size());
             terminalEvent.setType(terminalEventType);
@@ -1236,12 +1350,14 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
 
     // ──────────────────────────── Activities ────────────────────────────
 
-    public Activity createActivity(String name, String region, Map<String, String> tags) {
+    public synchronized Activity createActivity(String name, String region, Map<String, String> tags) {
+        validateActivityName(name);
         String arn = regionResolver.buildArn("states", region, "activity:" + name);
         if (activityStore.get(arn).isPresent()) {
             throw new AwsException("ActivityAlreadyExists", "Activity already exists: " + arn, 400);
         }
         Activity activity = new Activity();
+        activity.setCreationDate(nowEpochSeconds());
         activity.setActivityArn(arn);
         activity.setName(name);
         if (tags != null && !tags.isEmpty()) {
@@ -1268,7 +1384,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                 token -> new AwsException("InvalidToken", "Invalid nextToken.", 400));
     }
 
-    public void deleteActivity(String arn) {
+    public synchronized void deleteActivity(String arn) {
         activityStore.delete(arn);
         activityQueues.remove(arn);
     }
@@ -1282,7 +1398,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         BlockingQueue<ActivityTask> queue = activityQueues.computeIfAbsent(activityArn,
                 k -> new LinkedBlockingQueue<>());
         try {
-            return queue.poll(60, TimeUnit.SECONDS);
+            return waits.poll(queue, ACTIVITY_TASK_POLL_NANOS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return null;
@@ -1303,7 +1419,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         synchronized (this) {
             if (tokenResetsInProgress == 0) {
                 pendingTaskTokens.put(token, new PendingTask(accountId, authorizationArn, future, null));
-                taskHeartbeatNanos.put(token, System.nanoTime());
+                taskHeartbeatNanos.put(token, nanoTime.getAsLong());
                 return future;
             }
         }
@@ -1347,7 +1463,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             return pending.resourceArn();
         }
         ClosedTask closed = token == null ? null : closedTaskTokens.get(token);
-        if (closed != null && System.nanoTime() - closed.closedAtNanos() < CLOSED_TOKEN_RETENTION_NANOS) {
+        if (closed != null && nanoTime.getAsLong() - closed.closedAtNanos() < CLOSED_TOKEN_RETENTION_NANOS) {
             requireTokenScope(closed.accountId(), closed.resourceArn(), callerAccountId, region);
             return closed.resourceArn();
         }
@@ -1361,7 +1477,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
      */
     public long lastTaskHeartbeatNanos(String taskToken) {
         Long reportedAt = taskToken != null ? taskHeartbeatNanos.get(taskToken) : null;
-        return reportedAt != null ? reportedAt : System.nanoTime();
+        return reportedAt != null ? reportedAt : nanoTime.getAsLong();
     }
 
     enum TokenTimeout { NONE, CLAIMED, EXECUTION, TASK, HEARTBEAT }
@@ -1403,7 +1519,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     }
 
     private void rememberClosed(String token, PendingTask pending) {
-        long now = System.nanoTime();
+        long now = nanoTime.getAsLong();
         closedTaskTokens.entrySet().removeIf(entry -> now - entry.getValue().closedAtNanos()
                 >= CLOSED_TOKEN_RETENTION_NANOS);
         closedTaskTokens.put(token, new ClosedTask(pending.accountId(), pending.resourceArn(), now));
@@ -1423,7 +1539,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             return pending;
         }
         ClosedTask closed = token == null ? null : closedTaskTokens.get(token);
-        if (closed != null && System.nanoTime() - closed.closedAtNanos() >= CLOSED_TOKEN_RETENTION_NANOS) {
+        if (closed != null && nanoTime.getAsLong() - closed.closedAtNanos() >= CLOSED_TOKEN_RETENTION_NANOS) {
             closedTaskTokens.remove(token);
             closed = null;
         }
@@ -1484,7 +1600,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     /** A foreign, closed or unknown token cannot refresh a task's heartbeat. */
     public synchronized void sendTaskHeartbeat(String taskToken) {
         requirePendingTask(taskToken);
-        taskHeartbeatNanos.put(taskToken, System.nanoTime());
+        taskHeartbeatNanos.put(taskToken, nanoTime.getAsLong());
     }
 
     // ──────────────────────────── Map runs ────────────────────────────
@@ -1627,6 +1743,16 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         stateMachineStore.put(arn, updated);
     }
 
+    public synchronized void replaceActivityTags(String arn, Map<String, String> tags) {
+        Activity current = describeActivity(arn);
+        Activity updated = new Activity();
+        updated.setActivityArn(current.getActivityArn());
+        updated.setName(current.getName());
+        updated.setCreationDate(current.getCreationDate());
+        updated.setTags(new HashMap<>(tags != null ? tags : Map.of()));
+        activityStore.put(arn, updated);
+    }
+
     private StateMachineVersion addVersion(StateMachine stateMachine, String description) {
         if (stateMachine.getVersions().size() >= MAX_VERSIONS_PER_STATE_MACHINE) {
             throw new AwsException("ServiceQuotaExceededException",
@@ -1639,7 +1765,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         StateMachineVersion version = new StateMachineVersion(
                 stateMachine.getStateMachineArn() + ":" + next,
                 next,
-                EpochSeconds.fromMillis(System.currentTimeMillis()));
+                nowEpochSeconds());
         version.setDescription(description);
         version.setName(stateMachine.getName());
         version.setDefinition(stateMachine.getDefinition());
@@ -1647,6 +1773,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         version.setType(stateMachine.getType());
         version.setStatus(stateMachine.getStatus());
         version.setRevisionId(stateMachine.getRevisionId());
+        version.setConfigurationUpdateDate(stateMachine.getUpdateDate() != null
+                ? stateMachine.getUpdateDate() : stateMachine.getCreationDate());
+        version.setConfigurationRevisionId(stateMachine.getUpdateDate() != null
+                ? stateMachine.getRevisionId() : null);
         version.setLoggingConfiguration(copyNode(stateMachine.getLoggingConfiguration()));
         version.setTracingConfiguration(copyNode(stateMachine.getTracingConfiguration()));
         version.setEncryptionConfiguration(copyNode(stateMachine.getEncryptionConfiguration()));
@@ -1657,6 +1787,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     private StateMachine copyStateMachine(StateMachine source) {
         StateMachine copy = new StateMachine();
         copy.setStateMachineArn(source.getStateMachineArn());
+        copy.setIncarnationId(source.getIncarnationId());
         copy.setName(source.getName());
         copy.setDefinition(source.getDefinition());
         copy.setRoleArn(source.getRoleArn());
@@ -1725,6 +1856,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             StateMachine current, StateMachineVersion version) {
         StateMachine described = new StateMachine();
         described.setStateMachineArn(version.getStateMachineVersionArn());
+        described.setIncarnationId(current.getIncarnationId());
         described.setName(version.getName() != null ? version.getName() : current.getName());
         described.setDefinition(version.getDefinition() != null
                 ? version.getDefinition() : current.getDefinition());
@@ -1761,6 +1893,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         copy.setType(source.getType());
         copy.setStatus(source.getStatus());
         copy.setRevisionId(source.getRevisionId());
+        copy.setConfigurationUpdateDate(source.getConfigurationUpdateDate());
+        copy.setConfigurationRevisionId(source.getConfigurationRevisionId());
         copy.setLoggingConfiguration(copyNode(source.getLoggingConfiguration()));
         copy.setTracingConfiguration(copyNode(source.getTracingConfiguration()));
         copy.setEncryptionConfiguration(copyNode(source.getEncryptionConfiguration()));
@@ -2120,6 +2254,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                 message.substring(0, locationMatcher.start()).trim(), locationMatcher.group(1));
     }
 
+    public static void validateActivityName(String name) {
+        boolean invalidCharacter = name != null && name.codePoints().anyMatch(codePoint ->
+                Character.isWhitespace(codePoint)
+                        || Character.isSpaceChar(codePoint)
+                        || Character.isISOControl(codePoint)
+                        || codePoint >= 0xD800 && codePoint <= 0xDFFF
+                        || codePoint == 0xFFFE || codePoint == 0xFFFF || codePoint == 0x10FFFF
+                        || INVALID_STATE_MACHINE_NAME_CHARACTERS.indexOf(codePoint) >= 0);
+        if (name == null || name.isBlank() || name.length() > 80 || invalidCharacter) {
+            throw new AwsException("InvalidName", "Invalid activity name: '" + name + "'", 400);
+        }
+    }
+
     private static void validateStateMachineName(String name) {
         boolean invalidCharacter = name != null && name.codePoints().anyMatch(codePoint ->
                 Character.isWhitespace(codePoint)
@@ -2374,6 +2521,24 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             throw new AwsException("InvalidEncryptionConfiguration",
                     "encryptionConfiguration.kmsDataKeyReusePeriodSeconds must be between 60 and 900.", 400);
         }
+    }
+
+    public ObjectNode testState(JsonNode request) {
+        TestStateDefinition.Prepared prepared = TestStateDefinition.prepare(request, objectMapper);
+        if (prepared.stateName() != null) {
+            validateDefinition(prepared.definitionText());
+        }
+        TestStateDefinition.validateSupported(prepared);
+        if (prepared.stateName() == null) {
+            List<String> errors = new ArrayList<>();
+            validateState("/", prepared.state(), false,
+                    new HashSet<>(transitionTargets(prepared.state())), errors);
+            if (!errors.isEmpty()) {
+                throw new AwsException("InvalidDefinition", "Invalid state definition: " + errors.getFirst(), 400);
+            }
+        }
+        validateRoleArn(prepared.roleArn());
+        return aslExecutor.testPureState(prepared, regionResolver.getAccountId(), regionResolver.getPartition());
     }
 
     private void validateDefinition(String definition) {

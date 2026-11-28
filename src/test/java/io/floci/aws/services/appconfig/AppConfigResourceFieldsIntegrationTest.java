@@ -275,12 +275,20 @@ class AppConfigResourceFieldsIntegrationTest {
     }
 
     private static String createProfile(String applicationId, String name) {
-        return given()
+        String profileId = given()
                 .contentType(ContentType.JSON)
                 .body("{\"Name\":\"" + name + "\",\"LocationUri\":\"hosted\",\"Type\":\"AWS.Freeform\"}")
                 .when().post("/applications/" + applicationId + "/configurationprofiles")
                 .then().statusCode(201)
                 .extract().path("Id");
+        given()
+                .contentType(ContentType.JSON)
+                .body("{}")
+                .when().post("/applications/" + applicationId + "/configurationprofiles/" + profileId
+                        + "/hostedconfigurationversions")
+                .then().statusCode(201)
+                .header("Version-Number", equalTo("1"));
+        return profileId;
     }
 
     private static String createGradualStrategy() {

@@ -1,6 +1,7 @@
 # CloudHSM v2
 
 **Protocol:** JSON 1.1 (`X-Amz-Target: BaldrApiService.*`)
+**Smithy RPC v2 CBOR:** `POST /service/BaldrApiService/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Endpoint:** `POST http://localhost:4566/`
 
 ## Supported Actions

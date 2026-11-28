@@ -1978,7 +1978,7 @@ public class EmrService implements Resettable, StoredResourceArns, ContainerTear
         SecurityConfiguration sc = new SecurityConfiguration();
         sc.setName(name);
         sc.setSecurityConfiguration(json);
-        sc.setCreationDateTime(Instant.now());
+        sc.setCreationDateTime(now());
         secConfigStore.put(key, sc);
         return sc;
     }
@@ -2387,7 +2387,7 @@ public class EmrService implements Resettable, StoredResourceArns, ContainerTear
         return blockPublicAccessStore.get(region).orElseGet(() -> {
             EmrBlockPublicAccess setting = new EmrBlockPublicAccess();
             setting.setConfiguration(DEFAULT_BLOCK_PUBLIC_ACCESS);
-            setting.setCreationDateTime(Instant.now());
+            setting.setCreationDateTime(now());
             setting.setCreatedByArn(regionResolver.buildGlobalArn("iam", "root"));
             blockPublicAccessStore.put(region, setting);
             return setting;
@@ -2398,7 +2398,7 @@ public class EmrService implements Resettable, StoredResourceArns, ContainerTear
         validateBlockPublicAccess(configuration);
         EmrBlockPublicAccess setting = new EmrBlockPublicAccess();
         setting.setConfiguration(configuration.toString());
-        setting.setCreationDateTime(Instant.now());
+        setting.setCreationDateTime(now());
         setting.setCreatedByArn(regionResolver.buildGlobalArn("iam", "root"));
         blockPublicAccessStore.put(region, setting);
     }
@@ -4419,7 +4419,8 @@ public class EmrService implements Resettable, StoredResourceArns, ContainerTear
         return cluster.getRegion() != null ? cluster.getRegion() : regionResolver.getRegion();
     }
 
-    private Instant now() {
+    /** The instant on the service's clock, which the handler measures a terminated cluster's retention against. */
+    Instant now() {
         return clock.instant().truncatedTo(ChronoUnit.MILLIS);
     }
 

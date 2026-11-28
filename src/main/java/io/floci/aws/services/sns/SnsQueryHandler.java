@@ -296,7 +296,10 @@ public class SnsQueryHandler {
         try {
             Subscription sub = snsService.subscribe(topicArn, protocol, endpoint, region, attributes);
 
-            String result = new XmlBuilder().elem("SubscriptionArn", sub.getSubscriptionArn()).build();
+            boolean pending = "true".equals(sub.getAttributes().get("PendingConfirmation"));
+            String arn = pending && !Boolean.parseBoolean(getParam(params, "ReturnSubscriptionArn"))
+                    ? "pending confirmation" : sub.getSubscriptionArn();
+            String result = new XmlBuilder().elem("SubscriptionArn", arn).build();
             return Response.ok(AwsQueryResponse.envelope("Subscribe", AwsNamespaces.SNS, result)).build();
         } catch (AwsException e) {
             return xmlErrorResponse(e);

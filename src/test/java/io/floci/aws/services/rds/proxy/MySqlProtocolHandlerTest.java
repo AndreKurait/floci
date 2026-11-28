@@ -24,6 +24,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
@@ -566,8 +567,8 @@ class MySqlProtocolHandlerTest {
     private void withLoggedInClient(int backendCompressionCapabilities, int clientCompressionCapability,
                                     boolean tls, LoggedInClientAssertion assertion) throws Exception {
         byte[] nonce = fixedNonce();
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = new Socket("localhost", clientServer.getLocalPort());
              Socket proxyClient = clientServer.accept();
              Socket backend = new Socket("localhost", backendServer.getLocalPort());
@@ -958,8 +959,8 @@ class MySqlProtocolHandlerTest {
         AtomicReference<Byte> backendResponseSeq = new AtomicReference<>();
         AtomicReference<byte[]> backendResponsePayload = new AtomicReference<>();
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
             ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
                 try {
                     mockMySqlBackend(
@@ -1017,8 +1018,8 @@ class MySqlProtocolHandlerTest {
         RdsProxyTlsCertificates tlsCertificates = testTlsCertificates();
         tlsCertificates.ensureHost("172.17.0.6");
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
                 try {
@@ -1106,8 +1107,8 @@ class MySqlProtocolHandlerTest {
         RdsProxyTlsCertificates tlsCertificates = testTlsCertificates();
         tlsCertificates.ensureHost("172.17.0.7");
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             ProxyTestTask<Void> backendTask = ProxyTestTask.start(() -> {
                 try (Socket socket = backendServer.accept()) {
@@ -1189,8 +1190,8 @@ class MySqlProtocolHandlerTest {
 
     @Test
     void silentBackendHandshakeFailsWithinTheConfiguredTimeoutInsteadOfHanging() throws Exception {
-        try (ServerSocket silentBackend = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0)) {
+        try (ServerSocket silentBackend = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket()) {
 
             try (Socket ourClient = new Socket("localhost", clientServer.getLocalPort());
                  Socket proxyClient = clientServer.accept();
@@ -1375,8 +1376,8 @@ class MySqlProtocolHandlerTest {
     void distinguishesProxyCloseFromClientCloseAtTimeoutReset(boolean closeProxy) throws Exception {
         CountDownLatch resettingTimeout = new CountDownLatch(1);
         CountDownLatch resumeReset = new CountDownLatch(1);
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = new Socket("localhost", clientServer.getLocalPort());
              Socket proxyClient = clientServer.accept();
              Socket backend = new Socket("localhost", backendServer.getLocalPort());
@@ -1442,8 +1443,8 @@ class MySqlProtocolHandlerTest {
     /** One client HandshakeResponse against a single backend connection that accepts it. */
     private DirectLogin directLogin(byte[] clientResponse, boolean iamEnabled) throws Exception {
         AtomicReference<byte[]> backendResponse = new AtomicReference<>();
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = new Socket("localhost", clientServer.getLocalPort());
              Socket proxyClient = clientServer.accept();
              Socket backend = new Socket("localhost", backendServer.getLocalPort())) {
@@ -1489,9 +1490,9 @@ class MySqlProtocolHandlerTest {
             tlsCertificates.ensureHost("172.17.0.8");
         }
 
-        try (ServerSocket backendServer = new ServerSocket(0);
-             ServerSocket masterBackendServer = new ServerSocket(0);
-             ServerSocket clientServer = new ServerSocket(0);
+        try (ServerSocket backendServer = loopbackServerSocket();
+             ServerSocket masterBackendServer = loopbackServerSocket();
+             ServerSocket clientServer = loopbackServerSocket();
              Socket ourClient = new Socket("localhost", clientServer.getLocalPort());
              Socket proxyClient = clientServer.accept();
              Socket backend = new Socket("localhost", backendServer.getLocalPort())) {
@@ -2044,5 +2045,9 @@ class MySqlProtocolHandlerTest {
     private static void writeInt16LE(ByteArrayOutputStream out, int value) {
         out.write(value & 0xFF);
         out.write((value >> 8) & 0xFF);
+    }
+
+    private static ServerSocket loopbackServerSocket() throws IOException {
+        return new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
     }
 }

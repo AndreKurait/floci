@@ -397,18 +397,15 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
-    /**
-     * An event bus update that failed after its tag snapshot may already have changed tags, so the
-     * engine keeps that attempt for {@link #rollbackUpdate} instead of putting the previous resource
-     * back over it. A failure before the snapshot changed nothing and is left to the engine.
-     */
-    @Override
-    public boolean retainsFailedUpdateState(StackResource resource) {
-        return ("AWS::Events::EventBus".equals(resource.getResourceType())
-                && resource.getAttributes().containsKey(CfnRollback.EVENT_BUS_UPDATE_SNAPSHOT_ATTR))
-                || ("AWS::Events::Rule".equals(resource.getResourceType())
-                && (resource.getAttributes().containsKey(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR)
-                    || ReplacementCleanup.hasRollbackState(resource)));
+    private boolean ruleExists(String name, String bus, String region) {
+        try {
+            return eventBridgeService.describeRule(name, bus, region) != null;
+        } catch (AwsException failure) {
+            if (!"ResourceNotFoundException".equals(failure.getErrorCode())) {
+                throw failure;
+            }
+            return false;
+        }
     }
 
     @Override
@@ -422,6 +419,20 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
         if (snapshot != null && attempted.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR)) {
             previous.getAttributes().put(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR, snapshot);
         }
+    }
+
+    /**
+     * An event bus update that failed after its tag snapshot may already have changed tags, so the
+     * engine keeps that attempt for {@link #rollbackUpdate} instead of putting the previous resource
+     * back over it. A failure before the snapshot changed nothing and is left to the engine.
+     */
+    @Override
+    public boolean retainsFailedUpdateState(StackResource resource) {
+        return ("AWS::Events::EventBus".equals(resource.getResourceType())
+                && resource.getAttributes().containsKey(CfnRollback.EVENT_BUS_UPDATE_SNAPSHOT_ATTR))
+                || ("AWS::Events::Rule".equals(resource.getResourceType())
+                && (resource.getAttributes().containsKey(CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR)
+                    || ReplacementCleanup.hasRollbackState(resource)));
     }
 
     /**
@@ -722,12 +733,14 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
             try {
                 policy = MAPPER.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
                         .readTree(policy.textValue());
-            } catch (JsonProcessingException e) {
-                throw new AwsException("ValidationError", "EventBus Policy must contain valid JSON.", 400);
+            } catch (JsonProcessingException failure) {
+                throw new AwsException("ValidationError",
+                        "AWS::Events::EventBus Policy must contain valid JSON.", 400);
             }
         }
         if (policy == null || !policy.isObject()) {
-            throw new AwsException("ValidationError", "EventBus Policy must resolve to a JSON object.", 400);
+            throw new AwsException("ValidationError",
+                    "AWS::Events::EventBus Policy must resolve to a JSON object.", 400);
         }
         return policy;
     }

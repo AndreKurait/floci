@@ -218,6 +218,8 @@ floci:
       seed-deployer-principal: false    # Set to true to create a local floci-deployer admin principal
       seed-deployer-access-key-id: floci  # Access key ID of the seeded deployer's key
 
+      # bootstrap-principals-file: /run/secrets/floci-bootstrap.json  # explicit owner-only account administrators
+
     networkfirewall:
       enabled: true
 
@@ -296,6 +298,8 @@ floci:
     acm:
       enabled: true
       validation-wait-seconds: 0              # Seconds before transitioning PENDING_VALIDATION → ISSUED
+      expiry-sweep-enabled: false             # Opt in to managed renewal of private certificates and expiry events
+      expiry-sweep-seconds: 3600              # Seconds between expiry sweeps
 
     ses:
       enabled: true

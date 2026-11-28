@@ -138,7 +138,8 @@ class ApiGatewayHttpsBackendTrustTest {
         WebSocketIntegrationInvoker invoker = new WebSocketIntegrationInvoker(mock(LambdaService.class),
                 mock(AwsServiceRouter.class), new ObjectMapper(), mock(VtlTemplateEngine.class),
                 ExtraCaConfigs.config(false, extraCaPath));
-        return invoker.invoke("us-east-1", integration(integrationType), "{}", Map.of(), Map.of(), Map.of());
+        return invoker.invoke("us-east-1", "api", "prod", "$default",
+                integration(integrationType), "{}", Map.of(), Map.of(), Map.of());
     }
 
     private Integration integration(String integrationType) {

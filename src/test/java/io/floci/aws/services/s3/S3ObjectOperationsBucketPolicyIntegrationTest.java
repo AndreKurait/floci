@@ -64,6 +64,17 @@ class S3ObjectOperationsBucketPolicyIntegrationTest {
     }
 
     @Test
+    void aPrivateObjectCanBeCreatedWhenTheBucketPolicyDeniesAclChanges() {
+        String bucket = bucket(false);
+        policy(bucket, deny("s3:PutObjectAcl"));
+
+        owner().header("x-amz-acl", "private").body("private data")
+                .when().put(bucket + "/private").then().statusCode(200);
+        owner().header("x-amz-acl", "private").queryParam("acl", "")
+                .when().put(bucket + "/private").then().statusCode(403);
+    }
+
+    @Test
     void getObjectAttributesNeedsTheReadAsWell() {
         String bucket = bucket(false);
         owner().body("data").when().put(bucket + "/doc").then().statusCode(200);

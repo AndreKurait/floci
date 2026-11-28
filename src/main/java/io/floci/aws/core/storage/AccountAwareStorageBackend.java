@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -124,8 +125,29 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public boolean persistIfCurrent(String key, V value) {
+        return persistIfCurrentForAccount(prefix(), key, value);
+    }
+
+    public boolean persistIfCurrentForAccount(String accountId, String key, V value) {
+        return delegate.persistIfCurrent(accountId + "/" + key, value);
+    }
+
+    @Override
     public void putAll(Map<String, V> entries) {
         putAllForAccount(prefix(), entries);
+    }
+
+    @Override
+    public void putAllDurably(Map<String, V> entries) {
+        putAllDurablyForAccount(prefix(), entries);
+    }
+
+    public void putAllDurablyForAccount(String accountId, Map<String, V> entries) {
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        entries.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
+        delegate.putAllDurably(prefixedEntries);
+        trackOwner(accountId);
     }
 
     @Override
@@ -137,6 +159,31 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         Map<String, V> prefixedEntries = new LinkedHashMap<>();
         entries.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
         delegate.putAllAtomically(prefixedEntries);
+        trackOwner(accountId);
+    }
+
+    /** Publishes one batch across account partitions, without changing request identity. */
+    public void putAllAccountsAtomically(List<AccountEntry<V>> entries) {
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        for (AccountEntry<V> entry : entries) {
+            prefixedEntries.put(entry.accountId() + "/" + entry.key(), entry.value());
+        }
+        delegate.putAllAtomically(prefixedEntries);
+        entries.forEach(entry -> trackOwner(entry.accountId()));
+    }
+
+    @Override
+    public void applyAtomically(Map<String, V> entries, Set<String> keys) {
+        applyAtomicallyForAccount(prefix(), entries, keys);
+    }
+
+    public void applyAtomicallyForAccount(String accountId, Map<String, V> entries, Set<String> keys) {
+        Map<String, V> replacements = Map.copyOf(entries);
+        Set<String> deletions = Set.copyOf(keys);
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        replacements.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
+        Set<String> prefixedKeys = deletions.stream().map(key -> accountId + "/" + key).collect(Collectors.toSet());
+        delegate.applyAtomically(prefixedEntries, prefixedKeys);
         trackOwner(accountId);
     }
 
@@ -188,6 +235,10 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public void flushOrThrow() {
+        delegate.flushOrThrow();
+    }
+
     public boolean isEmpty() {
         // A store nothing has written answers without the key copy below.
         if (delegate.isEmpty()) {
@@ -263,6 +314,39 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         for (String rawKey : delegate.keys()) {
             accountAndKey.accept(ownerOf(rawKey), hasAccountPrefix(rawKey) ? rawKey.substring(13) : rawKey);
         }
+    }
+
+    /**
+     * A bounded page in raw-key order for background repair. The key-only scan rejects every
+     * value, retaining at most {@code limit} keys before loading that page's values. It does not
+     * copy the store's complete key set or materialize every account's resource inventory.
+     * A page can be short when selected rows disappear; callers resume after its last raw key.
+     */
+    public Map<String, AccountEntry<V>> scanAllAccountEntriesAfter(String afterRawKey, int limit) {
+        if (limit < 1) {
+            throw new IllegalArgumentException("A repair page requires a positive limit");
+        }
+        TreeSet<String> selected = new TreeSet<>();
+        delegate.scan(rawKey -> {
+            if (afterRawKey == null || rawKey.compareTo(afterRawKey) > 0) {
+                if (selected.size() < limit) {
+                    selected.add(rawKey);
+                } else if (rawKey.compareTo(selected.last()) < 0) {
+                    selected.pollLast();
+                    selected.add(rawKey);
+                }
+            }
+            return false;
+        });
+        Map<String, AccountEntry<V>> page = new LinkedHashMap<>();
+        for (String rawKey : selected) {
+            boolean scoped = hasAccountPrefix(rawKey);
+            String owner = scoped ? rawKey.substring(0, 12) : defaultAccountId;
+            String logicalKey = scoped ? rawKey.substring(13) : rawKey;
+            delegate.get(rawKey).ifPresent(value ->
+                    page.put(rawKey, new AccountEntry<>(owner, logicalKey, value)));
+        }
+        return page;
     }
 
     /**
@@ -449,6 +533,24 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     public Optional<V> getLegacyForAccount(String accountId, String key) {
         return defaultAccountId.equals(accountId) && !hasAccountPrefix(key)
                 ? delegate.get(key) : Optional.empty();
+    }
+
+    /**
+     * Reads an explicitly scoped entry, or an owner-approved legacy entry, without migration.
+     *
+     * <p>A present scoped row takes precedence even if its value fails the caller's later
+     * ownership check. The monitor spans both reads so a concurrent legacy migration cannot
+     * move the row between them. No owner registration or storage write occurs.
+     */
+    public synchronized Optional<V> getForAccountIncludingLegacyReadOnly(
+            String accountId, String key, Predicate<V> legacyOwner) {
+        Optional<V> scoped = getForAccount(accountId, key);
+        return scoped.isPresent() ? scoped : getLegacyMatching(key, legacyOwner);
+    }
+
+    /** Reads an unprefixed entry without migration when its stored metadata proves ownership. */
+    public synchronized Optional<V> getLegacyMatching(String key, Predicate<V> legacyOwner) {
+        return hasAccountPrefix(key) ? Optional.empty() : delegate.get(key).filter(legacyOwner);
     }
 
     /**

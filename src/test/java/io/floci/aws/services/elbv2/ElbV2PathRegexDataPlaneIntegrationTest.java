@@ -23,6 +23,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+import static io.floci.aws.services.elbv2.ElbV2PathRegexTest.READ_REGEXES;
 import static io.floci.aws.services.elbv2.PathRegexFixtures.MATCH_PATTERNS;
 import static io.floci.aws.testing.AlbFixtures.createListener;
 import static io.floci.aws.testing.AlbFixtures.createLoadBalancer;
@@ -32,6 +33,7 @@ import static io.floci.aws.testing.AlbFixtures.deleteTargetGroup;
 import static io.floci.aws.testing.AlbFixtures.registerTarget;
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -288,30 +290,39 @@ class ElbV2PathRegexDataPlaneIntegrationTest {
     }
 
     private String createSplitRule(int primaryWeight, int secondaryWeight) {
+        return createSplitRule(primaryWeight, secondaryWeight, MATCH_PATTERNS);
+    }
+
+    private String createSplitRule(int primaryWeight, int secondaryWeight, List<String> patterns) {
         RequestSpecification request = given().header("Authorization", AUTH)
                 .formParam("Action", "CreateRule")
                 .formParam("ListenerArn", listenerArn)
                 .formParam("Priority", "75");
-        conditionAndAction(request, primaryWeight, secondaryWeight);
+        conditionAndAction(request, primaryWeight, secondaryWeight, patterns);
         return request.post("/").then().statusCode(200).extract()
                 .path("CreateRuleResponse.CreateRuleResult.Rules.member.RuleArn");
     }
 
     private void modifySplitRule(String ruleArn, int primaryWeight, int secondaryWeight) {
+        modifySplitRule(ruleArn, primaryWeight, secondaryWeight, MATCH_PATTERNS);
+    }
+
+    private void modifySplitRule(String ruleArn, int primaryWeight, int secondaryWeight, List<String> patterns) {
         RequestSpecification request = given().header("Authorization", AUTH)
                 .formParam("Action", "ModifyRule")
                 .formParam("RuleArn", ruleArn);
-        conditionAndAction(request, primaryWeight, secondaryWeight);
+        conditionAndAction(request, primaryWeight, secondaryWeight, patterns);
         Response response = request.post("/").then().statusCode(200).extract().response();
-        assertEquals(MATCH_PATTERNS, response.xmlPath().getList(
+        assertEquals(patterns, response.xmlPath().getList(
                 "ModifyRuleResponse.ModifyRuleResult.Rules.member.Conditions.member.PathPatternConfig.RegexValues.member"));
     }
 
-    private void conditionAndAction(RequestSpecification request, int primaryWeight, int secondaryWeight) {
+    private void conditionAndAction(RequestSpecification request, int primaryWeight, int secondaryWeight,
+                                    List<String> patterns) {
         request.formParam("Conditions.member.1.Field", "path-pattern");
-        for (int i = 0; i < MATCH_PATTERNS.size(); i++) {
+        for (int i = 0; i < patterns.size(); i++) {
             request.formParam("Conditions.member.1.PathPatternConfig.RegexValues.member." + (i + 1),
-                    MATCH_PATTERNS.get(i));
+                    patterns.get(i));
         }
         request.formParam("Actions.member.1.Type", "forward")
                 .formParam("Actions.member.1.ForwardConfig.TargetGroups.member.1.TargetGroupArn", primaryTg)
@@ -334,4 +345,53 @@ class ElbV2PathRegexDataPlaneIntegrationTest {
     private Response get(String pathAndQuery) {
         return given().baseUri("http://127.0.0.1").port(listenerPort).urlEncodingEnabled(false).get(pathAndQuery);
     }
+
+    @Test
+    void readTrafficRegexRuleSendsMatchingPathsToTheWeightedTargetGroups() {
+        String ruleArn = createSplitRule(0, 100, READ_REGEXES);
+
+        for (int i = 0; i < 20; i++) {
+            assertEquals("secondary", get("/idx/_search").asString());
+            assertEquals("secondary", get("/_count").asString());
+            assertEquals("secondary", get("/idx/_rank_eval").asString());
+        }
+        assertEquals("primary", get("/idx/_doc/1").asString());
+        assertEquals("primary", get("/_bulk").asString());
+        // The path, not the query string, is matched.
+        assertEquals("primary", get("/idx/_doc/1?q=/_search").asString());
+
+        modifySplitRule(ruleArn, 70, 30, READ_REGEXES);
+        int toSecondary = 0;
+        int samples = 400;
+        for (int i = 0; i < samples; i++) {
+            if ("secondary".equals(get("/idx/_search").asString())) {
+                toSecondary++;
+            }
+        }
+        assertTrue(toSecondary > samples * 0.15 && toSecondary < samples * 0.45,
+                "expected about 30% on the secondary, got " + toSecondary + " of " + samples);
+
+        modifySplitRule(ruleArn, 100, 0, READ_REGEXES);
+        for (int i = 0; i < 20; i++) {
+            assertEquals("primary", get("/idx/_search").asString());
+        }
+    }
+
+
+    @Test
+    void queryApiRejectsValuesAndRegexValuesTogether() {
+        given().header("Authorization", AUTH)
+                .formParam("Action", "CreateRule")
+                .formParam("ListenerArn", listenerArn)
+                .formParam("Priority", "90")
+                .formParam("Conditions.member.1.Field", "path-pattern")
+                .formParam("Conditions.member.1.PathPatternConfig.Values.member.1", "/a/*")
+                .formParam("Conditions.member.1.PathPatternConfig.RegexValues.member.1", "^/a/.*$")
+                .formParam("Actions.member.1.Type", "forward")
+                .formParam("Actions.member.1.TargetGroupArn", secondaryTg)
+                .post("/")
+                .then().statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("ValidationError"));
+    }
+
 }

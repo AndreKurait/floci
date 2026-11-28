@@ -2,16 +2,20 @@ package io.floci.aws.services.elbv2;
 
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.Resettable;
+import io.floci.aws.core.common.concurrent.DeadlineWaits;
+import io.floci.aws.core.common.concurrent.KeyedWorkQueue;
 import io.floci.aws.core.common.concurrent.SocketDeadline;
 import io.floci.aws.services.ec2.Ec2InstancePorts;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
 import io.floci.aws.services.elbv2.model.TargetDescription;
 import io.floci.aws.services.elbv2.model.TargetGroup;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.quarkus.runtime.Startup;
 import io.vertx.core.Vertx;
-import io.vertx.core.WorkerExecutor;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -27,12 +31,18 @@ import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
+@Startup
 @ApplicationScoped
 public class ElbV2HealthChecker implements Resettable {
 
@@ -40,30 +50,80 @@ public class ElbV2HealthChecker implements Resettable {
     private static final int MAX_CONCURRENT_PROBES = 32;
 
     private final Vertx vertx;
-    private final WorkerExecutor probeWorkers;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
     private final Ec2InstancePorts instancePorts;
+    private final ElbV2VpcNetworkManager vpcNetworks;
+    private final long maxHealthCheckIntervalMillis;
+    private final LongSupplier nanoTime;
+    private final DeadlineWaits probeDeadline;
     private final SSLSocketFactory backendTls = backendTls();
+    private final Set<ProbeIdentity> activeProbes = new HashSet<>();
 
     // tgArn → (targetKey → TargetState)
     private final Map<String, Map<String, TargetState>> states = new ConcurrentHashMap<>();
-    // tgArn → timerId
-    private final Map<String, Long> timers = new ConcurrentHashMap<>();
+    private final Map<String, Monitoring> timers = new ConcurrentHashMap<>();
     private final Semaphore probeSlots = new Semaphore(MAX_CONCURRENT_PROBES);
+    private final KeyedWorkQueue<ProbeWork> probes = new KeyedWorkQueue<>(
+            "elb-health-probe", MAX_CONCURRENT_PROBES, 4096, this::runProbe);
 
-    ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
-        this(vertx, config, ec2Service, new Ec2InstancePorts());
+    /** Null in unit tests, which run without security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
+
+    /** Null in unit tests; only consulted under security-group enforcement. */
+    @Inject
+    Instance<ElbV2Service> elbV2Service;
+
+    private Set<String> originGroups(String origin) {
+        return elbV2Service == null || !elbV2Service.isResolvable() ? Set.of()
+                : elbV2Service.get().originSecurityGroups(origin);
+    }
+
+    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
+        this(vertx, config, ec2Service, new Ec2InstancePorts(), null, System::nanoTime, DeadlineWaits.SYSTEM);
+    }
+
+    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                             Ec2InstancePorts instancePorts) {
+        this(vertx, config, ec2Service, instancePorts, null);
+    }
+
+    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                             ElbV2VpcNetworkManager vpcNetworks) {
+        this(vertx, config, ec2Service, new Ec2InstancePorts(), vpcNetworks);
     }
 
     @Inject
     public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
-                              Ec2InstancePorts instancePorts) {
+                             Ec2InstancePorts instancePorts, ElbV2VpcNetworkManager vpcNetworks) {
+        this(vertx, config, ec2Service, instancePorts, vpcNetworks, System::nanoTime, DeadlineWaits.SYSTEM);
+    }
+
+    ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service, LongSupplier nanoTime) {
+        this(vertx, config, ec2Service, new Ec2InstancePorts(), null, nanoTime, DeadlineWaits.SYSTEM);
+    }
+
+    /** The probe cadence and each probe's timeout are both counted on {@code waits}. */
+    ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service, DeadlineWaits waits) {
+        this(vertx, config, ec2Service, new Ec2InstancePorts(), null, waits::nanoTime, waits);
+    }
+
+    private ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                              Ec2InstancePorts instancePorts, ElbV2VpcNetworkManager vpcNetworks,
+                              LongSupplier nanoTime, DeadlineWaits probeDeadline) {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
         this.instancePorts = instancePorts;
-        this.probeWorkers = vertx.createSharedWorkerExecutor("floci-elbv2-health-probes", MAX_CONCURRENT_PROBES);
+        this.vpcNetworks = vpcNetworks;
+        this.nanoTime = nanoTime;
+        this.probeDeadline = probeDeadline;
+        maxHealthCheckIntervalMillis = config.services().elbv2().maxHealthCheckIntervalMillis();
+        if (maxHealthCheckIntervalMillis < 0) {
+            throw new IllegalArgumentException(
+                    "floci.services.elbv2.max-health-check-interval-millis must not be negative");
+        }
     }
 
     public static int effectivePort(TargetDescription target, TargetGroup tg) {
@@ -85,63 +145,79 @@ public class ElbV2HealthChecker implements Resettable {
     }
 
     public synchronized void startMonitoring(TargetGroup tg) {
-        if (config.services().elbv2().mock()) {
-            return;
-        }
-        if ("lambda".equals(tg.getTargetType())) {
+        if (config.services().elbv2().mock() || "lambda".equals(tg.getTargetType())) {
             return;
         }
         String tgArn = tg.getTargetGroupArn();
-        states.computeIfAbsent(tgArn, k -> new ConcurrentHashMap<>());
-
-        long intervalMs = (tg.getHealthCheckIntervalSeconds() != null ? tg.getHealthCheckIntervalSeconds() : 30) * 1000L;
-        long timerId = vertx.setPeriodic(intervalMs, id -> {
-            if (Objects.equals(timers.get(tgArn), id)) {
-                probeAll(tgArn, tg);
-            }
-        });
-        Long previous = timers.put(tgArn, timerId);
-        if (previous != null) {
-            vertx.cancelTimer(previous);
+        long intervalMs = effectiveIntervalMillis(tg);
+        Map<String, TargetState> targets = states.computeIfAbsent(tgArn, k -> new ConcurrentHashMap<>());
+        ProbeSettings settings = ProbeSettings.of(tg);
+        Monitoring previous = timers.get(tgArn);
+        if (previous != null && previous.intervalMillis() == intervalMs
+                && previous.settings().equals(settings) && previous.group() == tg) {
+            return;
         }
+        long timerId;
+        if (previous != null && previous.intervalMillis() == intervalMs) {
+            timerId = previous.timerId();
+        } else {
+            timerId = vertx.setPeriodic(intervalMs, id -> probeAll(tgArn, id));
+            if (previous != null) {
+                vertx.cancelTimer(previous.timerId());
+            }
+            targets.values().forEach(state -> state.hasProbeDeadline = false);
+        }
+        timers.put(tgArn, new Monitoring(timerId, intervalMs, tg, settings));
+    }
+
+    private long effectiveIntervalMillis(TargetGroup group) {
+        long interval = (group.getHealthCheckIntervalSeconds() != null
+                ? group.getHealthCheckIntervalSeconds() : 30) * 1000L;
+        if (interval <= 0) {
+            throw new IllegalArgumentException("The target group health-check interval must be positive");
+        }
+        return maxHealthCheckIntervalMillis > 0 ? Math.min(interval, maxHealthCheckIntervalMillis) : interval;
     }
 
     public synchronized void stopMonitoring(String tgArn) {
-        Long timerId = timers.remove(tgArn);
-        if (timerId != null) {
-            vertx.cancelTimer(timerId);
+        Monitoring monitoring = timers.remove(tgArn);
+        if (monitoring != null) {
+            vertx.cancelTimer(monitoring.timerId());
         }
         states.remove(tgArn);
     }
 
     public synchronized void clear() {
-        timers.values().forEach(vertx::cancelTimer);
+        timers.values().forEach(monitoring -> vertx.cancelTimer(monitoring.timerId()));
         timers.clear();
         states.clear();
     }
 
     @PreDestroy
-    void destroy() {
+    void shutdown() {
         clear();
-        probeWorkers.close();
+        probes.close();
     }
 
-    public void addTargets(String tgArn, List<TargetDescription> targets, TargetGroup tg) {
+    public synchronized void addTargets(String tgArn, List<TargetDescription> targets, TargetGroup tg) {
         if (config.services().elbv2().mock()) {
             return;
         }
         Map<String, TargetState> tgStates = states.computeIfAbsent(tgArn, k -> new ConcurrentHashMap<>());
-        for (TargetDescription t : targets) {
-            int port = effectivePort(t, tg);
-            String key = stateKey(t.getId(), port);
-            tgStates.putIfAbsent(key, new TargetState());
+        Map<String, TargetState> registered = new HashMap<>();
+        for (TargetDescription target : targets) {
+            String key = stateKey(target.getId(), effectivePort(target, tg));
+            TargetState state = new TargetState();
+            if (tgStates.putIfAbsent(key, state) == null) {
+                registered.put(key, state);
+            }
         }
-        if (Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {
-            vertx.setTimer(1, ignored -> probeAll(tgArn, tg));
+        if (!registered.isEmpty() && Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {
+            vertx.setTimer(1, ignored -> probeTargets(tgArn, tg, registered, true));
         }
     }
 
-    public void removeTargets(String tgArn, List<TargetDescription> targets, TargetGroup tg) {
+    public synchronized void removeTargets(String tgArn, List<TargetDescription> targets, TargetGroup tg) {
         Map<String, TargetState> tgStates = states.get(tgArn);
         if (tgStates == null) {
             return;
@@ -165,144 +241,198 @@ public class ElbV2HealthChecker implements Resettable {
         if (s == null) {
             return TargetHealthStatus.registrationInProgress();
         }
-        synchronized (s) {
-            return new TargetHealthStatus(s.status, s.reason, s.description);
-        }
+        return s.health;
     }
 
     public boolean isHealthy(String tgArn, TargetDescription target, int port) {
         return "healthy".equals(getState(tgArn, target.getId(), port));
     }
 
-    void probeAll(String tgArn, TargetGroup tg) {
-        Map<String, TargetState> tgStates = states.get(tgArn);
-        if (tgStates == null || !Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {
+    /** Probe queue counters; a probe is counted as completed only after its result was published or dropped. */
+    KeyedWorkQueue.Snapshot probeSnapshot() {
+        return probes.snapshot();
+    }
+
+    private synchronized void probeAll(String tgArn, long timerId) {
+        Monitoring monitoring = timers.get(tgArn);
+        Map<String, TargetState> targets = states.get(tgArn);
+        if (monitoring != null && monitoring.timerId() == timerId && targets != null) {
+            probeTargets(tgArn, monitoring.group(), targets, true);
+        }
+    }
+
+    synchronized void probeAll(String tgArn, TargetGroup group) {
+        Map<String, TargetState> targets = states.get(tgArn);
+        if (targets != null) {
+            probeTargets(tgArn, group, targets, false);
+        }
+    }
+
+    private synchronized void probeTargets(String tgArn, TargetGroup tg, Map<String, TargetState> selected,
+                                           boolean respectInterval) {
+        Map<String, TargetState> targets = states.get(tgArn);
+        if (targets == null || !Boolean.TRUE.equals(tg.getHealthCheckEnabled())) {
             return;
         }
-        for (Map.Entry<String, TargetState> entry : tgStates.entrySet()) {
+        for (Map.Entry<String, TargetState> entry : selected.entrySet()) {
             String key = entry.getKey();
             TargetState state = entry.getValue();
-            String[] parts = key.split(":", 2);
-            if (parts.length != 2) {
+            if (targets.get(key) != state || state.inFlight || state.workerRunning
+                    || activeProbes.contains(new ProbeIdentity(tgArn, key))) {
                 continue;
             }
-            String targetId = parts[0];
-            int port;
-            try {
-                port = Integer.parseInt(parts[1]);
-            } catch (NumberFormatException e) {
+            if (respectInterval && state.hasProbeDeadline && nanoTime.getAsLong() - state.nextProbeNanos < 0) {
                 continue;
             }
-            String protocol = tg.getHealthCheckProtocol();
-            boolean tcpCheck = "TCP".equals(protocol);
-            String path = tg.getHealthCheckPath() != null ? tg.getHealthCheckPath() : "/";
-            String matcher = tg.getMatcher() != null ? tg.getMatcher() : "200";
-            int timeout = tg.getHealthCheckTimeoutSeconds() != null ? tg.getHealthCheckTimeoutSeconds() : 5;
-            int healthyThreshold = tg.getHealthyThresholdCount() != null ? tg.getHealthyThresholdCount() : 5;
-            int unhealthyThreshold = tg.getUnhealthyThresholdCount() != null ? tg.getUnhealthyThresholdCount() : 2;
-            int probePort = healthCheckPort(tg, port);
-
-            synchronized (state) {
-                if (state.inFlight || state.workerRunning) {
-                    continue;
-                }
-                state.inFlight = true;
+            // Split at the last colon so IPv6 literals remain intact.
+            int separator = key.lastIndexOf(':');
+            if (separator < 0) {
+                continue;
             }
-            try {
-                probeWorkers.<Integer>executeBlocking(() -> {
-                    synchronized (state) {
-                        if (states.get(tgArn) != tgStates || tgStates.get(key) != state
-                                || !probeSlots.tryAcquire()) {
-                            return null;
-                        }
-                        state.workerRunning = true;
-                    }
-                    return SocketDeadline.call(timeout, () -> {
-                        Ec2InstancePorts.Endpoint endpoint = ElbV2TargetResolver.resolve(ec2Service,
-                                instancePorts, tg, targetId, probePort);
-                        return tcpCheck
-                                ? connectOnce(endpoint.host(), endpoint.port(), timeout)
-                                : probeOnce(endpoint.host(), endpoint.port(), path, timeout, protocol);
-                    }, () -> {
-                        synchronized (state) {
-                            state.workerRunning = false;
-                            probeSlots.release();
-                        }
-                    });
-                }, false).onComplete(outcome -> {
-                    synchronized (state) {
-                        try {
-                            if (states.get(tgArn) != tgStates || tgStates.get(key) != state) {
-                                return;
-                            }
-                            if (outcome.failed()) {
-                                state.consecutiveSuccesses = 0;
-                                state.consecutiveFailures++;
-                                if (state.consecutiveFailures >= unhealthyThreshold) {
-                                    state.status = "unhealthy";
-                                    if (isTimeout(outcome.cause())) {
-                                        state.reason = "Target.Timeout";
-                                        state.description = "Request timed out";
-                                    } else {
-                                        state.reason = "Target.FailedHealthChecks";
-                                        state.description = "Health checks failed";
-                                    }
-                                }
-                                LOG.debugv("Health check failed for {0}:{1} - {2}",
-                                        targetId, port, outcome.cause().getMessage());
-                            } else if (outcome.result() != null) {
-                                int statusCode = outcome.result();
-                                if (tcpCheck || matchesStatusCode(statusCode, matcher)) {
-                                    state.consecutiveFailures = 0;
-                                    state.consecutiveSuccesses++;
-                                    boolean initialApplicationTarget = "initial".equals(state.status)
-                                            && ("HTTP".equals(tg.getProtocol()) || "HTTPS".equals(tg.getProtocol())
-                                            || "lambda".equals(tg.getTargetType()));
-                                    if (initialApplicationTarget || state.consecutiveSuccesses >= healthyThreshold) {
-                                        state.status = "healthy";
-                                        state.reason = null;
-                                        state.description = null;
-                                    } else if ("initial".equals(state.status)) {
-                                        state.reason = "Elb.InitialHealthChecking";
-                                        state.description = "Initial health checks in progress";
-                                    }
-                                } else {
-                                    state.consecutiveSuccesses = 0;
-                                    state.consecutiveFailures++;
-                                    if (state.consecutiveFailures >= unhealthyThreshold) {
-                                        state.status = "unhealthy";
-                                        state.reason = "Target.ResponseCodeMismatch";
-                                        state.description = "Health checks failed with these codes: [" + statusCode + "]";
-                                    }
-                                }
-                            }
-                        } finally {
-                            state.inFlight = false;
-                        }
-                    }
-                });
-            } catch (RuntimeException | Error error) {
-                synchronized (state) {
-                    state.inFlight = false;
-                }
-                throw error;
+            String targetId = key.substring(0, separator);
+            int port = Integer.parseInt(key.substring(separator + 1));
+            state.inFlight = true;
+            ProbeWork work = new ProbeWork(tgArn, key, targetId, port, tg, state,
+                    timers.get(tgArn), ProbeSettings.of(tg));
+            if (!probes.submit(work)) {
+                state.inFlight = false;
             }
         }
     }
 
-    /** A TCP health check passes once the connection opens; nothing is sent. */
-    private static int connectOnce(String host, int port, int timeoutSeconds) throws IOException {
-        try (Socket socket = new Socket(Proxy.NO_PROXY)) {
-            socket.connect(new InetSocketAddress(ElbV2TargetResolver.resolveCheckedAddress(host), port),
-                    timeoutSeconds * 1000);
-            return 0;
+    private boolean current(ProbeWork work) {
+        Map<String, TargetState> targets = states.get(work.groupArn());
+        return targets != null && targets.get(work.key()) == work.state()
+                && timers.get(work.groupArn()) == work.monitoring()
+                && work.settings().equals(ProbeSettings.of(work.group()));
+    }
+
+    private void runProbe(ProbeWork work) {
+        TargetState state = work.state();
+        ProbeIdentity identity = new ProbeIdentity(work.groupArn(), work.key());
+        try {
+            synchronized (this) {
+                if (!current(work) || activeProbes.contains(identity)) {
+                    return;
+                }
+                long interval = TimeUnit.MILLISECONDS.toNanos(work.monitoring() != null
+                        ? work.monitoring().intervalMillis() : effectiveIntervalMillis(work.group()));
+                if (!probeSlots.tryAcquire()) {
+                    return;
+                }
+                activeProbes.add(identity);
+                state.workerRunning = true;
+                long now = nanoTime.getAsLong();
+                // Retain the cadence across worker jitter instead of delaying every following timer tick.
+                state.nextProbeNanos = state.hasProbeDeadline
+                        ? state.nextProbeNanos + Math.max(1, (now - state.nextProbeNanos) / interval + 1) * interval
+                        : now + interval;
+                state.hasProbeDeadline = true;
+            }
+            int statusCode = 0;
+            Exception failure = null;
+            try {
+                statusCode = SocketDeadline.call(work.settings().timeout(), () -> {
+                    String origin = ElbV2TargetResolver.healthCheckOrigin(work.group());
+                    int probePort = healthCheckPort(work.group(), work.port());
+                    Ec2InstancePorts.Endpoint endpoint = ElbV2TargetResolver.resolve(ec2Service, instancePorts,
+                            securityGroupFirewall, work.group(), work.targetId(), probePort, origin, originGroups(origin));
+                    return probeOnce(endpoint.host(), endpoint.port(),
+                            work.settings().path(), work.settings().timeout(), work.settings().protocol(),
+                            vpcNetworks == null ? Proxy.NO_PROXY : vpcNetworks.proxy(work.group()).javaProxy());
+                }, () -> {
+                    synchronized (this) {
+                        state.workerRunning = false;
+                        activeProbes.remove(identity);
+                        probeSlots.release();
+                        Map<String, TargetState> targets = states.get(work.groupArn());
+                        TargetState replacement = targets != null ? targets.get(work.key()) : null;
+                        Monitoring monitoring = timers.get(work.groupArn());
+                        if (replacement != null && replacement != state && monitoring != null) {
+                            probeTargets(work.groupArn(), monitoring.group(),
+                                    Map.of(work.key(), replacement), true);
+                        }
+                    }
+                }, probeDeadline);
+            } catch (IOException | RuntimeException error) {
+                failure = error;
+            }
+            synchronized (this) {
+                if (!current(work)) {
+                    return;
+                }
+                applyResult(state, work.settings(), statusCode, failure);
+            }
+        } finally {
+            synchronized (this) {
+                state.inFlight = false;
+            }
         }
     }
 
-    private int probeOnce(String host, int port, String path, int timeoutSeconds, String protocol) throws IOException {
+    private void applyResult(TargetState state, ProbeSettings settings, int statusCode, Exception failure) {
+        if (failure == null && ("TCP".equals(settings.protocol())
+                || matchesStatusCode(statusCode, settings.matcher()))) {
+            state.consecutiveFailures = 0;
+            state.consecutiveSuccesses++;
+            boolean initialApplicationTarget = "initial".equals(state.health.state())
+                    && ("HTTP".equals(settings.targetProtocol()) || "HTTPS".equals(settings.targetProtocol())
+                    || "lambda".equals(settings.targetType()));
+            if (initialApplicationTarget || state.consecutiveSuccesses >= settings.healthyThreshold()) {
+                state.health = new TargetHealthStatus("healthy", null, null);
+            } else if ("initial".equals(state.health.state())) {
+                state.health = new TargetHealthStatus("initial", "Elb.InitialHealthChecking",
+                        "Initial health checks in progress");
+            }
+        } else {
+            state.consecutiveSuccesses = 0;
+            state.consecutiveFailures++;
+            if (state.consecutiveFailures >= settings.unhealthyThreshold()) {
+                if (failure == null) {
+                    state.health = new TargetHealthStatus("unhealthy", "Target.ResponseCodeMismatch",
+                            "Health checks failed with these codes: [" + statusCode + "]");
+                } else if (isTimeout(failure)) {
+                    state.health = new TargetHealthStatus("unhealthy", "Target.Timeout", "Request timed out");
+                } else {
+                    state.health = new TargetHealthStatus("unhealthy", "Target.FailedHealthChecks", "Health checks failed");
+                }
+            }
+        }
+    }
+
+    private record Monitoring(long timerId, long intervalMillis, TargetGroup group, ProbeSettings settings) {}
+
+    private record ProbeIdentity(String groupArn, String targetKey) {}
+
+    private record ProbeWork(String groupArn, String key, String targetId, int port, TargetGroup group,
+                             TargetState state, Monitoring monitoring, ProbeSettings settings) {}
+
+    private record ProbeSettings(String path, String matcher, String port, String protocol, boolean enabled,
+                                 int timeout, int healthyThreshold, int unhealthyThreshold,
+                                 String targetProtocol, String targetType) {
+        static ProbeSettings of(TargetGroup group) {
+            return new ProbeSettings(group.getHealthCheckPath() != null ? group.getHealthCheckPath() : "/",
+                    group.getMatcher() != null ? group.getMatcher() : "200", group.getHealthCheckPort(),
+                    group.getHealthCheckProtocol(), Boolean.TRUE.equals(group.getHealthCheckEnabled()),
+                    group.getHealthCheckTimeoutSeconds() != null ? group.getHealthCheckTimeoutSeconds() : 5,
+                    group.getHealthyThresholdCount() != null ? group.getHealthyThresholdCount() : 5,
+                    group.getUnhealthyThresholdCount() != null ? group.getUnhealthyThresholdCount() : 2,
+                    group.getProtocol(), group.getTargetType());
+        }
+    }
+
+    private int probeOnce(String host, int port, String path, int timeoutSeconds, String protocol,
+                          Proxy proxy) throws IOException {
+        if ("TCP".equals(protocol)) {
+            try (Socket socket = new Socket(proxy)) {
+                socket.connect(new InetSocketAddress(ElbV2TargetResolver.resolveCheckedAddress(host), port),
+                        timeoutSeconds * 1000);
+                return 200;
+            }
+        }
         String scheme = "HTTPS".equals(protocol) ? "https" : "http";
         URL url = new URL(scheme, ElbV2TargetResolver.resolveCheckedAddress(host), port, path);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection(proxy);
         if (conn instanceof HttpsURLConnection https) {
             https.setSSLSocketFactory(backendTls);
             https.setHostnameVerifier((hostname, session) -> true);
@@ -405,10 +535,10 @@ public class ElbV2HealthChecker implements Resettable {
     private static class TargetState {
         boolean inFlight;
         boolean workerRunning;
-        volatile String status = "initial";
-        volatile String reason = "Elb.RegistrationInProgress";
-        volatile String description = "Target registration is in progress";
-        volatile int consecutiveSuccesses = 0;
-        volatile int consecutiveFailures = 0;
+        boolean hasProbeDeadline;
+        long nextProbeNanos;
+        volatile TargetHealthStatus health = TargetHealthStatus.registrationInProgress();
+        int consecutiveSuccesses;
+        int consecutiveFailures;
     }
 }

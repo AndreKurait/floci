@@ -36,6 +36,7 @@ public class Instance {
     // interface the caller created. AutomaticPublicAddress decides from it in every mode.
     private boolean associatePublicIp = false;
     private String keyName;
+    private String keyPairPublicKey;
     private List<GroupIdentifier> securityGroups = new ArrayList<>();
     private List<InstanceNetworkInterface> networkInterfaces = new ArrayList<>();
     private String architecture;
@@ -46,6 +47,7 @@ public class Instance {
     private Instant launchTime;
     private int amiLaunchIndex;
     private String clientToken;
+    private boolean replayProtected;
     private String monitoring = "disabled";
     private boolean sourceDestCheck = true;
     private boolean ebsOptimized = false;
@@ -86,8 +88,12 @@ public class Instance {
     private String creditSpecificationCpuCredits;
 
     // Docker backing fields (not serialised to AWS wire format)
+    // Retain the admitted runtime ancestor when a shared AMI later becomes unavailable.
+    private String launchableImageId;
     private String dockerContainerId;
     private String containerBridgeIp;
+    // Separate from IMDS source registration: set only after public routing is prepared.
+    private String containerPublicIp;
     /**
      * The container's default-bridge address, kept alongside {@code containerBridgeIp} when the
      * instance is also attached to its VPC's Docker network. IMDS identifies a caller by the
@@ -121,14 +127,23 @@ public class Instance {
     public String getImageId() { return imageId; }
     public void setImageId(String imageId) { this.imageId = imageId; }
 
+    /** Runtime ancestor admitted at launch, independent of later source-image permission changes. */
+    public String getLaunchableImageId() { return launchableImageId; }
+    /** Persist the runtime binding without changing the AWS-visible ImageId. */
+    public void setLaunchableImageId(String launchableImageId) { this.launchableImageId = launchableImageId; }
+
     public InstanceState getState() { return state; }
-    public synchronized void setState(InstanceState state) { this.state = state; }
+    public synchronized void setState(InstanceState state) {
+        this.state = state;
+        notifyAll();
+    }
 
     public synchronized boolean compareAndSetState(InstanceState expected, InstanceState updated) {
         if (state != expected) {
             return false;
         }
         state = updated;
+        notifyAll();
         return true;
     }
 
@@ -190,6 +205,8 @@ public class Instance {
 
     public String getKeyName() { return keyName; }
     public void setKeyName(String keyName) { this.keyName = keyName; }
+    public String getKeyPairPublicKey() { return keyPairPublicKey; }
+    public void setKeyPairPublicKey(String keyPairPublicKey) { this.keyPairPublicKey = keyPairPublicKey; }
 
     public List<GroupIdentifier> getSecurityGroups() { return securityGroups; }
     public void setSecurityGroups(List<GroupIdentifier> securityGroups) { this.securityGroups = securityGroups; }
@@ -217,6 +234,9 @@ public class Instance {
 
     public int getAmiLaunchIndex() { return amiLaunchIndex; }
     public void setAmiLaunchIndex(int amiLaunchIndex) { this.amiLaunchIndex = amiLaunchIndex; }
+
+    public boolean isReplayProtected() { return replayProtected; }
+    public void setReplayProtected(boolean replayProtected) { this.replayProtected = replayProtected; }
 
     public String getClientToken() { return clientToken; }
     public void setClientToken(String clientToken) { this.clientToken = clientToken; }
@@ -273,6 +293,8 @@ public class Instance {
     public void setTerminatedAt(long terminatedAt) { this.terminatedAt = terminatedAt; }
 
     public String getContainerBridgeIp() { return containerBridgeIp; }
+    public String getContainerPublicIp() { return containerPublicIp; }
+    public void setContainerPublicIp(String containerPublicIp) { this.containerPublicIp = containerPublicIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
 
     public String getServiceNetworkIp() { return serviceNetworkIp; }

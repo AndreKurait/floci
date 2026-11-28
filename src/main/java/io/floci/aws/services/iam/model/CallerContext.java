@@ -9,7 +9,8 @@ import java.util.List;
  * <p>Carries all inputs required for the complete AWS policy evaluation algorithm:
  * <ul>
  *   <li>{@code identityPolicies}: inline + attached policies of the user, role, and groups</li>
- *   <li>{@code sessionPolicyDocument}: optional inline session policy from AssumeRole (Phase 3)</li>
+ *   <li>{@code sessionPolicyDocument}: optional inline session policy</li>
+ *   <li>{@code managedSessionPolicyDocuments}: separately versioned managed session policies</li>
  *   <li>{@code boundaryPolicyDocument}: optional permissions boundary document (Phase 3)</li>
  *   <li>{@code scpLevels}: optional effective service control policies for the caller's
  *       account, one list of policy documents per organization level (root, each OU on the
@@ -28,8 +29,47 @@ public record CallerContext(
         String boundaryPolicyDocument,
         List<List<String>> scpLevels,
         String principalArn,
-        List<PolicySource> identityPolicySources
+        List<PolicySource> identityPolicySources,
+        List<String> managedSessionPolicyDocuments,
+        VerifiedIdentityContext verifiedIdentityContext
 ) {
+    public CallerContext {
+        managedSessionPolicyDocuments = managedSessionPolicyDocuments == null
+                ? List.of() : List.copyOf(managedSessionPolicyDocuments);
+    }
+
+    public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
+                         String boundaryPolicyDocument, List<List<String>> scpLevels,
+                         String principalArn, List<PolicySource> identityPolicySources) {
+        this(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels,
+                principalArn, identityPolicySources, List.of(), null);
+    }
+
+    public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
+                         String boundaryPolicyDocument, List<List<String>> scpLevels, String principalArn,
+                         List<String> managedSessionPolicyDocuments, VerifiedIdentityContext verifiedIdentityContext) {
+        this(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels,
+                principalArn, null, managedSessionPolicyDocuments, verifiedIdentityContext);
+    }
+
+    public List<String> sessionPolicyDocuments() {
+        List<String> documents = new ArrayList<>(managedSessionPolicyDocuments);
+        if (sessionPolicyDocument != null) {
+            documents.add(sessionPolicyDocument);
+        }
+        return List.copyOf(documents);
+    }
+
+    public CallerContext withManagedSessionPolicies(List<String> documents) {
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, identityPolicySources, documents, verifiedIdentityContext);
+    }
+
+    public CallerContext withVerifiedIdentityContext(VerifiedIdentityContext context) {
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, identityPolicySources, managedSessionPolicyDocuments, context);
+    }
+
     /** Source-compatible constructor for callers predating named policy sources. */
     public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
                          String boundaryPolicyDocument, List<List<String>> scpLevels,
@@ -75,7 +115,7 @@ public record CallerContext(
     /** Copy of this context with the effective SCP levels attached. */
     public CallerContext withScpLevels(List<List<String>> levels) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, levels,
-                principalArn, identityPolicySources);
+                principalArn, identityPolicySources, managedSessionPolicyDocuments, verifiedIdentityContext);
     }
 
     /** Copy of this context with one more identity policy, evaluated like the caller's own. */
@@ -109,19 +149,19 @@ public record CallerContext(
             named.addAll(padded(sources, policyDocuments.size()));
         }
         return new CallerContext(policies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels,
-                principalArn, named);
+                principalArn, named, managedSessionPolicyDocuments, verifiedIdentityContext);
     }
 
     /** Copy of this context with the permissions boundary document a caller handed in instead. */
     public CallerContext withBoundaryPolicy(String policyDocument) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, policyDocument, scpLevels,
-                principalArn, identityPolicySources);
+                principalArn, identityPolicySources, managedSessionPolicyDocuments, verifiedIdentityContext);
     }
 
     /** Copy of this context with the caller principal ARN attached. */
     public CallerContext withPrincipalArn(String principalArn) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels,
-                principalArn, identityPolicySources);
+                principalArn, identityPolicySources, managedSessionPolicyDocuments, verifiedIdentityContext);
     }
 
     /** {@code sources} as a list of exactly {@code size}, naming nothing where it says nothing. */

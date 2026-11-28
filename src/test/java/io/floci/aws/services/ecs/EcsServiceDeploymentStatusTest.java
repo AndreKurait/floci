@@ -1,15 +1,37 @@
 package io.floci.aws.services.ecs;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.EpochSeconds;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.ecs.container.EcsContainerManager;
+import io.floci.aws.services.ecs.container.HostVolumePolicy;
+import io.floci.aws.services.ecs.exec.EcsExecSessionRegistry;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.EcsServiceModel;
 import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.services.ecs.model.ServiceDeployment;
 import io.floci.aws.services.ecs.model.TaskDefinition;
+import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
+import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -17,6 +39,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
@@ -24,6 +48,7 @@ import static org.mockito.Mockito.when;
  * selected by task set id rather than by position in a listing: several minted in one clock tick
  * share a createdAt, so their order in the listing is map iteration order.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceDeploymentStatusTest {
 
     private static final String REGION = "us-east-1";
@@ -48,6 +73,43 @@ class EcsServiceDeploymentStatusTest {
         ServiceDeployment done = onlyDeployment(service, "dstat-svc", "dstat-cluster");
         assertEquals("SUCCESSFUL", done.getStatus());
         assertNotNull(done.getFinishedAt(), "a finished deployment reports when it finished");
+    }
+
+    /**
+     * A task-definition change mints a new deployment id, so the timestamps have to move with it.
+     * Reporting the service's creation time would contradict the new id and misrepresent when the
+     * deployment started. One millisecond is the smallest step DescribeServices can show.
+     */
+    @Test
+    void aNewDeploymentCarriesItsOwnStartTimeNotTheServiceCreationTime() {
+        TestTime time = TestTime.create();
+        EcsService service = newMockModeService(time.clock());
+        ObjectMapper mapper = new ObjectMapper();
+        EcsJsonHandler handler = new EcsJsonHandler(service, mapper,
+                new HostVolumePolicy(mock(EmulatorConfig.class, RETURNS_DEEP_STUBS)));
+        service.createCluster("dtime-cluster", REGION);
+        registerTaskDef(service, "dtime-fam-a", "app:1");
+        Instant created = time.now();
+        service.createService("dtime-cluster", "dtime-svc", "dtime-fam-a", 0,
+                LaunchType.FARGATE, List.of(), null, REGION);
+        JsonNode before = describedService(handler, mapper, "dtime-cluster", "dtime-svc");
+        assertEquals(EpochSeconds.fromInstant(created), before.path("createdAt").asDouble());
+        assertEquals(EpochSeconds.fromInstant(created),
+                before.path("deployments").path(0).path("createdAt").asDouble());
+
+        time.advance(Duration.ofMillis(1));
+        TaskDefinition next = registerTaskDef(service, "dtime-fam-b", "app:2");
+        service.updateService("dtime-cluster", "dtime-svc", next.getTaskDefinitionArn(), null, null, REGION);
+
+        JsonNode after = describedService(handler, mapper, "dtime-cluster", "dtime-svc");
+        assertEquals(1, after.path("deployments").size());
+        assertNotEquals(before.path("deployments").path(0).path("id").asText(),
+                after.path("deployments").path(0).path("id").asText());
+        assertEquals(EpochSeconds.fromInstant(created.plusMillis(1)),
+                after.path("deployments").path(0).path("createdAt").asDouble(),
+                "a new deployment carries the instant it started");
+        assertEquals(EpochSeconds.fromInstant(created), after.path("createdAt").asDouble(),
+                "the service keeps the instant it was created");
     }
 
     /** A service already at its requested count has converged, so its deployment is finished. */
@@ -478,5 +540,50 @@ class EcsServiceDeploymentStatusTest {
         cd.setImage(image);
         return service.registerTaskDefinition(family, List.of(cd), null, null, null,
                 null, null, List.of(), REGION);
+    }
+
+private static EcsService newMockModeService() {
+        return newMockModeService(Clock.systemUTC());
+    }
+private static EcsService newMockModeService(Clock clock) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().ecs().mock()).thenReturn(true);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        EcsService service = new EcsService(
+                new RegionResolver(REGION, "000000000000"),
+                mock(EcsContainerManager.class),
+                config,
+                mock(EcsLoadBalancerRegistrar.class),
+                new InMemoryStorageFactory(),
+                null,
+                new EcsExecSessionRegistry(),
+                null,
+                null,
+                clock);
+        service.initializeStorage();
+        return service;
+    }
+private static JsonNode describedService(EcsJsonHandler handler, ObjectMapper mapper, String cluster,
+                                             String name) {
+        ObjectNode request = mapper.createObjectNode().put("cluster", cluster);
+        request.putArray("services").add(name);
+        Response response = handler.handle("DescribeServices", request, REGION);
+        return mapper.valueToTree(response.getEntity()).path("services").path(0);
+    }
+    private static final class InMemoryStorageFactory extends StorageFactory {
+        private final Map<String, StorageBackend<String, ?>> stores = new HashMap<>();
+
+        private InMemoryStorageFactory() {
+            super(null, null);
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <V> AccountAwareStorageBackend<V> create(String serviceName,
+                                                        String fileName,
+                                                        TypeReference<Map<String, V>> typeReference) {
+            return (AccountAwareStorageBackend<V>) stores.computeIfAbsent(fileName,
+                    ignored -> AccountAwareStorageBackend.inMemory("000000000000"));
+        }
     }
 }

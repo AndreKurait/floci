@@ -16,6 +16,7 @@ import io.floci.aws.services.s3.S3Service;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
+import org.mockito.InOrder;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -35,6 +36,7 @@ import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -69,6 +71,60 @@ class ApiGatewayRestApiCfnProvisionerTest {
         assertEquals("api-1", r.getAttributes().get("RestApiId"));
         assertEquals("root-1", r.getAttributes().get("RootResourceId"));
         verify(api, never()).putRestApi(anyString(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void restApiCreateAppliesItsDeclaredPolicyAfterItsDocument() throws Exception {
+        // Red before the provisioner read Policy: the API kept no resource policy, so API Gateway
+        // refused every IAM-authorized caller from another account.
+        when(api.createRestApi(eq("us-east-1"), anyMap())).thenReturn(restApi("api-1", "shop", null, "REGIONAL"));
+        when(api.findRootResourceId("us-east-1", "api-1")).thenReturn(Optional.of("root-1"));
+        String policy = """
+                {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "execute-api:Invoke",
+                 "Principal": {"AWS": ["arn:aws:iam::111122223333:root"]}, "Resource": "execute-api:/*"}]}
+                """;
+        ProvisionContext ctx = policyCtx(null);
+
+        provisioner.provision(resource("AWS::ApiGateway::RestApi", "Api"), props(
+                "{\"Name\": \"shop\", \"Body\": {\"openapi\": \"3.0.1\", \"paths\": {}}, \"Policy\": " + policy + "}"),
+                ctx);
+
+        InOrder order = inOrder(api);
+        order.verify(api).putRestApi(eq("us-east-1"), eq("api-1"), eq("overwrite"), anyString());
+        order.verify(api).updateRestApi("us-east-1", "api-1",
+                List.of(op("replace", "/policy", mapper.readTree(policy).toString())));
+    }
+
+    @Test
+    void restApiUpdateAppliesItsDeclaredPolicyAndItsRollbackPutsThePreviousOneBack() throws Exception {
+        RestApi existing = restApi("api-1", "shop", null, "REGIONAL");
+        existing.setPolicy("{\"Statement\":[]}");
+        existingApi(existing);
+        StackResource r = resource("AWS::ApiGateway::RestApi", "Api");
+        provisioner.provision(r, props("""
+                {"Name": "shop", "Policy": "{\\"Statement\\":[{\\"Effect\\":\\"Allow\\"}]}"}
+                """), policyCtx("api-1"));
+
+        verify(api).updateRestApi("us-east-1", "api-1",
+                List.of(op("replace", "/policy", "{\"Statement\":[{\"Effect\":\"Allow\"}]}")));
+        assertTrue(provisioner.rollbackUpdate(r));
+        verify(api).updateRestApi("us-east-1", "api-1", List.of(
+                op("replace", "/name", "shop"), op("replace", "/description", null),
+                op("replace", "/policy", "{\"Statement\":[]}")));
+    }
+
+    @Test
+    void restApiWithoutAPolicyNeverWritesOne() throws Exception {
+        // Passes with or without the change: an undeclared Policy leaves the API's own.
+        existingApi(restApi("api-1", "shop", null, "REGIONAL"));
+        StackResource r = resource("AWS::ApiGateway::RestApi", "Api");
+        provisioner.provision(r, props("{\"Name\": \"shop\"}"), policyCtx("api-1"));
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        ArgumentCaptor<List<Map<String, String>>> patches = ArgumentCaptor.forClass(List.class);
+        verify(api, times(2)).updateRestApi(eq("us-east-1"), eq("api-1"), patches.capture());
+        assertTrue(patches.getAllValues().stream().flatMap(List::stream)
+                .noneMatch(operation -> "/policy".equals(operation.get("path"))));
     }
 
     @Test
@@ -225,6 +281,7 @@ class ApiGatewayRestApiCfnProvisionerTest {
                 op("replace", "/name", "shop"), op("replace", "/description", "v2")));
         verify(api).updateRestApi("us-east-1", "api-1", List.of(
                 op("replace", "/name", "shop"), op("replace", "/description", "v1")));
+        verify(api, never()).deleteRestApi(anyString(), anyString());
         assertFalse(r.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
         // The stack still holds the API it kept.
         verify(api, never()).deleteRestApi(anyString(), anyString());
@@ -516,6 +573,24 @@ class ApiGatewayRestApiCfnProvisionerTest {
     }
 
     @Test
+    void authorizerForwardsCredentials() throws Exception {
+        Authorizer authorizer = new Authorizer();
+        authorizer.setId("auth-credentials");
+        when(api.createAuthorizer(eq("us-east-1"), eq("api-1"), anyMap())).thenReturn(authorizer);
+        StackResource r = resource("AWS::ApiGateway::Authorizer", "Auth");
+        provisioner.provision(r, props("""
+                {"RestApiId":"api-1","Name":"token","Type":"TOKEN",
+                 "AuthorizerCredentials":"arn:aws:iam::000000000000:role/authorizer"}
+                """), ctx());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> request = ArgumentCaptor.forClass(Map.class);
+        verify(api).createAuthorizer(eq("us-east-1"), eq("api-1"), request.capture());
+        assertEquals("arn:aws:iam::000000000000:role/authorizer", request.getValue().get("authorizerCredentials"));
+        assertEquals("auth-credentials", r.getPhysicalId());
+        assertEquals("auth-credentials", r.getAttributes().get("AuthorizerId"));
+    }
+
+    @Test
     void authorizerPublishesAuthorizerId() throws Exception {
         Authorizer authorizer = new Authorizer();
         authorizer.setId("auth-1");
@@ -702,6 +777,19 @@ class ApiGatewayRestApiCfnProvisionerTest {
 
     private ProvisionContext ctx() {
         return ctx(null);
+    }
+
+    /** {@link #ctx(String)} whose engine also resolves a JSON-valued property, as the real engine does. */
+    private ProvisionContext policyCtx(String priorPhysicalId) {
+        ProvisionContext ctx = ctx(priorPhysicalId);
+        when(ctx.engine().resolveJsonAttribute(any())).thenAnswer(inv -> {
+            JsonNode node = inv.getArgument(0);
+            if (node == null || node.isMissingNode() || node.isNull()) {
+                return null;
+            }
+            return node.isTextual() ? node.asText() : node.toString();
+        });
+        return ctx;
     }
 
     private ProvisionContext ctx(String priorPhysicalId) {

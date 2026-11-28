@@ -28,13 +28,35 @@ public class AthenaJsonHandler {
     private final AthenaService athenaService;
     private final AthenaNamedQueryService namedQueryService;
     private final ObjectMapper mapper;
+    private final AthenaPreparedStatementHandler preparedStatements;
+    private final AthenaBatchQueryService batchQueryService;
 
     @Inject
     public AthenaJsonHandler(AthenaService athenaService, AthenaNamedQueryService namedQueryService,
-                              ObjectMapper mapper) {
+                             ObjectMapper mapper, AthenaPreparedStatementService preparedStatementService,
+                             AthenaBatchQueryService batchQueryService) {
         this.athenaService = athenaService;
         this.namedQueryService = namedQueryService;
         this.mapper = mapper;
+        this.preparedStatements = new AthenaPreparedStatementHandler(preparedStatementService);
+        this.batchQueryService = batchQueryService;
+    }
+
+    public AthenaJsonHandler(AthenaService athenaService, AthenaNamedQueryService namedQueryService,
+                             ObjectMapper mapper) {
+        this(athenaService, namedQueryService, mapper, new AthenaPreparedStatementService(athenaService),
+                new AthenaBatchQueryService(athenaService, null, mapper));
+    }
+
+    public AthenaJsonHandler(AthenaService athenaService, ObjectMapper mapper,
+                             AthenaPreparedStatementService preparedStatementService,
+                             AthenaBatchQueryService batchQueryService) {
+        this(athenaService, null, mapper, preparedStatementService, batchQueryService);
+    }
+
+    public AthenaJsonHandler(AthenaService athenaService, ObjectMapper mapper) {
+        this(athenaService, mapper, new AthenaPreparedStatementService(athenaService),
+                new AthenaBatchQueryService(athenaService, null, mapper));
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
@@ -79,6 +101,12 @@ public class AthenaJsonHandler {
                 namedQueryService.deleteNamedQuery(region, text(request, "NamedQueryId"));
                 yield Response.ok().build();
             }
+            case "CreatePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "GetPreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "UpdatePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "DeletePreparedStatement" -> preparedStatements.handle(action, request, region);
+            case "BatchGetPreparedStatement" -> preparedStatements.handle(action, request, region);
+
             case "StartQueryExecution" -> {
                 String query = request.get("QueryString").asText();
                 String named = text(request, "WorkGroup");
@@ -99,12 +127,13 @@ public class AthenaJsonHandler {
                 yield Response.ok(Map.of("QueryExecutionId", id)).build();
             }
             case "GetQueryExecution" -> {
-                String id = request.get("QueryExecutionId").asText();
+                String id = AthenaBatchQueryService.directIdentifier(request);
                 QueryExecution execution = athenaService.getQueryExecution(region, id);
-                yield Response.ok(Map.of("QueryExecution", execution)).build();
+                yield Response.ok(Map.of("QueryExecution", batchQueryService.wireExecution(execution))).build();
             }
+            case "BatchGetQueryExecution" -> Response.ok(batchQueryService.batchGet(region, request)).build();
             case "GetQueryResults" -> {
-                String id = request.get("QueryExecutionId").asText();
+                String id = AthenaBatchQueryService.directIdentifier(request);
                 ResultSet results = athenaService.getQueryResults(region, id);
                 yield Response.ok(Map.of("ResultSet", results)).build();
             }
@@ -125,7 +154,7 @@ public class AthenaJsonHandler {
                 yield Response.ok(response).build();
             }
             case "StopQueryExecution" -> {
-                athenaService.stopQueryExecution(region, request.get("QueryExecutionId").asText());
+                athenaService.stopQueryExecution(region, AthenaBatchQueryService.directIdentifier(request));
                 yield Response.ok(Map.of()).build();
             }
             case "GetWorkGroup" -> {
@@ -221,8 +250,23 @@ public class AthenaJsonHandler {
                 yield Response.ok(Map.of("Tags", athenaService.listTagsForResource(resourceArn))).build();
             }
             case "DeleteWorkGroup" -> {
-                String wg = text(request, "WorkGroup");
-                namedQueryService.deleteWorkGroup(region, wg, request.path("RecursiveDeleteOption").asBoolean(false));
+                String wg = request.path("WorkGroup").asText(null);
+                if (wg == null || !wg.matches("[a-zA-Z0-9._-]{1,128}")) {
+                    throw new AwsException("InvalidRequestException", "WorkGroup is required.", 400);
+                }
+                if ("primary".equals(wg)) {
+                    throw new AwsException("InvalidRequestException", "The primary workgroup cannot be deleted.", 400);
+                }
+                JsonNode recursive = request.get("RecursiveDeleteOption");
+                if (recursive != null && !recursive.isNull() && !recursive.isBoolean()) {
+                    throw new AwsException("InvalidRequestException", "RecursiveDeleteOption must be a boolean.", 400);
+                }
+                boolean deleteRecursively = recursive != null && recursive.asBoolean(false);
+                if (namedQueryService != null) {
+                    namedQueryService.deleteWorkGroup(region, wg, deleteRecursively);
+                } else {
+                    athenaService.deleteWorkGroup(wg, region, deleteRecursively);
+                }
                 yield Response.ok(Map.of()).build();
             }
             default -> throw new AwsException("InvalidAction", "Action " + action + " is not supported", 400);

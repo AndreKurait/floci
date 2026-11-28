@@ -5,6 +5,7 @@ import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
 import io.floci.aws.testing.EnforcementFixtures;
 import io.floci.aws.testing.IamEnforcementProfile;
 import io.floci.aws.testing.LogsAuthorizationFixtures;
+import io.floci.aws.testing.LogsDeliveryFixture;
 import io.floci.aws.testing.PartitionCleanup;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -14,6 +15,7 @@ import io.restassured.response.Response;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -45,6 +47,24 @@ class LogsStreamAuthorizationIntegrationTest {
 
     @TestHTTPResource
     URI endpoint;
+
+    private LogsDeliveryFixture delivery;
+
+    private LogsDeliveryFixture delivery() {
+        if (delivery == null) {
+            delivery = new LogsDeliveryFixture(endpoint, ACCOUNT, REGION);
+        }
+        return delivery;
+    }
+
+    @AfterEach
+    void closeDeliveryFixture() {
+        if (delivery != null) {
+            delivery.close();
+            delivery = null;
+        }
+    }
+
 
     @Inject
     CloudWatchLogsService logsService;
@@ -158,8 +178,10 @@ class LogsStreamAuthorizationIntegrationTest {
     void aGroupCallIsCheckedOnTheGroupTheRequestNames(String action) {
         String group = group(Map.of());
         String other = group(Map.of());
+        String passRole = action.equals("PutSubscriptionFilter")
+                ? "," + EnforcementFixtures.statement("Allow", "iam:PassRole", delivery().roleArn()) : "";
         String caller = user(policy("Allow", action,
-                "arn:aws:logs:" + REGION + ":" + ACCOUNT + ":log-group:" + group, ""));
+                "arn:aws:logs:" + REGION + ":" + ACCOUNT + ":log-group:" + group, "") + passRole);
         call(endpoint.getPort(), caller, action, groupCall(action, other))
                 .statusCode(400).body(containsString("AccessDeniedException"));
         call(endpoint.getPort(), caller, action, groupCall(action, group)).statusCode(200);
@@ -172,13 +194,13 @@ class LogsStreamAuthorizationIntegrationTest {
                 : Map.of("logGroupName", group, "logStreamName", stream);
     }
 
-    private static Map<String, ?> groupCall(String action, String group) {
+    private Map<String, ?> groupCall(String action, String group) {
         return switch (action) {
             case "PutMetricFilter" -> Map.of("logGroupName", group, "filterName", "errors", "filterPattern", "ERROR",
                     "metricTransformations", List.of(Map.of("metricName", "Errors", "metricNamespace", "App",
                             "metricValue", "1")));
             case "PutSubscriptionFilter" -> Map.of("logGroupName", group, "filterName", "ship", "filterPattern", "",
-                    "destinationArn", "arn:aws:lambda:" + REGION + ":" + ACCOUNT + ":function:ship");
+                    "destinationArn", delivery().targetArn(), "roleArn", delivery().roleArn());
             default -> Map.of("logGroupName", group);
         };
     }

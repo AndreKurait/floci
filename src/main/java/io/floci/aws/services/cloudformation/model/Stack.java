@@ -34,6 +34,8 @@ public class Stack {
     /** AWS account that owns this stack; absent only on legacy records. */
     private String accountId;
     private String region;
+    /** CloudFormation's execution role, retained for subsequent operations. */
+    private volatile String roleArn;
     /**
      * ExecuteChangeSet hands deployment to a background executor and returns without waiting for
      * it, so a caller (DescribeStacks) observes this field from a different thread than the one
@@ -79,7 +81,8 @@ public class Stack {
     private Map<String, ChangeSet> changeSets = orderedMap();
     private Map<String, String> tags = orderedMap();
     private boolean enableTerminationProtection = false;
-    private String stackPolicyBody;
+    private boolean disableRollback = false;
+    private volatile String stackPolicyBody;
     private volatile String delegatedRoleBoundaryArn;
     /**
      * Set when an update rollback fails, and kept until a rollback completes or the stack is
@@ -103,8 +106,12 @@ public class Stack {
     public void setAccountId(String accountId) { this.accountId = accountId; }
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
+    public String getRoleArn() { return roleArn; }
+    public void setRoleArn(String roleArn) { this.roleArn = roleArn; }
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
+    public boolean isDisableRollback() { return disableRollback; }
+    public void setDisableRollback(boolean disableRollback) { this.disableRollback = disableRollback; }
     public String getStatusReason() { return statusReason; }
     public void setStatusReason(String statusReason) { this.statusReason = statusReason; }
     public String getParentId() { return parentId; }

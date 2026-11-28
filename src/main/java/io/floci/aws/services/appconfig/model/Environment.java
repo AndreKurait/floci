@@ -26,6 +26,7 @@ public class Environment {
     @JsonProperty("Monitors")
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private List<Monitor> monitors;
+
     private Map<String, String> tags = new HashMap<>();
 
     public Environment() {}
@@ -49,5 +50,7 @@ public class Environment {
     public void setMonitors(List<Monitor> monitors) { this.monitors = monitors != null ? List.copyOf(monitors) : null; }
 
     public Map<String, String> getTags() { return tags; }
-    public void setTags(Map<String, String> tags) { this.tags = tags != null ? tags : new HashMap<>(); }
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags == null ? new HashMap<>() : new HashMap<>(tags);
+    }
 }

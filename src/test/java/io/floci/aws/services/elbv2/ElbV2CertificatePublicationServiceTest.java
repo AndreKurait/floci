@@ -194,12 +194,14 @@ class ElbV2CertificatePublicationServiceTest {
                         null, List.of(), List.of(), List.of(), Map.of()));
                 assertTrue(publicationEntered.await(5, TimeUnit.SECONDS));
                 long owner = Thread.currentThread().threadId();
-                await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-                    ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(publisher.get().threadId());
-                    assertNotNull(info);
-                    assertEquals(Thread.State.BLOCKED, info.getThreadState());
-                    assertEquals(owner, info.getLockOwnerId());
-                });
+                await().atMost(Duration.ofSeconds(5))
+                        .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                        .untilAsserted(() -> {
+                            ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(publisher.get().threadId());
+                            assertNotNull(info);
+                            assertEquals(Thread.State.BLOCKED, info.getThreadState());
+                            assertEquals(owner, info.getLockOwnerId());
+                        });
                 service.deleteLoadBalancer(REGION, lb.getLoadBalancerArn());
             }
             ExecutionException refused = assertThrows(ExecutionException.class, () -> creation.get(5, TimeUnit.SECONDS));

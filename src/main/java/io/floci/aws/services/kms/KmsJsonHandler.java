@@ -21,9 +21,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
-import java.util.*;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 
 import static io.floci.aws.core.common.ReservedTags.rejectUnknownReservedTags;
 
@@ -33,12 +38,30 @@ public class KmsJsonHandler {
     private final KmsService service;
     private final ObjectMapper objectMapper;
     private final RegionResolver regionResolver;
+    private final KmsListedGranteeServicePrincipals listedPrincipals;
+    private final KmsGrantCallers grantCallers;
 
     @Inject
-    public KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver) {
+    public KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver,
+                          KmsListedGranteeServicePrincipals listedPrincipals, KmsGrantCallers grantCallers) {
         this.service = service;
         this.objectMapper = objectMapper;
         this.regionResolver = regionResolver;
+        this.listedPrincipals = listedPrincipals;
+        this.grantCallers = grantCallers;
+    }
+
+    KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver,
+                   KmsListedGranteeServicePrincipals listedPrincipals) {
+        this(service, objectMapper, regionResolver, listedPrincipals, null);
+    }
+
+    KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver) {
+        this(service, objectMapper, regionResolver, null, null);
+    }
+
+    private String listed(Object principal) {
+        return listedPrincipals == null ? (String) principal : listedPrincipals.listed((String) principal);
     }
 
     private static final Set<String> KEY_ID_OPERATIONS = Set.of(
@@ -79,6 +102,66 @@ public class KmsJsonHandler {
         } else if ("CreateAlias".equals(action) || "UpdateAlias".equals(action)) {
             validateKeyIdMember(request, "TargetKeyId");
         }
+        Optional<String> owner = grantCallers == null ? Optional.empty() : foreignKeyOwner(action, request, region);
+        if (owner.isEmpty()) {
+            return dispatch(action, request, region, dryRun);
+        }
+        // Another account's key: usable only through a grant, evaluated where the key lives.
+        KmsService.GrantCaller caller = grantCallers.current();
+        return grantCallers.asAccount(owner.get(), () -> {
+            requireGrant(action, request, region, caller);
+            return dispatch(action, request, region, dryRun);
+        });
+    }
+
+    /**
+     * The account owning the key this request names, when that is not the caller's and the action
+     * is one a grant can admit. Decrypt may name its key through the ciphertext alone, and
+     * RetireGrant through the grant token alone.
+     */
+    private Optional<String> foreignKeyOwner(String action, JsonNode request, String region) {
+        if (!KmsService.GRANT_ACTIONS.contains(action)) {
+            return Optional.empty();
+        }
+        String callerAccount = regionResolver.getAccountId();
+        String keyId = request.path("KeyId").isTextual() ? request.path("KeyId").asText() : null;
+        if (keyId != null && !keyId.isBlank()) {
+            return service.foreignKeyOwner(keyId, callerAccount);
+        }
+        if ("Decrypt".equals(action) && request.path("CiphertextBlob").isTextual()) {
+            try {
+                byte[] blob = Base64.getDecoder().decode(request.path("CiphertextBlob").asText());
+                return service.foreignCiphertextOwner(blob, region, callerAccount);
+            } catch (IllegalArgumentException e) {
+                return Optional.empty();
+            }
+        }
+        if ("RetireGrant".equals(action) && request.path("GrantToken").isTextual()) {
+            return service.foreignGrantTokenOwner(request.path("GrantToken").asText(), region, callerAccount);
+        }
+        return Optional.empty();
+    }
+
+    private void requireGrant(String action, JsonNode request, String region, KmsService.GrantCaller caller) {
+        String keyId = request.path("KeyId").isTextual() ? request.path("KeyId").asText() : null;
+        if ("RetireGrant".equals(action)) {
+            service.requireRetirableBy(request.path("GrantToken").asText(null), keyId,
+                    request.path("GrantId").asText(null), region, caller);
+            return;
+        }
+        if ((keyId == null || keyId.isBlank()) && "Decrypt".equals(action)) {
+            keyId = service.ciphertextKeyId(Base64.getDecoder().decode(request.path("CiphertextBlob").asText()))
+                    .orElseThrow(() -> new AwsException("InvalidCiphertextException", null, 400));
+        }
+        List<String> operations = new ArrayList<>();
+        request.path("Operations").forEach(operation -> operations.add(operation.asText()));
+        Map<String, Object> constraints = request.path("Constraints").isObject()
+                ? objectMapper.convertValue(request.path("Constraints"), Map.class) : null;
+        service.requireGrantFor(action, keyId, region, caller, readEncryptionContext(request.path("EncryptionContext")),
+                operations, constraints);
+    }
+
+    private Response dispatch(String action, JsonNode request, String region, boolean dryRun) {
         return switch (action) {
             case "CreateKey" -> handleCreateKey(request, region);
             case "GenerateRandom" -> handleGenerateRandom(request, region);
@@ -310,7 +393,7 @@ public class KmsJsonHandler {
             ObjectNode entry = array.addObject();
             entry.put("GrantId", (String) grant.get("GrantId"));
             entry.put("KeyId", (String) grant.get("KeyId"));
-            entry.put("GranteePrincipal", (String) grant.get("GranteePrincipal"));
+            entry.put("GranteePrincipal", listed(grant.get("GranteePrincipal")));
             entry.put("CreationDate", ((Number) grant.get("CreationDate")).longValue());
             if (grant.get("Name") != null) {
                 entry.put("Name", (String) grant.get("Name"));
@@ -323,7 +406,7 @@ public class KmsJsonHandler {
             List<String> operationValues = (List<String>) grant.get("Operations");
             operationValues.forEach(operations::add);
             if (grant.get("RetiringPrincipal") != null) {
-                entry.put("RetiringPrincipal", (String) grant.get("RetiringPrincipal"));
+                entry.put("RetiringPrincipal", listed(grant.get("RetiringPrincipal")));
             }
         }
         response.put("Truncated", (boolean) result.get("Truncated"));

@@ -18,13 +18,16 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.floci.aws.testing.IamTestPolicies.EMPTY_POLICY_DOCUMENT;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
@@ -39,6 +42,46 @@ class IamSessionRetirementStorageTest {
 
     @TempDir
     Path directory;
+
+    @ParameterizedTest
+    @ValueSource(strings = {"persistent", "hybrid", "wal"})
+    void restoredInstanceCredentialsLoseLiveProvenanceAndAreRetired(String mode) {
+        EmulatorConfig config = StorageFactories.config(directory, DEFAULT_ACCOUNT);
+        String instanceArn = "arn:aws:ec2:us-west-2:111122223333:instance/i-1234567890abcdef0";
+        StorageFactory factory = StorageFactories.open(config, mode);
+        try {
+            IamService iam = new IamService(factory, config,
+                    new RegionResolver("us-east-1", DEFAULT_ACCOUNT), Clock.systemUTC());
+            SessionCredential session = new SessionCredential(ACCESS_KEY, "fixture-secret", "fixture-token",
+                    "arn:aws:iam::111122223333:role/nodes/worker", Instant.now().plusSeconds(3600),
+                    null, OTHER_ACCOUNT);
+            session.setEc2InstanceId("i-1234567890abcdef0");
+            session.setEc2InstanceArn(instanceArn);
+            session.setEc2RoleId("AROAWORKER");
+            iam.registerEc2InstanceSession(session);
+        } finally {
+            factory.shutdownAll();
+        }
+        StorageFactory reopened = StorageFactories.open(config, mode);
+        try {
+            IamService iam = new IamService(reopened, config,
+                    new RegionResolver("us-east-1", DEFAULT_ACCOUNT), Clock.systemUTC());
+            assertTrue(iam.ec2InstanceProfileSession(ACCESS_KEY).isEmpty());
+            List<SessionCredential> restored = iam.issuedSessionCandidates(ACCESS_KEY);
+            assertEquals(1, restored.size());
+            SessionCredential stored = restored.getFirst();
+            assertNull(stored.getEc2InstanceArn());
+            assertEquals("i-1234567890abcdef0", stored.getEc2InstanceId());
+            assertEquals("AROAWORKER", stored.getEc2RoleId());
+            assertEquals(OTHER_ACCOUNT, stored.getOriginAccountId());
+            assertEquals("fixture-secret", iam.findSecretKey(ACCESS_KEY, "fixture-token").orElseThrow());
+            assertEquals(1, iam.sweepOrphanedEc2InstanceSessions());
+            assertTrue(iam.ec2InstanceProfileSession(ACCESS_KEY).isEmpty());
+            assertTrue(iam.findSecretKey(ACCESS_KEY, "fixture-token").isEmpty());
+        } finally {
+            reopened.shutdownAll();
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})

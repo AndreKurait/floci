@@ -107,10 +107,10 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-tag-on-create.json"
 # The IAM namespaces whose operations this file reads: those Floci serves over the JSON and Query
 # protocols and Smithy RPC v2 CBOR, and the REST ones whose routes Floci authorizes by operation.
 NAMESPACES = (
-    "access-analyzer", "acm", "appconfig", "application-autoscaling", "aps", "athena", "autoscaling",
-    "bcm-data-exports", "bcm-pricing-calculator", "bedrock", "budgets", "ce", "cloudformation", "cloudhsm",
-    "cloudtrail", "cloudwatch", "codedeploy", "codeguru-reviewer", "codepipeline", "cognito-identity", "cognito-idp",
-    "comprehend", "config", "controltower", "cur",
+    "access-analyzer", "acm", "acm-pca", "appconfig", "application-autoscaling", "aps", "athena",
+    "autoscaling", "batch", "bcm-data-exports", "bcm-pricing-calculator", "bedrock", "budgets", "ce",
+    "cloudformation", "cloudhsm", "cloudtrail", "cloudwatch", "codedeploy", "codeguru-reviewer",
+    "codepipeline", "cognito-identity", "cognito-idp", "comprehend", "config", "controltower", "cur",
     "datasync", "dms", "dsql", "dynamodb", "ec2", "ecr", "ecs", "eks", "elasticache", "elasticfilesystem",
     "elasticloadbalancing", "elasticmapreduce", "emr-containers", "emr-serverless", "es", "events", "firehose", "fis", "globalaccelerator",
     "glue",
@@ -123,13 +123,23 @@ NAMESPACES = (
     "xray",
 )
 
+# An explicitly bounded REST addition must not enable unrelated creation operations on regeneration.
+PARTIAL_NAMESPACES = {
+    "appconfig": [
+        "CreateApplication", "CreateConfigurationProfile", "CreateDeploymentStrategy", "CreateEnvironment",
+        "CreateExperimentDefinition", "CreateExtension", "CreateExtensionAssociation", "StartDeployment",
+        "StartExperimentRun",
+    ],
+    "batch": ["CreateSchedulingPolicy"],
+}
+
 _NO_ROUTES = "REST routes no rule maps yet"
 # Namespaces Floci serves whose operations list a tagging action but are not read here yet, each with
 # why. `TagOnCreateNamespacesIntegrationTest` fails for a namespace Floci serves that is in neither list.
 NOT_COVERED = {
     "airflow": _NO_ROUTES, "app-integrations": _NO_ROUTES, "appsync": _NO_ROUTES,
     "aws-marketplace": _NO_ROUTES, "backup": _NO_ROUTES,
-    "batch": _NO_ROUTES, "bedrock-agentcore": _NO_ROUTES,
+    "batch": "only CreateSchedulingPolicy is read; other creation tags remain uncovered", "bedrock-agentcore": _NO_ROUTES,
     "cloudfront": "its creation tags are a Tags structure holding Items, which this file does not read yet",
     "connect": _NO_ROUTES,
     "detective": _NO_ROUTES, "dlm": _NO_ROUTES,
@@ -479,9 +489,16 @@ def entry_for(operation: str, upstream: dict, models: dict[str, dict]) -> dict:
     return {**head, "tags": [members[path] for path in sorted(members)]}
 
 
+def in_partial_scope(operation: str, partial: dict[str, list[str]]) -> bool:
+    namespace, name = operation.split(":", 1)
+    return namespace not in partial or name in partial[namespace]
+
+
 def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> dict:
     upstream = with_rest_operations(tag_on_create_operations(documents), documents, rest_operations(data))
-    covered = {operation: value for operation, value in upstream.items() if namespace_of(operation) in NAMESPACES}
+    partial = {namespace: names for namespace, names in PARTIAL_NAMESPACES.items() if namespace in NAMESPACES}
+    covered = {operation: value for operation, value in upstream.items()
+               if namespace_of(operation) in NAMESPACES and in_partial_scope(operation, partial)}
     _check_overrides(covered)
     namespaces: dict[str, list[str]] = {}
     for namespace in sorted(NAMESPACES):
@@ -501,7 +518,7 @@ def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> 
     elsewhere = sorted({namespace_of(operation) for operation in upstream} - set(NAMESPACES))
     typed = {namespace_of(operation) for operation, entry in operations.items()
              for member in entry.get("tags", []) if "resourceType" in member}
-    return {
+    document = {
         "_source": {
             "generator": "tools/aws/regen_iam_tag_on_create.py",
             "reference": provenance,
@@ -516,6 +533,9 @@ def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> 
         "resourceArns": resource_arns(documents, typed),
         "operations": operations,
     }
+    if partial:
+        document["partialNamespaces"] = partial
+    return document
 
 
 def stale_namespaces(document: dict) -> list[str]:
@@ -555,6 +575,8 @@ def render(document: dict) -> str:
     lines = ["{"]
     for key in ("_source", "namespaces", "notCovered", "otherNamespaces", "resourceArns"):
         lines.append(f'  "{key}": {json.dumps(document[key])},')
+    if "partialNamespaces" in document:
+        lines.append(f'  "partialNamespaces": {json.dumps(document["partialNamespaces"])},')
     lines.append('  "operations": {')
     operations = list(document["operations"].items())
     for index, (operation, entry) in enumerate(operations):
@@ -580,6 +602,20 @@ def validate(document: dict) -> list[str]:
         problems.append("namespaces is not sorted")
     if list(operations) != sorted(operations):
         problems.append("operations is not sorted")
+    partial = document.get("partialNamespaces", {})
+    if not isinstance(partial, dict):
+        problems.append("partialNamespaces must be an object")
+        partial = {}
+    for namespace, names in partial.items():
+        if (namespace not in namespaces or not isinstance(names, list) or not names
+                or not all(isinstance(name, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", name) for name in names)
+                or len(set(names)) != len(names)):
+            problems.append(f"partialNamespaces has invalid operation names for {namespace!r}")
+            continue
+        permitted = {namespace + ":" + name for name in names}
+        present = {operation for operation in operations if namespace_of(operation) == namespace}
+        if permitted != present:
+            problems.append(f"partialNamespaces does not exactly match the operations read for {namespace}")
     arns = document.get("resourceArns", {})
     if not isinstance(arns, dict) or not all(
             namespace in namespaces and isinstance(types, dict) and types and all(
@@ -687,7 +723,9 @@ def verify_against(vendored: dict, upstream: dict[str, dict],
         elif not set(actual["clients"]) <= set(vendored["namespaces"][namespace_of(operation)]):
             untrue.append(f"AWS lists {operation} for {actual['clients']}, which the file does not read")
     added = sorted(operation for operation in upstream
-                   if namespace_of(operation) in vendored["namespaces"] and operation not in vendored["operations"])
+                   if namespace_of(operation) in vendored["namespaces"]
+                   and in_partial_scope(operation, vendored.get("partialNamespaces", {}))
+                   and operation not in vendored["operations"])
     return untrue, added
 
 

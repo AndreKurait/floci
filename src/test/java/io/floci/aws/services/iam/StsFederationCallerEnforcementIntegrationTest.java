@@ -5,6 +5,7 @@ import io.floci.aws.testing.PartitionCleanup;
 import io.floci.aws.testing.SignedIamEnforcementProfile;
 import io.floci.aws.testutil.StsRequests;
 import io.floci.aws.testutil.StsRequests.Credentials;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
@@ -13,14 +14,25 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.ssm.SsmClient;
+import software.amazon.awssdk.services.ssm.model.DescribeParametersResponse;
+import software.amazon.awssdk.services.ssm.model.SsmException;
 
+import java.net.URI;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Verifies that STS refuses {@code GetFederationToken} to a caller with temporary credentials, only
@@ -41,6 +53,9 @@ class StsFederationCallerEnforcementIntegrationTest {
     private static final String ALLOW_STS_DENY_FEDERATION_TOKEN = "{\"Version\":\"2012-10-17\",\"Statement\":["
             + "{\"Effect\":\"Allow\",\"Action\":\"sts:*\",\"Resource\":\"*\"},"
             + "{\"Effect\":\"Deny\",\"Action\":\"sts:GetFederationToken\",\"Resource\":\"*\"}]}";
+
+    @TestHTTPResource("/")
+    URI endpoint;
 
     @Inject IamService iam;
     @RegisterExtension final PartitionCleanup cleanup = new PartitionCleanup();
@@ -124,6 +139,43 @@ class StsFederationCallerEnforcementIntegrationTest {
         request(issued, "GetSessionToken", Map.of()).then().statusCode(403)
                 .body("ErrorResponse.Error.Code", equalTo("AccessDenied"));
         request(issued, "GetCallerIdentity", Map.of()).then().statusCode(200);
+    }
+
+    @Test
+    void issuedUserSessionSuppliesTokenTimeToManagementConditions() throws Exception {
+        String condition = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"ssm:DescribeParameters\","
+                + "\"Resource\":\"*\",\"Condition\":{\"DateLessThan\":{\"aws:TokenIssueTime\":\"2100-01-01T00:00:00Z\"}}}}";
+        Credentials user = userWithPolicy(condition);
+        Credentials session = remember(request(user, "GetSessionToken", Map.of()), "GetSessionToken");
+        assertEquals("AccessDeniedException", assertThrows(SsmException.class,
+                () -> parameters(user)).awsErrorDetails().errorCode());
+        assertNotNull(parameters(session));
+        String name = iam.resolveCallerArns(user.key()).orElseThrow().userName();
+        iam.putUserPolicy(name, "sts", condition.replace("2100-01-01", "2000-01-01"));
+        assertEquals("AccessDeniedException", assertThrows(SsmException.class,
+                () -> parameters(session)).awsErrorDetails().errorCode());
+    }
+
+    @Test
+    void temporaryUserCannotBypassManagementTokenTimeDeny() throws Exception {
+        String policy = "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"ssm:DescribeParameters\",\"Resource\":\"*\"},"
+                + "{\"Effect\":\"Deny\",\"Action\":\"ssm:DescribeParameters\",\"Resource\":\"*\","
+                + "\"Condition\":{\"DateLessThan\":{\"aws:TokenIssueTime\":\"2100-01-01T00:00:00Z\"}}}]}";
+        Credentials user = userWithPolicy(policy);
+        Credentials session = remember(request(user, "GetSessionToken", Map.of()), "GetSessionToken");
+        assertNotNull(parameters(user));
+        assertEquals("AccessDeniedException", assertThrows(SsmException.class,
+                () -> parameters(session)).awsErrorDetails().errorCode());
+    }
+
+    private DescribeParametersResponse parameters(Credentials credentials) {
+        AwsCredentials caller = credentials.token() == null
+                ? AwsBasicCredentials.create(credentials.key(), credentials.secret())
+                : AwsSessionCredentials.create(credentials.key(), credentials.secret(), credentials.token());
+        try (SsmClient client = SsmClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(caller)).build()) {
+            return client.describeParameters();
+        }
     }
 
     private Credentials issue(String action) throws Exception {

@@ -2,6 +2,7 @@ package io.floci.aws.services.eks;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Frame;
 import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.DockerHostResolver;
@@ -35,14 +36,18 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * Docker-gated integration test proving containerd registry host configuration via node group launch
@@ -59,7 +64,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  */
 @QuarkusTest
 @TestProfile(RdsMockProfile.class)
-// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
+// Bounded cluster/workload waits total 315 s; allow Docker setup and cleanup as well.
 @Timeout(value = 6, unit = TimeUnit.MINUTES)
 @EnabledIfSystemProperty(named = "nightly.checks.enabled", matches = "true")
 class EksRegistryHostsDockerNightlyIntegrationTest {
@@ -109,6 +114,7 @@ class EksRegistryHostsDockerNightlyIntegrationTest {
         String repo = "reg-hosts-it-" + suffix;
         String host = IMAGE_ACCOUNT + ".dkr.ecr.us-east-1.localhost:" + httpPort;
         String imageRef = host + "/" + repo + ":v1";
+        Set<String> clusterVolumes = new HashSet<>();
 
         // ECR answers a push to a repository nobody created with NAME_UNKNOWN, so the account creates it first.
         RestAssuredJsonUtils.configureAwsContentTypes();
@@ -122,12 +128,22 @@ class EksRegistryHostsDockerNightlyIntegrationTest {
                         + "\"arn:aws:iam::000000000000:role/eks-service-role\"}")
                 .when().post("/clusters")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteCluster(clusterName));
+        cleanup.register(() -> {
+            if (eksService.listClusters().contains(clusterName)) {
+                eksService.deleteCluster(clusterName);
+            }
+        });
 
         Cluster cluster = eksService.describeCluster(clusterName);
         assertNotNull(cluster.getContainerId(), "Container ID must not be null");
+        clusterVolumes.addAll(containerVolumes(cluster.getContainerId()));
+        assertFalse(clusterVolumes.isEmpty(), "the real k3s container must have storage to retire");
         waitUntilReady(cluster);
         eksClusterManager.finalizeCluster(cluster);
+        EksTestNode originalNode = EksTestNode.of(dockerClient, eksClusterManager, cluster);
+        awaitNodeInitialized(originalNode, Instant.EPOCH);
+        assertEquals(0, originalNode.kubectl("--request-timeout=2s", "create", "configmap",
+                "storage-continuity", "--from-literal=value=" + suffix).exitCode());
 
         // Verify symlink was created before container started
         assertEquals(EksClusterManager.CONTAINERD_CERTS_TARGET, EksTestNode.of(dockerClient, eksClusterManager, cluster)
@@ -178,7 +194,12 @@ class EksRegistryHostsDockerNightlyIntegrationTest {
                         """.formatted(nodegroupName, lt.getLaunchTemplateId()))
                 .when().post("/clusters/" + clusterName + "/node-groups")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteNodeGroup(clusterName, nodegroupName));
+        cleanup.register(() -> {
+            if (eksService.listClusters().contains(clusterName)
+                    && eksService.listNodeGroups(clusterName).contains(nodegroupName)) {
+                eksService.deleteNodeGroup(clusterName, nodegroupName);
+            }
+        });
 
         // Re-read cluster and container ID: applying the first node group replaces the k3s container
         // to apply node capacity limits, invalidating the previous container ID.
@@ -186,6 +207,7 @@ class EksRegistryHostsDockerNightlyIntegrationTest {
         assertNotNull(cluster.getContainerId(), "Container ID must not be null after node group creation");
         waitUntilReady(cluster);
         EksTestNode node = EksTestNode.of(dockerClient, eksClusterManager, cluster);
+        clusterVolumes.addAll(containerVolumes(node.containerId()));
 
         // Verify user data script wrote hosts.toml into k3s certs.d through the symlink
         String hostsTomlPath = EksClusterManager.CONTAINERD_CERTS_TARGET + "/" + host + "/hosts.toml";
@@ -201,12 +223,10 @@ class EksRegistryHostsDockerNightlyIntegrationTest {
                 .untilAsserted(() -> assertEquals(hostsToml, node.execOutput("cat", hostsTomlPath),
                         "hosts.toml must survive container restart"));
 
-        await("serviceaccount and Ready nodes with renewed Leases").atMost(Duration.ofSeconds(30))
-                .pollInterval(Duration.ofSeconds(1))
-                .until(() -> node.kubectl("--request-timeout=2s", "get", "serviceaccount", "default").exitCode() == 0
-                        && node.kubectl("--request-timeout=2s", "wait", "--for=condition=Ready", "nodes", "--all",
-                                "--timeout=1s").exitCode() == 0
-                        && leasesRenewedAfter(node, restartCompletedAt));
+        awaitNodeInitialized(node, restartCompletedAt);
+        assertEquals(suffix, node.kubectl("--request-timeout=2s", "get", "configmap",
+                "storage-continuity", "-o", "jsonpath={.data.value}").stdout().trim(),
+                "the named data volume must survive capacity replacement and container restart");
 
         node.apply("""
                 apiVersion: v1
@@ -226,6 +246,33 @@ class EksRegistryHostsDockerNightlyIntegrationTest {
             throw e;
         }
         node.kubectl("delete", "pod", POD, "--now");
+        eksService.deleteNodeGroup(clusterName, nodegroupName);
+        eksService.deleteCluster(clusterName);
+        for (String volume : clusterVolumes) {
+            assertThrows(NotFoundException.class, () -> dockerClient.inspectVolumeCmd(volume).exec(),
+                    "Deleted cluster retained mounted volume " + volume);
+        }
+    }
+
+    private static void awaitNodeInitialized(EksTestNode node, Instant renewedAfter) {
+        await("serviceaccount and initialized Ready nodes with renewed Leases").atMost(Duration.ofSeconds(30))
+                .pollInterval(Duration.ofSeconds(1))
+                .until(() -> {
+                    ContainerExec.Result initializing = node.kubectl("--request-timeout=2s", "get", "nodes", "-o",
+                            "jsonpath={.items[*].spec.taints[?(@.key==\"node.cloudprovider.kubernetes.io/uninitialized\")].key}");
+                    return node.kubectl("--request-timeout=2s", "get", "serviceaccount", "default").exitCode() == 0
+                            && node.kubectl("--request-timeout=2s", "wait", "--for=condition=Ready", "nodes", "--all",
+                                    "--timeout=1s").exitCode() == 0
+                            && leasesRenewedAfter(node, renewedAfter)
+                            && initializing.exitCode() == 0 && initializing.stdout().isBlank();
+                });
+    }
+
+    private List<String> containerVolumes(String containerId) {
+        return dockerClient.inspectContainerCmd(containerId).exec().getMounts().stream()
+                .map(mount -> mount.getName())
+                .filter(name -> name != null && !name.isBlank())
+                .toList();
     }
 
     /** Whether every node's Lease was renewed after {@code restart}. */

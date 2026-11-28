@@ -133,3 +133,9 @@ Releases are cut from `main` by the Release Cut workflow, scheduled at 00:30 US 
 ## Reporting Security Issues
 
 Do **not** open public issues for security vulnerabilities. Use [GitHub private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing/privately-reporting-a-security-vulnerability) instead.
+
+## Background scheduling
+
+See [event-driven reconciliation](performance/reconciliation.md) for the shared
+bounded queue contract, application-wide scheduling review, concurrency implications
+and an SDK benchmark that separates API latency from completed work.

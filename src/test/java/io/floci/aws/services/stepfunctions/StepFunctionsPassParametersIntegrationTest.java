@@ -8,10 +8,13 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Verifies a Pass state applies its {@code Parameters} (with intrinsics) — previously they were
@@ -45,22 +48,13 @@ class StepFunctionsPassParametersIntegrationTest {
         assertFalse(miss.path("validation").path("result").asBoolean());
     }
 
-    private String run(String input) throws InterruptedException {
+    private String run(String input) {
         String smArn = create("pass-params-" + System.currentTimeMillis());
         String execArn = start(smArn, input);
-        for (int i = 0; i < 50; i++) {
-            Response resp = describe(execArn);
-            String status = resp.jsonPath().getString("status");
-            if ("SUCCEEDED".equals(status)) {
-                return resp.jsonPath().getString("output");
-            }
-            if ("FAILED".equals(status) || "ABORTED".equals(status)) {
-                fail("Execution " + status + ": " + resp.body().asString());
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution did not complete");
-        return null;
+        Response resp = waitForTerminalState(execArn, Duration.ofSeconds(5));
+        String status = resp.jsonPath().getString("status");
+        assertEquals("SUCCEEDED", status, "Execution " + status + ": " + resp.body().asString());
+        return resp.jsonPath().getString("output");
     }
 
     private String create(String name) {
@@ -81,14 +75,6 @@ class StepFunctionsPassParametersIntegrationTest {
                 .when().post("/");
         resp.then().statusCode(200);
         return resp.jsonPath().getString("executionArn");
-    }
-
-    private Response describe(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("{\"executionArn\":\"" + execArn + "\"}")
-                .when().post("/");
     }
 
     private static String quote(String raw) {

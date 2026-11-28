@@ -15,6 +15,8 @@ import io.vertx.core.datagram.DatagramSocket;
 import io.vertx.core.datagram.DatagramSocketOptions;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -86,14 +88,19 @@ class CloudMapDnsPacketIntegrationTest {
     }
 
     @Test
-    void unknownCallerRetainsPrivateCloudMapAnswersAcrossTheWire() throws Exception {
+    void unknownCallerUsesPublicAnswersWithoutLeakingPrivateCloudMapRecords() throws Exception {
         String namespace = namespaceWithApiInstance();
-        byte[] request = DnsTestQuery.query("api." + namespace, 1, 0x1234);
+        String name = "api." + namespace;
+        byte[] request = DnsTestQuery.query(name, 1, 0x1234);
+        DnsRecordSource publicSource = queryName -> name.equals(queryName)
+                ? Optional.of(DnsAnswer.records(List.of("203.0.113.9"), 15)) : Optional.empty();
         for (List<DnsRecordSource> sources : bothSourceOrders()) {
-            byte[] response = query(new EmbeddedDnsServer(List.of(), sources, List.of(), List.of()), request);
+            List<DnsRecordSource> withPublic = new ArrayList<>(sources);
+            withPublic.add(publicSource);
+            byte[] response = query(new EmbeddedDnsServer(List.of(), withPublic, List.of(), List.of()), request);
             assertEquals(0, ByteBuffer.wrap(response).getShort(2) & 15);
             assertEquals(1, ByteBuffer.wrap(response).getShort(6));
-            assertArrayEquals(new byte[]{(byte) 172, 31, 0, 6},
+            assertArrayEquals(new byte[]{(byte) 203, 0, 113, 9},
                     Arrays.copyOfRange(response, response.length - 4, response.length));
         }
     }
@@ -103,10 +110,14 @@ class CloudMapDnsPacketIntegrationTest {
      * has no record for, or NOERROR/NODATA for a name holding only another type (the TXT below).
      * With that source consulted first, Cloud Map's A record must still win.
      */
-    @Test
-    void cloudMapInstanceResolvesWhenTheRoute53ZoneSourceIsConsultedFirst() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void cloudMapInstanceResolvesWhenTheRoute53ZoneSourceIsConsultedFirst(boolean publicNamespace) throws Exception {
         String namespace = uniqueNamespace();
-        String namespaceId = privateDnsNamespace(namespace);
+        String namespaceId = publicNamespace
+                ? cloudMapService.createPublicDnsNamespace(namespace, null, null, Map.of(), REGION)
+                        .getTargets().get("NAMESPACE")
+                : privateDnsNamespace(namespace);
         Service service = cloudMapService.createService("both", namespaceId, null, null,
                 "{\"DnsRecords\":[{\"Type\":\"A\",\"TTL\":15}]}", null, null, null, Map.of(), REGION);
         cloudMapService.registerInstance(service.getId(), "task-1", null,

@@ -12,6 +12,7 @@ import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.services.ec2.model.LaunchTemplate;
+import io.floci.aws.services.ec2.model.Placement;
 import io.floci.aws.services.ec2.model.Reservation;
 import io.floci.aws.services.elb.ElbClassicService;
 import io.floci.aws.services.elbv2.ElbV2Service;
@@ -312,7 +313,7 @@ class AutoScalingStandbyTest {
 
         assertEquals("Standby", lifecycle("i-a"));
         assertEquals(List.of("i-a", "i-b", "i-replacement-1"), memberIds());
-        assertEquals("Pending", lifecycle("i-replacement-1"));
+        assertEquals("InService", lifecycle("i-replacement-1"));
         reconciler.reconcile(group());
         assertEquals("InService", lifecycle("i-replacement-1"));
         assertEquals("Standby", lifecycle("i-a"));
@@ -408,6 +409,7 @@ class AutoScalingStandbyTest {
         ok(enterStandby(true, "i-a"));
         reconciler.reconcile(group());
 
+        ec2States.put("i-c", InstanceState.running());
         MultivaluedHashMap<String, String> attach = params(GROUP);
         attach.add("InstanceIds.member.1", "i-c");
         assertEquals(200, handler.handle("AttachInstances", attach, REGION).getStatus());
@@ -528,6 +530,21 @@ class AutoScalingStandbyTest {
     }
 
     @Test
+    void standbyTerminationReturnsAnActivityWithoutLaunchingAReplacement() {
+        ok(enterStandby(true, "i-a"));
+        reconciler.reconcile(group());
+        assertEquals("Standby", lifecycle("i-a"));
+
+        String activityId = service.terminateInstanceInAutoScalingGroup(REGION, "i-a", false).getActivityId();
+        reconciler.reconcile(group());
+
+        assertEquals(List.of("i-b"), memberIds());
+        assertEquals(1, group().getDesiredCapacity());
+        assertEquals("Successful", activity(describeScalingActivities(), activityId, "StatusCode"));
+        assertNoLaunch();
+    }
+
+    @Test
     void anInstanceEc2NoLongerHasIsReplacedWhenItLeavesStandby() {
         ok(enterStandby(true, "i-a"));
         reconciler.reconcile(group());
@@ -607,7 +624,8 @@ class AutoScalingStandbyTest {
         detach.add("InstanceIds.member.1", "i-b");
         detach.add("InstanceIds.member.2", "i-a");
         detach.add("ShouldDecrementDesiredCapacity", "true");
-        assertError(handler.handle("DetachInstances", detach, REGION), "The instance i-a is not in InService or Standby.");
+        assertError(handler.handle("DetachInstances", detach, REGION), "The instance i-a is not in InService or Standby or Pending:Retained or Terminating:Retained"
+                        + " or Warmed:Pending:Retained or Warmed:Terminating:Retained.");
 
         assertEquals(entering ? "EnteringStandby" : "Pending", lifecycle("i-a"));
         assertEquals(List.of("i-a", "i-b"), memberIds());
@@ -688,8 +706,10 @@ class AutoScalingStandbyTest {
                 changer.set(Thread.currentThread());
                 return handler.handle(action, change, REGION);
             });
-            await().atMost(Duration.ofSeconds(5)).until(() -> changing.isDone()
-                    || changer.get() != null && changer.get().getState() == Thread.State.BLOCKED);
+            await().atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .until(() -> changing.isDone()
+                            || changer.get() != null && changer.get().getState() == Thread.State.BLOCKED);
             assertFalse(changing.isDone(), action + " must wait for a standby move or reconcile pass in progress");
             release.countDown();
             assertEquals(200, changing.get(5, TimeUnit.SECONDS).getStatus());
@@ -991,6 +1011,9 @@ class AutoScalingStandbyTest {
         Instance instance = new Instance();
         instance.setInstanceId(id);
         instance.setState(state);
+        Placement placement = new Placement();
+        placement.setAvailabilityZone("us-east-1a");
+        instance.setPlacement(placement);
         return instance;
     }
 

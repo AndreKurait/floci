@@ -14,6 +14,7 @@ import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import io.floci.aws.testing.MutableClock;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -29,11 +30,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -314,16 +316,15 @@ class GlueJobRunServiceTest {
             Future<?> start = pool.submit(() -> service.startJobRun("etl", null, new JobRun()));
             assertTrue(store.putStarted.await(10, TimeUnit.SECONDS));
 
+            AtomicReference<Thread> deleting = new AtomicReference<>();
             Future<?> delete = pool.submit(() -> {
+                deleting.set(Thread.currentThread());
                 glueService.deleteJob("etl", REGION);
                 service.deleteRuns("etl");
                 return null;
             });
-            try {
-                delete.get(500, TimeUnit.MILLISECONDS);
-            } catch (TimeoutException expected) {
-                // With the lock held by the paused start, the delete is still waiting here.
-            }
+            ThreadStates.awaitBlockedOrDone(deleting, delete);
+            assertFalse(delete.isDone(), "with the lock held by the paused start, the delete is still waiting");
             store.release.countDown();
             start.get(10, TimeUnit.SECONDS);
             delete.get(10, TimeUnit.SECONDS);

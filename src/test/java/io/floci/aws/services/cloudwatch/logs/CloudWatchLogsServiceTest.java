@@ -8,6 +8,7 @@ import io.floci.aws.services.cloudwatch.logs.model.LogEvent;
 import io.floci.aws.services.cloudwatch.logs.model.LogGroup;
 import io.floci.aws.services.cloudwatch.logs.model.LogStream;
 import io.floci.aws.services.cloudwatch.logs.model.SubscriptionFilter;
+import io.floci.aws.testing.TestTime;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -515,6 +516,48 @@ class CloudWatchLogsServiceTest {
     private static void startAndWaitUntilFinishedOrStuck(Thread thread) {
         thread.start();
         ThreadStates.awaitState(thread, ThreadStates.PARKED_OR_DONE, Duration.ofSeconds(5), "the worker");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 30, 365})
+    void anEventIsKeptForTheWholeRetentionPeriodAndDroppedOneMillisecondLater(int retentionInDays) {
+        TestTime time = TestTime.create();
+        CloudWatchLogsService timed = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10000,
+                new RegionResolver("us-east-1", "000000000000"), 0L, time::currentTimeMillis);
+        timed.createLogGroup("/app/logs", retentionInDays, null, REGION);
+        timed.createLogStream("/app/logs", "stream-1", REGION);
+        long written = time.currentTimeMillis();
+        timed.putLogEvents("/app/logs", "stream-1", eventsAt(written), REGION);
+
+        time.advance(Duration.ofDays(retentionInDays));
+        long atRetention = time.currentTimeMillis();
+        timed.putLogEvents("/app/logs", "stream-1", eventsAt(atRetention), REGION);
+        assertEquals(List.of(written, atRetention), storedTimestamps(timed, "/app/logs", "stream-1"),
+                "an event exactly as old as the retention period is still inside it");
+
+        time.advance(Duration.ofMillis(1));
+        long afterRetention = time.currentTimeMillis();
+        timed.putLogEvents("/app/logs", "stream-1", eventsAt(afterRetention), REGION);
+        assertEquals(List.of(atRetention, afterRetention), storedTimestamps(timed, "/app/logs", "stream-1"));
+    }
+
+    @Test
+    void anEventWithoutATimestampIsStampedWithTheTimeOfThePut() {
+        TestTime time = TestTime.create();
+        CloudWatchLogsService timed = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10000,
+                new RegionResolver("us-east-1", "000000000000"), 0L, time::currentTimeMillis);
+        timed.createLogGroup("/app/logs", null, null, REGION);
+        timed.createLogStream("/app/logs", "stream-1", REGION);
+        time.advance(Duration.ofHours(3));
+
+        timed.putLogEvents("/app/logs", "stream-1", List.of(Map.of("message", "no timestamp")), REGION);
+
+        LogEvent stored = timed.getLogEvents("/app/logs", "stream-1", null, null, 100, true, null, REGION)
+                .events().getFirst();
+        assertEquals(time.currentTimeMillis(), stored.getTimestamp());
+        assertEquals(time.currentTimeMillis(), stored.getIngestionTime());
     }
 
     @Test
@@ -2280,5 +2323,60 @@ class CloudWatchLogsServiceTest {
 
         assertEquals(0, atStart.events().size());
         assertEquals("b/0", atStart.nextBackwardToken(), "token must echo back to signal start of stream");
+    }
+
+    @Test
+    void groupsStreamsSubscriptionFiltersAndResourcePoliciesAreDatedOnTheServiceClock() {
+        TestTime time = TestTime.create();
+        CloudWatchLogsService timed = new CloudWatchLogsService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 10000,
+                new RegionResolver("us-east-1", "000000000000"), 0L, time::currentTimeMillis);
+        long start = time.currentTimeMillis();
+
+        timed.createLogGroup("/app/logs", null, null, REGION);
+        assertEquals(start, timed.describeLogGroups("/app/logs", REGION).getFirst().getCreatedTime());
+
+        time.advance(Duration.ofMinutes(1));
+        timed.createLogStream("/app/logs", "stream-1", REGION);
+        assertEquals(start + 60_000,
+                timed.describeLogStreams("/app/logs", null, REGION).getFirst().getCreatedTime());
+
+        time.advance(Duration.ofMinutes(1));
+        timed.putSubscriptionFilter("/app/logs", "my-filter", "ERROR",
+                "arn:aws:lambda:us-east-1:000000000000:function:test", null, REGION);
+        assertEquals(start + 120_000, timed.describeSubscriptionFilters("/app/logs", null, null, 50, REGION)
+                .subscriptionFilters().getFirst().getCreationTime());
+
+        time.advance(Duration.ofMinutes(1));
+        assertEquals(start + 180_000, timed.putResourcePolicy("policy", "{}", REGION).getLastUpdatedTime());
+    }
+
+
+    @Test
+    void describeSubscriptionFiltersRejectsATokenOutsideTheList() {
+        service.createLogGroup("/app/logs", null, null, REGION);
+        service.putSubscriptionFilter("/app/logs", "my-filter", "ERROR",
+                "arn:aws:lambda:us-east-1:000000000000:function:test", null, REGION);
+
+        for (String token : List.of("5", "-1", "not-a-token")) {
+            AwsException rejected = assertThrows(AwsException.class,
+                    () -> service.describeSubscriptionFilters("/app/logs", null, token, 50, REGION), token);
+            assertEquals("InvalidParameterException", rejected.getErrorCode(), token);
+            assertEquals("The specified nextToken is invalid.", rejected.getMessage(), token);
+        }
+        assertEquals(0, service.describeSubscriptionFilters("/app/logs", null, "1", 50, REGION)
+                .subscriptionFilters().size());
+    }
+
+    @Test
+    void lastEventTimestampStaysAtTheNewestEventWhenAnOlderOneArrivesLater() {
+        service.createLogGroup("/app/logs", null, null, REGION);
+        service.createLogStream("/app/logs", "stream-1", REGION);
+        service.putLogEvents("/app/logs", "stream-1", eventsAt(2000), REGION);
+        service.putLogEvents("/app/logs", "stream-1", eventsAt(1000), REGION);
+
+        LogStream stream = service.describeLogStreams("/app/logs", null, REGION).getFirst();
+        assertEquals(1000L, stream.getFirstEventTimestamp());
+        assertEquals(2000L, stream.getLastEventTimestamp());
     }
 }

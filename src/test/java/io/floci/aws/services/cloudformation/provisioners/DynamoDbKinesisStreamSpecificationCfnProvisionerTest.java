@@ -9,6 +9,7 @@ import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.NativeDynamoDbTableService;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Reply;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
 import io.floci.aws.services.dynamodb.model.KinesisStreamingDestination;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
@@ -19,6 +20,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static io.floci.aws.services.cloudformation.provisioners.DynamoDbCreateCalls.onDemandCreate;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -65,7 +67,11 @@ class DynamoDbKinesisStreamSpecificationCfnProvisionerTest {
     private final NativeDynamoDbBackend backend =
             new NativeDynamoDbBackend(null, null, tableService, dynamoDb, null, null, mapper);
     private final DynamoDbCfnProvisioner provisioner = new DynamoDbCfnProvisioner(
-            new DynamoDbFacade(backend, backend, new RegionResolver(REGION, "000000000000")));
+            new DynamoDbFacade(backend, backend, new RegionResolver(REGION, "000000000000")), call -> {
+                assertEquals("DeleteTable", call.action());
+                backend.deleteTable(call.scope(), call.body().path("TableName").asText());
+                return new Reply(200, null, Map.of());
+            });
 
     private ProvisionContext ctx() {
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);

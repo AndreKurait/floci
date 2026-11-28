@@ -1,28 +1,38 @@
 package io.floci.aws.services.elb;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegionFacts;
 import io.floci.aws.core.common.CertificateReferenceResolver;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.concurrent.KeyedWriteLocks;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackedMap;
+import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.floci.aws.services.acm.AcmService;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.EmulatorOriginSource;
+import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
+import io.floci.aws.services.ec2.SecurityGroupNftCompiler;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.elb.model.ClassicHealthCheck;
 import io.floci.aws.services.elb.model.ClassicListener;
 import io.floci.aws.services.elb.model.ClassicLoadBalancer;
+import io.floci.aws.services.elb.model.ClassicLoadBalancerAttributes;
+import io.floci.aws.services.elb.model.ClassicLoadBalancerPolicy;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.ServerCertificateReferenceProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -34,7 +44,9 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -54,10 +66,11 @@ import java.util.stream.Collectors;
  * inventing a result.
  */
 @ApplicationScoped
-public class ElbClassicService implements ServerCertificateReferenceProvider {
+public class ElbClassicService implements ServerCertificateReferenceProvider, EmulatorOriginSource {
 
     private static final Logger LOG = Logger.getLogger(ElbClassicService.class);
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final ObjectMapper SNAPSHOT_MAPPER = new ObjectMapper().registerModule(new JavaTimeModule());
 
     private final Ec2Service ec2Service;
     private final ElbClassicHealthChecker healthChecker;
@@ -65,12 +78,20 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     private final RegionResolver regionResolver;
     private final IamService iamService;
     private final CertificateReferenceResolver certificates;
+    private final ElbClassicFrontendManager frontends;
+    private final KeyedWriteLocks<String> runtimeWrites = new KeyedWriteLocks<>();
+
+    /** Left null by the unit tests, which wire this service without EC2 security-group enforcement. */
+    @Inject
+    Instance<SecurityGroupFirewallManager> securityGroupFirewall;
 
     // region → load balancer name → record, in the calling account
     private final Map<String, Map<String, ClassicLoadBalancer>> loadBalancers;
     // The store behind loadBalancers, for the startup passes that must reach every account; null
     // without a StorageFactory, when loadBalancers is a plain in-memory map
     private final AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> loadBalancerStore;
+    private final Map<String, Integer> dnsNameCounts = new ConcurrentHashMap<>();
+    private final Object dnsIndexLock = new Object();
 
     /** Serializes listener writes against each other; see {@link #createLoadBalancerListeners}. */
     private final Object listenerLock = new Object();
@@ -90,7 +111,6 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         this(ec2Service, healthChecker, storageFactory, config, regionResolver, null, null);
     }
 
-    @Inject
     public ElbClassicService(Ec2Service ec2Service,
                              ElbClassicHealthChecker healthChecker,
                              StorageFactory storageFactory,
@@ -98,12 +118,25 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                              RegionResolver regionResolver,
                              IamService iamService,
                              AcmService acmService) {
+        this(ec2Service, healthChecker, storageFactory, config, regionResolver, iamService, acmService, null);
+    }
+
+    @Inject
+    public ElbClassicService(Ec2Service ec2Service,
+                             ElbClassicHealthChecker healthChecker,
+                             StorageFactory storageFactory,
+                             EmulatorConfig config,
+                             RegionResolver regionResolver,
+                             IamService iamService,
+                             AcmService acmService,
+                             ElbClassicFrontendManager frontends) {
         this.ec2Service = ec2Service;
         this.healthChecker = healthChecker;
         this.config = config;
         this.regionResolver = regionResolver;
         this.iamService = iamService;
         this.certificates = new CertificateReferenceResolver(iamService, acmService);
+        this.frontends = frontends;
         this.loadBalancerStore = storageFactory != null
                 ? storageFactory.create("elb", "elb-load-balancers.json",
                         new TypeReference<Map<String, Map<String, ClassicLoadBalancer>>>() {})
@@ -133,6 +166,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
      * reachable from {@link #initializeStorage()} may touch an injected collaborator.
      */
     public void restorePersistedRuntime() {
+        dnsNameCounts.clear();
         for (StoredRegion stored : storedRegions()) {
             for (ClassicLoadBalancer lb : stored.regionLbs().values()) {
                 // A balancer stored before balancers recorded their account belongs to the account
@@ -144,6 +178,10 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                 // fixed zone every balancer used to report; take the region's zone again.
                 lb.setCanonicalHostedZoneNameId(
                         AwsRegionFacts.classicElbHostedZoneId(stored.region()).orElse(null));
+                if (frontends != null) {
+                    frontends.reconcile(lb);
+                }
+                indexDnsName(lb);
                 healthChecker.startMonitoring(lb);
                 healthChecker.registerInstances(lb, lb.getInstanceIds());
             }
@@ -181,7 +219,15 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
 
     private void storeRegion(String accountId, String region, Map<String, ClassicLoadBalancer> regionLbs) {
         if (loadBalancerStore != null) {
-            loadBalancerStore.putForAccount(accountId, region, regionLbs);
+            loadBalancerStore.putAllAtomicallyForAccount(accountId, Map.of(region, regionLbs));
+        } else {
+            loadBalancers.put(region, regionLbs);
+        }
+    }
+
+    private void persistRegion(String region, Map<String, ClassicLoadBalancer> regionLbs) {
+        if (loadBalancerStore != null) {
+            loadBalancerStore.putAllAtomically(Map.of(region, regionLbs));
         } else {
             loadBalancers.put(region, regionLbs);
         }
@@ -196,79 +242,110 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                                                   List<String> securityGroups,
                                                   String scheme,
                                                   Map<String, String> tags) {
-        validateName(name);
-        if (listeners == null || listeners.isEmpty()) {
-            // Listeners is a required member of CreateAccessPointInput, and unlike LoadBalancerName
-            // the model gives its member shape required fields — an empty list cannot be honoured.
-            throw new AwsException("ValidationError",
-                    "At least one listener must be specified.", 400);
-        }
-        for (ClassicListener listener : listeners) {
-            validateListener(listener);
-        }
-        requireCertificates(region, listeners);
-
-        Map<String, ClassicLoadBalancer> regionLbs =
-                loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-        if (regionLbs.containsKey(name)) {
-            throw duplicateLoadBalancerName(name);
-        }
-
-        String id = randomHex();
-        String dnsName = name + "-" + id + ".elb." + dnsSuffix();
-
-        ClassicLoadBalancer lb = new ClassicLoadBalancer();
-        lb.setLoadBalancerName(name);
-        lb.setRegion(region);
-        if (regionResolver != null && regionResolver.getAccountId() != null) {
-            lb.setAccountId(regionResolver.getAccountId());
-        }
-        lb.setDnsName(dnsName);
-        lb.setCanonicalHostedZoneName(dnsName);
-        lb.setCanonicalHostedZoneNameId(AwsRegionFacts.classicElbHostedZoneId(region).orElse(null));
-        lb.setScheme(scheme != null && !scheme.isBlank() ? scheme : "internet-facing");
-        lb.setCreatedTime(Instant.now());
-        lb.setListeners(new ArrayList<>(listeners));
-        lb.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
-        lb.setHealthCheck(ClassicHealthCheck.defaults());
-        if (tags != null && !tags.isEmpty()) {
-            lb.setTags(new LinkedHashMap<>(tags));
-        }
-
-        if (subnets != null && !subnets.isEmpty()) {
-            lb.setSubnets(new ArrayList<>(subnets));
-            Map<String, Subnet> byId = resolveSubnets(region, subnets);
-            lb.setVpcId(singleVpcId(byId.values()));
-            lb.setAvailabilityZones(byId.values().stream()
-                    .map(Subnet::getAvailabilityZone)
-                    .distinct()
-                    .collect(Collectors.toCollection(ArrayList::new)));
-        } else if (availabilityZones != null) {
-            lb.setAvailabilityZones(new ArrayList<>(availabilityZones));
-        }
-        if (lb.getVpcId() != null && lb.getSecurityGroups().isEmpty()) {
-            // AWS associates a security group with a VPC load balancer created without one; for a
-            // non-default VPC that is the VPC's default group. (In a default VPC AWS creates a
-            // default_elb_<id> group instead; not modelled, see docs/services/elb-classic.md.)
-            ec2Service.defaultSecurityGroupOf(region, lb.getVpcId())
-                    .ifPresent(sg -> lb.getSecurityGroups().add(sg.getGroupId()));
-        }
-        populateSourceSecurityGroup(region, lb);
-
-        whileCertificatesHeld(listeners, () -> {
-            // The certificate check again, and this is the one that counts. The one above it
-            // fails fast and keeps AWS's error precedence, but a check made before the lock says
-            // nothing about the moment of the write. The unique name is a separate problem that
-            // putIfAbsent settles on its own, lock or no lock: checked and then written as two
-            // steps, two creates of one name both pass and only the second survives.
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            validateName(name);
+            if (listeners == null || listeners.isEmpty()) {
+                // Listeners is a required member of CreateAccessPointInput, and unlike LoadBalancerName
+                // the model gives its member shape required fields — an empty list cannot be honoured.
+                throw new AwsException("ValidationError",
+                        "At least one listener must be specified.", 400);
+            }
+            for (ClassicListener listener : listeners) {
+                validateListener(listener);
+            }
             requireCertificates(region, listeners);
-            if (regionLbs.putIfAbsent(name, lb) != null) {
+
+            Map<String, ClassicLoadBalancer> regionLbs =
+                    loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
+            if (regionLbs.containsKey(name)) {
                 throw duplicateLoadBalancerName(name);
             }
-            loadBalancers.put(region, regionLbs);
-        });
-        healthChecker.startMonitoring(lb);
-        return lb;
+
+            String id = randomHex();
+            String dnsName = name + "-" + id + ".elb." + dnsSuffix();
+
+            ClassicLoadBalancer lb = new ClassicLoadBalancer();
+            lb.setLoadBalancerName(name);
+            lb.setRegion(region);
+            if (regionResolver != null && regionResolver.getAccountId() != null) {
+                lb.setAccountId(regionResolver.getAccountId());
+            }
+            lb.setDnsName(dnsName);
+            lb.setCanonicalHostedZoneName(dnsName);
+            lb.setCanonicalHostedZoneNameId(AwsRegionFacts.classicElbHostedZoneId(region).orElse(null));
+            lb.setScheme(scheme != null && !scheme.isBlank() ? scheme : "internet-facing");
+            lb.setCreatedTime(Instant.now());
+            lb.setListeners(new ArrayList<>(listeners));
+            attachDefaultPolicies(lb, listeners);
+            lb.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
+            lb.setHealthCheck(ClassicHealthCheck.defaults());
+            if (tags != null && !tags.isEmpty()) {
+                lb.setTags(new LinkedHashMap<>(tags));
+            }
+
+            if (subnets != null && !subnets.isEmpty()) {
+                lb.setSubnets(new ArrayList<>(subnets));
+                Map<String, Subnet> byId = resolveSubnets(region, subnets);
+                lb.setVpcId(singleVpcId(byId.values()));
+                lb.setAvailabilityZones(byId.values().stream()
+                        .map(Subnet::getAvailabilityZone)
+                        .distinct()
+                        .collect(Collectors.toCollection(ArrayList::new)));
+            } else if (availabilityZones != null) {
+                lb.setAvailabilityZones(new ArrayList<>(availabilityZones));
+            }
+            if (lb.getVpcId() != null && lb.getSecurityGroups().isEmpty()) {
+                // AWS associates a security group with a VPC load balancer created without one; for a
+                // non-default VPC that is the VPC's default group. (In a default VPC AWS creates a
+                // default_elb_<id> group instead; not modelled, see docs/services/elb-classic.md.)
+                ec2Service.defaultSecurityGroupOf(region, lb.getVpcId())
+                        .ifPresent(sg -> lb.getSecurityGroups().add(sg.getGroupId()));
+            }
+            populateSourceSecurityGroup(region, lb);
+
+            if (frontends != null) {
+                frontends.reconcile(lb);
+            }
+            try {
+                whileCertificatesHeld(listeners, () -> {
+                    // Recheck publication after startup without holding certificate or DNS locks during I/O.
+                    requireCertificates(region, listeners);
+                    synchronized (dnsIndexLock) {
+                        if (regionLbs.putIfAbsent(name, lb) != null) {
+                            throw duplicateLoadBalancerName(name);
+                        }
+                        try {
+                            persistRegion(region, regionLbs);
+                        } catch (RuntimeException failure) {
+                            regionLbs.remove(name, lb);
+                            try {
+                                persistRegion(region, regionLbs);
+                            } catch (RuntimeException compensation) {
+                                if (compensation != failure) {
+                                    failure.addSuppressed(compensation);
+                                }
+                            }
+                            throw failure;
+                        }
+                        indexDnsName(lb);
+                    }
+                });
+            } catch (RuntimeException failure) {
+                if (frontends != null) {
+                    try {
+                        frontends.remove(lb);
+                    } catch (RuntimeException cleanupFailure) {
+                        if (cleanupFailure != failure) {
+                            failure.addSuppressed(cleanupFailure);
+                        }
+                    }
+                }
+                throw failure;
+            }
+            healthChecker.startMonitoring(lb);
+            emulatorOriginsChanged(lb);
+            return lb;
+        }
     }
 
     public List<ClassicLoadBalancer> describeLoadBalancers(String region, List<String> names) {
@@ -286,6 +363,35 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             result.add(lb);
         }
         return result;
+    }
+
+    /** Public load-balancer names select the owner independently of an API caller's credentials. */
+    List<ClassicLoadBalancer> findByDnsName(String dnsName) {
+        String normalized = normalizedDnsName(dnsName);
+        if (normalized == null || !dnsNameCounts.containsKey(normalized)) {
+            return List.of();
+        }
+        Collection<Map<String, ClassicLoadBalancer>> regions =
+                loadBalancerStore != null
+                        ? loadBalancerStore.scanAllAccounts() : loadBalancers.values();
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(lb -> normalized.equals(normalizedDnsName(lb.getDnsName())))
+                .toList();
+    }
+
+    private void indexDnsName(ClassicLoadBalancer lb) {
+        String name = normalizedDnsName(lb.getDnsName());
+        if (name != null) {
+            dnsNameCounts.merge(name, 1, Integer::sum);
+        }
+    }
+
+    private static String normalizedDnsName(String name) {
+        if (name == null) {
+            return null;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".") ? lower : lower + ".";
     }
 
     private void populateSourceSecurityGroup(String region, ClassicLoadBalancer lb) {
@@ -312,14 +418,67 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
 
     /** Deletes a load balancer. Deleting one that does not exist succeeds, as it does on AWS. */
     public void deleteLoadBalancer(String region, String name) {
-        Map<String, ClassicLoadBalancer> regionLbs = loadBalancers.get(region);
-        if (regionLbs == null) {
-            return;
-        }
-        ClassicLoadBalancer removed = regionLbs.remove(name);
-        if (removed != null) {
-            healthChecker.stopMonitoring(removed);
-            loadBalancers.put(region, regionLbs);
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer removed;
+            ClassicLoadBalancer existing = loadBalancers.getOrDefault(region, Map.of()).get(name);
+            if (existing != null && frontends != null) {
+                try {
+                    frontends.remove(existing);
+                } catch (RuntimeException failure) {
+                    try {
+                        frontends.reconcile(existing);
+                    } catch (RuntimeException frontendFailure) {
+                        if (frontendFailure != failure) {
+                            failure.addSuppressed(frontendFailure);
+                        }
+                    }
+                    throw failure;
+                }
+            }
+            try {
+                synchronized (dnsIndexLock) {
+                    Map<String, ClassicLoadBalancer> regionLbs = loadBalancers.get(region);
+                    if (regionLbs == null) {
+                        return;
+                    }
+                    removed = regionLbs.remove(name);
+                    if (removed != null) {
+                        persistRegion(region, regionLbs);
+                        String dnsName = normalizedDnsName(removed.getDnsName());
+                        if (dnsName != null) {
+                            dnsNameCounts.computeIfPresent(dnsName, (key, count) -> count == 1 ? null : count - 1);
+                        }
+                    }
+                }
+            } catch (RuntimeException failure) {
+                if (existing != null) {
+                    try {
+                        synchronized (dnsIndexLock) {
+                            Map<String, ClassicLoadBalancer> regionLbs = loadBalancers.get(region);
+                            regionLbs.put(name, existing);
+                            persistRegion(region, regionLbs);
+                        }
+                    } catch (RuntimeException storageFailure) {
+                        if (storageFailure != failure) {
+                            failure.addSuppressed(storageFailure);
+                        }
+                    }
+                    if (frontends != null) {
+                        try {
+                            frontends.reconcile(existing);
+                        } catch (RuntimeException frontendFailure) {
+                            if (frontendFailure != failure) {
+                                failure.addSuppressed(frontendFailure);
+                            }
+                        }
+                    }
+                }
+                throw failure;
+            }
+            if (removed != null) {
+                healthChecker.stopMonitoring(removed);
+                emulatorOriginsChanged(removed);
+            }
         }
     }
 
@@ -339,98 +498,236 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     // ── Listeners ─────────────────────────────────────────────────────────────
 
     public void createLoadBalancerListeners(String region, String name, List<ClassicListener> listeners) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        for (ClassicListener listener : listeners) {
-            validateListener(listener);
-        }
-        requireCertificates(region, listeners);
-        whileCertificatesHeld(listeners, () -> {
-            requireCertificates(region, listeners);
-            // The port of an existing listener decides whether this one is added, so the walk and
-            // the add are one step. Two threads adding the same port would otherwise both find it
-            // absent and both add it, and a removal landing in between would drop a listener this
-            // call has already decided to keep.
-            synchronized (listenerLock) {
-                for (ClassicListener listener : listeners) {
-                    ClassicListener existing = lb.getListeners().stream()
-                            .filter(l -> l.getLoadBalancerPort().equals(listener.getLoadBalancerPort()))
-                            .findFirst()
-                            .orElse(null);
-                    if (existing != null) {
-                        // AWS accepts a repeat of an identical listener and rejects a conflicting one.
-                        if (!sameListener(existing, listener)) {
-                            throw new AwsException("DuplicateListener",
-                                    "A listener already exists for " + name + " with LoadBalancerPort "
-                                            + listener.getLoadBalancerPort()
-                                            + ", but with a different InstancePort, Protocol, or "
-                                            + "SSLCertificateId", 400);
-                        }
-                        continue;
-                    }
-                    lb.getListeners().add(listener);
-                }
-                persist(region);
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            for (ClassicListener listener : listeners) {
+                validateListener(listener);
             }
-        });
+            requireCertificates(region, listeners);
+            whileCertificatesHeld(listeners, () -> {
+                requireCertificates(region, listeners);
+                // The port of an existing listener decides whether this one is added, so the walk and
+                // the add are one step. Two threads adding the same port would otherwise both find it
+                // absent and both add it, and a removal landing in between would drop a listener this
+                // call has already decided to keep.
+                synchronized (listenerLock) {
+                    for (ClassicListener listener : listeners) {
+                        ClassicListener existing = lb.getListeners().stream()
+                                .filter(l -> l.getLoadBalancerPort().equals(listener.getLoadBalancerPort()))
+                                .findFirst()
+                                .orElse(null);
+                        if (existing != null) {
+                            // AWS accepts a repeat of an identical listener and rejects a conflicting one.
+                            if (!sameListener(existing, listener)) {
+                                throw new AwsException("DuplicateListener",
+                                        "A listener already exists for " + name + " with LoadBalancerPort "
+                                                + listener.getLoadBalancerPort()
+                                                + ", but with a different InstancePort, Protocol, or "
+                                                + "SSLCertificateId", 400);
+                            }
+                            continue;
+                        }
+                        lb.getListeners().add(listener);
+                        attachDefaultPolicies(lb, List.of(listener));
+                    }
+                    persist(region, lb);
+                }
+            });
+        }
     }
 
     public void deleteLoadBalancerListeners(String region, String name, List<Integer> loadBalancerPorts) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        // Under the same monitor as the add, so a removal cannot land between that method's look
-        // at the port and its decision. No certificate lock: removing a listener can only drop a
-        // reference to a certificate, never record one, and a delete that reads the list while
-        // this runs reads a snapshot of it.
-        synchronized (listenerLock) {
-            lb.getListeners().removeIf(l -> loadBalancerPorts.contains(l.getLoadBalancerPort()));
-            persist(region);
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            // Under the same monitor as the add, so a removal cannot land between that method's look
+            // at the port and its decision. No certificate lock: removing a listener can only drop a
+            // reference to a certificate, never record one, and a delete that reads the list while
+            // this runs reads a snapshot of it.
+            synchronized (listenerLock) {
+                lb.getListeners().removeIf(l -> loadBalancerPorts.contains(l.getLoadBalancerPort()));
+                Map<Integer, List<String>> bindings = new LinkedHashMap<>(lb.getListenerPolicies());
+                loadBalancerPorts.forEach(bindings::remove);
+                lb.setListenerPolicies(bindings);
+                persist(region, lb);
+            }
         }
+    }
+
+    public void createLoadBalancerPolicy(String region, String name, String policyName,
+                                         String policyType, Map<String, String> attributes) {
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            synchronized (listenerLock) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                ClassicLoadBalancerPolicy policy = ClassicSslPolicies.create(policyName, policyType, attributes);
+                Map<String, ClassicLoadBalancerPolicy> policies = new LinkedHashMap<>(lb.getPolicies());
+                if (policies.putIfAbsent(policyName, policy) != null) {
+                    throw new AwsException("DuplicatePolicyName", "Policy " + policyName + " already exists.", 400);
+                }
+                lb.setPolicies(policies);
+                persist(region, lb);
+            }
+        }
+    }
+
+    public List<ClassicLoadBalancerPolicy> describeLoadBalancerPolicies(String region, String name,
+                                                                       List<String> policyNames) {
+        Map<String, ClassicLoadBalancerPolicy> policies = name == null
+                ? ClassicSslPolicies.predefined() : requireLoadBalancer(region, name).getPolicies();
+        if (policyNames.isEmpty()) {
+            return List.copyOf(policies.values());
+        }
+        List<ClassicLoadBalancerPolicy> result = new ArrayList<>();
+        for (String policyName : policyNames) {
+            ClassicLoadBalancerPolicy policy = policies.get(policyName);
+            if (policy == null) {
+                throw new AwsException("PolicyNotFound", "Policy " + policyName + " does not exist.", 400);
+            }
+            result.add(policy);
+        }
+        return List.copyOf(result);
+    }
+
+    public void deleteLoadBalancerPolicy(String region, String name, String policyName) {
+        ClassicSslPolicies.requireValue(policyName, "PolicyName");
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            synchronized (listenerLock) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                if (lb.getListenerPolicies().values().stream().anyMatch(names -> names.contains(policyName))) {
+                    throw new AwsException("InvalidConfigurationRequest",
+                            "Policy " + policyName + " is enabled on a listener.", 409);
+                }
+                Map<String, ClassicLoadBalancerPolicy> policies = new LinkedHashMap<>(lb.getPolicies());
+                policies.remove(policyName);
+                lb.setPolicies(policies);
+                persist(region, lb);
+            }
+        }
+    }
+
+    public void setLoadBalancerPoliciesOfListener(String region, String name, Integer port, List<String> names) {
+        if (port == null || port < 1 || port > 65535) {
+            throw new AwsException("ValidationError", "LoadBalancerPort must be between 1 and 65535.", 400);
+        }
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            synchronized (listenerLock) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                ClassicListener listener = lb.getListeners().stream()
+                        .filter(value -> port.equals(value.getLoadBalancerPort())).findFirst()
+                        .orElseThrow(() -> new AwsException("ListenerNotFound",
+                                "There is no listener on port " + port + ".", 400));
+                for (String policyName : names) {
+                    if (!lb.getPolicies().containsKey(policyName)) {
+                        throw new AwsException("PolicyNotFound", "Policy " + policyName + " does not exist.", 400);
+                    }
+                }
+                boolean tls = ClassicSslPolicies.tls(listener);
+                if (!names.isEmpty() && (!tls || names.size() != 1)) {
+                    throw new AwsException("InvalidConfigurationRequest",
+                            "An SSL negotiation policy requires one HTTPS or SSL listener policy.", 409);
+                }
+                boolean protectedFrontend = frontends != null && frontends.enabled();
+                if (tls && protectedFrontend && names.isEmpty()) {
+                    throw new AwsException("UnsupportedOperation",
+                            "Clearing all protected Classic TLS policies is not supported by Floci.", 400);
+                }
+                if (tls && !names.isEmpty() && !protectedFrontend && !config.services().elb().mock()) {
+                    throw new AwsException("UnsupportedOperation",
+                            "Per-listener TLS policy enforcement requires protected Classic VPC frontends.", 400);
+                }
+                Map<Integer, List<String>> bindings = new LinkedHashMap<>(lb.getListenerPolicies());
+                bindings.put(port, List.copyOf(names));
+                lb.setListenerPolicies(bindings);
+                persist(region, lb);
+            }
+        }
+    }
+
+    private static void attachDefaultPolicies(ClassicLoadBalancer lb, List<ClassicListener> listeners) {
+        Map<Integer, List<String>> bindings = new LinkedHashMap<>(lb.getListenerPolicies());
+        Map<String, ClassicLoadBalancerPolicy> policies = new LinkedHashMap<>(lb.getPolicies());
+        for (ClassicListener listener : listeners) {
+            if (ClassicSslPolicies.tls(listener) && !bindings.containsKey(listener.getLoadBalancerPort())) {
+                policies.putIfAbsent(ClassicSslPolicies.DEFAULT, ClassicSslPolicies.predefined().get(ClassicSslPolicies.DEFAULT));
+                bindings.put(listener.getLoadBalancerPort(), List.of(ClassicSslPolicies.DEFAULT));
+            }
+        }
+        lb.setPolicies(policies);
+        lb.setListenerPolicies(bindings);
     }
 
     // ── Health ────────────────────────────────────────────────────────────────
 
     public ClassicHealthCheck configureHealthCheck(String region, String name, ClassicHealthCheck healthCheck) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        validateHealthCheck(healthCheck);
-        lb.setHealthCheck(healthCheck);
-        persist(region);
-        healthChecker.healthCheckChanged(lb);
-        return healthCheck;
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            validateHealthCheck(healthCheck);
+            lb.setHealthCheck(healthCheck);
+            persist(region, lb);
+            return healthCheck;
+        }
     }
 
     public List<String> registerInstances(String region, String name, List<String> instanceIds) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        for (String id : instanceIds) {
-            if (!lb.getInstanceIds().contains(id)) {
-                lb.getInstanceIds().add(id);
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            for (String id : instanceIds) {
+                if (!lb.getInstanceIds().contains(id)) {
+                    lb.getInstanceIds().add(id);
+                }
             }
+            persist(region, lb);
+            if (frontends == null || !frontends.enabled()) {
+                healthChecker.registerInstances(lb, instanceIds);
+            }
+            return List.copyOf(lb.getInstanceIds());
         }
-        persist(region);
-        healthChecker.registerInstances(lb, instanceIds);
-        return List.copyOf(lb.getInstanceIds());
     }
 
     public List<String> deregisterInstances(String region, String name, List<String> instanceIds) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        lb.getInstanceIds().removeAll(instanceIds);
-        persist(region);
-        healthChecker.deregisterInstances(lb, instanceIds);
-        return List.copyOf(lb.getInstanceIds());
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            lb.getInstanceIds().removeAll(instanceIds);
+            persist(region, lb);
+            if (frontends == null || !frontends.enabled()) {
+                healthChecker.deregisterInstances(lb, instanceIds);
+            }
+            return List.copyOf(lb.getInstanceIds());
+        }
+    }
+
+    /** Instances still serving requests after deregistration, across every frontend node. */
+    public Set<String> deregisteringInstances(String region, String name) {
+        ClassicLoadBalancer loadBalancer = requireLoadBalancer(region, name);
+        return frontends == null ? Set.of() : frontends.drainingInstances(loadBalancer);
     }
 
     /** The health of each requested instance, or of every registered instance when none is named. */
     public Map<String, ElbClassicHealthChecker.InstanceHealth> describeInstanceHealth(
             String region, String name, List<String> instanceIds) {
         ClassicLoadBalancer lb = requireLoadBalancer(region, name);
+        Set<String> draining = frontends == null ? Set.of() : frontends.drainingInstances(lb);
+        Set<String> registeredOrDraining = new LinkedHashSet<>(lb.getInstanceIds());
+        registeredOrDraining.addAll(draining);
         List<String> wanted = instanceIds == null || instanceIds.isEmpty()
-                ? lb.getInstanceIds()
+                ? List.copyOf(registeredOrDraining)
                 : instanceIds;
         Map<String, ElbClassicHealthChecker.InstanceHealth> result = new LinkedHashMap<>();
         for (String id : wanted) {
-            if (!lb.getInstanceIds().contains(id)) {
-                throw new AwsException("InvalidInstance",
-                        "Could not find EC2 instance " + id + ".", 400);
+            if (draining.contains(id)) {
+                result.put(id, new ElbClassicHealthChecker.InstanceHealth("InService", "N/A",
+                        "Instance deregistration currently in progress"));
+                continue;
             }
-            result.put(id, healthChecker.getHealth(lb, id));
+            if (lb.getInstanceIds().contains(id)) {
+                result.put(id, healthChecker.getHealth(lb, id));
+            } else {
+                if (ec2Service.getInstance(region, id).isEmpty()) {
+                    throw new AwsException("InvalidInstance",
+                            "Could not find EC2 instance " + id + ".", 400);
+                }
+                result.put(id, new ElbClassicHealthChecker.InstanceHealth("OutOfService", "Instance",
+                        "Instance is not currently registered with the LoadBalancer."));
+            }
         }
         return result;
     }
@@ -439,10 +736,59 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
 
     public ClassicLoadBalancer modifyLoadBalancerAttributes(String region, String name,
                                                             AttributeUpdate update) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        update.applyTo(lb.getAttributes());
-        persist(region);
-        return lb;
+        if (update.connectionDrainingTimeout() != null
+                && (update.connectionDrainingTimeout() < 1 || update.connectionDrainingTimeout() > 3600)) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Connection draining timeout must be between 1 and 3600 seconds.", 400);
+        }
+        if (update.idleTimeout() != null && (update.idleTimeout() < 1 || update.idleTimeout() > 4000)) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Idle timeout must be between 1 and 4000 seconds.", 400);
+        }
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            update.applyTo(lb.getAttributes());
+            persist(region, lb);
+            return lb;
+        }
+    }
+
+    /** Restore the mutable configuration captured before a failed CloudFormation update. */
+    public void restoreLoadBalancerConfiguration(String region, String name, ClassicLoadBalancer previous) {
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer current = mutableLoadBalancer(region, name);
+            for (ClassicListener listener : previous.getListeners()) {
+                validateListener(listener);
+                if (ClassicSslPolicies.tls(listener)) {
+                    ClassicSslPolicies.options(ClassicSslPolicies.effective(previous, listener));
+                }
+            }
+            requireCertificates(region, previous.getListeners());
+            validateHealthCheck(previous.getHealthCheck());
+            if (!previous.getSubnets().isEmpty()) {
+                singleVpcId(resolveSubnets(region, previous.getSubnets()).values());
+            }
+            whileCertificatesHeld(previous.getListeners(), () -> {
+                requireCertificates(region, previous.getListeners());
+                current.setListeners(new ArrayList<>(previous.getListeners()));
+                current.setSubnets(new ArrayList<>(previous.getSubnets()));
+                current.setAvailabilityZones(new ArrayList<>(previous.getAvailabilityZones()));
+                current.setSecurityGroups(new ArrayList<>(previous.getSecurityGroups()));
+                current.setInstanceIds(new ArrayList<>(previous.getInstanceIds()));
+                current.setHealthCheck(previous.getHealthCheck());
+                current.setAttributes(previous.getAttributes());
+                current.setTags(new LinkedHashMap<>(previous.getTags()));
+                current.setPolicies(previous.getPolicies());
+                current.setListenerPolicies(previous.getListenerPolicies());
+                populateSourceSecurityGroup(region, current);
+                persist(region, current);
+            });
+            emulatorOriginsChanged(current);
+            if (frontends == null || !frontends.enabled()) {
+                healthChecker.healthCheckChanged(current);
+                healthChecker.reconcileInstances(current);
+            }
+        }
     }
 
     /** The subset of {@code LoadBalancerAttributes} a request actually carried; unset stays unset. */
@@ -456,7 +802,7 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
                                   Integer idleTimeout,
                                   Map<String, String> additionalAttributes) {
 
-        void applyTo(io.floci.aws.services.elb.model.ClassicLoadBalancerAttributes attrs) {
+        void applyTo(ClassicLoadBalancerAttributes attrs) {
             if (crossZoneEnabled != null) attrs.setCrossZoneLoadBalancingEnabled(crossZoneEnabled);
             if (accessLogEnabled != null) attrs.setAccessLogEnabled(accessLogEnabled);
             if (accessLogS3BucketName != null) attrs.setAccessLogS3BucketName(accessLogS3BucketName);
@@ -472,50 +818,71 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
     }
 
     public List<String> applySecurityGroups(String region, String name, List<String> securityGroups) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        lb.setSecurityGroups(new ArrayList<>(securityGroups));
-        populateSourceSecurityGroup(region, lb);
-        persist(region);
-        return List.copyOf(lb.getSecurityGroups());
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            lb.setSecurityGroups(new ArrayList<>(securityGroups));
+            populateSourceSecurityGroup(region, lb);
+            persist(region, lb);
+            emulatorOriginsChanged(lb);
+            return List.copyOf(lb.getSecurityGroups());
+        }
     }
 
     public List<String> attachToSubnets(String region, String name, List<String> subnets) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        resolveSubnets(region, subnets);
-        for (String subnet : subnets) {
-            if (!lb.getSubnets().contains(subnet)) {
-                lb.getSubnets().add(subnet);
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            List<String> proposed = new ArrayList<>(lb.getSubnets());
+            for (String subnet : subnets) {
+                if (!proposed.contains(subnet)) {
+                    proposed.add(subnet);
+                }
             }
+            singleVpcId(resolveSubnets(region, proposed).values());
+            lb.setSubnets(proposed);
+            refreshZonesFromSubnets(region, lb);
+            persist(region, lb);
+            emulatorOriginsChanged(lb);
+            return List.copyOf(lb.getSubnets());
         }
-        refreshZonesFromSubnets(region, lb);
-        persist(region);
-        return List.copyOf(lb.getSubnets());
     }
 
     public List<String> detachFromSubnets(String region, String name, List<String> subnets) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        lb.getSubnets().removeAll(subnets);
-        refreshZonesFromSubnets(region, lb);
-        persist(region);
-        return List.copyOf(lb.getSubnets());
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            List<String> proposed = new ArrayList<>(lb.getSubnets());
+            proposed.removeAll(subnets);
+            if (proposed.isEmpty()) {
+                throw new AwsException("InvalidConfigurationRequest",
+                        "A VPC load balancer must retain at least one subnet.", 409);
+            }
+            lb.setSubnets(proposed);
+            refreshZonesFromSubnets(region, lb);
+            persist(region, lb);
+            emulatorOriginsChanged(lb);
+            return List.copyOf(lb.getSubnets());
+        }
     }
 
     public List<String> enableAvailabilityZones(String region, String name, List<String> zones) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        for (String zone : zones) {
-            if (!lb.getAvailabilityZones().contains(zone)) {
-                lb.getAvailabilityZones().add(zone);
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            for (String zone : zones) {
+                if (!lb.getAvailabilityZones().contains(zone)) {
+                    lb.getAvailabilityZones().add(zone);
+                }
             }
+            persist(region, lb);
+            return List.copyOf(lb.getAvailabilityZones());
         }
-        persist(region);
-        return List.copyOf(lb.getAvailabilityZones());
     }
 
     public List<String> disableAvailabilityZones(String region, String name, List<String> zones) {
-        ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-        lb.getAvailabilityZones().removeAll(zones);
-        persist(region);
-        return List.copyOf(lb.getAvailabilityZones());
+        try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+            ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+            lb.getAvailabilityZones().removeAll(zones);
+            persist(region, lb);
+            return List.copyOf(lb.getAvailabilityZones());
+        }
     }
 
     // ── Tags ──────────────────────────────────────────────────────────────────
@@ -526,23 +893,27 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
      */
     public synchronized void addTags(String region, List<String> names, Map<String, String> tags) {
         for (String name : names) {
-            ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-            Map<String, String> merged = new LinkedHashMap<>(lb.getTags());
-            merged.putAll(tags);
-            lb.setTags(merged);
+            try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                Map<String, String> merged = new LinkedHashMap<>(lb.getTags());
+                merged.putAll(tags);
+                lb.setTags(merged);
+                persist(region, lb);
+            }
         }
-        persist(region);
     }
 
     /** Gives each load balancer a new map without {@code tagKeys}, one tag call at a time. */
     public synchronized void removeTags(String region, List<String> names, Collection<String> tagKeys) {
         for (String name : names) {
-            ClassicLoadBalancer lb = requireLoadBalancer(region, name);
-            Map<String, String> remaining = new LinkedHashMap<>(lb.getTags());
-            remaining.keySet().removeAll(tagKeys);
-            lb.setTags(remaining);
+            try (RuntimeWrite ignored = runtimeWrite(region, name)) {
+                ClassicLoadBalancer lb = mutableLoadBalancer(region, name);
+                Map<String, String> remaining = new LinkedHashMap<>(lb.getTags());
+                remaining.keySet().removeAll(tagKeys);
+                lb.setTags(remaining);
+                persist(region, lb);
+            }
         }
-        persist(region);
     }
 
     /**
@@ -566,12 +937,110 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         return result;
     }
 
+    /**
+     * Every VPC load balancer with security groups at the shared edge, in every account. That edge
+     * sends health checks and backend requests from Floci's own address; a protected frontend sends
+     * them from its own namespace, which already carries the load balancer's groups.
+     */
+    @Override
+    public List<SecurityGroupNftCompiler.EmulatorOrigin> emulatorOrigins() {
+        if (frontends != null && frontends.enabled()) {
+            return List.of();
+        }
+        List<SecurityGroupNftCompiler.EmulatorOrigin> origins = new ArrayList<>();
+        for (StoredRegion stored : storedRegions()) {
+            for (ClassicLoadBalancer lb : stored.regionLbs().values()) {
+                String accountId = lb.getAccountId() != null ? lb.getAccountId() : stored.accountId();
+                List<String> groups = lb.getSecurityGroups();
+                if (accountId != null && lb.getVpcId() != null && groups != null && !groups.isEmpty()) {
+                    origins.add(new SecurityGroupNftCompiler.EmulatorOrigin(accountId, stored.region(),
+                            lb.getVpcId(), groups.stream().filter(Objects::nonNull).collect(Collectors.toSet())));
+                }
+            }
+        }
+        return origins;
+    }
+
+    private void emulatorOriginsChanged(ClassicLoadBalancer lb) {
+        if (lb.getVpcId() != null && (frontends == null || !frontends.enabled())
+                && securityGroupFirewall != null && securityGroupFirewall.isResolvable()) {
+            securityGroupFirewall.get().emulatorOriginsChanged();
+        }
+    }
+
     // ── Internals ─────────────────────────────────────────────────────────────
 
-    private void persist(String region) {
+    private void persist(String region, ClassicLoadBalancer loadBalancer) {
         Map<String, ClassicLoadBalancer> regionLbs = loadBalancers.get(region);
+        ClassicLoadBalancer previous = regionLbs != null
+                ? regionLbs.get(loadBalancer.getLoadBalancerName()) : null;
+        boolean changed = frontends != null && frontends.reconcile(loadBalancer);
         if (regionLbs != null) {
-            loadBalancers.put(region, regionLbs);
+            regionLbs.put(loadBalancer.getLoadBalancerName(), loadBalancer);
+            try {
+                persistRegion(region, regionLbs);
+            } catch (RuntimeException failure) {
+                if (previous != null) {
+                    regionLbs.put(previous.getLoadBalancerName(), previous);
+                    try {
+                        persistRegion(region, regionLbs);
+                    } catch (RuntimeException storageFailure) {
+                        if (storageFailure != failure) {
+                            failure.addSuppressed(storageFailure);
+                        }
+                    }
+                    if (changed) {
+                        try {
+                            frontends.reconcile(previous);
+                        } catch (RuntimeException frontendFailure) {
+                            if (frontendFailure != failure) {
+                                failure.addSuppressed(frontendFailure);
+                            }
+                        }
+                    }
+                }
+                throw failure;
+            }
+        }
+        if (changed) {
+            healthChecker.startMonitoring(loadBalancer);
+            healthChecker.reconcileInstances(loadBalancer);
+        } else if (previous != loadBalancer && (frontends == null || !frontends.enabled())) {
+            healthChecker.healthCheckChanged(loadBalancer);
+        }
+    }
+
+    private ClassicLoadBalancer mutableLoadBalancer(String region, String name) {
+        ClassicLoadBalancer loadBalancer = requireLoadBalancer(region, name);
+        return frontends != null ? frontends.copy(loadBalancer)
+                : SNAPSHOT_MAPPER.convertValue(loadBalancer, ClassicLoadBalancer.class);
+    }
+
+    private RuntimeWrite runtimeWrite(String region, String name) {
+        String account = regionResolver != null ? regionResolver.getAccountId()
+                : config != null ? config.defaultAccountId() : "";
+        String key = account + "/" + region + "/" + name;
+        try {
+            runtimeWrites.acquire(key);
+            return new RuntimeWrite(key);
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted waiting for a Classic load-balancer update", failure);
+        }
+    }
+
+    private final class RuntimeWrite implements AutoCloseable {
+        private final String key;
+
+        private RuntimeWrite(String key) {
+            this.key = key;
+        }
+
+        @Override
+        public void close() {
+            if (key != null) {
+                runtimeWrites.release(key);
+            }
         }
     }
 
@@ -596,6 +1065,13 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             if (!byId.containsKey(subnetId)) {
                 throw new AwsException("SubnetNotFound",
                         "The subnet ID '" + subnetId + "' does not exist", 400);
+            }
+        }
+        Set<String> zones = new LinkedHashSet<>();
+        for (Subnet subnet : byId.values()) {
+            if (!zones.add(subnet.getAvailabilityZone())) {
+                throw new AwsException("InvalidConfigurationRequest",
+                        "A load balancer can attach at most one subnet per Availability Zone.", 409);
             }
         }
         return byId;
@@ -764,6 +1240,10 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
             throw new AwsException("ValidationError",
                     "InstancePort must be between 1 and 65535.", 400);
         }
+        if (listener.getLoadBalancerPort() < 1 || listener.getLoadBalancerPort() > 65535) {
+            throw new AwsException("ValidationError",
+                    "LoadBalancerPort must be between 1 and 65535.", 400);
+        }
     }
 
     /**
@@ -775,6 +1255,13 @@ public class ElbClassicService implements ServerCertificateReferenceProvider {
         if (hc.getTarget() == null || hc.getTarget().isBlank()) {
             throw new AwsException("ValidationError",
                     "HealthCheck.Target is required.", 400);
+        }
+        ElbClassicHealthChecker.Target target = ElbClassicHealthChecker.Target.parse(hc.getTarget());
+        if (target == null || target.port() < 1 || target.port() > 65535) {
+            // A target the checker cannot read is never probed.
+            throw new AwsException("ValidationError",
+                    "HealthCheck.Target must be HTTP, HTTPS, TCP or SSL, a colon and a port between 1 and 65535,"
+                            + " for example HTTP:80/health.", 400);
         }
         requireRange("HealthCheck.Interval", hc.getInterval(), 5, 300);
         requireRange("HealthCheck.Timeout", hc.getTimeout(), 2, 60);

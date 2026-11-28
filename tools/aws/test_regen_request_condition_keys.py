@@ -132,8 +132,9 @@ def test_the_vendored_table_covers_its_namespaces():
         "route53:ChangeResourceRecordSets"]
     assert document["memberShapes"]["route53:ChangeResourceRecordSets"][
         "ChangeBatch.Changes.Change.ResourceRecordSet.Name"] == "DNSName"
-    assert document["protocols"] == {"eks": "rest-json", "lambda": "rest-json",
-                                     "redshift": "query", "route53": "rest-xml", "sts": "query"}
+    assert document["protocols"] == {"account": "rest-json", "eks": "rest-json",
+                                     "lambda": "rest-json", "redshift": "query",
+                                     "route53": "rest-xml", "ssm": "json", "sts": "query"}
 
 
 @pytest.mark.parametrize("changed", [
@@ -207,3 +208,24 @@ def test_assume_role_reads_its_session_name_and_external_id():
     assert document["actions"]["sts:AssumeRoleWithSAML"] == ["sts:RoleSessionName"]
     assert "sts:AssumeRoleWithSAML" not in document["members"]
     assert "sts:GetCallerIdentity" not in document["actions"]
+
+def test_account_region_conditions_match_all_three_named_operations_only():
+    document = json.loads(OUTPUT.read_text())
+    expected = {"account:" + operation: ["account:TargetRegion"]
+                for operation in ("EnableRegion", "DisableRegion", "GetRegionOptStatus")}
+    assert {action: keys for action, keys in document["actions"].items()
+            if action.startswith("account:")} == expected
+    assert {action: keys for action, keys in document["members"].items()
+            if action.startswith("account:")} == {
+        action: {"account:TargetRegion": ["RegionName"]} for action in expected}
+    assert "account:ListRegions" not in document["actions"]
+    assert "account:ListRegions" not in document["members"]
+
+
+def test_account_condition_member_cannot_silently_drift_to_a_different_field():
+    model = {"metadata": {"protocol": "rest-json"},
+             "operations": {"EnableRegion": {"input": {"shape": "Input"}}},
+             "shapes": {"Input": {"members": {"OtherRegion": {"shape": "String"}}},
+                        "String": {"type": "string"}}}
+    with pytest.raises(ValueError, match="no RegionName member"):
+        request_members("account", model, {"account:EnableRegion": ["account:TargetRegion"]})

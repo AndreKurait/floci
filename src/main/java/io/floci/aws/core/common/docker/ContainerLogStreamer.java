@@ -36,10 +36,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -137,6 +139,30 @@ public class ContainerLogStreamer {
             String accountId, String containerId, String logGroup, String logStream,
             String region, String logPrefix) {
         return attachForAccount(accountId, containerId, logGroup, logStream, region, logPrefix, null);
+    }
+
+    /** Registers live output pipes before a runtime that may immediately exit and be removed starts. */
+    public Closeable attachBeforeStartForAccount(
+            String accountId, String containerId, String logGroup, String logStream,
+            String region, String logPrefix, Duration readinessTimeout) {
+        ensureLogGroupAndStreamForAccount(accountId, logGroup, logStream, region);
+        LogReassemblyCallback callback = new LogReassemblyCallback(line -> {
+            String trimmed = line.stripTrailing();
+            if (!trimmed.isEmpty()) {
+                LOG.infov("[{0}] {1}", logPrefix, trimmed);
+                forwardToCloudWatchLogs(accountId, logGroup, logStream, region, trimmed);
+            }
+        });
+        try {
+            dockerClient.attachContainerCmd(containerId)
+                    .withStdOut(true).withStdErr(true).withFollowStream(true).withLogs(false)
+                    .exec(callback);
+            callback.awaitAttachment(readinessTimeout);
+            return new ContainerLogHandle(callback);
+        } catch (RuntimeException e) {
+            callback.closeTransportAndFlush();
+            throw e;
+        }
     }
 
     /**
@@ -300,7 +326,7 @@ public class ContainerLogStreamer {
 
     /** Observes reassembled lines from a newly created container without forwarding or logging them. */
     public Closeable observe(String containerId, Consumer<String> observer) {
-        return follow(containerId, null, new LogReassemblyCallback(observer, 0));
+        return follow(containerId, null, new LogReassemblyCallback(0, (stream, line) -> observer.accept(line)));
     }
 
     /**
@@ -400,6 +426,13 @@ public class ContainerLogStreamer {
             String accountId, String logGroup, String logStream, String region, String logPrefix,
             boolean logToConsole) {
         return frameCallback(accountId, logGroup, logStream, region, logPrefix, logToConsole);
+    }
+
+    /** Reassembles exec output into bounded UTF-8 lines, including the final unterminated line. */
+    public ResultCallback.Adapter<Frame> execLineLogCallbackForAccount(
+            String accountId, String logGroup, String logStream, String region) {
+        return new LogReassemblyCallback(
+                line -> forwardToCloudWatchLogs(accountId, logGroup, logStream, region, line));
     }
 
     /**
@@ -528,6 +561,9 @@ public class ContainerLogStreamer {
         // is still the only one emitting; a consumer that gathers lines sends them on from here.
         private final Runnable drained;
         private final long closeGraceMillis;
+        private final ScheduledExecutorService closeScheduler;
+        private final CompletableFuture<Void> attachment = new CompletableFuture<>();
+        private volatile Throwable attachmentFailure;
         // Guarded by 'buffers'. Set only by the Docker transport terminal callback; afterwards onNext
         // refuses to append, so nothing is ever buffered past the final flush.
         private boolean terminated;
@@ -540,11 +576,12 @@ public class ContainerLogStreamer {
         private boolean emitting;
 
         LogReassemblyCallback(Consumer<String> lineConsumer) {
-            this(lineConsumer, DEFAULT_CLOSE_GRACE_MILLIS);
+            this(lineConsumer, CLOSE_DRAIN_SCHEDULER);
         }
 
-        LogReassemblyCallback(Consumer<String> lineConsumer, long closeGraceMillis) {
-            this(closeGraceMillis, (stream, line) -> lineConsumer.accept(line));
+        /** The default close grace, timed by a scheduler a test moves itself. */
+        LogReassemblyCallback(Consumer<String> lineConsumer, ScheduledExecutorService closeScheduler) {
+            this(DEFAULT_CLOSE_GRACE_MILLIS, (stream, line) -> lineConsumer.accept(line), closeScheduler);
         }
 
         LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer) {
@@ -552,9 +589,56 @@ public class ContainerLogStreamer {
         }
 
         LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer, Runnable drained) {
+            this(closeGraceMillis, lineConsumer, drained, CLOSE_DRAIN_SCHEDULER);
+        }
+
+        private LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer,
+                                      ScheduledExecutorService closeScheduler) {
+            this(closeGraceMillis, lineConsumer, () -> { }, closeScheduler);
+        }
+
+        private LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer,
+                                      Runnable drained, ScheduledExecutorService closeScheduler) {
             this.lineConsumer = lineConsumer;
             this.drained = drained;
             this.closeGraceMillis = closeGraceMillis;
+            this.closeScheduler = closeScheduler;
+        }
+
+        @Override
+        public void onStart(Closeable stream) {
+            super.onStart(stream);
+            boolean alreadyTerminated;
+            synchronized (buffers) {
+                alreadyTerminated = terminated;
+            }
+            if (alreadyTerminated) {
+                closeTransportAndFlush();
+                return;
+            }
+            attachment.complete(null);
+        }
+
+        void awaitAttachment(Duration timeout) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Interrupted while attaching container output");
+            }
+            try {
+                attachment.get(Math.max(0, timeout.toNanos()), TimeUnit.NANOSECONDS);
+                if (attachmentFailure != null) {
+                    throw new IllegalStateException("Container output stream failed before start", attachmentFailure);
+                }
+                synchronized (buffers) {
+                    if (terminated) {
+                        throw new IllegalStateException("Container output stream ended before start");
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while attaching container output", e);
+            } catch (ExecutionException | TimeoutException e) {
+                throw new IllegalStateException("Container output stream was not ready before start", e);
+            }
         }
 
         @Override
@@ -591,6 +675,8 @@ public class ContainerLogStreamer {
         public void onComplete() {
             callbackGate.readLock().lock();
             try {
+                attachmentFailure = new IllegalStateException("Container output stream ended before start");
+                attachment.completeExceptionally(attachmentFailure);
                 flush();
                 super.onComplete();
             } finally {
@@ -602,6 +688,8 @@ public class ContainerLogStreamer {
         public void onError(Throwable throwable) {
             callbackGate.readLock().lock();
             try {
+                attachmentFailure = throwable;
+                attachment.completeExceptionally(throwable);
                 flush();
                 super.onError(throwable);
             } finally {
@@ -619,7 +707,7 @@ public class ContainerLogStreamer {
                     if (terminated || fallbackFinalization != null) {
                         return;
                     }
-                    fallbackFinalization = CLOSE_DRAIN_SCHEDULER.schedule(
+                    fallbackFinalization = closeScheduler.schedule(
                             this::closeTransportAndFlush, closeGraceMillis, TimeUnit.MILLISECONDS);
                 }
             }

@@ -19,10 +19,16 @@ public class ChangeSet {
     private String executionStatus = "AVAILABLE";
     private String statusReason;
     private String templateBody;
+    /** The transform result captured when this change set was created; absent for older stored change sets. */
+    private String processedTemplateBody;
+    /** A requested execution-role change is applied only when this change set executes. */
+    private String roleArn;
     private Map<String, String> parameters;
     private List<String> capabilities;
     private Map<String, String> tags;
-    private String changeSetType; // CREATE or UPDATE
+    private String changeSetType; // CREATE, UPDATE or IMPORT
+    private List<ResourceToImport> resourcesToImport = List.of();
+    private Map<String, String> importPhysicalIds = Map.of();
     private Instant creationTime = Instant.now();
     // AWS change sets carry no stack policy; this is the policy a CreateStack or UpdateStack
     // applies with its change set.
@@ -44,6 +50,10 @@ public class ChangeSet {
     public void setStatusReason(String statusReason) { this.statusReason = statusReason; }
     public String getTemplateBody() { return templateBody; }
     public void setTemplateBody(String templateBody) { this.templateBody = templateBody; }
+    public String getProcessedTemplateBody() { return processedTemplateBody; }
+    public void setProcessedTemplateBody(String processedTemplateBody) { this.processedTemplateBody = processedTemplateBody; }
+    public String getRoleArn() { return roleArn; }
+    public void setRoleArn(String roleArn) { this.roleArn = roleArn; }
     public Map<String, String> getParameters() { return parameters; }
     public void setParameters(Map<String, String> parameters) { this.parameters = parameters; }
     public List<String> getCapabilities() { return capabilities; }
@@ -52,6 +62,14 @@ public class ChangeSet {
     public void setTags(Map<String, String> tags) { this.tags = tags == null ? null : new LinkedHashMap<>(tags); }
     public String getChangeSetType() { return changeSetType; }
     public void setChangeSetType(String changeSetType) { this.changeSetType = changeSetType; }
+    public List<ResourceToImport> getResourcesToImport() { return resourcesToImport; }
+    public Map<String, String> getImportPhysicalIds() { return importPhysicalIds; }
+    public void setImportPhysicalIds(Map<String, String> importPhysicalIds) {
+        this.importPhysicalIds = Map.copyOf(importPhysicalIds);
+    }
+    public void setResourcesToImport(List<ResourceToImport> resourcesToImport) {
+        this.resourcesToImport = List.copyOf(resourcesToImport);
+    }
     public Instant getCreationTime() { return creationTime; }
     public void setCreationTime(Instant creationTime) { this.creationTime = creationTime; }
     public String getStackPolicyBody() { return stackPolicyBody; }

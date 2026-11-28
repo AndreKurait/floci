@@ -41,7 +41,7 @@ class FlociDuckClientServiceTest {
     void executeOmitsNullOutputPath() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         AtomicReference<JsonNode> requestBody = new AtomicReference<>();
-        server = HttpServer.create(new InetSocketAddress(0), 0);
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/execute", exchange -> {
             String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
             requestBody.set(mapper.readTree(body));
@@ -76,7 +76,7 @@ class FlociDuckClientServiceTest {
         // host, so the sidecar must call Floci on the port it listens on.
         ObjectMapper mapper = new ObjectMapper();
         AtomicReference<JsonNode> requestBody = new AtomicReference<>();
-        server = HttpServer.create(new InetSocketAddress(0), 0);
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/execute", exchange -> {
             requestBody.set(mapper.readTree(exchange.getRequestBody().readAllBytes()));
             exchange.sendResponseHeaders(200, -1);
@@ -105,7 +105,7 @@ class FlociDuckClientServiceTest {
     void executeInjectsSessionTokenDdlAndPassesCredentials() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         AtomicReference<JsonNode> requestBody = new AtomicReference<>();
-        server = HttpServer.create(new InetSocketAddress(0), 0);
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/execute", exchange -> {
             requestBody.set(mapper.readTree(exchange.getRequestBody().readAllBytes()));
             exchange.sendResponseHeaders(200, -1);
@@ -142,7 +142,7 @@ class FlociDuckClientServiceTest {
     void queryInjectsSessionTokenDdlAndPassesCredentials() throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         AtomicReference<JsonNode> requestBody = new AtomicReference<>();
-        server = HttpServer.create(new InetSocketAddress(0), 0);
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/query", exchange -> {
             requestBody.set(mapper.readTree(exchange.getRequestBody().readAllBytes()));
             String response = "{\"status\": \"success\", \"rows\": [{\"col\": 1}]}";

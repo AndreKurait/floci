@@ -9,10 +9,13 @@ import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.datagram.DatagramSocket;
+import io.vertx.core.net.NetServer;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.InetAddress;
 import java.net.SocketException;
@@ -34,6 +37,7 @@ import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** The address the embedded DNS server gives the containers Floci launches. */
@@ -59,6 +63,7 @@ class EmbeddedDnsServerAddressTest {
 
     private final Vertx vertx = mock(Vertx.class);
     private final DatagramSocket socket = mock(DatagramSocket.class);
+    private final NetServer tcp = mock(NetServer.class);
     private final DockerBridgeAddress dockerBridge = mock(DockerBridgeAddress.class);
 
     private static EmulatorConfig config(OptionalInt hostPort, boolean bridgeListenerEnabled) {
@@ -79,6 +84,14 @@ class EmbeddedDnsServerAddressTest {
         CurrentContainerNetworkResolver currentContainer = mock(CurrentContainerNetworkResolver.class);
         when(currentContainer.resolveContainerIp()).thenReturn(Optional.of("172.19.0.2"));
         when(vertx.createDatagramSocket(any())).thenReturn(socket);
+        when(socket.close()).thenReturn(Future.succeededFuture());
+        when(vertx.createNetServer(any())).thenReturn(tcp);
+        when(tcp.connectHandler(any())).thenReturn(tcp);
+        when(tcp.close()).thenReturn(Future.succeededFuture());
+        when(tcp.listen(anyInt(), anyString())).thenAnswer(invocation -> {
+            when(tcp.actualPort()).thenReturn(invocation.getArgument(0));
+            return Future.succeededFuture(tcp);
+        });
         return new EmbeddedDnsServer(config, containerDetector, vertx, mock(Instance.class),
                 mock(Instance.class), mock(Instance.class), currentContainer, dockerBridge);
     }
@@ -92,6 +105,7 @@ class EmbeddedDnsServerAddressTest {
 
         assertEquals(Optional.of("172.19.0.2"), server.getServerIp());
         verify(socket).listen(53, "172.19.0.2");
+        verify(tcp).listen(53, "172.19.0.2");
         verify(socket, never()).listen(5354, "127.0.0.1");
         verify(dockerBridge, never()).resolve();
     }
@@ -106,6 +120,7 @@ class EmbeddedDnsServerAddressTest {
         EmbeddedDnsServer server = server(config(OptionalInt.empty(), true), false);
 
         assertEquals(Optional.of("172.17.0.1"), server.getServerIp());
+        verify(tcp).listen(53, "172.17.0.1");
     }
 
     // Catches: the host listener handed to containers, which cannot reach the host's loopback.
@@ -116,6 +131,7 @@ class EmbeddedDnsServerAddressTest {
         EmbeddedDnsServer server = server(config(OptionalInt.of(5354), false), false);
 
         verify(socket).listen(5354, "127.0.0.1");
+        verify(tcp).listen(5354, "127.0.0.1");
         assertEquals(Optional.empty(), server.getServerIp());
     }
 
@@ -177,5 +193,55 @@ class EmbeddedDnsServerAddressTest {
         server(config(OptionalInt.of(70000), false), false);
 
         verify(socket, never()).listen(anyInt(), anyString());
+    }
+    @Test
+    void explicitListenerUsesItsAddressWithoutResolvingAContainer() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.dns().listenAddress()).thenReturn(Optional.of("127.0.0.2"));
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+
+        assertEquals("127.0.0.2", EmbeddedDnsServer.resolveServerIp(config, resolver));
+        verifyNoInteractions(resolver);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0.0.0.0", "::1", "224.0.0.1", "resolver.example.test", "not an address"})
+    void listenerRequiresAConcreteIpv4Address(String value) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.dns().listenAddress()).thenReturn(Optional.of(value));
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+
+        assertThrows(IllegalArgumentException.class, () -> EmbeddedDnsServer.resolveServerIp(config, resolver));
+        verifyNoInteractions(resolver);
+    }
+
+    @Test
+    void usesReachableContainerAddressInsteadOfSystemHostname() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+        when(resolver.resolveContainerIp()).thenReturn(Optional.of("172.26.0.2"));
+
+        assertEquals("172.26.0.2", EmbeddedDnsServer.resolveServerIp(config, resolver));
+    }
+
+    @Test
+    void explicitNetworkCannotSilentlyFallBackToAnotherHostInterface() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.of("services-network"));
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+        when(resolver.resolveContainerIp()).thenReturn(Optional.empty());
+
+        assertThrows(IllegalStateException.class, () -> EmbeddedDnsServer.resolveServerIp(config, resolver));
+    }
+
+    @Test
+    void unconfiguredStandaloneContainerRetainsHostnameFallback() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dockerNetwork()).thenReturn(Optional.empty());
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+        when(resolver.resolveContainerIp()).thenReturn(Optional.empty());
+
+        assertEquals(InetAddress.getLocalHost().getHostAddress(),
+                EmbeddedDnsServer.resolveServerIp(config, resolver));
     }
 }

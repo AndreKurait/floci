@@ -953,7 +953,7 @@ class TaskPermissionsTest {
                     null, false, new TaskPermissions.ControlServices(null, null, null, null)).isPresent(),
                 action.group(1));
         }
-        assertEquals(36, actions);
+        assertEquals(37, actions);
     }
 
     /** An API the handler does not serve is checked as the direct request is, and the handler answers it. */

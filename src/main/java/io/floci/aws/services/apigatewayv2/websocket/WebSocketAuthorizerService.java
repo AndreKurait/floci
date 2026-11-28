@@ -3,9 +3,14 @@ package io.floci.aws.services.apigatewayv2.websocket;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
+import io.floci.aws.core.common.ServiceRoleCallAuthorizer;
 import io.floci.aws.services.apigateway.AuthorizerPolicyEvaluator;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.apigatewayv2.model.Authorizer;
+import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
@@ -36,17 +41,26 @@ public class WebSocketAuthorizerService {
     private final ObjectMapper objectMapper;
     private final AuthorizerPolicyEvaluator authorizerPolicyEvaluator;
 
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
+    private final ServiceRoleCallAuthorizer serviceRoleCallAuthorizer;
+    private final RegionResolver regionResolver;
+
     @Inject
     public WebSocketAuthorizerService(ApiGatewayV2Service apiGatewayV2Service,
                                       LambdaService lambdaService,
                                       WebSocketProxyEventBuilder proxyEventBuilder,
                                       ObjectMapper objectMapper,
-                                      AuthorizerPolicyEvaluator authorizerPolicyEvaluator) {
+                                      AuthorizerPolicyEvaluator authorizerPolicyEvaluator,
+                                      ServiceCallAuthorizer serviceCallAuthorizer, RegionResolver regionResolver,
+                                      ServiceRoleCallAuthorizer serviceRoleCallAuthorizer) {
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
         this.proxyEventBuilder = proxyEventBuilder;
         this.objectMapper = objectMapper;
         this.authorizerPolicyEvaluator = authorizerPolicyEvaluator;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
+        this.regionResolver = regionResolver;
+        this.serviceRoleCallAuthorizer = serviceRoleCallAuthorizer;
     }
 
     /**
@@ -134,10 +148,27 @@ public class WebSocketAuthorizerService {
         // Invoke the authorizer Lambda
         InvokeResult invokeResult;
         try {
-            invokeResult = lambdaService.invokeTarget(region, functionName,
+            String accountId = regionResolver.getAccountId();
+            String functionArn = LambdaArnUtils.functionArn(functionName, regionResolver.getPartition(),
+                    region, accountId);
+            String credentials = authorizer.getAuthorizerCredentialsArn();
+            Decision decision;
+            if (credentials == null || credentials.isBlank()) {
+                String sourceArn = AwsArnUtils.Arn.of("execute-api", region, accountId,
+                        apiId + "/authorizers/" + authorizerId).toString();
+                decision = serviceCallAuthorizer.authorize("apigateway", "lambda:InvokeFunction", functionArn,
+                        sourceArn, accountId);
+            } else {
+                decision = serviceRoleCallAuthorizer.authorizeWithoutSourceContext("apigateway", credentials,
+                        "lambda:InvokeFunction", functionArn, accountId, regionResolver.getPartition());
+            }
+            if (decision == Decision.DENY) {
+                return AuthorizerResult.error();
+            }
+            invokeResult = lambdaService.invokeTarget(region, functionArn,
                     authorizerEventJson.getBytes(), InvocationType.RequestResponse);
         } catch (Exception e) {
-            LOG.warnv("Lambda authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Lambda authorizer invocation failed for API {0}: {1}", apiId, e.getMessage());
             return AuthorizerResult.error();
         }
 
@@ -185,7 +216,7 @@ public class WebSocketAuthorizerService {
 
             return AuthorizerResult.allow(context);
         } catch (Exception e) {
-            LOG.warnv("Failed to parse authorizer policy for API {0}: {1}", apiId, e.getMessage());
+            LOG.warnv(e, "Failed to parse authorizer policy for API {0}: {1}", apiId, e.getMessage());
             return AuthorizerResult.error();
         }
     }

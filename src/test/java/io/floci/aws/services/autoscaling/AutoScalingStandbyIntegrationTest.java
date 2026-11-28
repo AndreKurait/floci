@@ -1,25 +1,36 @@
 package io.floci.aws.services.autoscaling;
 
 import io.floci.aws.testing.AlbFixtures;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.xml.XmlPath;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
+import software.amazon.awssdk.services.autoscaling.model.AutoScalingException;
+import software.amazon.awssdk.services.autoscaling.model.AutoScalingGroup;
+import software.amazon.awssdk.services.autoscaling.model.CreateAutoScalingGroupRequest;
+import software.amazon.awssdk.services.autoscaling.model.CreateLaunchConfigurationRequest;
+import software.amazon.awssdk.services.autoscaling.model.DeleteAutoScalingGroupRequest;
+import software.amazon.awssdk.services.autoscaling.model.DeleteLaunchConfigurationRequest;
+import software.amazon.awssdk.services.autoscaling.model.EnterStandbyResponse;
+import software.amazon.awssdk.services.autoscaling.model.ExitStandbyResponse;
+import software.amazon.awssdk.services.autoscaling.model.LifecycleState;
 
+import java.net.URI;
 import java.util.List;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * The standby round trip a client stopping a node's traffic makes, over the Query API: lower MinSize,
- * EnterStandby with ShouldDecrementDesiredCapacity, wait for Standby, later ExitStandby and wait for
- * InService. On the way the instance leaves and rejoins the group's target group and Classic load balancer,
- * and the group launches no replacement for it.
- */
 @QuarkusTest
 class AutoScalingStandbyIntegrationTest {
 
@@ -32,6 +43,8 @@ class AutoScalingStandbyIntegrationTest {
             + ".AutoScalingGroups.member";
     private static final String ENTERED = "EnterStandbyResponse.EnterStandbyResult.Activities.member";
     private static final String EXITED = "ExitStandbyResponse.ExitStandbyResult.Activities.member";
+    @TestHTTPResource
+    URI endpoint;
 
     @Inject
     AutoScalingReconciler reconciler;
@@ -163,31 +176,102 @@ class AutoScalingStandbyIntegrationTest {
     }
 
     @Test
-    void errorsUseTheQueryErrorShape() {
-        XmlPath missing = given().header("Authorization", AUTH).formParam("Action", "EnterStandby")
-                .formParam("AutoScalingGroupName", "no-such-standby-group")
-                .formParam("InstanceIds.member.1", "i-0123456789abcdef0")
-                .formParam("ShouldDecrementDesiredCapacity", "false")
-                .post("/").then().statusCode(400).extract().xmlPath();
-        assertEquals("ValidationError", missing.getString("ErrorResponse.Error.Code"));
-        assertEquals("Sender", missing.getString("ErrorResponse.Error.Type"));
-
-        XmlPath noDecrement = given().header("Authorization", AUTH).formParam("Action", "EnterStandby")
-                .formParam("AutoScalingGroupName", "no-such-standby-group")
-                .post("/").then().statusCode(400).extract().xmlPath();
-        assertEquals("1 validation error detected: Value null at 'shouldDecrementDesiredCapacity' failed to"
-                + " satisfy constraint: Member must not be null", noDecrement.getString("ErrorResponse.Error.Message"));
+    void standbyPreservesMembershipAndRestoresCapacityThroughSdk() {
+        String name = "standby-" + UUID.randomUUID();
+        try (AutoScalingClient client = AutoScalingClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create("414141414141", "test"))).build()) {
+            withStandbyGroup(client, name, () -> {
+                reconciler.reconcileAll();
+                reconciler.reconcileAll();
+                String id = group(client, name).instances().getFirst().instanceId();
+                AutoScalingException minimum = assertThrows(AutoScalingException.class,
+                        () -> client.enterStandby(r -> r.autoScalingGroupName(name)
+                                .instanceIds(id).shouldDecrementDesiredCapacity(true)));
+                assertEquals("ValidationError", minimum.awsErrorDetails().errorCode());
+                assertEquals(LifecycleState.IN_SERVICE, group(client, name).instances().getFirst().lifecycleState());
+                client.updateAutoScalingGroup(r -> r.autoScalingGroupName(name).minSize(0));
+                EnterStandbyResponse response = client.enterStandby(r -> r.autoScalingGroupName(name)
+                        .instanceIds(id).shouldDecrementDesiredCapacity(true));
+                assertEquals(1, response.activities().size());
+                assertEquals("InProgress", response.activities().getFirst().statusCodeAsString());
+                reconciler.reconcileAll();
+                assertEquals(0, group(client, name).desiredCapacity());
+                assertEquals(1, group(client, name).instances().size());
+                assertEquals(LifecycleState.STANDBY, group(client, name).instances().getFirst().lifecycleState());
+                assertEquals("Standby", client.describeAutoScalingInstances(r -> r.instanceIds(id))
+                        .autoScalingInstances().getFirst().lifecycleState());
+                assertThrows(AutoScalingException.class, () -> client.enterStandby(r -> r.autoScalingGroupName(name)
+                        .instanceIds(id).shouldDecrementDesiredCapacity(true)));
+                ExitStandbyResponse exiting = client.exitStandby(r -> r.autoScalingGroupName(name).instanceIds(id));
+                assertEquals(1, exiting.activities().size());
+                assertEquals("PreInService", exiting.activities().getFirst().statusCodeAsString());
+                reconciler.reconcileAll();
+                assertEquals(1, group(client, name).desiredCapacity());
+                assertEquals(id, group(client, name).instances().getFirst().instanceId());
+                assertEquals(LifecycleState.IN_SERVICE, group(client, name).instances().getFirst().lifecycleState());
+                // Keeping desired capacity launches a replacement without terminating the standby member.
+                client.enterStandby(r -> r.autoScalingGroupName(name).instanceIds(id).shouldDecrementDesiredCapacity(false));
+                reconciler.reconcileAll();
+                reconciler.reconcileAll();
+                assertEquals(1, group(client, name).desiredCapacity());
+                assertEquals(2, group(client, name).instances().size());
+                client.updateAutoScalingGroup(r -> r.autoScalingGroupName(name).maxSize(1));
+                assertThrows(AutoScalingException.class, () -> client.exitStandby(r -> r.autoScalingGroupName(name).instanceIds(id)));
+                assertEquals(1, group(client, name).desiredCapacity());
+                client.updateAutoScalingGroup(r -> r.autoScalingGroupName(name).maxSize(2));
+                client.exitStandby(r -> r.autoScalingGroupName(name).instanceIds(id));
+                assertEquals(2, group(client, name).desiredCapacity());
+            });
+        }
     }
 
-    private static XmlPath group(String name) {
-        return given().header("Authorization", AUTH).formParam("Action", "DescribeAutoScalingGroups")
-                .formParam("AutoScalingGroupNames.member.1", name)
-                .post("/").then().statusCode(200).extract().xmlPath();
+    @Test
+    void failedBodyCleansActualGroupAndLaunchConfiguration() {
+        String name = "standby-cleanup-" + UUID.randomUUID();
+        AssertionError primary = new AssertionError("Injected after successful group creation");
+        try (AutoScalingClient client = AutoScalingClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create("414141414141", "test"))).build()) {
+            AssertionError actual = assertThrows(AssertionError.class, () -> withStandbyGroup(client, name, () -> {
+                assertEquals(name, group(client, name).autoScalingGroupName());
+                assertEquals(1, client.describeLaunchConfigurations(r -> r.launchConfigurationNames(name))
+                        .launchConfigurations().size());
+                throw primary;
+            }));
+            assertSame(primary, actual);
+            assertTrue(client.describeAutoScalingGroups(r -> r.autoScalingGroupNames(name)).autoScalingGroups().isEmpty());
+            assertTrue(client.describeLaunchConfigurations(r -> r.launchConfigurationNames(name)).launchConfigurations().isEmpty());
+        }
     }
 
-    private static String member(XmlPath group, String instanceId, String field) {
-        return group.getString(GROUP_PATH + ".Instances.member.find { it.InstanceId == '" + instanceId + "' }."
-                + field);
+    static void withStandbyGroup(AutoScalingClient client, String name, Runnable body) {
+        try (Cleanup launch = () -> deleteOwned(() -> client.deleteLaunchConfiguration(
+                DeleteLaunchConfigurationRequest.builder().launchConfigurationName(name).build()),
+                "Launch configuration '" + name + "' not found.")) {
+            client.createLaunchConfiguration(CreateLaunchConfigurationRequest.builder().launchConfigurationName(name)
+                    .imageId("ami-amazonlinux2023").instanceType("t3.micro").build());
+            try (Cleanup group = () -> deleteOwned(() -> client.deleteAutoScalingGroup(
+                    DeleteAutoScalingGroupRequest.builder().autoScalingGroupName(name).forceDelete(true).build()),
+                    "Auto Scaling group '" + name + "' not found.")) {
+                client.createAutoScalingGroup(CreateAutoScalingGroupRequest.builder().autoScalingGroupName(name)
+                        .launchConfigurationName(name).minSize(1).maxSize(2).desiredCapacity(1)
+                        .availabilityZones("us-east-1a").build());
+                body.run();
+            }
+        }
+    }
+
+    static void deleteOwned(Runnable delete, String missingMessage) {
+        try {
+            delete.run();
+        } catch (AutoScalingException expected) {
+            // A failed create may leave no resource; tolerate only this exact owned name being absent.
+            if (expected.awsErrorDetails() == null || !"ValidationError".equals(expected.awsErrorDetails().errorCode())
+                    || !missingMessage.equals(expected.awsErrorDetails().errorMessage())) {
+                throw expected;
+            }
+        }
     }
 
     private static List<String> classicInstances(String loadBalancer) {
@@ -204,5 +288,42 @@ class AutoScalingStandbyIntegrationTest {
                 .post("/").then().statusCode(200).extract().xmlPath()
                 .getString("DescribeScalingActivitiesResponse.DescribeScalingActivitiesResult.Activities.member"
                         + ".find { it.ActivityId == '" + activityId + "' }." + field);
+    }
+
+    private interface Cleanup extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    private static AutoScalingGroup group(AutoScalingClient client, String name) {
+        return client.describeAutoScalingGroups(r -> r.autoScalingGroupNames(name)).autoScalingGroups().getFirst();
+    }
+    private static XmlPath group(String name) {
+        return given().header("Authorization", AUTH).formParam("Action", "DescribeAutoScalingGroups")
+                .formParam("AutoScalingGroupNames.member.1", name)
+                .post("/").then().statusCode(200).extract().xmlPath();
+    }
+
+    private static String member(XmlPath group, String instanceId, String field) {
+        return group.getString(GROUP_PATH + ".Instances.member.find { it.InstanceId == '" + instanceId + "' }."
+                + field);
+    }
+
+
+    @Test
+    void errorsUseTheQueryErrorShape() {
+        XmlPath missing = given().header("Authorization", AUTH).formParam("Action", "EnterStandby")
+                .formParam("AutoScalingGroupName", "no-such-standby-group")
+                .formParam("InstanceIds.member.1", "i-0123456789abcdef0")
+                .formParam("ShouldDecrementDesiredCapacity", "false")
+                .post("/").then().statusCode(400).extract().xmlPath();
+        assertEquals("ValidationError", missing.getString("ErrorResponse.Error.Code"));
+        assertEquals("Sender", missing.getString("ErrorResponse.Error.Type"));
+
+        XmlPath noDecrement = given().header("Authorization", AUTH).formParam("Action", "EnterStandby")
+                .formParam("AutoScalingGroupName", "no-such-standby-group")
+                .post("/").then().statusCode(400).extract().xmlPath();
+        assertEquals("1 validation error detected: Value null at 'shouldDecrementDesiredCapacity' failed to"
+                + " satisfy constraint: Member must not be null", noDecrement.getString("ErrorResponse.Error.Message"));
     }
 }

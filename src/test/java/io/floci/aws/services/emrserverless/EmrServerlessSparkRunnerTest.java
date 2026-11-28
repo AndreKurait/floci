@@ -6,6 +6,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.exception.InternalServerErrorException;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
@@ -19,6 +20,7 @@ import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
+import io.floci.aws.services.ecr.registry.EcrWorkloadImagePull;
 import io.floci.aws.services.lambda.launcher.BootstrapProcess;
 import io.floci.aws.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.floci.aws.services.lambda.launcher.LambdaExecutionRoleCredentials;
@@ -48,6 +50,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -57,6 +60,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -2392,12 +2396,89 @@ class EmrServerlessSparkRunnerTest {
         verify(lifecycle, never()).removeIfExists("hdfs");
     }
 
+    @Test
+    void customImagePullUsesApplicationServiceGrantAndForwardsItsCredential() {
+        ContainerBuilder builder = mock(ContainerBuilder.class);
+        ContainerBuilder.Builder spec = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
+        String custom = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/spark/custom:7.5.0";
+        String image = "localhost:5100/123456789012/eu-west-1/spark/custom:7.5.0";
+        String application = "arn:aws:emr-serverless:eu-west-1:123456789012:/applications/app";
+        AuthConfig credential = new AuthConfig().withRegistryAddress("localhost:5100")
+                .withUsername("AWS").withPassword("scoped");
+        EcrWorkloadImagePull pulls = mock(EcrWorkloadImagePull.class);
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        when(builder.newContainer(anyString())).thenReturn(spec);
+        when(builder.resolveImage(image)).thenReturn(image);
+        when(ecr.rewriteImageUri(custom)).thenReturn(image);
+        when(pulls.withEmrServerlessPull(eq(image), eq(application), any())).thenAnswer(invocation -> {
+            Function<AuthConfig, LaunchImage> operation = invocation.getArgument(2);
+            return operation.apply(credential);
+        });
+        when(lifecycle.resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, null, credential))
+                .thenReturn(new LaunchImage("sha256:pulled", "sha256:manifest"));
+
+        runner(builder, pulls).run(customImageJob(custom).withImagePullSourceArn(application), progress);
+
+        verify(pulls).withEmrServerlessPull(eq(image), eq(application), any());
+        verify(lifecycle).resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, null, credential);
+        verify(lifecycle, never()).resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, null);
+        verify(builder).newContainer("sha256:pulled");
+    }
+
+    @Test
+    void deniedCustomImageNeverFallsBackToJobRoleOrUncredentialedCache() {
+        ContainerBuilder builder = mock(ContainerBuilder.class);
+        String custom = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/spark/custom:7.5.0";
+        String image = "localhost:5100/123456789012/eu-west-1/spark/custom:7.5.0";
+        String application = "arn:aws:emr-serverless:eu-west-1:123456789012:/applications/app";
+        EcrWorkloadImagePull pulls = mock(EcrWorkloadImagePull.class);
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        when(builder.resolveImage(image)).thenReturn(image);
+        when(ecr.rewriteImageUri(custom)).thenReturn(image);
+        when(pulls.withEmrServerlessPull(eq(image), eq(application), any()))
+                .thenThrow(new AwsException("DENIED", "Image access denied", 403));
+
+        SparkJobRunner.Outcome outcome = runner(builder, pulls).run(
+                customImageJob(custom).withImagePullSourceArn(application), progress);
+
+        assertEquals("Image access denied", outcome.failure());
+        verify(lifecycle, never()).resolveImageForLaunch(anyString(), any(), any());
+        verify(lifecycle, never()).create(any());
+        verify(builder, never()).newContainer(anyString());
+        verify(progress, never()).started();
+    }
+
+    @Test
+    void missingOrForeignApplicationIdentityNeverEntersImageCache() {
+        ContainerBuilder builder = mock(ContainerBuilder.class);
+        String custom = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/spark/custom:7.5.0";
+        String image = "localhost:5100/123456789012/eu-west-1/spark/custom:7.5.0";
+        EcrWorkloadImagePull pulls = mock(EcrWorkloadImagePull.class);
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        when(builder.resolveImage(image)).thenReturn(image);
+        when(ecr.rewriteImageUri(custom)).thenReturn(image);
+        EmrServerlessSparkRunner runner = runner(builder, pulls);
+        for (String source : Arrays.asList(null,
+                "arn:aws:emr-serverless:eu-west-1:222222222222:/applications/app",
+                "arn:aws:emr-serverless:us-east-1:123456789012:/applications/app")) {
+            assertEquals("The application's image-pull identity is unavailable",
+                    runner.run(customImageJob(custom).withImagePullSourceArn(source), progress).failure());
+        }
+        verify(pulls, never()).withEmrServerlessPull(anyString(), anyString(), any());
+        verify(lifecycle, never()).resolveImageForLaunch(anyString(), any(), any());
+        verify(lifecycle, never()).create(any());
+    }
+
     // A runner whose driver container, "driver", starts at once and exits with code 0 unless a test says otherwise.
     private EmrServerlessSparkRunner runner() {
         return runner(mock(ContainerBuilder.class, RETURNS_DEEP_STUBS));
     }
 
     private EmrServerlessSparkRunner runner(ContainerBuilder builder) {
+        return runner(builder, null);
+    }
+
+    private EmrServerlessSparkRunner runner(ContainerBuilder builder, EcrWorkloadImagePull pulls) {
         when(lifecycle.getDockerClient()).thenReturn(docker);
         when(lifecycle.create(any())).thenReturn("driver");
         when(lifecycle.startCreated(eq("driver"), any())).thenReturn(new ContainerLifecycleManager.ContainerInfo(
@@ -2409,7 +2490,7 @@ class EmrServerlessSparkRunnerTest {
         when(lifecycle.resolveImageForLaunch(anyString(), eq(ImagePullBehavior.PREFER_CACHED), isNull()))
                 .thenAnswer(pull -> new LaunchImage(pull.getArgument(0), null));
         return new EmrServerlessSparkRunner(builder, lifecycle, logStreamer, awsEnv,
-                mock(LambdaExecutionRoleCredentials.class), s3, ecr, config, new MutableClock(), Duration.ZERO);
+                mock(LambdaExecutionRoleCredentials.class), s3, ecr, config, new MutableClock(), Duration.ZERO, pulls);
     }
 
     // What the driver wrote, as Docker gives it once asked for an ended container's output.

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.iam.IamClient;
 
+import java.time.Duration;
 import java.util.List;
 
 import static io.restassured.RestAssured.given;
@@ -828,21 +829,27 @@ class CloudFormationIamInlinePolicyIntegrationTest {
 
     /** DeleteStack runs asynchronously; poll until the inline policy has been detached (404) or time out. */
     private static void awaitInlinePolicyGone(String roleName, String policyName) throws InterruptedException {
-        for (int i = 0; i < 100; i++) {
-            int sc = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", IAM_AUTH)
                 .formParam("Action", "GetRolePolicy")
                 .formParam("RoleName", roleName)
                 .formParam("PolicyName", policyName)
-            .when().post("/").then().extract().statusCode();
-            if (sc == 404) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        throw new AssertionError("Timed out waiting for inline policy " + policyName
-                + " to be detached from role " + roleName);
+            .when().post("/").then().extract().statusCode(),
+                status -> status == 404,
+                status -> "Timed out waiting for inline policy " + policyName
+                        + " to be detached from role " + roleName);
+    }
+
+    private static void awaitManagedPolicyGone(String policyArn) throws InterruptedException {
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), () -> given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", IAM_AUTH)
+                .formParam("Action", "GetPolicy")
+                .formParam("PolicyArn", policyArn)
+            .when().post("/").then().extract().statusCode(),
+                status -> status == 404,
+                status -> "Timed out waiting for managed policy " + policyArn + " to be deleted");
     }
 
     private static void assertFailedResource(String stackName, String logicalId,

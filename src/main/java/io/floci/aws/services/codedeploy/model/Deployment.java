@@ -14,15 +14,18 @@ public class Deployment {
     private String applicationName;
     private String deploymentGroupName;
     private String deploymentConfigName;
-    private String status;
+    private volatile String status;
     private Map<String, Object> revision;
     private Double createTime;
-    private Double startTime;
-    private Double completeTime;
-    private Map<String, String> errorInformation;
+    private volatile Double startTime;
+    private volatile Double completeTime;
+    private volatile Map<String, String> errorInformation;
     private String description;
     private String creator;
     private String computePlatform;
+    private String fileExistsBehavior;
+    private Map<String, Object> autoRollbackConfiguration;
+    private volatile Map<String, String> rollbackInfo;
 
     public String getDeploymentId() { return deploymentId; }
     public void setDeploymentId(String deploymentId) { this.deploymentId = deploymentId; }
@@ -62,4 +65,13 @@ public class Deployment {
 
     public String getComputePlatform() { return computePlatform; }
     public void setComputePlatform(String computePlatform) { this.computePlatform = computePlatform; }
+
+    public String getFileExistsBehavior() { return fileExistsBehavior; }
+    public void setFileExistsBehavior(String fileExistsBehavior) { this.fileExistsBehavior = fileExistsBehavior; }
+
+    public Map<String, Object> getAutoRollbackConfiguration() { return autoRollbackConfiguration; }
+    public void setAutoRollbackConfiguration(Map<String, Object> configuration) { this.autoRollbackConfiguration = configuration; }
+
+    public Map<String, String> getRollbackInfo() { return rollbackInfo; }
+    public void setRollbackInfo(Map<String, String> rollbackInfo) { this.rollbackInfo = rollbackInfo; }
 }

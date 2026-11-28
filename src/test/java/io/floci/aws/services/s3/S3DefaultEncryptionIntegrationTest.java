@@ -1,12 +1,17 @@
 package io.floci.aws.services.s3;
 
 import io.floci.aws.testing.S3TestClients;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.kms.KmsClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
@@ -19,6 +24,7 @@ import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 import software.amazon.awssdk.services.s3.model.UploadPartCopyResponse;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -34,7 +40,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 @QuarkusTest
 class S3DefaultEncryptionIntegrationTest {
 
-    private static final String KMS_KEY = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555";
+    @TestHTTPResource
+    URI endpoint;
+
+    private KmsClient kms;
+    private String kmsKey;
 
     private final List<String> otherBuckets = new ArrayList<>();
     private S3Client s3;
@@ -43,6 +53,10 @@ class S3DefaultEncryptionIntegrationTest {
     @BeforeEach
     void createBucket() {
         s3 = S3TestClients.pathStyle();
+        kms = KmsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create("741624100001", "test"))).build();
+        kmsKey = kms.createKey().keyMetadata().arn();
         bucket = "default-encryption-" + UUID.randomUUID();
         s3.createBucket(r -> r.bucket(bucket));
     }
@@ -53,7 +67,12 @@ class S3DefaultEncryptionIntegrationTest {
             S3TestClients.deleteBucket(s3, bucket);
             otherBuckets.forEach(other -> S3TestClients.deleteBucket(s3, other));
         } finally {
-            s3.close();
+            try {
+                kms.scheduleKeyDeletion(r -> r.keyId(kmsKey).pendingWindowInDays(7));
+            } finally {
+                kms.close();
+                s3.close();
+            }
         }
     }
 
@@ -75,10 +94,10 @@ class S3DefaultEncryptionIntegrationTest {
         PutObjectResponse put = s3.putObject(r -> r.bucket(bucket).key("kms"), RequestBody.fromString("kms"));
 
         assertEquals(ServerSideEncryption.AWS_KMS, put.serverSideEncryption());
-        assertEquals(KMS_KEY, put.ssekmsKeyId());
+        assertEquals(kmsKey, put.ssekmsKeyId());
         HeadObjectResponse head = head("kms");
         assertEquals(ServerSideEncryption.AWS_KMS, head.serverSideEncryption());
-        assertEquals(KMS_KEY, head.ssekmsKeyId());
+        assertEquals(kmsKey, head.ssekmsKeyId());
     }
 
     @Test
@@ -93,7 +112,7 @@ class S3DefaultEncryptionIntegrationTest {
 
         HeadObjectResponse head = head("multipart");
         assertEquals(ServerSideEncryption.AWS_KMS, head.serverSideEncryption());
-        assertEquals(KMS_KEY, head.ssekmsKeyId());
+        assertEquals(kmsKey, head.ssekmsKeyId());
     }
 
     @Test
@@ -109,11 +128,11 @@ class S3DefaultEncryptionIntegrationTest {
                 .destinationBucket(bucket).destinationKey("multipart").uploadId(uploadId).partNumber(2));
 
         assertEquals(ServerSideEncryption.AWS_KMS, created.serverSideEncryption());
-        assertEquals(KMS_KEY, created.ssekmsKeyId());
+        assertEquals(kmsKey, created.ssekmsKeyId());
         assertEquals(ServerSideEncryption.AWS_KMS, part.serverSideEncryption());
-        assertEquals(KMS_KEY, part.ssekmsKeyId());
+        assertEquals(kmsKey, part.ssekmsKeyId());
         assertEquals(ServerSideEncryption.AWS_KMS, copied.serverSideEncryption());
-        assertEquals(KMS_KEY, copied.ssekmsKeyId());
+        assertEquals(kmsKey, copied.ssekmsKeyId());
         s3.abortMultipartUpload(r -> r.bucket(bucket).key("multipart").uploadId(uploadId));
     }
 
@@ -132,10 +151,10 @@ class S3DefaultEncryptionIntegrationTest {
 
         assertEquals(ServerSideEncryption.AWS_KMS, part.serverSideEncryption());
         assertEquals(ServerSideEncryption.AWS_KMS, completed.serverSideEncryption());
-        assertEquals(KMS_KEY, completed.ssekmsKeyId());
+        assertEquals(kmsKey, completed.ssekmsKeyId());
         HeadObjectResponse head = head("multipart");
         assertEquals(ServerSideEncryption.AWS_KMS, head.serverSideEncryption());
-        assertEquals(KMS_KEY, head.ssekmsKeyId());
+        assertEquals(kmsKey, head.ssekmsKeyId());
     }
 
     @Test
@@ -161,16 +180,16 @@ class S3DefaultEncryptionIntegrationTest {
         String kmsBucket = otherBucket();
         s3.putBucketEncryption(r -> r.bucket(kmsBucket).serverSideEncryptionConfiguration(c -> c.rules(rule ->
                 rule.applyServerSideEncryptionByDefault(d -> d.sseAlgorithm(ServerSideEncryption.AWS_KMS)
-                        .kmsMasterKeyID(KMS_KEY)))));
+                        .kmsMasterKeyID(kmsKey)))));
 
         CopyObjectResponse copy = s3.copyObject(r -> r.sourceBucket(bucket).sourceKey("source")
                 .destinationBucket(kmsBucket).destinationKey("copy"));
 
         assertEquals(ServerSideEncryption.AWS_KMS, copy.serverSideEncryption());
-        assertEquals(KMS_KEY, copy.ssekmsKeyId());
+        assertEquals(kmsKey, copy.ssekmsKeyId());
         HeadObjectResponse head = s3.headObject(r -> r.bucket(kmsBucket).key("copy"));
         assertEquals(ServerSideEncryption.AWS_KMS, head.serverSideEncryption());
-        assertEquals(KMS_KEY, head.ssekmsKeyId());
+        assertEquals(kmsKey, head.ssekmsKeyId());
     }
 
     @Test
@@ -192,7 +211,7 @@ class S3DefaultEncryptionIntegrationTest {
     private void useKmsDefault() {
         s3.putBucketEncryption(r -> r.bucket(bucket).serverSideEncryptionConfiguration(c -> c.rules(rule ->
                 rule.applyServerSideEncryptionByDefault(d -> d.sseAlgorithm(ServerSideEncryption.AWS_KMS)
-                        .kmsMasterKeyID(KMS_KEY)))));
+                        .kmsMasterKeyID(kmsKey)))));
     }
 
     private String otherBucket() {

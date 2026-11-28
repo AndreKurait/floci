@@ -22,7 +22,8 @@ class MetricValuesTest {
         MetricDatum template = MetricDatum.of("Latency", "Milliseconds", 0, List.of(), 123);
         List<MetricDatum> weighted = MetricValues.fromQuery(Map.of(
                 "Values.member.1", List.of("7"), "Values.member.2", List.of("11"),
-                "Counts.member.1", List.of("0"), "Counts.member.2", List.of("2")), "", template);
+                "Counts.member.1", List.of("0"), "Counts.member.2", List.of("2")), "", template)
+                .stream().flatMap(MetricValues::expand).toList();
         assertEquals(2, weighted.size());
         assertTrue(weighted.getFirst().hasSampleCount());
         assertEquals(0, weighted.getFirst().getSampleCount());
@@ -48,6 +49,9 @@ class MetricValuesTest {
         List<MetricDatum> samples = MetricValues.fromJson(
                 MAPPER.readTree("{\"Values\":[2,5],\"Counts\":[1000000000,2]}"),
                 "MetricData.member.1", MetricDatum.of("Latency", "Milliseconds", 0, List.of(), 123));
+        assertEquals(1, samples.size());
+        assertEquals(2, samples.getFirst().getSampleValues().length);
+        samples = samples.stream().flatMap(MetricValues::expand).toList();
         assertEquals(2, samples.size());
         assertEquals(1_000_000_000, samples.getFirst().getSampleCount());
         assertEquals(2_000_000_000, samples.getFirst().getSum());

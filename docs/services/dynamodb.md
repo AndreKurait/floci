@@ -3,6 +3,16 @@
 **Protocol:** JSON 1.0 (`X-Amz-Target: DynamoDB_20120810.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
+## Compressed requests
+
+DynamoDB JSON 1.0 requests accept `Content-Encoding: gzip` for modern operations and the supported
+legacy operations. Signature verification uses the compressed bytes. Floci then decompresses the
+body before IAM evaluates table resources and item keys.
+
+The decompressed body is limited to 16,000,000 bytes, matching the largest request accepted in a live
+AWS probe. Floci returns HTTP 413 for larger bodies and HTTP 400 for invalid gzip; that probe received
+HTTP 500 for these cases. DynamoDB Streams and other request formats retain their existing handling.
+
 ## ListTables authorization
 
 With IAM enforcement enabled, `ListTables` evaluates the regional table collection
@@ -92,6 +102,8 @@ table of that name, the one DynamoDB acts on.
 | `DescribeGlobalTable` | Read a global table's replication group |
 | `UpdateGlobalTable` | Add or remove replica regions |
 | `ListGlobalTables` | List global tables, optionally filtered by region |
+| `UpdateTableReplicaAutoScaling` | Store table and index auto scaling settings for logical replicas |
+| `DescribeTableReplicaAutoScaling` | Read stored logical replica auto scaling settings |
 | `DescribeExport` | Get export status and metadata |
 | `ListExports` | List exports, optionally filtered by table ARN |
 | `ImportTable` | Create a table and load DynamoDB JSON from S3 into it |
@@ -273,6 +285,77 @@ record:
 A Lambda event source mapping or an EventBridge pipe that should see only TTL deletions filters on
 it with the pattern
 `{"userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}}`.
+
+## Warm throughput
+
+The built-in backend reports warm throughput for tables and global secondary indexes
+with at least their current provisioned read/write capacity. A capacity increase
+raises that resource's persisted warm peak; a later decrease retains the peak.
+New on-demand resources start with 12,000 read units and 4,000 write units. Billing
+mode changes retain a higher recorded peak.
+
+`CreateTable`, `UpdateTable`, index creation and updates, and
+[Application Auto Scaling registration](applicationautoscaling.md#dynamodb-capacity-at-registration)
+share this behavior. Explicit prewarming requests are not implemented. A legacy
+stored table or index without peak fields uses its current capacity as a floor;
+peak history that was never stored cannot be recovered.
+
+Registration serializes capacity changes with table create, update and delete.
+If a storage operation reports failure before target replacement, it restores the
+selected capacity and decoded stored warm value and attempts to persist that
+restoration. The table and target stores do not share a transaction. Persistence
+errors hidden by a backend, compensation failures, intermediate reads and process
+loss retain their backend-specific limits.
+
+## Local secondary index reads
+
+A Query filter can use only attributes projected into the local secondary index,
+even with `ALL_ATTRIBUTES`. A Scan that selects `ALL_ATTRIBUTES` or requests an
+unprojected attribute evaluates its filter against the fetched full items.
+A projected-only Scan or `COUNT` evaluates its filter against the index projection.
+
+When a read fetches base items through a local secondary index, consumed capacity
+includes every evaluated base item before filtering. Filtering out one or all
+returned items does not remove that fetch cost. The original `INDEXES` response
+and the table's consumed-capacity metric use the same captured charge.
+
+## CloudWatch capacity metrics
+
+With the native backend and CloudWatch Metrics enabled, `PutItem`, `GetItem`,
+`DeleteItem`, `UpdateItem`, `Query`, `Scan`, `BatchWriteItem` and `BatchGetItem`
+publish their actual consumed capacity in `AWS/DynamoDB`, even when
+`ReturnConsumedCapacity` is omitted or `NONE`. Table and local secondary index
+usage share `TableName`; global secondary index usage has both `TableName` and
+`GlobalSecondaryIndexName`. Conditional write refusals publish their consumed
+write cost while preserving the ordinary error response.
+
+Read `ConsumedReadCapacityUnits` and `ConsumedWriteCapacityUnits` with `Sum` and
+a 60-second period. A fully observed idle minute has an actual zero sample.
+Provisioned tables and global secondary indexes publish
+`ProvisionedReadCapacityUnits` and `ProvisionedWriteCapacityUnits` at five-minute
+boundaries and when a changed capacity is observed. Fresh on-demand resources
+have no provisioned samples; switching to on-demand retains historical samples.
+
+Publication follows completed item operations and retains their captured account,
+Region, table identity and numeric cost. A later `BatchWriteItem` failure publishes
+only operations that returned before the failure. A failed `BatchGetItem` does
+not retain read usage accumulated before its failure. Metric-storage exceptions
+do not change an accepted item operation. Synchronous storage latency can still delay its
+response. The item and metric stores share no transaction.
+
+Retries are held in memory for up to one hour, with a maximum of 4,096 pending
+samples. Idle discovery tracks up to 10,000 resources and 100,000 resource/metric
+minutes; overload suppresses uncertain idle claims. Reset and shutdown discard
+publisher state, and process loss can lose pending metrics. Publication checks
+the current table identity and GSI membership, but does not serialize CloudWatch
+storage with a concurrent table or index deletion. Metric history older than
+15 days is removed. Five-minute gauges sample observed changes rather than
+reconstructing an exact time-weighted history.
+
+This covers the eight native item APIs. Transactions, PartiQL, TTL, imports,
+DynamoDB Local and vector-specific metrics are separate paths. It supplies metrics
+for local workloads. Matching predefined policies use those real metrics through
+[Application Auto Scaling target tracking](applicationautoscaling.md#native-dynamodb-target-tracking).
 
 ## DynamoDB Local backend
 
@@ -754,3 +837,26 @@ With IAM enforcement enabled, `ExecuteStatement` checks `dynamodb:PartiQLSelect`
 statement's operation. A policy can grant that action on the specific table ARN; a wildcard
 resource or a `dynamodb:ExecuteStatement` permission is not required. This mapping covers the
 single-statement API; batch and transaction authorization are separate paths.
+
+## Replica auto scaling settings
+
+On the native backend, `UpdateTableReplicaAutoScaling` stores write settings for the table and its
+global secondary indexes, and read settings for named logical replicas and their indexes.
+`DescribeTableReplicaAutoScaling` returns those settings for the existing replica group. Both
+operations accept the table name or its exact account, region, and partition ARN.
+
+Updates preserve omitted settings, including policy fields. Explicit `false`, zero cooldowns, and
+64-bit capacity bounds survive readback and storage reload. Effective minimum and maximum bounds
+are validated together before any settings are written; a refused multi-member update changes no
+settings. The settings use DynamoDB's existing storage mode and `dynamodb-replica-autoscaling.json`;
+no additional configuration is required. Deleting and recreating a table starts with no settings. A settings-file
+cleanup failure is reported after the existing table, item, stream, and forwarding teardown. A
+retained settings record is tied to the deleted table's identity and cannot affect a recreated table.
+
+This is configuration metadata on the existing logical replica model. It does not replicate items,
+change provisioned throughput in response to load, or create Application Auto Scaling resources.
+Role ARNs and policy names are retained only when supplied; Floci neither creates nor assumes a
+role, verifies its existence, nor invents role or policy defaults. Replica and index descriptions
+follow the native backend's immediate `ACTIVE` state. Changing billing mode does not apply or
+remove these settings. Settings for removed replicas or indexes are hidden, but removing and
+re-adding the same replica region or index name can retain its prior settings.

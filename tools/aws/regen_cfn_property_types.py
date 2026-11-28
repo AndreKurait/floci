@@ -50,24 +50,43 @@ ARCHIVE_URL = "https://schema.cloudformation.us-east-1.amazonaws.com/Cloudformat
 FETCH_TIMEOUT_SECONDS = 60
 
 # The resource types whose provisioners read their properties through CfnPropertyTypes.
-RESOURCE_TYPES = ["AWS::AutoScaling::LaunchConfiguration", "AWS::DSQL::Cluster", "AWS::EC2::Instance",
-                  "AWS::EC2::LaunchTemplate", "AWS::ECS::TaskDefinition", "AWS::EKS::Cluster",
-                  "AWS::EMR::Cluster", "AWS::EMR::InstanceFleetConfig", "AWS::EMR::InstanceGroupConfig",
-                  "AWS::EMR::SecurityConfiguration", "AWS::EMR::Step", "AWS::EMR::Studio",
-                  "AWS::EMR::StudioSessionMapping",
-                  "AWS::EMRContainers::VirtualCluster", "AWS::EMRServerless::Application",
-                  "AWS::Events::Connection", "AWS::Events::Rule",
-                  "AWS::Lambda::Function", "AWS::Lambda::LayerVersion",
-                  "AWS::SES::ConfigurationSetEventDestination"]
+RESOURCE_TYPES = [
+    'AWS::AutoScaling::LaunchConfiguration',
+    'AWS::DSQL::Cluster',
+    'AWS::DynamoDB::Table',
+    'AWS::EC2::Instance',
+    'AWS::EC2::LaunchTemplate',
+    'AWS::ECS::TaskDefinition',
+    'AWS::EKS::Cluster',
+    'AWS::EMR::Cluster',
+    'AWS::EMR::InstanceFleetConfig',
+    'AWS::EMR::InstanceGroupConfig',
+    'AWS::EMR::SecurityConfiguration',
+    'AWS::EMR::Step',
+    'AWS::EMR::Studio',
+    'AWS::EMR::StudioSessionMapping',
+    'AWS::EMRContainers::VirtualCluster',
+    'AWS::EMRServerless::Application',
+    'AWS::ElasticLoadBalancingV2::LoadBalancer',
+    'AWS::ElasticLoadBalancingV2::TargetGroup',
+    'AWS::Events::Connection',
+    'AWS::Events::Rule',
+    'AWS::Lambda::Function',
+    'AWS::Lambda::LayerVersion',
+    'AWS::SES::ConfigurationSetEventDestination',
+    'AWS::SSM::PatchBaseline',
+    'AWS::SSM::ResourceDataSync',
+]
 
 # The shared shape each unconstrained scalar body is written as, inline; a definition keeps its own name.
 SCALAR_SHAPES = {"string": "String", "integer": "Integer", "boolean": "Boolean", "double": "Double", "json": "Json"}
 SCHEMA_SCALARS = {"string": "string", "integer": "integer", "boolean": "boolean", "number": "double"}
 SHAPE_TYPES = {"structure", "list", "map", *SCALAR_SHAPES}
 
-# Types the provisioners rely on, each measured on CloudFormation: (shape, member) -> member shape,
+# Types the provisioners rely on: (shape, member) -> member shape,
 # and for a list or a map the shape of its items or values.
 ANCHORS = {
+    ("AWS::DynamoDB::Table", "DeletionProtectionEnabled"): "Boolean",
     ("AWS::Events::Rule/RetryPolicy", "MaximumRetryAttempts"): "Integer",
     ("AWS::Events::Rule/EcsParameters", "EnableECSManagedTags"): "Boolean",
     ("AWS::Events::Rule/AwsVpcConfiguration", "Subnets"): ["String"],
@@ -83,9 +102,14 @@ ANCHORS = {
     ("AWS::ECS::TaskDefinition/KernelCapabilities", "Add"): ["String"],
     ("AWS::SES::ConfigurationSetEventDestination/EventDestination", "Enabled"): "Boolean",
     ("AWS::SES::ConfigurationSetEventDestination/EventDestination", "MatchingEventTypes"): ["String"],
+    ("AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription", "Port"): "Integer",
+    ("AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute", "Value"): "String",
+    ("AWS::SSM::PatchBaseline", "DefaultBaseline"): "Boolean",
+    ("AWS::SSM::PatchBaseline/Rule", "ApproveAfterDays"): "Integer",
+    ("AWS::SSM::ResourceDataSync/S3Destination", "BucketRegion"): "AWS::SSM::ResourceDataSync/S3Destination.BucketRegion",
 }
 
-# Required members the provisioners rely on, measured the same way: shape -> its required members.
+# Required members the provisioners rely on: shape -> its required members.
 REQUIRED_ANCHORS = {
     "AWS::ECS::TaskDefinition/ContainerDefinition": ["Name", "Image"],
     "AWS::ECS::TaskDefinition/Tmpfs": ["Size"],
@@ -96,6 +120,10 @@ REQUIRED_ANCHORS = {
     "AWS::SES::ConfigurationSetEventDestination/EventBridgeDestination": ["EventBusArn"],
     "AWS::SES::ConfigurationSetEventDestination/DimensionConfiguration": [
         "DimensionValueSource", "DefaultDimensionValue", "DimensionName"],
+    "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription": ["Id"],
+    "AWS::SSM::PatchBaseline": ["Name"],
+    "AWS::SSM::ResourceDataSync": ["SyncName"],
+    "AWS::SSM::ResourceDataSync/S3Destination": ["BucketName", "BucketRegion", "SyncFormat"],
 }
 
 

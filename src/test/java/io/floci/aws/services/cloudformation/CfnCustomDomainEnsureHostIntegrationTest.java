@@ -9,6 +9,7 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -141,17 +142,14 @@ class CfnCustomDomainEnsureHostIntegrationTest {
 
     /** Stack operations run on a background executor; wait for the terminal status. */
     private static void awaitStackStatus(String expected) throws InterruptedException {
-        String body = "";
-        for (int i = 0; i < 200; i++) {
-            body = describeStack();
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> describeStack(), body -> {
             if (body.contains("<StackStatus>" + expected + "</StackStatus>")) {
-                return;
+                return true;
             }
             if (body.contains("FAILED</StackStatus>") || body.contains("ROLLBACK_COMPLETE</StackStatus>")) {
                 fail("stack did not reach " + expected + ": " + body);
             }
-            Thread.sleep(50);
-        }
-        fail("stack did not reach " + expected + " within the timeout: " + body);
+            return false;
+        }, body -> "stack did not reach " + expected + " within the timeout: " + body);
     }
 }

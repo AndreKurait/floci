@@ -100,8 +100,11 @@ public class SsmSessionService implements Resettable {
         String key = sessionKey(region, sessionId);
         SessionRequest request = new SessionRequest(sessionId, arn, owner, node, document.name(), document.content(),
                 document.parameters());
-        sessions.put(key, new SsmSession(sessionId, target, owner, document.name(), reason,
-                SessionState.CONNECTED, clock.instant(), null));
+        SsmSession session = new SsmSession(sessionId, target, owner, document.name(), reason,
+                SessionState.CONNECTED, clock.instant(), null);
+        session.setAccountId(node.accountId());
+        session.setRegion(region);
+        sessions.put(key, session);
         String token;
         try {
             token = gateway.startSession(request, state -> RequestScopes.runAs(node.accountId(), region,
@@ -147,7 +150,8 @@ public class SsmSessionService implements Resettable {
         List<Predicate<SsmSession>> predicates = filters.stream().map(SsmSessionService::filter).toList();
         Instant cutoff = clock.instant().minus(HISTORY_RETENTION);
         String prefix = sessionKey(region, "");
-        List<SsmSession> matching = sessions.scan(key -> key.startsWith(prefix)).stream()
+        List<SsmSession> matching = sessions.scan(key -> key.startsWith(prefix)
+                        || key.startsWith(region + "::")).stream()
                 .filter(session -> active == session.active())
                 .filter(session -> active || !session.endDate().isBefore(cutoff))
                 .filter(session -> predicates.stream().allMatch(predicate -> predicate.test(session)))

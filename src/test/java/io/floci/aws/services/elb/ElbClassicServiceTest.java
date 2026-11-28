@@ -2,11 +2,14 @@ package io.floci.aws.services.elb;
 
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegionFacts;
+import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
+import io.floci.aws.services.ec2.SecurityGroupNftCompiler;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.elb.model.ClassicHealthCheck;
@@ -16,13 +19,17 @@ import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -33,6 +40,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -44,9 +52,13 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -111,6 +123,45 @@ class ElbClassicServiceTest {
         assertTrue(service.tagsInAccount("111111111111", REGION, "missing").isEmpty());
     }
 
+    /**
+     * The shared Classic edge sends health checks and backend requests from Floci's own address, so
+     * its VPC load balancers' groups are emulator origins; a protected frontend sends from its own
+     * namespace, which already carries the groups, so it is none.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void sharedEdgeLoadBalancerSecurityGroupsAreEmulatorOrigins() {
+        ElbClassicService shared = new ElbClassicService(ec2Service, healthChecker, null, null,
+                new RegionResolver(REGION, DEFAULT_ACCOUNT));
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        Instance<SecurityGroupFirewallManager> firewalls = mock(Instance.class);
+        when(firewalls.isResolvable()).thenReturn(true);
+        when(firewalls.get()).thenReturn(firewall);
+        shared.securityGroupFirewall = firewalls;
+
+        shared.createLoadBalancer(REGION, "edge", List.of(httpListener()), List.of(), List.of("subnet-a"),
+                List.of("sg-1"), null, Map.of());
+        assertEquals(List.of(new SecurityGroupNftCompiler.EmulatorOrigin(DEFAULT_ACCOUNT, REGION, "vpc-1",
+                Set.of("sg-1"))), shared.emulatorOrigins());
+
+        shared.applySecurityGroups(REGION, "edge", List.of("sg-2"));
+        assertEquals(List.of(new SecurityGroupNftCompiler.EmulatorOrigin(DEFAULT_ACCOUNT, REGION, "vpc-1",
+                Set.of("sg-2"))), shared.emulatorOrigins());
+        shared.deleteLoadBalancer(REGION, "edge");
+        assertEquals(List.of(), shared.emulatorOrigins());
+        verify(firewall, times(3)).emulatorOriginsChanged();
+
+        ElbClassicFrontendManager frontends = mock(ElbClassicFrontendManager.class);
+        when(frontends.enabled()).thenReturn(true);
+        ElbClassicService protectedEdge = new ElbClassicService(ec2Service, healthChecker, null, null,
+                new RegionResolver(REGION, DEFAULT_ACCOUNT), null, null, frontends);
+        protectedEdge.securityGroupFirewall = firewalls;
+        protectedEdge.createLoadBalancer(REGION, "protected", List.of(httpListener()), List.of(),
+                List.of("subnet-a"), List.of("sg-1"), null, Map.of());
+        assertEquals(List.of(), protectedEdge.emulatorOrigins());
+        verify(firewall, times(3)).emulatorOriginsChanged();
+    }
+
     @Test
     void omittedInstanceProtocolMatchesExplicitDefaultOnListenerRetry() {
         ClassicListener listener = httpListener();
@@ -126,6 +177,7 @@ class ElbClassicServiceTest {
         tcp.setLoadBalancerPort(443);
         tcp.setInstancePort(9090);
         service.createLoadBalancerListeners(REGION, "default-listener", List.of(tcp));
+        lb = service.requireLoadBalancer(REGION, "default-listener");
         assertEquals("TCP", lb.getListeners().getLast().getInstanceProtocol());
         ClassicListener explicit = new ClassicListener();
         explicit.setProtocol("TCP");
@@ -133,7 +185,7 @@ class ElbClassicServiceTest {
         explicit.setInstancePort(9090);
         explicit.setInstanceProtocol("TCP");
         service.createLoadBalancerListeners(REGION, "default-listener", List.of(explicit));
-        assertEquals(2, lb.getListeners().size());
+        assertEquals(2, service.requireLoadBalancer(REGION, "default-listener").getListeners().size());
     }
 
     @Test
@@ -203,6 +255,64 @@ class ElbClassicServiceTest {
                         List.of(), List.of("subnet-a", "subnet-b"), List.of("sg-1"), null, Map.of()));
         assertEquals("InvalidConfigurationRequest", e.getErrorCode());
         assertEquals(409, e.getHttpStatus());
+    }
+
+    @Test
+    void creatingTwoSubnetsInOneZoneIsRejected() {
+        AwsException failure = assertThrows(AwsException.class, () ->
+                service.createLoadBalancer(REGION, "duplicate-zone", List.of(httpListener()),
+                        List.of(), List.of("subnet-a", "subnet-other-a"), List.of("sg-1"), null, Map.of()));
+        assertEquals("InvalidConfigurationRequest", failure.getErrorCode());
+        assertEquals(409, failure.getHttpStatus());
+        verify(healthChecker, never()).startMonitoring(any());
+    }
+
+    @Test
+    void attachingASecondSubnetInTheSameZoneLeavesTheExistingSelectionUntouched() {
+        ClassicLoadBalancer lb = create("same-zone");
+        assertThrows(AwsException.class, () ->
+                service.attachToSubnets(REGION, "same-zone", List.of("subnet-other-a")));
+        assertEquals(List.of("subnet-a"), lb.getSubnets());
+        assertEquals(List.of(REGION + "a"), lb.getAvailabilityZones());
+    }
+
+    @Test
+    void attachingASubnetFromAnotherVpcDoesNotChangeTheExistingVpcOrSubnets() {
+        ClassicLoadBalancer lb = create("other-vpc");
+        when(ec2Service.describeSubnets(anyString(), anyList(), any())).thenAnswer(invocation -> {
+            List<String> ids = invocation.getArgument(1);
+            return ids.stream().map(id -> {
+                Subnet subnet = new Subnet();
+                subnet.setSubnetId(id);
+                subnet.setVpcId("subnet-a".equals(id) ? "vpc-1" : "vpc-2");
+                subnet.setAvailabilityZone(REGION + id.charAt(id.length() - 1));
+                return subnet;
+            }).toList();
+        });
+        assertThrows(AwsException.class, () -> service.attachToSubnets(REGION, "other-vpc", List.of("subnet-b")));
+        assertEquals("vpc-1", lb.getVpcId());
+        assertEquals(List.of("subnet-a"), lb.getSubnets());
+        assertEquals(List.of(REGION + "a"), lb.getAvailabilityZones());
+    }
+
+    @Test
+    void detachingTheLastSubnetLeavesTheExistingSelectionUntouched() {
+        ClassicLoadBalancer lb = create("last-subnet");
+        assertThrows(AwsException.class, () ->
+                service.detachFromSubnets(REGION, "last-subnet", List.of("subnet-a")));
+        assertEquals(List.of("subnet-a"), lb.getSubnets());
+        assertEquals(List.of(REGION + "a"), lb.getAvailabilityZones());
+    }
+
+    @Test
+    void subnetChangesKeepOneSubnetPerEnabledZone() {
+        ClassicLoadBalancer lb = create("three-zones");
+        assertEquals(List.of("subnet-a", "subnet-b", "subnet-c"),
+                service.attachToSubnets(REGION, "three-zones", List.of("subnet-b", "subnet-c", "subnet-a")));
+        assertEquals(List.of(REGION + "a", REGION + "b", REGION + "c"), service.requireLoadBalancer(REGION, "three-zones").getAvailabilityZones());
+        assertEquals(List.of("subnet-a", "subnet-c"),
+                service.detachFromSubnets(REGION, "three-zones", List.of("subnet-b")));
+        assertEquals(List.of(REGION + "a", REGION + "c"), service.requireLoadBalancer(REGION, "three-zones").getAvailabilityZones());
     }
 
     @Test
@@ -372,6 +482,7 @@ class ElbClassicServiceTest {
 
         service.configureHealthCheck(REGION, "my-elb", hc);
 
+        lb = service.requireLoadBalancer(REGION, "my-elb");
         assertEquals("HTTP:8080/health", lb.getHealthCheck().getTarget());
         verify(healthChecker).healthCheckChanged(lb);
     }
@@ -397,15 +508,55 @@ class ElbClassicServiceTest {
         service.registerInstances(REGION, "my-elb", List.of("i-1"));
         assertEquals(List.of("i-1"), service.registerInstances(REGION, "my-elb", List.of("i-1")));
         assertEquals(List.of(), service.deregisterInstances(REGION, "my-elb", List.of("i-1")));
-        verify(healthChecker).deregisterInstances(lb, List.of("i-1"));
+        verify(healthChecker).deregisterInstances(service.requireLoadBalancer(REGION, "my-elb"), List.of("i-1"));
     }
 
     @Test
-    void describeInstanceHealthRejectsAnInstanceThatIsNotRegistered() {
+    void describeInstanceHealthRejectsAnInstanceThatDoesNotExist() {
         create("my-elb");
         AwsException e = assertThrows(AwsException.class,
                 () -> service.describeInstanceHealth(REGION, "my-elb", List.of("i-unknown")));
         assertEquals("InvalidInstance", e.getErrorCode());
+    }
+
+    @Test
+    void existingUnregisteredInstanceHasOutOfServiceHealthWithoutRegistration() {
+        create("my-elb");
+        when(ec2Service.getInstance(REGION, "i-existing")).thenReturn(Optional.of(
+                mock(io.floci.aws.services.ec2.model.Instance.class))); // Name clash with CDI Instance.
+
+        ElbClassicHealthChecker.InstanceHealth health = service.describeInstanceHealth(
+                REGION, "my-elb", List.of("i-existing")).get("i-existing");
+
+        assertEquals(new ElbClassicHealthChecker.InstanceHealth("OutOfService", "Instance",
+                "Instance is not currently registered with the LoadBalancer."), health);
+        assertTrue(service.describeInstanceHealth(REGION, "my-elb", List.of()).isEmpty());
+        assertTrue(service.requireLoadBalancer(REGION, "my-elb").getInstanceIds().isEmpty());
+        verify(healthChecker, never()).getHealth(any(), anyString());
+    }
+
+    @Test
+    void aKnownDeregisteredInstanceIsReportedOutOfService() {
+        create("my-elb");
+        when(ec2Service.getInstance(REGION, "i-known")).thenReturn(
+                Optional.of(new io.floci.aws.services.ec2.model.Instance()));
+        assertEquals(new ElbClassicHealthChecker.InstanceHealth("OutOfService", "Instance",
+                        "Instance is not currently registered with the LoadBalancer."),
+                service.describeInstanceHealth(REGION, "my-elb", List.of("i-known")).get("i-known"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 3601})
+    void anInvalidDrainingTimeoutLeavesAttributesUnchanged(int timeout) {
+        create("my-elb");
+        AwsException failure = assertThrows(AwsException.class, () -> service.modifyLoadBalancerAttributes(
+                REGION, "my-elb", new ElbClassicService.AttributeUpdate(true, null, null, null, null,
+                        true, timeout, null, Map.of())));
+        assertEquals("InvalidConfigurationRequest", failure.getErrorCode());
+        ClassicLoadBalancer actual = service.requireLoadBalancer(REGION, "my-elb");
+        assertEquals(300, actual.getAttributes().getConnectionDrainingTimeout());
+        assertEquals(false, actual.getAttributes().isConnectionDrainingEnabled());
+        assertEquals(false, actual.getAttributes().isCrossZoneLoadBalancingEnabled());
     }
 
     @Test
@@ -447,6 +598,143 @@ class ElbClassicServiceTest {
         ClassicLoadBalancer lb = create("my-elb");
         service.createLoadBalancerListeners(REGION, "my-elb", List.of(httpListener()));
         assertEquals(1, lb.getListeners().size());
+    }
+
+    @Test
+    void runtimeRegistrationPreservesExistingHealthState() {
+        ElbClassicFrontendManager frontends = mock(ElbClassicFrontendManager.class);
+        service = new ElbClassicService(ec2Service, healthChecker, null, null, null, null, null, frontends);
+        ClassicLoadBalancer lb = create("members-elb");
+        when(frontends.copy(lb)).thenReturn(lb);
+        when(frontends.reconcile(lb)).thenReturn(true);
+        clearInvocations(healthChecker);
+
+        service.registerInstances(REGION, "members-elb", List.of("i-new"));
+
+        verify(healthChecker, never()).stopMonitoring(any());
+        verify(healthChecker).startMonitoring(lb);
+        verify(healthChecker).reconcileInstances(lb);
+    }
+
+    @Test
+    void drainingInstanceRemainsVisibleUntilRuntimeCompletion() {
+        ElbClassicFrontendManager frontends = mock(ElbClassicFrontendManager.class);
+        service = new ElbClassicService(ec2Service, healthChecker, null, null, null, null, null, frontends);
+        ClassicLoadBalancer lb = create("draining-elb");
+        when(frontends.drainingInstances(lb)).thenReturn(Set.of("i-draining"));
+
+        Map<String, ElbClassicHealthChecker.InstanceHealth> health =
+                service.describeInstanceHealth(REGION, "draining-elb", List.of());
+
+        assertEquals(Set.of("i-draining"), service.deregisteringInstances(REGION, "draining-elb"));
+        assertEquals(Set.of("i-draining"), health.keySet());
+        assertEquals(new ElbClassicHealthChecker.InstanceHealth("InService", "N/A",
+                "Instance deregistration currently in progress"), health.get("i-draining"));
+        assertEquals(health, service.describeInstanceHealth(REGION, "draining-elb", List.of("i-draining")));
+        verify(healthChecker, never()).getHealth(any(), anyString());
+
+        when(frontends.drainingInstances(lb)).thenReturn(Set.of());
+        assertTrue(service.deregisteringInstances(REGION, "draining-elb").isEmpty());
+        assertTrue(service.describeInstanceHealth(REGION, "draining-elb", List.of()).isEmpty());
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.describeInstanceHealth(REGION, "draining-elb", List.of("i-draining")));
+        assertEquals("InvalidInstance", failure.getErrorCode());
+    }
+
+    @Test
+    void failedFrontendCreationLeavesNoDeclarationOrDnsEntry() {
+        ElbClassicFrontendManager frontends = mock(ElbClassicFrontendManager.class);
+        service = new ElbClassicService(ec2Service, healthChecker, null, null, null, null, null, frontends);
+        AtomicReference<ClassicLoadBalancer> attempted =
+                new AtomicReference<>();
+        when(frontends.reconcile(any())).thenAnswer(invocation -> {
+            attempted.set(invocation.getArgument(0));
+            throw new IllegalStateException("frontend rejected");
+        });
+
+        assertThrows(IllegalStateException.class, () -> create("rejected-elb"));
+
+        assertTrue(service.describeLoadBalancers(REGION, List.of()).isEmpty());
+        assertTrue(service.findByDnsName(attempted.get().getDnsName()).isEmpty());
+        verify(healthChecker, never()).startMonitoring(any());
+    }
+
+    @Test
+    void failedFrontendRemovalRetainsDeclarationAndDnsEntry() {
+        ElbClassicFrontendManager frontends = mock(ElbClassicFrontendManager.class);
+        service = new ElbClassicService(ec2Service, healthChecker, null, null, null, null, null, frontends);
+        ClassicLoadBalancer created = create("retained-elb");
+        doThrow(new IllegalStateException("frontend removal rejected"))
+                .when(frontends).remove(created);
+
+        assertThrows(IllegalStateException.class, () -> service.deleteLoadBalancer(REGION, "retained-elb"));
+
+        assertEquals(List.of(created), service.describeLoadBalancers(REGION, List.of()));
+        assertEquals(List.of(created), service.findByDnsName(created.getDnsName()));
+        verify(healthChecker, never()).stopMonitoring(any());
+    }
+
+    @Test
+    void restoresHealthAndHostedZonesWithoutMovingAnotherAccountsBalancer() {
+        RequestContext context = new RequestContext();
+        context.setAccountId("111111111111");
+        @SuppressWarnings("unchecked")
+        Instance<RequestContext> contexts = mock(Instance.class);
+        when(contexts.get()).thenReturn(context);
+        AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> storage =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), contexts, "111111111111");
+        StorageFactory factory = mock(StorageFactory.class);
+        doReturn(storage).when(factory).create(eq("elb"), eq("elb-load-balancers.json"), any());
+        ClassicLoadBalancer own = new ClassicLoadBalancer();
+        ClassicLoadBalancer foreign = new ClassicLoadBalancer();
+        own.setDnsName("restored.elb.example.test");
+        foreign.setDnsName(own.getDnsName());
+        foreign.setInstanceIds(List.of("i-foreign"));
+        storage.putForAccount("111111111111", REGION, Map.of("same-name", own));
+        storage.putForAccount("222222222222", REGION, Map.of("same-name", foreign));
+        service = new ElbClassicService(ec2Service, healthChecker, factory, null);
+        service.initializeStorage();
+
+        service.restorePersistedRuntime();
+
+        assertEquals(AwsRegionFacts.classicElbHostedZoneId(REGION).orElseThrow(),
+                foreign.getCanonicalHostedZoneNameId());
+        assertEquals(Map.of("same-name", own), storage.getForAccount("111111111111", REGION).orElseThrow());
+        assertEquals(Map.of("same-name", foreign), storage.getForAccount("222222222222", REGION).orElseThrow());
+        assertInstanceOf(ConcurrentHashMap.class,
+                storage.getForAccount("111111111111", REGION).orElseThrow());
+        assertInstanceOf(ConcurrentHashMap.class,
+                storage.getForAccount("222222222222", REGION).orElseThrow());
+        verify(healthChecker).startMonitoring(own);
+        verify(healthChecker).startMonitoring(foreign);
+        verify(healthChecker).registerInstances(foreign, List.of("i-foreign"));
+        assertEquals(2, service.findByDnsName("RESTORED.elb.example.test.").size());
+        service.deleteLoadBalancer(REGION, "same-name");
+        assertEquals(List.of(foreign), service.findByDnsName("restored.elb.example.test."));
+        context.setAccountId("222222222222");
+        service.deleteLoadBalancer(REGION, "same-name");
+        assertTrue(service.findByDnsName("restored.elb.example.test.").isEmpty());
+    }
+
+    @Test
+    void unrelatedAndDeletedDnsNamesDoNotScanStoredLoadBalancers() {
+        AccountAwareStorageBackend<Map<String, ClassicLoadBalancer>> storage =
+                spy(AccountAwareStorageBackend.<Map<String, ClassicLoadBalancer>>inMemory("111111111111"));
+        StorageFactory factory = mock(StorageFactory.class);
+        doReturn(storage).when(factory).create(eq("elb"), eq("elb-load-balancers.json"), any());
+        service = new ElbClassicService(ec2Service, healthChecker, factory, null);
+        service.initializeStorage();
+        service.restorePersistedRuntime();
+        clearInvocations(storage);
+
+        assertTrue(service.findByDnsName("unrelated.example.test.").isEmpty());
+        verify(storage, never()).scanAllAccounts();
+        ClassicLoadBalancer created = create("indexed-elb");
+        assertEquals(List.of(created), service.findByDnsName(created.getDnsName().toUpperCase(Locale.ROOT) + "."));
+        service.deleteLoadBalancer(REGION, created.getLoadBalancerName());
+        clearInvocations(storage);
+        assertTrue(service.findByDnsName(created.getDnsName() + ".").isEmpty());
+        verify(storage, never()).scanAllAccounts();
     }
 
     /** A balancer stored before the zone was looked up per region carries the old fixed zone. */

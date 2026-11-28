@@ -1,9 +1,11 @@
 package io.floci.aws.services.lambda.runtime;
 
+import io.floci.aws.services.lambda.TimelineInvocationTimer;
 import io.floci.aws.services.lambda.model.InvokeResult;
 import io.floci.aws.services.lambda.model.PendingInvocation;
 import io.floci.aws.services.lambda.model.ResponseStreamListener;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
@@ -62,6 +64,26 @@ class RuntimeApiServerTest {
     private RuntimeApiServer server;
     private int port;
     private HttpClient httpClient;
+
+    @Test
+    void runtimeFailureNotifiesEarlyAndLateListenersOnlyOnce() {
+        AtomicInteger calls = new AtomicInteger();
+        server.onRuntimeFailure(calls::incrementAndGet);
+        server.handleRuntimeProcessExited(1);
+        server.handleRuntimeProcessExited(2);
+        assertEquals(1, calls.get());
+        server.onRuntimeFailure(calls::incrementAndGet);
+        assertEquals(2, calls.get());
+    }
+
+    @Test
+    void intentionalShutdownDoesNotSignalRuntimeFailure() {
+        AtomicInteger calls = new AtomicInteger();
+        server.onRuntimeFailure(calls::incrementAndGet);
+        server.quiesce();
+        server.handleRuntimeProcessExited(0);
+        assertEquals(0, calls.get());
+    }
 
     @BeforeEach
     void setUp() throws Exception {
@@ -196,14 +218,16 @@ class RuntimeApiServerTest {
     @Test
     @Timeout(10)
     void nextEndpoint_startsDeadlineWhenInvocationIsDispatched() throws Exception {
-        long queuedDeadline = System.currentTimeMillis() + 1_000;
+        TestTime time = TestTime.create();
+        Duration handlerTimeout = Duration.ofSeconds(1);
         PendingInvocation invocation = new PendingInvocation(
-                "req-deadline", "{}".getBytes(), queuedDeadline,
+                "req-deadline", "{}".getBytes(), time.currentTimeMillis() + handlerTimeout.toMillis(),
                 "arn:aws:lambda:us-east-1:000000000000:function:test",
-                new CompletableFuture<>());
+                new CompletableFuture<>(), new TimelineInvocationTimer(time));
         server.enqueue(invocation);
 
-        Thread.sleep(300);
+        // The invocation waits in the queue before a runtime asks for it
+        time.advance(Duration.ofMillis(300));
         HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
                         .uri(URI.create("http://localhost:" + port
                                 + "/2018-06-01/runtime/invocation/next"))
@@ -212,7 +236,7 @@ class RuntimeApiServerTest {
 
         long advertisedDeadline = Long.parseLong(response.headers()
                 .firstValue("Lambda-Runtime-Deadline-Ms").orElseThrow());
-        assertTrue(advertisedDeadline >= queuedDeadline + 200,
+        assertEquals(time.currentTimeMillis() + handlerTimeout.toMillis(), advertisedDeadline,
                 "queueing and cold-start time must not consume the handler timeout");
     }
 
@@ -669,6 +693,8 @@ class RuntimeApiServerTest {
     @Test
     @Timeout(15)
     void initErrorEndpoint_failsThePendingInvocationAndCondemnsTheEnvironment() throws Exception {
+        AtomicInteger failures = new AtomicInteger();
+        server.onRuntimeFailure(failures::incrementAndGet);
         CompletableFuture<InvokeResult> resultFuture = new CompletableFuture<>();
         PendingInvocation invocation = new PendingInvocation(
                 "req-init-error", "{}".getBytes(), System.currentTimeMillis() + 60_000,
@@ -686,6 +712,7 @@ class RuntimeApiServerTest {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(202, initErrorResponse.statusCode());
+        assertEquals(1, failures.get());
 
         InvokeResult result = resultFuture.get(2, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
@@ -972,8 +999,11 @@ class RuntimeApiServerTest {
         }
         quiesceDone.get(5, TimeUnit.SECONDS);
 
+        // Closing the server ends the parked request, so what the poller received over the whole
+        // life of its connection is known without waiting to see whether something still arrives
+        server.close().get(5, TimeUnit.SECONDS);
         try {
-            HttpResponse<String> response = parkedResponse.get(2, TimeUnit.SECONDS);
+            HttpResponse<String> response = parkedResponse.get(5, TimeUnit.SECONDS);
             assertFalse(response.statusCode() == 200
                     && "req-latch-enqueue".equals(response.headers()
                             .firstValue("Lambda-Runtime-Aws-Request-Id").orElse("")),
@@ -981,7 +1011,7 @@ class RuntimeApiServerTest {
                             + "would cause silent discard of /response. Got "
                             + response.statusCode());
         } catch (Exception expected) {
-            // socket close from tearDown — expected shape.
+            // the closed server dropped the parked connection, which is the expected shape
         }
         InvokeResult result = invocation.getResultFuture().get(2, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
@@ -1048,8 +1078,11 @@ class RuntimeApiServerTest {
         }
         quiesceDone.get(5, TimeUnit.SECONDS);
 
+        // Closing the server ends the parked request, so what the poller received over the whole
+        // life of its connection is known without waiting to see whether something still arrives
+        server.close().get(5, TimeUnit.SECONDS);
         try {
-            HttpResponse<String> response = nextResponse.get(2, TimeUnit.SECONDS);
+            HttpResponse<String> response = nextResponse.get(5, TimeUnit.SECONDS);
             assertFalse(response.statusCode() == 200
                     && "req-latch-nextpath".equals(response.headers()
                             .firstValue("Lambda-Runtime-Aws-Request-Id").orElse("")),
@@ -1057,7 +1090,7 @@ class RuntimeApiServerTest {
                             + "would cause silent discard of /response. Got "
                             + response.statusCode());
         } catch (Exception expected) {
-            // socket close from tearDown — expected shape.
+            // the closed server dropped the parked connection, which is the expected shape
         }
         InvokeResult result = invocation.getResultFuture().get(2, TimeUnit.SECONDS);
         assertEquals("Unhandled", result.getFunctionError());
@@ -1100,6 +1133,7 @@ class RuntimeApiServerTest {
 
         Context dispatchContext = dispatchObserved.get(5, TimeUnit.SECONDS);
         await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
+                .pollDelay(Duration.ZERO)
                 .until(() -> server.pendingQueueSize() == 1 && server.inFlightSize() == 0);
         CompletableFuture<Void> dispatchReturned = new CompletableFuture<>();
         dispatchContext.runOnContext(ignored -> dispatchReturned.complete(null));
@@ -1147,6 +1181,7 @@ class RuntimeApiServerTest {
         server.enqueue(invocation);
 
         await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
+                .pollDelay(Duration.ZERO)
                 .until(() -> server.pendingQueueSize() == 1 && server.inFlightSize() == 0);
 
         assertEquals(1, server.pendingQueueSize(),
@@ -1876,6 +1911,8 @@ class RuntimeApiServerTest {
     @Test
     @Timeout(10)
     void extensionInitError_returns202AndUnregistersExtension() throws Exception {
+        AtomicInteger failures = new AtomicInteger();
+        server.onRuntimeFailure(failures::incrementAndGet);
         String extensionId = registerExtension("failing-extension", "INVOKE");
 
         HttpResponse<String> response = httpClient.send(HttpRequest.newBuilder()
@@ -1888,6 +1925,7 @@ class RuntimeApiServerTest {
                 HttpResponse.BodyHandlers.ofString());
 
         assertEquals(202, response.statusCode());
+        assertEquals(1, failures.get());
         assertEquals("OK", new JsonObject(response.body()).getString("status"));
 
         // The unregistered extension is no longer a valid target for /event/next.
@@ -1942,7 +1980,9 @@ class RuntimeApiServerTest {
 
         String first = registerExtension("first-extension", "INVOKE");
         String second = registerExtension("second-extension", "INVOKE");
-        Thread.sleep(200);
+        // Both registrations have been answered and neither extension has polled: a wait that
+        // cannot block reports the barrier as closed, so the waiter above cannot have got through
+        assertFalse(server.awaitExtensionsReady(0), "registering alone must not open the barrier");
         assertFalse(awaited.isDone(), "registering alone must not open the barrier");
 
         pollExtensionEventNext(first);
@@ -1974,7 +2014,10 @@ class RuntimeApiServerTest {
             }
         });
 
-        Thread.sleep(700);
+        // The registration has been answered and the extension has not polled: a wait that
+        // cannot block reports the barrier as closed, so the waiter above cannot have got through
+        assertFalse(server.awaitExtensionsReady(0),
+                "a registered-but-not-yet-polling extension must keep the barrier closed");
         assertFalse(awaited.isDone(),
                 "a registered-but-not-yet-polling extension must keep the barrier closed");
 
@@ -2558,6 +2601,7 @@ class RuntimeApiServerTest {
             }
 
             await().alias("all concurrent runtime pollers parked").atMost(Duration.ofSeconds(5))
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                     .until(() -> servers.stream().allMatch(s -> s.waitingContextsSize() == 1));
             for (CompletableFuture<HttpResponse<String>> f : pending) {
                 assertFalse(f.isDone(), "all pollers should be parked, none held on a blocking thread");
@@ -2624,6 +2668,7 @@ class RuntimeApiServerTest {
                         .GET().build(),
                 HttpResponse.BodyHandlers.ofString());
         await().alias("extension poll reached the server").atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .until(() -> server.isExtensionParked(extensionId) || pending.isDone());
         return pending;
     }

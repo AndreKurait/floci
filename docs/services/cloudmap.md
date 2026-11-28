@@ -2,6 +2,7 @@
 
 **Protocol:** JSON 1.1
 **Header:** `X-Amz-Target: Route53AutoNaming_v20170314.<Action>`
+**Smithy RPC v2 CBOR:** `POST /service/Route53AutoNaming_v20170314/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Endpoint prefix:** `servicediscovery`
 
 Floci emulates the AWS Cloud Map (service discovery) control plane in-process:
@@ -44,13 +45,15 @@ ignored. These existing filter limitations are unchanged.
 
 ### DNS resolution
 
-For a querying workload with a known VPC, private namespace answers require an
-association with the namespace's backing Route 53 zone. Additional associations
-and their removal take effect on subsequent queries. An unrelated known VPC cannot
-read private registrations. Callers without a known VPC retain unscoped private
-answers for compatibility. Conflicting runtime identities return DNS REFUSED
-before any record lookup or forwarding. The most specific visible private zone wins, and its
-negative answers do not fall back to a public namespace.
+Private namespace answers require a querying managed workload in a VPC associated
+with the namespace's backing Route 53 zone. Additional VPC associations and their
+removal take effect on subsequent queries. An unrelated VPC or an unknown caller
+cannot read private registrations. The most specific associated private zone wins,
+and its negative answers do not fall back to a public namespace.
+
+Public registrations participate in the backing zone's authoritative lookup.
+Explicit Route 53 records, delegations and more specific public zones retain
+authority over the same name; ambiguous public zones remain refused.
 
 A DNS namespace is answerable, not just storable. Floci's embedded DNS server
 resolves `<service>.<namespace>` to the `AWS_INSTANCE_IPV4` of the instances
@@ -91,14 +94,13 @@ still resolve their explicitly configured A records.
 
 UDP replies respect the legacy 512-byte limit or the client's EDNS payload size,
 capped at 4096 bytes. Oversized answers are truncated at whole-record boundaries
-and carry the DNS truncation flag. The embedded server remains UDP-only; TCP
-retry is not implemented.
+and carry the DNS truncation flag. Clients can retry truncated UDP answers over TCP to retrieve the complete record set.
 
 `HTTP` namespaces do not resolve, matching AWS, where they are reachable only
 through `DiscoverInstances`.
 
 When Floci itself runs in Docker, the containers it launches resolve these names
-through it, and publishing the Floci container's port 53/udp lets the host's
+through it, and publishing the Floci container's ports 53/udp and 53/tcp lets the host's
 resolver use it too. When Floci runs natively, the containers it launches resolve
 them through a listener on the Docker bridge, which needs a Linux host and
 permission to bind port 53, and the host's own resolver can be pointed at a

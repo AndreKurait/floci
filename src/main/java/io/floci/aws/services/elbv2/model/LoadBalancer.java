@@ -27,6 +27,7 @@ public class LoadBalancer {
     private String ipAddressType;
     private String region;
     private Map<String, String> attributes = new LinkedHashMap<>();
+    private List<String> backendNetworkInterfaceIds = new ArrayList<>();
 
     public LoadBalancer() {}
 
@@ -71,4 +72,9 @@ public class LoadBalancer {
 
     public Map<String, String> getAttributes() { return attributes; }
     public void setAttributes(Map<String, String> attributes) { this.attributes = attributes; }
+
+    public List<String> getBackendNetworkInterfaceIds() { return backendNetworkInterfaceIds; }
+    public void setBackendNetworkInterfaceIds(List<String> ids) {
+        this.backendNetworkInterfaceIds = ids == null ? new ArrayList<>() : new ArrayList<>(ids);
+    }
 }

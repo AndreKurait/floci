@@ -4,11 +4,15 @@ import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.QuarkusTestProfile;
+import io.quarkus.test.junit.TestProfile;
 import io.quarkus.test.junit.mockito.InjectSpy;
 import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
+
+import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.contains;
@@ -27,7 +31,16 @@ import static org.mockito.ArgumentMatchers.anyString;
  * inside the table's own provision is injected through a spy on the DynamoDB service.
  */
 @QuarkusTest
+@TestProfile(CloudFormationDynamoDbTimeToLiveIntegrationTest.FaultInjectionProfile.class)
 class CloudFormationDynamoDbTimeToLiveIntegrationTest {
+
+    public static final class FaultInjectionProfile implements QuarkusTestProfile {
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            // Scheduled capacity reads must not interleave with Mockito's configuration of the spy.
+            return Map.of("floci.services.cloudwatchmetrics.enabled", "false");
+        }
+    }
 
     private static final String CFN_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/cloudformation/aws4_request";

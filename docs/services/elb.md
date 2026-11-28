@@ -4,9 +4,63 @@
 
 Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB) through the ELBv2 management API. The control plane is AWS SDK / CLI / Terraform compatible. HTTP, HTTPS, and TCP listeners can forward to registered instance and IP targets using the target's reachable local address.
 
+Shutdown retires this emulator's ALB backend network helpers before shared VPC
+routing stops. Stored load balancers and their network interfaces remain available
+for runtime restoration on restart. Reset also retires those helpers; a failed
+removal stays visible and does not prevent cleanup of the other owned helpers.
+Startup restores the persisted VPC and subnet address plans before reconnecting
+the load balancers and starting dependent ECS tasks.
+
+### DNS names
+
+By default a load balancer's `DNSName` is `<name>-<id>.elb.<FLOCI_HOSTNAME>`, which resolves to Floci
+under the emulator's own DNS suffix. With `FLOCI_SERVICES_ELBV2_DNS_NAME_STRATEGY=aws` a new load
+balancer gets the form AWS documents instead, for clients that check it:
+
+| Type | `DNSName` |
+|---|---|
+| Application, internet-facing | `<name>-<digits>.<region>.elb.<dns-suffix>` |
+| Application, internal | `internal-<name>-<digits>.<region>.elb.<dns-suffix>` |
+| Network or Gateway | `<name>-<id>.elb.<region>.<dns-suffix>`, where `<id>` is the id in the ARN |
+
+`<dns-suffix>` is the region's partition suffix, for example `amazonaws.com` or `amazonaws.com.cn`.
+Floci's DNS answers such a name, and the same name with `dualstack.` in front, with the address the
+default form resolves to. That answer comes ahead of `FLOCI_DNS_SPOOF_AWS_ENDPOINTS`, which would
+otherwise give it the AWS API address. A name in those zones (`<region>.elb.<dns-suffix>` and
+`elb.<region>.<dns-suffix>`) that no load balancer has gets NXDOMAIN, as on AWS, rather than being spoofed or
+forwarded upstream; names outside them resolve as before. A client that uses another resolver needs those zones
+forwarded to Floci's DNS. Listener selection by DNS
+name and Route 53 aliases work the same with either form. A load balancer keeps the name it was
+created with when the setting changes.
+
+### Route 53 aliases
+
+A public Route 53 `A` alias to an existing Application Load Balancer resolves to
+Floci's listener address. The target DNS name and canonical hosted-zone ID must
+both match the stored load balancer. DNS lookup finds the owner across accounts
+without changing account-scoped management reads. Target names accept DNS casing,
+a trailing dot, and the `dualstack.` prefix.
+
+The IPv4 listener currently supplies no IPv6 address. Network and Gateway Load
+Balancer aliases, health-evaluated aliases, and advanced routing policies remain
+unsupported. Unknown, deleted, ambiguous, or mismatched targets cannot resolve
+through a suffix match or upstream DNS fallback.
+
 > Classic (v1) Elastic Load Balancing is a **different API** served from the same endpoint host —
 > see [ELB Classic (v1)](elb-classic.md). Requests are routed by their `Version` parameter:
 > `2015-12-01` here, `2012-06-01` there.
+
+## DNS alias targets
+
+The embedded DNS alias resolver identifies ALBs by their stored DNS name across
+accounts and requires the target's canonical hosted-zone ID. Names are case
+insensitive and may include a trailing dot or the `dualstack.` prefix. Ambiguous
+owners, mismatched hosted zones and unsupported target types are refused.
+
+A valid A target uses the bound emulator address with a 60-second TTL. An
+internet-facing ALB uses the caller VPC's public API transport when native public
+HTTPS routing is enabled on port 443. An unavailable address produces no data;
+the resolver does not synthesize an IPv6 address.
 
 ## Supported Actions
 
@@ -20,6 +74,7 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 | ModifyLoadBalancerAttributes | Updates persisted load balancer attributes. |
 | DescribeLoadBalancerAttributes | Returns attributes stored for a load balancer. |
 | DescribeCapacityReservation | Returns the stored capacity reservation fields for a load balancer. |
+| DescribeProvisionedCapacity | Legacy capacity view for an application load balancer without a reservation. |
 | SetSecurityGroups | Replaces the security groups associated with a load balancer. |
 | SetSubnets | Replaces the subnets associated with a load balancer. |
 | SetIpAddressType | Updates the IP address type stored for a load balancer. |
@@ -45,12 +100,33 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 
 ### Listeners
 
+Standalone ALB HTTP and HTTPS listeners use the API listener's configured
+`quarkus.http.proxy` forwarding policy. With proxy address forwarding enabled,
+the same Quarkus parser and trusted-proxy checks determine the client address
+appended to `X-Forwarded-For`. Configure `trusted-proxies` explicitly and have the
+upstream proxy replace caller-supplied forwarding headers with its actual peer.
+The original Host, request target and listener scheme still determine routing
+and backend requests; forwarded authority and prefix values do not replace them.
+Resource listeners do not authenticate client certificates. When the API proxy
+policy requires a trusted client certificate, these listeners retain the socket
+peer identity and ignore forwarding claims. This does not change TLS certificates
+or the ALB's append/preserve/remove attribute. Shared-port TLS routing retains its existing listener selection rules.
+
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
 Listener responses carry the listener's default certificate in `Certificates`, and omit the
 member when the listener has none. The certificate list `AddListenerCertificates` builds is
 read through `DescribeListenerCertificates` rather than through a listener response, as the
 reference describes.
+
+With Floci TLS enabled, an ALB HTTPS listener on the AWS HTTPS proxy port
+(normally `443`) shares that socket with AWS API callbacks. TLS SNI must uniquely
+identify a listener by its load-balancer DNS name, host rules or certificate
+hostnames. The selected ALB serves its own certificate and configured actions;
+unmatched names and clients without SNI continue to the API backend. The public
+Floci API port and non-HTTPS proxy-port collisions remain reserved. See
+[TLS shared-port routing](../configuration/tls.md) for limits.
+
 
 Creating an HTTPS or TLS listener without `SslPolicy` selects `ELBSecurityPolicy-2016-08`,
 matching AWS's default for API, CLI and CloudFormation creation. An explicit policy
@@ -104,6 +180,11 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 
 ## Behavior Notes
 
+- `CreateLoadBalancer` retries with the same name, type, scheme, IP address type, subnets,
+  security groups and tags return the existing load balancer without resetting its listeners
+  or attributes. Omitted defaults and reordered subnet, security-group and tag collections
+  describe the same configuration. A name used with different settings returns
+  `DuplicateLoadBalancerName`.
 - `DescribeLoadBalancers`, `DescribeTargetGroups`, `DescribeListeners`, `DescribeRules`,
   `DescribeAccountLimits` and `DescribeListenerCertificates` return their complete matching
   results without a `NextMarker`. These handlers do not yet split results using `PageSize`
@@ -119,16 +200,30 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   preserve the configured success-code matcher, and do not follow redirects.
 - One health-check deadline covers connection, TLS handshake and response headers.
   Partial bytes do not renew it. Expiry closes the probe and counts toward `Target.Timeout`.
-- Health probes connect directly without JVM proxy settings. A timed-out lookup keeps
+- Health probes ignore JVM proxy settings and use the ALB's managed backend transport
+  when native VPC networking is enabled. A timed-out lookup keeps
   its target and shared worker slot until the underlying work actually exits. This bounds
   background work even when name resolution ignores interruption.
 - Backend TLS uses the runtime's supported protocols and ciphers. Floci does not reproduce
   AWS ALB's backend security-policy selection from the frontend listener policy.
-- ALB listeners share the emulator's network address. Stored subnet and security-group
-  associations do not create a load-balancer VPC network boundary or enforce frontend
-  ingress and backend egress rules. These listeners cannot yet reproduce NAT allowlisting failures.
+- With native VPC networking and security-group enforcement enabled, each ALB subnet has a
+  service-held ENI and protected namespace. HTTP/HTTPS requests, WebSocket handshakes, and
+  health checks originate from those private addresses using the ALB's security groups.
+  Target ingress can reference the ALB security group; ALB egress and VPC routes still apply.
+  A missing backend namespace fails the connection instead of using the emulator's network.
+  `SetSecurityGroups` updates these ENIs, `SetSubnets` reconciles them, and deletion removes
+  their helpers before releasing their addresses. Saved ENI identities support restoration.
+- The managed backend transport uses the stock Dante SOCKS5 server in the network helper.
+  Only the emulator's control address may connect to that listener. Its return-route exception
+  matches replies to that connection; target traffic follows the normal VPC rules.
+  Custom network-helper images must include `sockd`, supplied by Alpine's `dante-server` package.
+- ALB frontend listeners still share the emulator's network address. This backend transport
+  does not enforce frontend security-group ingress or provide a native public ALB address.
+  NLB TCP listeners retain their existing transport. Native ALB backend networking currently
+  follows the native VPC implementation's IPv4 boundary.
 - TCP listeners relay bytes bidirectionally without parsing HTTP or terminating TLS. TLS passthrough requires a TCP listener, with certificates configured at the target, not at the listener. Targets are selected per connection using round-robin among healthy targets, falling back to registered targets when none are healthy. The default TCP idle timeout is 350 seconds, configurable via the `tcp.idle_timeout.seconds` listener attribute (60 to 6000 seconds).
-- TCP listeners require a dedicated local port. Floci still shares its address across load balancers, so a second listener on an in-use TCP port registers successfully and logs a warning, but serves no traffic until the listener holding the port is deleted or moved, and ports reserved by Floci remain unavailable. Address isolation and TLS-terminating NLB listeners are not provided by the TCP proxy.
+- TCP listeners require a dedicated local port. Floci still shares its address across load balancers, so a second TCP listener on an in-use TCP port registers successfully and logs a warning, but serves no traffic until the listener holding the port is deleted or moved, and ports reserved by Floci remain unavailable to TCP listeners. Address isolation and TLS-terminating NLB listeners are not provided by the TCP proxy.
+- A TCP listener never takes a port away from another load balancer's HTTP or HTTPS listener. Those are selected by their load balancer's name and the port, as on AWS, where each load balancer has its own addresses: an HTTP listener by `Host` through the emulator's endpoint (a request to Floci's port whose `Host` names the load balancer and the listener port), and an HTTPS listener on the TLS proxy's port (`floci.tls.aws-https-port`) by SNI. On any other port the TCP listener keeps the local socket, so a client that connects to that port directly reaches the TCP listener.
 - An asynchronous socket-bind failure retains the admitted listeners and retries while they
   remain configured. Retry delays grow from 100 milliseconds to five seconds; a successful
   bind resets the delay. Deleting the last listener or stopping Floci cancels its retry.
@@ -137,11 +232,25 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - ACM certificates must be issued before attaching them. Reimporting an attached ACM certificate refreshes subsequent full TLS handshakes; existing connections keep their negotiated certificate. Reload does not invalidate TLS session caches: a resumed session can retain its previously authenticated certificate after replacement or removal until the session expires or is invalidated. ACM deletion and revocation are refused while a listener still references the certificate.
 - Certificate replacement keeps the previous key material available to new handshakes while the replacement loads. A failed reload leaves the previous certificate active.
 - Unusable saved listeners are retained for correction and logged individually so other saved listeners can start.
-- HTTP or HTTPS listeners sharing a local port must use the same protocol. Requests select a load balancer by its DNS name, a hostname declared by its rules, or a certificate hostname; ambiguous hostnames return 502. TCP never serves a port alongside either protocol; see the TCP note above.
+- HTTP or HTTPS listeners sharing a local port must use the same protocol. Requests select a load balancer by its DNS name, a public Route 53 alias, a hostname declared by its rules, or a certificate hostname; ambiguous hostnames return 502. TCP never serves a port alongside either protocol; see the TCP note above.
 - Load balancer, target group, listener, rule, and tag state is persisted through Floci storage and rebuilt on service startup.
-- Load balancers are created in `active` state.
+- Load balancers return `active` after their required backend namespaces are ready.
+  Native ALBs remain `provisioning` during preparation. Failed preparation attempts clean up
+  their owned resources; a cleanup failure retains the failed balancer and ENI identities for deletion.
 - `CreateLoadBalancer` takes `Subnets` or `SubnetMappings`; specifying both is rejected with `ValidationError`. Application Load Balancers use the regional zone policy described below: by default, two distinct ordinary AZs are required in every region. Empty subnet requests remain invalid. Requests below the minimum return `ValidationError`: `At least two subnets in two different Availability Zones must be specified` (or `At least one subnet must be specified` when single-zone operation is enabled). Subnet-count checks precede lookup, and rejected requests create no load balancer. CloudFormation uses the same service validation; an update that keeps the balancer and omits subnets preserves its current subnets.
 - `SetSubnets` uses the same regional policy for `Subnets` and `SubnetMappings`. Specifying both, an empty request, or a request below the effective AZ minimum is rejected before mutation. Repeated zones return `InvalidConfigurationRequest`: `A load balancer cannot be attached to multiple subnets in the same Availability Zone`. With no subnets, NLB and GWLB return `ValidationError`: `At least one subnet must be specified`. AWS does not document the one-subnet ALB update error; Floci uses the create error and order. Each selected subnet must belong to the load balancer's VPC. Network Load Balancers may use one subnet. The AWS requirement that a Gateway Load Balancer retain every existing subnet is not currently enforced.
+- `DescribeProvisionedCapacity` is a Floci Query extension, using version `2015-12-01`
+  and one `LoadBalancerArn`. Its `ProvisionedCapacity` has `MinimumLBCapacityUnits=0`,
+  `Status=disabled` and `DecreasesRemaining=4`; `LastModifiedTime` is absent.
+  Capacity is never reserved, so no daily decreases are consumed. Load balancer
+  startup or health does not imply a pending capacity reservation. Per-account
+  capacity quota overrides and reservation mutations are not implemented.
+  The action rejects invalid scope and other types, and hides deleted or inaccessible
+  load balancers. With IAM enforcement enabled, its policy action is
+  `elasticloadbalancing:DescribeProvisionedCapacity`, scoped to the named load balancer.
+  The public AWS ELBv2 endpoint rejected this action with `InvalidAction` in a live
+  comparison using an ordinary account; it is not in the public SDK model. The public
+  `DescribeCapacityReservation` action remains separate.
 - EC2 refuses deletion of subnets and VPCs still referenced by load balancers with `DependencyViolation`. These account- and region-scoped dependencies follow persisted load balancer state; changing subnets or deleting the load balancer releases its old references. A CloudFormation update that names other subnets in `Subnets` or `SubnetMappings` moves the load balancer the way `SetSubnets` does, and a rolled-back update moves it back. An independent target group does not prevent subnet or VPC deletion.
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Gateway listeners require `Protocol` and `Port` to be omitted on create and modify. Their control-plane response reports `GENEVE` without a port. CloudFormation preserves omitted gateway listener settings on create and update; other load balancer types retain their existing `HTTP` and port 80 defaults.
@@ -152,6 +261,19 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - Health checks probe the target group's `HealthCheckPort` when it is a port number, and each target's own port when it is `traffic-port` (the default).
 - `HealthCheckProtocol` defaults to `HTTP` for `HTTP` and `HTTPS` target groups and for target type `alb`, and to `TCP` for every other protocol, as for Network and Gateway Load Balancers. A health check uses `HTTP`, `HTTPS` or `TCP`. `TCP` is refused for `HTTP` and `HTTPS` target groups and for target type `alb`. `GENEVE`, `TLS`, `UDP`, `TCP_UDP`, `QUIC` and `TCP_QUIC` are refused for every target group. Each refusal is a `ValidationError` naming the protocols the target group takes, such as `Health check protocol 'TCP' must be one of 'HTTP, HTTPS'`, from `CreateTargetGroup` and `ModifyTargetGroup` alike, and changes nothing.
 - A `TCP` check has no `HealthCheckPath` or `Matcher`. Naming either for one, the default `TCP` check included, is refused with `InvalidConfigurationRequest` (`Health check paths are not supported for TCP health checks`, and the same for matchers). Moving a `TCP` check to `HTTP` or `HTTPS` takes both, or `ModifyTargetGroup` answers `ValidationError` `Path and return code are required for layer 7 health checks.`. Moving a check to `TCP` drops its path and matcher.
+
+- For faster local readiness tests, set
+  `floci.services.elbv2.max-health-check-interval-millis`, for example `100`.
+  Zero, the default, preserves each target group's requested interval. A positive
+  value caps the interval between probes without changing the settings returned
+  by the API. Real HTTP probes, their timeouts, healthy and unhealthy thresholds,
+  and the bounded probe queue still apply; one target never has overlapping probes.
+  This deliberately accelerates local health transitions and does not reproduce
+  AWS wall-clock timing. Negative values are rejected during startup. Registration
+  probes start a target's cadence; an earlier group timer tick does not advance its
+  health threshold. Probe ownership survives deregistration until the worker exits.
+- `CreateTargetGroup` and `ModifyTargetGroup` validate `HealthCheckIntervalSeconds`
+  against the AWS range of 5 to 300 before changing stored settings or active timers.
 - Each `CreateListener` automatically creates an immutable default rule (`priority=default`, `isDefault=true`). This rule cannot be deleted; use `ModifyListener` to change its action.
 - `PathPatternConfig.RegexValues` supports regex conditions in `CreateRule`, `ModifyRule`, `DescribeRules`, and CloudFormation `ListenerRule`. Each expression is 1 to 128 characters; a condition accepts either glob `Values` or `RegexValues`. Rules containing path regexes allow at most three match evaluations per condition and five across the rule. Expressions match the whole request path, excluding its query string, and multiple expressions are ORed. Matching uses RE2/J with bounded, linear-time execution. Lookarounds, backreferences, atomic groups, possessive quantifiers, recursion, subroutines, and Unicode character classes are rejected. Escaped or quoted literal text remains valid. Existing `Values` glob matching is unchanged.
 - Mixed glob and regex values, invalid regex syntax, and excess per-rule match values return AWS's `ValidationError` messages. The syntax error does not echo the submitted pattern.
@@ -189,7 +311,13 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   [ALB Host header rules](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-load-balancer-attributes.html#host-header-preservation);
   the backend address is never substituted for the client authority.
 - `routing.http.xff_header_processing.mode` (default `append`) controls `X-Forwarded-For` for HTTP, WebSocket and Lambda targets. `append` adds the client address to any value the client sent, `preserve` forwards the client's header unchanged, and `remove` drops it. `routing.http.xff_client_port.enabled` (default `false`) adds the client port as `ip:port` or `[ipv6]:port`, in `append` mode only. `ModifyLoadBalancerAttributes` answers `InvalidConfigurationRequest` for any other value of either attribute.
-- `X-Forwarded-Proto` and `X-Forwarded-Port` are always set from the client's connection to the listener, replacing any value the client sent.
+- ALB HTTP and HTTPS listeners use the same `quarkus.http.proxy.*` forwarding policy as
+  the shared API endpoint, including HTTPS listeners sharing the TLS proxy. With forwarding
+  enabled and `trusted-proxies` configured, an admitted proxy's accepted `Forwarded` client
+  address is the address appended to `X-Forwarded-For`; untrusted headers cannot replace
+  the connection's client address.
+- `X-Forwarded-Proto` uses the effective client connection after configured proxy handling.
+  `X-Forwarded-Port` uses the original listener port. Both replace any value the client sent.
 - `RegisterTargets` rejects link-local and cloud instance-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`) with `InvalidTarget`, and the load balancer and its health checks refuse to connect to them. Loopback and private addresses stay reachable so a load balancer can front a neighbouring container.
 - Requests forwarded to a target carry `X-Amzn-Trace-Id`. A request without the header gets a new `Root` field, a request with a `Root` field gets a new `Self` field, and an existing `Self` field is updated. Other fields are kept. Above 7 KB of request headers the header is rewritten to a new `Root` field. Floci does not send these traces to X-Ray.
 
@@ -239,6 +367,39 @@ Load-balancer security-group IDs are stored and returned by `CreateLoadBalancer`
 not evaluate security-group ingress or egress rules, target security-group references,
 network ACLs, or VPC/subnet routing. An `internal` scheme does not create a private
 network boundary on the host. These declarations do not isolate reachable targets.
+The ALB backend path above is the exception for application load balancers.
+
+Network load balancers keep their existing transport: Floci dials NLB targets and sends
+their health checks from its own container address. With
+`FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, a target ingress rule that
+references a security group of a network load balancer in the target's VPC also accepts
+Floci's address on the Docker network it shares with the target (the target's VPC network
+where Floci joined it, otherwise Floci's main network), on that rule's protocol and ports.
+On AWS the NLB's nodes are in that group. A target that admits neither the group nor a CIDR
+containing that address still refuses the traffic, and its health check reports
+`Target.Timeout`. With isolated VPC address spaces, Floci dials a protected NLB target of the
+target group's VPC at its address on Floci's main network, because its private address lives
+only inside its namespace. NLB traffic never reaches a protected endpoint of another VPC or
+account, any protected endpoint from a target group without a VPC, or a host name registered
+as an ip target, and never a protected target whose ingress does not admit the traffic's port
+from that load balancer's own groups (or from Floci's address by CIDR), so a second NLB in the
+VPC does not reach a target that admits only the first: the health check fails and the
+connection is closed. This is decided by the
+listener or load balancer the traffic is for, so a target group shared with an ALB keeps
+these checks for the NLB's traffic. Application load balancer traffic gets none of this. Creating or deleting a network load balancer,
+`SetSecurityGroups` and `SetSubnets` update the targets' rules.
+
+Limits of the NLB rule:
+
+- Every network load balancer shares Floci's address on a network. Such a rule therefore
+  also admits other traffic Floci sends to that port from that address, from any account,
+  including Floci's own HTTP integrations (SNS, EventBridge API destinations, API Gateway)
+  and an ALB that has no managed VPC interfaces (native VPC networking off).
+- With isolated address spaces, a rule that admits only the VPC CIDR still refuses the
+  traffic, and so does an NLB without security groups.
+- The NLB's own ingress and egress rules are not applied.
+- Floci running outside a container admits nothing this way: it reaches containers from a
+  Docker gateway that every host process shares.
 
 `EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic` is not handled by
 `SetSecurityGroups`, is not returned as an enforcement setting, and does not filter
@@ -359,6 +520,19 @@ including a POST whose body the target consumed before closing.
 
 Listener sockets bind on the Floci host. Expose any listener ports you need in Docker Compose when Floci itself runs in a container, similar to RDS and ElastiCache proxy ports.
 
+The shared HTTP API endpoint also forwards requests whose Host names an existing load balancer
+or a public Route 53 alias/CNAME chain to one. An explicit Host port selects that listener;
+otherwise HTTP selects port 80 and HTTPS selects port 443. This supports an external TLS
+front door forwarding to the HTTP listener. Only HTTP listeners participate in shared-endpoint
+dispatch; HTTPS and TCP listeners retain their dedicated transports. An explicit port zero does
+not select the default listener. The shared endpoint does not use the single-listener
+fallback for unrelated hosts, so ordinary AWS API requests retain their existing handlers.
+Configured API hostnames and emulator DNS suffixes also retain ordinary API handling when
+a public alias uses the same name. Dedicated listener ports continue to resolve those aliases.
+After selecting a listener, target groups and load-balancer attributes are read in that
+listener's owning account. Unsigned data requests therefore work for load balancers created
+outside the emulator's default account.
+
 ### Two load balancers on the same port
 
 In AWS each load balancer has its own DNS name and addresses, so two of them can both listen on
@@ -369,24 +543,40 @@ on port 80 is correct for AWS and stays accepted here, but the request has to na
 
 A listener is chosen in this order:
 
-1. The Host header equals a load balancer's own DNS name (`{name}-{id}.elb.localhost.floci.io`).
-2. Exactly one listener on the port has a rule whose `host-header` condition matches the Host
+1. The Host header equals a load balancer's own DNS name (`{name}-{id}.elb.localhost.floci.io`, or the
+   AWS form; see [DNS names](#dns-names)).
+2. A public Route 53 A/AAAA alias or CNAME chain resolves the Host to a load balancer on the port.
+   A and AAAA aliases can coexist when they identify the same target. Alias target hosted-zone
+   IDs, with or without `/hostedzone/`, must match that load balancer's canonical zone.
+   Fully qualified targets and the `dualstack.` DNS prefix are supported.
+   Broken chains, conflicting answers, delegated names, and aliases to a removed or different
+   load balancer cannot fall back to another listener.
+3. Exactly one listener on the port has a rule whose `host-header` condition matches the Host
    header. This uses the same matching as the rule evaluation that follows, so it is
-   case-insensitive, ignores the port, and applies AWS's wildcards: `*` matches 0 or more
+   case-insensitive, ignores the port and final dot, and applies AWS's wildcards: `*` matches 0 or more
    characters and `?` matches exactly 1, which means `*.example.com` claims `test.example.com`
    but not `example.com`. `HostHeaderConfig.RegexValues` is not supported, by rule evaluation or
    by selection, so a load balancer that names itself only through a regex cannot be selected
    this way.
-3. Only one listener is on the port, in which case it answers any Host header.
+4. Exactly one listener has a certificate hostname matching the Host header.
+5. Only one listener is on the port, in which case it answers any Host header.
 
 If none of those resolve, and in particular when two load balancers declare the same hostname or
 neither declares any, the request answers `502 No listener for host`. Floci logs a warning naming
 both load balancers the first time a second one takes a port, because the targets behind them stay
 healthy and nothing else reports the collision.
 
-Giving each load balancer a `host-header` rule for the hostname it serves is usually enough, and it
-is the same configuration AWS needs. Moving one load balancer to a different listener port also
-works, at the cost of a Floci-only difference from the deployed template.
+Public Route 53 records select their actual load balancer before its rules run. Rule evaluation
+still sees the original Host and request path. For names without such records, distinct
+`host-header` rules or distinct listener ports can disambiguate the shared local socket.
+
+### Target health scheduling
+
+ELBv2 probes independent targets concurrently, with up to 32 probes running and one
+outstanding probe per target. Repeated target registration preserves probe cadence.
+Changing the health interval reschedules monitoring, and late results from old
+registrations or settings cannot change current health. Configured healthy and
+unhealthy thresholds still apply to real HTTP results.
 
 ## Application Load Balancer zone policy
 
@@ -418,3 +608,17 @@ These explicit overrides intentionally change local compatibility; they do not
 change the AWS API shape or require a separate Floci process for each region.
 
 CloudFormation rollback can restore a saved legacy ALB subnet list with repeated Availability Zones. This internal snapshot path still checks subnet existence, the zone minimum, and VPC membership; new API and stack-update requests continue to reject repeated zones.
+
+Classic VPC frontend ownership is stored in `elb-classic-frontends.json` through the
+ELB storage backend. An allocation intent precedes interface creation; internal
+interface metadata allows recovery if the interface identity was not yet recorded.
+Cleanup retains ownership until dependent resources and the interface are removed.
+Memory mode does not retain this journal across process exit, and hybrid mode keeps
+its configured asynchronous flush semantics. Keep the ELB and EC2 persistent data
+together when restoring a deployment. Process-crash and packet recovery require
+separate runtime qualification.
+
+Path-pattern `RegexValues` use a linear-time regex engine for admission and full-path matching.
+Lookarounds, backreferences, atomic groups, possessive quantifiers, recursion, subroutines,
+and Unicode character classes are rejected. Escaped or quoted literal text remains valid.
+Existing `Values` glob matching is unchanged.
