@@ -7,6 +7,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.Optional;
 
 /**
@@ -57,7 +59,8 @@ public class ContainerReachableEndpoint {
     }
 
     /**
-     * The Floci {@code http://host:port} base URL reachable from inside a launched Docker container.
+     * The HTTP base URL reachable from inside a launched Docker container. The public listener
+     * accepts HTTP alongside HTTPS; clients with CA trust can select {@link #baseUrlWithTls(boolean)}.
      *
      * <p>The port is the one Floci listens on, not the port in {@code floci.base-url}: base-url
      * advertises the host-facing address, which differs under a port mapping such as
@@ -70,15 +73,42 @@ public class ContainerReachableEndpoint {
         return baseUrl(true);
     }
 
-    /** Uses the Docker host when the container does not receive Floci's DNS resolver. */
+    /** Selects the workload network before handing an address to a container with different DNS. */
     public String baseUrl(boolean useEmbeddedDns) {
-        return "http://" + host(useEmbeddedDns) + ":" + port();
+        return baseUrl(useEmbeddedDns, "http");
+    }
+
+    /** Uses HTTPS when configured, for a client that receives the Floci CA trust bundle. */
+    public String baseUrlWithTls(boolean useEmbeddedDns) {
+        return baseUrl(useEmbeddedDns, config.tls().enabled() ? "https" : "http");
+    }
+
+    private String baseUrl(boolean useEmbeddedDns, String scheme) {
+        return scheme + "://" + authorityHost(host(useEmbeddedDns)) + ":" + port();
+    }
+
+    private static String authorityHost(String host) {
+        return host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
     }
 
     private String host(boolean useEmbeddedDns) {
-        return useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()
-                ? config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX)
-                : dockerHostResolver.resolve();
+        String flociHostname;
+        if (useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()) {
+            flociHostname = config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+        } else if (useEmbeddedDns) {
+            flociHostname = dockerHostResolver.resolve();
+        } else {
+            flociHostname = dockerHostResolver.resolveContainerIp().orElseGet(dockerHostResolver::resolve);
+        }
+        if (!useEmbeddedDns && !"host.docker.internal".equals(flociHostname)) {
+            try {
+                flociHostname = InetAddress.getByName(flociHostname).getHostAddress();
+            } catch (UnknownHostException e) {
+                throw new IllegalStateException("Cannot resolve the configured Floci Docker host", e);
+            }
+        }
+        // host.docker.internal is supplied through Docker's hosts mapping, independent of DNS.
+        return flociHostname;
     }
 
     /** The port of {@link #baseUrl()}: the one a launched container can reach Floci on. */
@@ -113,6 +143,6 @@ public class ContainerReachableEndpoint {
      */
     public Optional<String> httpsBaseUrl(boolean useEmbeddedDns) {
         String host = host(useEmbeddedDns);
-        return tlsCertificates.serves(host) ? Optional.of("https://" + host + ":" + port()) : Optional.empty();
+        return tlsCertificates.serves(host) ? Optional.of("https://" + authorityHost(host) + ":" + port()) : Optional.empty();
     }
 }
