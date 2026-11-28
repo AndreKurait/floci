@@ -322,6 +322,7 @@ public class Ec2QueryHandler {
                 case "DescribeCapacityReservations" -> handleDescribeCapacityReservations(params, region);
                 case "ModifyCapacityReservation" -> handleModifyCapacityReservation(params, region);
                 case "CancelCapacityReservation" -> handleCancelCapacityReservation(params, region);
+            case "MoveCapacityReservationInstances" -> handleMoveCapacityReservationInstances(params, region);
                 // Dedicated Hosts
                 case "AllocateHosts" -> handleAllocateHosts(params, region);
                 case "DescribeHosts" -> handleDescribeHosts(params, region);
@@ -807,6 +808,7 @@ public class Ec2QueryHandler {
         }
         String keyName = p.getFirst("KeyName");
         String subnetId = p.getFirst("SubnetId");
+        String availabilityZone = p.getFirst("Placement.AvailabilityZone");
         // The launch-time public-IP override arrives either on the primary
         // network interface spec (the shape Terraform's
         // associate_public_ip_address sends) or as the legacy top-level
@@ -891,6 +893,10 @@ public class Ec2QueryHandler {
                     "Network interfaces and an instance-level private IP address may not be specified on the same request", 400);
         }
         if (launchTemplateData != null) {
+            if (launchTemplateData.getPlacement() != null) {
+                availabilityZone = firstNonBlank(availabilityZone,
+                        launchTemplateData.getPlacement().getAvailabilityZone());
+            }
             if (marketType == null && launchTemplateData.getInstanceMarketOptions() != null) {
                 marketType = launchTemplateData.getInstanceMarketOptions().getMarketType();
             }
@@ -976,7 +982,7 @@ public class Ec2QueryHandler {
         }
         Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
-                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, dryRun(p),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification, shutdownBehavior);
@@ -5005,12 +5011,34 @@ public class Ec2QueryHandler {
         return booleanResponse("CancelCapacityReservation");
     }
 
+    private Response handleMoveCapacityReservationInstances(MultivaluedMap<String, String> p, String region) {
+        Integer instanceCount = intOrNull(p, "InstanceCount");
+        checkDryRun(p);
+        Ec2Service.CapacityReservationMoveResult moved = service.moveCapacityReservationInstances(region,
+                p.getFirst("SourceCapacityReservationId"), p.getFirst("DestinationCapacityReservationId"),
+                instanceCount, p.getFirst("ClientToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("MoveCapacityReservationInstancesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("sourceCapacityReservation").raw(capacityReservationXml(moved.source(), false))
+                .end("sourceCapacityReservation")
+                .start("destinationCapacityReservation").raw(capacityReservationXml(moved.destination(), false))
+                .end("destinationCapacityReservation")
+                .elem("instanceCount", moved.instanceCount())
+                .end("MoveCapacityReservationInstancesResponse");
+        return xmlResponse(xml.build());
+    }
+
     private String capacityReservationXml(CapacityReservation reservation) {
+        return capacityReservationXml(reservation, true);
+    }
+
+    private String capacityReservationXml(CapacityReservation reservation, boolean includeMetadata) {
         XmlBuilder xml = new XmlBuilder()
                 .elem("capacityReservationId", reservation.getCapacityReservationId())
                 .elem("ownerId", reservation.getOwnerId())
-                .elem("capacityReservationArn", reservation.getCapacityReservationArn())
-                .elem("availabilityZoneId", reservation.getAvailabilityZoneId())
+                .elem("capacityReservationArn", includeMetadata ? reservation.getCapacityReservationArn() : null)
+                .elem("availabilityZoneId", includeMetadata ? reservation.getAvailabilityZoneId() : null)
                 .elem("availabilityZone", reservation.getAvailabilityZone())
                 .elem("instanceType", reservation.getInstanceType())
                 .elem("instancePlatform", reservation.getInstancePlatform())
@@ -5028,7 +5056,7 @@ public class Ec2QueryHandler {
                 .elem("createDate", reservation.getCreateDate() != null ? ISO_FMT.format(reservation.getCreateDate()) : null)
                 .elem("outpostArn", reservation.getOutpostArn())
                 .elem("placementGroupArn", reservation.getPlacementGroupArn())
-                .raw(tagSetXml(reservation.getTags()));
+                .raw(includeMetadata ? tagSetXml(reservation.getTags()) : null);
         if (reservation.getCommitmentDuration() != null) {
             xml.start("commitmentInfo")
                     .elem("commitmentDuration", reservation.getCommitmentDuration())
